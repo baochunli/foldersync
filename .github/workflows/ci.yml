@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - run: scripts/fetch-rclone.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked -p sync-core -p sync-manager -p rclone-adapter -p sync-cli --all-targets -- -D warnings
+      - run: cargo test --locked -p sync-core -p sync-manager -p rclone-adapter -p sync-cli
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - run: scripts/fetch-rclone.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked -p sync-core -p sync-manager -p rclone-adapter -p sync-cli --all-targets -- -D warnings
+      - run: cargo test --locked -p sync-core -p sync-manager -p rclone-adapter -p sync-cli
+      - name: Install NSH 0.6.1
+        shell: bash
+        env:
+          NSH_VERSION: v0.6.1
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          test "$("$HOME/.local/bin/nsh" --version)" = "nsh 0.6.1 (2f51d86)"
+      - name: Build the NSH app
+        working-directory: apps/sync-ui
+        run: ~/.local/bin/nsh build
