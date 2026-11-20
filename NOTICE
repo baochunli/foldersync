@@ -1,0 +1,10 @@
+FolderSync is licensed under MIT. See LICENSE.
+
+Third-party project notices
+
+- Native Shell (NSH), Apache License 2.0
+  https://github.com/longbridge/nsh/blob/v0.6.1/LICENSE-APACHE
+- rclone, MIT License
+  https://github.com/rclone/rclone/blob/v1.76.0/COPYING
+
+Include the applicable license texts and notices with distributed packages.
