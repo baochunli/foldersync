@@ -2,7 +2,7 @@
 
 FolderSync qualifies synchronization behavior against pinned tool versions recorded in [`packaging/qualification-manifest.toml`](../packaging/qualification-manifest.toml) (`rclone 1.76.0`, `NSH 0.6.1`, `Rust 1.98.1`). See [`docs/engine-profile.md`](engine-profile.md) for the exact `rclone 1.76.0` argument profile and observed engine quirks.
 
-> **Qualification boundary:** Local-to-local fixtures verify wrapper orchestration, state persistence, multi-client reconciliation semantics on local filesystems, deletion guards, and phase interruptions. **Local tests never satisfy real Google Drive or removable-volume milestones.** Every real Google Drive, two-account, physical external-disk unplug, and notarized-app scenario below is an **owner-run** qualification task.
+> **Qualification & packaging boundary:** Local-to-local fixtures verify wrapper orchestration, state persistence, multi-client reconciliation semantics on local filesystems, deletion guards, and phase interruptions. **Local tests never satisfy real Google Drive or removable-volume milestones.** Furthermore, the currently packaged `FolderSync.app` ships the **in-memory demo UI** (`apps/sync-ui` `DemoSource`) without live `sync-manager` Finder handoff or runtime bundled-helper discovery; all operational installed-app owner checks and full `sync-cli` Drive runs below are **gated on `connect-t4` and `drive-t4`**.
 
 ## Automated Local-to-Local Qualification
 
@@ -31,7 +31,7 @@ python3 -m unittest discover -s tests/qualification -p "test_*.py" -v
 tests/qualification/run-local.sh
 ```
 
-The harness generates deterministic uniquely identifiable file contents (`--seed`), stores an external truth set outside all sync trees, isolates `HOME` and `--state-dir` / `--finder-dir` to fresh temporary directories, runs multi-cycle verification across three independent client state directories sharing one local remote fixture, and writes structured evidence to:
+The harness generates deterministic uniquely identifiable file contents (`--seed`), stores an external truth set outside all sync trees for every generated file, isolates `HOME` and `--state-dir` / `--finder-dir` to fresh temporary directories, runs multi-cycle verification across three independent client state directories sharing one local remote fixture, and writes structured evidence to:
 
 - `target/qualification/local-evidence.json`
 - `target/qualification/local-evidence.md`
@@ -45,7 +45,7 @@ Verified local scenarios (`sync-cli` + `sync-manager` + pinned `rclone 1.76.0` o
 | `three_client_edit_vs_delete` | `client-a` deletes `doc-a.txt` while `client-b` edits it; A syncs delete first, then B, C, A, B converge across cycles | **PASS** — B's edited version survives on all 3 clients + remote; pre-delete version verified in recovery |
 | `three_client_offline_return` | `client-c` stays offline while A and B create, edit, and delete (`sub/report.bin`) across 2 cycles; C edits `doc-b.txt` offline and adds a new file, then returns for multi-cycle convergence | **PASS** — C's new file propagates, both conflicting `doc-b.txt` versions survive as conflict copies, and deleted `sub/report.bin` is not resurrected |
 | `deletion_guard_abort_and_recovery` | Pause/resume intent persistence, followed by deleting 4 of 10 files (40%) with `--max-delete-percent 10` | **PASS** — `sync-cli run-once` exits non-zero, latches `RecoveryRequired`, publishes Finder `status.json` `state = "attention"`, and preserves all 10 remote files by SHA-256 |
-| `interruption_at_phases` | (A) Missing `RCLONE_TEST` pre-listing; (B) `SIGINT` sent to live `rclone bisync` child during a 1200-file batch; (C) simulated mid-run crash (`running` SQLite row) reconciled on `sync-cli status --json` | **PASS** — pre-listing aborts with `EndpointChanged` and zero remote mutation; mid-transfer `SIGINT` and crash reconciliation latch `RecoveryRequired` with opaque bisync workdir and `outcome.json` preserved |
+| `interruption_at_phases` | (A) Missing `RCLONE_TEST` pre-listing; (B) 500 uniquely identifiable truth-set batch files (`128 KiB` each), requiring observed partial transfer progress on remote (`1 <= n < 500`) + confirmed `SIGINT` delivered to the live `rclone bisync` child, verifying `RecoveryRequired` hold + refusal to auto-rerun, then running follow-up `--resilient --recover` + clean second cycle against the preserved workdir and verifying all 501/501 truth-set SHA-256 hashes (reports `NOT VERIFIED`, never `PASS`, if mid-transfer signal wasn't observed); (C) simulated mid-run crash (`running` SQLite row) reconciled on `sync-cli status --json` | **PASS** — observed mid-transfer `SIGINT` in flight, `RecoveryRequired` hold enforced, workdir preserved, and 501/501 truth-set SHA-256 hashes converged after follow-up cycles |
 
 **Observed small-mapping nuance (plan §10):** Because `--max-delete 10` enforces a 10% limit on tracked files, a tiny collection with 9 or fewer tracked files treats even a single deletion or conflict rename (`1 / 5 = 20%`) as exceeding 10% and aborts safely into `RecoveryRequired`. The 3-client fixture seeds 17 tracked files (16 ordinary files + `RCLONE_TEST`, so 1 delete = 5.9%) to exercise ordinary single-file conflicts and deletions under the default 10% guard.
 
@@ -57,12 +57,14 @@ The following scenarios require real Google Drive credentials, two separately au
 
 ### 1. Real Google Drive Qualification (`tests/qualification/run-drive.sh`)
 
-`tests/qualification/run-drive.sh` enforces strict safety guardrails: it refuses to run unless `--remote <name>`, `--state-dir <dir>`, and `--rclone-config <disposable-config>` are explicitly passed, refuses `~/Library/Application Support/FolderSync` and `~/.config/rclone`, and uses only the SHA-256-verified pinned `rclone 1.76.0` binary.
+`tests/qualification/run-drive.sh` enforces strict safety guardrails: it refuses to run unless `--remote <name>`, `--state-dir <dir>` (must be a fresh, empty, non-symlinked directory), and `--rclone-config <disposable-config>` are explicitly passed; refuses `~/Library/Application Support/FolderSync` and `~/.config/rclone`; redacts `--password-command stderr:` payloads at the capture boundary; and uses only the SHA-256-verified pinned `rclone 1.76.0` binary.
+
+> **Current Drive runner scope (gated on `drive-t4` / `connect-t4`):** Until `sync-cli` supports Google Drive mappings, `tests/qualification/run-drive.sh` executes **account connectivity + folder-ID preflight only** and records every unexercised Drive scenario as `NOT RUN` (overall status `INCOMPLETE`, non-zero exit). It will never report `PASS` while any scenario is `NOT RUN`.
 
 **Prerequisites (owner setup on a disposable shared Drive parent folder):**
 
 1. Create a disposable shared parent folder in Google Drive (never production household data).
-2. Configure a disposable app-owned rclone config file outside `~/.config/rclone` (e.g., inside a fresh `$QUAL_WORK/rclone.conf`) rooted at the actual shared parent folder ID using your own OAuth client credentials (plan §7, §8). Encrypt the config and test retrieval via `--password-command`.
+2. Configure a disposable app-owned rclone config file outside `~/.config/rclone` (e.g., inside a fresh `$QUAL_WORK/rclone.conf`) rooted at the actual shared parent folder ID using your own OAuth client credentials (plan §7, §8). Encrypt the config and retrieve its passphrase only via `--password-command`.
 3. Optionally configure a second remote (`--remote-b <name>`) authenticated as the second household Google account pointing at the same actual shared parent folder ID.
 
 **Execution:**
@@ -77,7 +79,7 @@ tests/qualification/run-drive.sh \
   --rclone-config "$QUAL_WORK/rclone.conf" \
   --dry-run
 
-# Run against the disposable Google Drive remote (writes target/qualification/drive-evidence.{json,md}):
+# Run preflight (and full Drive suite once drive-t4 wires sync-cli Drive mappings):
 tests/qualification/run-drive.sh \
   --remote qualdrive \
   --state-dir "$QUAL_WORK/state" \
@@ -88,20 +90,35 @@ tests/qualification/run-drive.sh \
 **Owner Drive checklist (plan §8, §15, §20):**
 
 - [ ] **Shared parent & folder IDs:** Confirm `rclone lsjson --dirs-only` returns unambiguous folder IDs for `Data/<collection>` and `Recovery/<collection>` without `shared_with_me`.
+  - *Expected outcome:* Exactly one folder ID matches the recorded collection ID; sync proceeds only on exact ID match.
+- [ ] **Changed Drive sharing permissions or changed root/collection folder ID:** Revoke/downgrade sharing on the disposable collection (or rename/replace the Drive folder at the same path so its object ID changes) before a run.
+  - *Expected outcome:* Preflight detects the ID mismatch or permission denial before any mutating transfer, pauses the mapping in `EndpointChanged` (on folder-ID change) or `AuthenticationRequired` / attention hold (on revoked sharing), and leaves local and cloud files untouched.
+- [ ] **Duplicate cloud folder or file names:** Create two identically named folders or files in the disposable Google Drive collection (Google Drive permits duplicate names in one parent).
+  - *Expected outcome:* Preflight `lsjson` / engine diagnostics detect ambiguous duplicate names and stop the mapping in an attention / `EndpointChanged` hold for manual resolution rather than choosing one arbitrarily or overwriting data.
+- [ ] **Cloud quota exhaustion:** Attempt an upload into an account or disposable test pool that hits Google Drive storage quota exhaustion.
+  - *Expected outcome:* Upload fails cleanly with an actionable quota error; existing local and cloud files remain intact and uncorrupted, no local deletion is triggered, and no automatic `--resync` runs.
 - [ ] **Two-account ownership, quota & recovery moves:** Using two separately authenticated accounts (`--remote` and `--remote-b`), verify list, upload, overwrite, deletion, and moving another account's overwritten/deleted file into `Recovery/<collection>/<device>/<run>`. Confirm which account's Google One / Drive quota is charged (plan §8).
+  - *Expected outcome:* Both accounts can read, edit, and preserve overwritten/deleted copies in `Recovery/` with exact truth-set SHA-256 hashes; quota ownership is documented explicitly.
 - [ ] **Three independent client states on Drive:** Run distinct edits, same-file conflict (`--conflict-resolve none --conflict-loser num`), edit/delete, edit/rename, Drive web edit, delayed upload, overlapping runs, and third-client offline return across multiple follow-up cycles; verify every truth-set SHA-256.
+  - *Expected outcome:* All versions accounted for (live file, `.conflict*` copy, or `Recovery/` copy) across follow-up cycles with zero silent data loss or resurrected deletions.
 - [ ] **Drive object policy:** Place a Google Doc/Sheet and a Drive shortcut in the disposable collection; confirm `--drive-skip-gdocs` and `--drive-skip-shortcuts` skip them without traversing shortcut targets or corrupting listings.
-- [ ] **OAuth & encrypted config refresh:** Verify token refresh persists cleanly to the encrypted `--config` via `--password-command`, and verify reauthorization after several days and after token revocation (`AuthenticationRequired` hold).
-- [ ] **Rate limiting & network loss:** Observe HTTP 403/429 throttling and network disconnect mid-run; confirm bounded backoff / recovery holds without data loss.
+  - *Expected outcome:* Native Google documents and shortcuts are skipped cleanly without exporting or pulling shortcut target contents into local storage.
+- [ ] **OAuth & encrypted config refresh:** Verify token refresh persists cleanly to the encrypted `--config` via `--password-command`, and verify reauthorization after several days and after token revocation.
+  - *Expected outcome:* Refreshed tokens persist cleanly; revoked tokens transition the mapping into `AuthenticationRequired` without hanging on hidden stdin prompts or leaking secrets in logs.
+- [ ] **Rate limiting & network loss:** Observe HTTP 403/429 throttling and network disconnect mid-run.
+  - *Expected outcome:* Bounded backoff or safe recovery hold without data corruption or duplicate concurrent runs.
 - [ ] **Scale benchmark (representative subset toward 20 TB):** Measure file count, no-change scan time, changed-file scan time, memory use, API throttling, and recovery-directory growth before enabling automatic scheduling on large collections (plan §13).
 
 ### 2. Physical External Disk & Unplug Tests (Owner Only — Plan §11, §20)
 
 Perform on a dedicated disposable APFS external drive (e.g., `/Volumes/TestSSD/QualData` with sibling `/Volumes/TestSSD/FolderSyncRecovery`) while keeping an independent truth copy on the internal disk:
 
-- [ ] **Absent before launch:** Unmount the disk before launching FolderSync; confirm mapping enters `VolumeUnavailable` (`Waiting for <Volume>`), never auto-creates `/Volumes/<Name>`, and never deletes cloud files.
-- [ ] **Wrong disk with identical display name:** Mount a second USB disk given the exact same volume display name (`/Volumes/TestSSD`); confirm persistent volume UUID binding rejects it and holds safely.
-- [ ] **Reconnect preserves manual pause:** Pause the mapping, eject the disk, reconnect the verified disk; confirm `Intent::Paused` remains `Paused` (never auto-resumes).
+- [ ] **Absent before launch:** Unmount the disk before launching FolderSync.
+  - *Expected outcome:* Mapping enters `VolumeUnavailable` (`Waiting for <Volume>`), never auto-creates `/Volumes/<Name>`, and never deletes cloud files.
+- [ ] **Wrong disk with identical display name:** Mount a second USB disk given the exact same volume display name (`/Volumes/TestSSD`).
+  - *Expected outcome:* Persistent volume UUID binding rejects the wrong disk and holds safely without syncing or mutating either side.
+- [ ] **Reconnect preserves manual pause:** Pause the mapping, eject the disk, reconnect the verified disk.
+  - *Expected outcome:* `Intent::Paused` remains `Paused` (never auto-resumes on volume mount).
 - [ ] **Mid-run unplug matrix (each phase separately):** Physically disconnect the external disk during:
   1. Before listing (immediately at run start)
   2. During listing
@@ -109,16 +126,26 @@ Perform on a dedicated disposable APFS external drive (e.g., `/Volumes/TestSSD/Q
   4. During upload (local → Drive)
   5. During download (Drive → local)
   6. During deletion propagation
-- [ ] **Post-unplug audit:** Reconnect the disk, inspect `state.sqlite`, run logs, opaque `bisync` workdir, and compare every file on both endpoints and in `Recovery/` against external truth-set SHA-256 hashes across two clean follow-up cycles. Per plan §11 and §15, if any phase causes silent data loss or unacceptable resurrection, keep automatic sync on removable roots unsupported until resolved.
+  - *Expected outcome:* Manager stops scheduling, requests graceful child cancellation, preserves opaque `bisync` workdir and run records, and requires revalidation after reconnect. Post-unplug audit compares every file on both endpoints and in `Recovery/` against external truth-set SHA-256 hashes across two clean follow-up cycles. Per plan §11 and §15, if any phase causes silent data loss or unacceptable resurrection, keep automatic sync on removable roots unsupported until resolved.
 
-### 3. Packaged Desktop App & Finder Sync Acceptance (Owner Only — Plan §19, §20)
+### 3. Packaged Desktop App & Finder Sync Acceptance (Owner Only — Gated on `connect-t4` / `drive-t4`, Plan §19, §20)
 
-Perform on a Developer-ID-signed and notarized `FolderSync.app` built via `packaging/build-app.sh --sign ...` and `packaging/notarize.sh` (see [`docs/release.md`](release.md)):
+Perform on a Developer-ID-signed and notarized `FolderSync.app` built via `packaging/build-app.sh --sign ...` and `packaging/notarize.sh` (see [`docs/release.md`](release.md)) **after** `connect-t4` and `drive-t4` wire the real manager, bundled-helper discovery, and Finder handoff into `apps/sync-ui`:
 
-- [ ] **Fresh install on a second Mac:** Install to `/Applications` on a Mac without Rust/Xcode CLT; verify Gatekeeper accepts the app and `spctl --assess` passes.
-- [ ] **Lifecycle & shutdown:** Verify startup, window close-to-background (keep-alive), tray menu actions, `Command-Q`, native Quit, macOS logout/restart interruption, launch-at-login preference, and second-instance exclusion (`manager.lock`).
-- [ ] **Installed permissions:** Verify filesystem access from the installed `.app` and `Contents/Helpers/rclone` to ordinary local directories, protected macOS folders, and external APFS volumes.
-- [ ] **Finder Sync extension:** Enable `FolderSync Finder` in System Settings; verify root-only badges (`synced`, `syncing`, `attention`, `paused`, `disk_missing`, `stale`), zero badges on child files/subfolders, and interactive context menu clicks (`Sync now`, `Pause`, `Open FolderSync`, `Show last run`) including host relaunch when the app is closed.
+- [ ] **Fresh install on a second Mac:** Install to `/Applications` on a Mac without Rust/Xcode CLT.
+  - *Expected outcome:* Gatekeeper accepts the notarized app without quarantine bypasses and `spctl --assess --type execute` succeeds.
+- [ ] **Lifecycle & shutdown:** Exercise startup, window close-to-background (keep-alive), tray menu actions, `Command-Q`, native Quit, macOS logout/restart interruption, launch-at-login preference, and second-instance exclusion (`manager.lock`).
+  - *Expected outcome:* Closing the window keeps the manager alive; Quit stops scheduling and drains or gracefully interrupts active runs; launching a second instance fails cleanly on `manager.lock`.
+- [ ] **Installed-app credentials (Keychain + `--password-command`):** Run syncs from `/Applications/FolderSync.app` using an encrypted app-owned `rclone.conf` whose passphrase is stored in macOS Keychain, and also test with the Keychain locked.
+  - *Expected outcome:* The installed signed app retrieves the passphrase cleanly via its credential helper without spawning hidden terminal prompts; a locked Keychain puts affected mappings into `AuthenticationRequired`; zero passphrases or tokens appear in `runs/`, logs, or exported diagnostic bundles.
+- [ ] **Installed-app filesystem permissions:** Sync ordinary internal folders, macOS protected folders (Documents/Desktop), and an external APFS volume from the installed `.app` and its `Contents/Helpers/rclone` child.
+  - *Expected outcome:* macOS TCC prompts resolve cleanly for the installed bundle and all permitted folders sync identically to CLI runs.
+- [ ] **Installed-app notifications:** Trigger attention-worthy states (conflicts, missing volume, expired auth, recovery required) while the settings window is hidden.
+  - *Expected outcome:* macOS user notifications fire from `FolderSync.app` with plain household status text and actionable next steps without leaking file contents or credentials.
+- [ ] **Update interruption (OS or app update terminating active sync):** Terminate the installed app during an active multi-file transfer (simulating a macOS restart/update or forced upgrade stop), then relaunch FolderSync.
+  - *Expected outcome:* Controlled shutdown requests graceful `SIGINT` when the OS permits; if terminated abruptly before completion, restart reconciles unfinished `runs` rows in SQLite, preserves the opaque `bisync` workdir, detects any surviving orphan child by PID + start time + executable without killing unrelated processes, and holds the affected mapping in `RecoveryRequired` until reviewed.
+- [ ] **Finder Sync extension:** Enable `FolderSync Finder` in System Settings.
+  - *Expected outcome:* Mapped-folder roots display accurate badges (`synced`, `syncing`, `attention`, `paused`, `disk_missing`, `stale`), child files/subfolders never show badges, and interactive context menu clicks (`Sync now`, `Pause`, `Open FolderSync`, `Show last run`) dispatch validated actions and relaunch the host app when closed.
 
 ### 4. Remaining Local / Cross-Platform Matrix Items
 
