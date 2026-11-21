@@ -15,7 +15,7 @@ See [docs/decisions/0002-finder-extension.md](../../docs/decisions/0002-finder-e
   - Extension → Host: `dev.foldersync.finder.action-requested`
 - **Shared handoff location (`<state dir>/finder`):**
   - In production dev / ad hoc / Developer ID builds outside the Mac App Store, `FinderExtension.entitlements` grants a narrow home-relative temporary file exception (`com.apple.security.temporary-exception.files.home-relative-path.read-write` for `/Library/Application Support/FolderSync/finder/`), resolved against the real user home directory (`getpwuid(getuid())`) rather than the App Sandbox container path. Every component from the state root down is validated via `fstatat(..., AT_SYMLINK_NOFOLLOW)` + `openat(..., O_DIRECTORY | O_NOFOLLOW)`, and `status.json` is opened with `O_NONBLOCK | O_NOFOLLOW` requiring a regular file (`S_IFREG`).
-  - Passing `--dev-shared-dir` creates a fresh disposable directory via `mktemp` under `<repo>/target/` with a scoped absolute-path temporary exception for isolated dev testing (arbitrary paths are rejected).
+  - Passing `--dev-shared-dir` creates a fresh private state directory under `<repo>/target/`. The build prints its path for `FOLDERSYNC_STATE_DIR` and grants the extension an absolute-path exception scoped to its `finder/` child. This lets the manager write directly to the extension's handoff directory.
 
 ## Build and Unit Tests (Xcode Command Line Tools only)
 
@@ -47,3 +47,5 @@ pluginkit -e ignore -i dev.foldersync.spike.host.finder-extension
 pluginkit -r "target/finder-mock/FolderSyncHost.app/Contents/PlugIns/FolderSyncFinder.appex"
 rm -rf target/finder-mock
 ```
+
+Remove the disposable directory printed as `State dir` by the build after unregistering the extension.

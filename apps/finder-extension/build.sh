@@ -34,8 +34,8 @@ Options:
   --with-mock-host         Also wrap the extension in a throwaway FolderSyncHost.app
                            for standalone local verification (creates a fresh mktemp handoff
                            dir inside <repo>/target/)
-  --dev-shared-dir         Create a fresh disposable handoff directory via mktemp under
-                           <repo>/target/ with a scoped absolute-path temporary file exception.
+  --dev-shared-dir         Create a fresh disposable state directory under <repo>/target/
+                           with an absolute-path temporary exception for its finder/ child.
                            When omitted in production (.appex-only) mode, uses the checked-in
                            home-relative exception for ~/Library/Application Support/FolderSync/finder.
   --bundle-id <id>         Host app bundle identifier
@@ -210,10 +210,10 @@ fi
 
 REAL_SHARED_DIR=""
 if [[ "$DEV_SHARED_DIR" -eq 1 || "$WITH_MOCK_HOST" -eq 1 ]]; then
-  # Always create a fresh disposable directory via mktemp directly under <repo>/target/.
-  FRESH_SHARED="$(mktemp -d "${TARGET_ROOT}/finder-dev-shared.XXXXXXXX")"
-  chmod 700 "$FRESH_SHARED"
-  REAL_SHARED_DIR="$(cd "$FRESH_SHARED" && pwd -P)"
+  # Match the live manager's <state dir>/finder layout without granting access to the state root.
+  DEV_STATE_DIR="$(mktemp -d "${TARGET_ROOT}/finder-dev-shared.XXXXXXXX")"
+  mkdir -m 700 "${DEV_STATE_DIR}/finder"
+  REAL_SHARED_DIR="$(cd "${DEV_STATE_DIR}/finder" && pwd -P)"
 fi
 
 if [[ "$WITH_MOCK_HOST" -eq 1 ]]; then
@@ -329,6 +329,7 @@ echo "  Extension:     ${APPEX_BUNDLE}"
 echo "  Bundle ID:     ${EXT_BUNDLE_ID}"
 echo "  Host ID:       ${HOST_BUNDLE_ID}"
 if [[ -n "$REAL_SHARED_DIR" ]]; then
+  echo "  State dir:     ${REAL_SHARED_DIR%/finder}"
   echo "  Shared dir:    ${REAL_SHARED_DIR} (fresh mktemp absolute temporary exception)"
 else
   echo "  Shared dir:    ~/Library/Application Support/FolderSync/finder (home-relative temporary exception)"
