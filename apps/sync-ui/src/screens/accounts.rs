@@ -1,19 +1,26 @@
 //! Accounts screen (`ui-spec.md` §5.7): connected identity, access status,
 //! reconnect, check access, and guarded remove account.
 
-use nsh_core::{file_dialog::OpenDialog, prelude::*};
+use std::path::PathBuf;
 
-use crate::contract::{AccountSnapshot, AccountStatus, IconKind, Tone, UiCommand};
+use nsh_base::input;
+use nsh_core::{file_dialog::OpenDialog, prelude::*};
+use sync_core::AccountId;
+use sync_manager::SecretString;
+
+use crate::contract::{
+    AccountSnapshot, AccountStatus, IconKind, ScreenRoute, Tone, UiCommand, UiSnapshot,
+};
 use crate::screens::AppController;
 use crate::theme::{
     BLOCK_GAP, BtnKind, CARD_ACTION_MARGIN, HEADER_BOTTOM_MARGIN, HEADER_GAP, KV_ROW_GAP, Palette,
-    S_COMPACT, S_SMALL, accented_card, app_button, card, card_title, icon, kv_row, page_title,
+    S_SMALL, accented_card, app_button, card, card_title, focus_ring, icon, kv_row, page_title,
     progress_bar, status_pill,
 };
 
 /// Renders the Accounts screen.
 pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
-    let show_real_connect_help = signal(false);
+    let form = signal(None::<AccountForm>);
 
     dynamic(move || {
         let snap = ctrl.snapshot.get();
@@ -41,7 +48,7 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
                                 "Add local folder account…",
                                 BtnKind::Default,
                                 false,
-                                false,
+                                snap.account_operation_pending,
                                 Some(IconKind::Folder),
                                 None,
                                 move || {
@@ -89,98 +96,350 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
                         } else {
                             view().into_element()
                         })
-                        .child(
-                            app_button(
-                                "Connect account…",
-                                BtnKind::Primary,
-                                false,
-                                false,
-                                Some(IconKind::Plus),
-                                None,
-                                move || {
-                                    if is_demo {
-                                        c_connect.send(UiCommand::ConnectDemoAccount);
-                                    } else {
-                                        show_real_connect_help.set(true);
-                                    }
-                                },
-                            )
-                            .test_id("accounts-connect-btn"),
-                        ),
+                        .child(connection_buttons(c_connect, &snap, form)),
                 ),
         );
 
-        if !is_demo && show_real_connect_help.get() {
-            root = root.child(
-                card()
-                    .border_color(p.run_bd)
-                    .child(card_title("Connect a Google Drive account"))
-                    .child(
-                        text("Browser Google Drive sign-in is provided by the Drive account onboarding flow. For local-to-local folder testing right now, use “Add local folder account…” above.")
-                            .text_size(px(S_COMPACT))
-                            .text_color(p.fg),
-                    )
-                    .child(view().flex_row().pt(px(4.0)).child(app_button(
-                        "Dismiss",
-                        BtnKind::Default,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || show_real_connect_help.set(false),
-                    ))),
-            );
-        }
+        let c_form = ctrl.clone();
+        root = root.child(account_form_view(c_form, form));
 
         if snap.accounts.is_empty() {
             root = root.child(card().child(text("No accounts connected yet.").text_color(p.muted)));
         } else {
             for acct in &snap.accounts {
-                root = root.child(account_card(ctrl.clone(), acct));
+                root = root.child(account_card(
+                    ctrl.clone(),
+                    acct,
+                    snap.account_operation_pending,
+                ));
             }
         }
 
-        if let Some(reconnecting_id) = &snap.reconnecting_account {
-            let c_open = ctrl.clone();
-            let c_cancel = ctrl.clone();
-            let c_complete = ctrl.clone();
-            let id_open = reconnecting_id.clone();
-            let id_complete = reconnecting_id.clone();
-            let mut btn_row = view()
+        root.child(authorization_card(ctrl.clone(), &snap))
+            .into_element()
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccountForm {
+    Connect,
+    Import,
+}
+
+pub(super) fn wizard_account_controls(ctrl: AppController) -> impl IntoElement {
+    let form = signal(None::<AccountForm>);
+    dynamic(move || {
+        let snap = ctrl.snapshot.get();
+        let c_accounts = ctrl.clone();
+        view()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(8.0))
+                    .child(connection_buttons(ctrl.clone(), &snap, form))
+                    .child(app_button(
+                        "Open Accounts",
+                        BtnKind::Ghost,
+                        false,
+                        false,
+                        None,
+                        None,
+                        move || c_accounts.navigate(ScreenRoute::Accounts),
+                    )),
+            )
+            .child(account_form_view(ctrl.clone(), form))
+            .child(authorization_card(ctrl.clone(), &snap))
+            .into_element()
+    })
+}
+
+fn connection_buttons(
+    ctrl: AppController,
+    snap: &UiSnapshot,
+    form: Signal<Option<AccountForm>>,
+) -> View {
+    let is_demo = snap.is_demo_mode;
+    view()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(8.0))
+        .child(if is_demo {
+            view().into_element()
+        } else {
+            app_button(
+                "Import existing remote…",
+                BtnKind::Default,
+                false,
+                snap.account_operation_pending,
+                None,
+                None,
+                move || form.set(Some(AccountForm::Import)),
+            )
+            .test_id("accounts-import-btn")
+            .into_element()
+        })
+        .child(
+            app_button(
+                "Connect Google Drive…",
+                BtnKind::Primary,
+                false,
+                snap.account_operation_pending,
+                Some(IconKind::Plus),
+                None,
+                move || {
+                    if is_demo {
+                        ctrl.send(UiCommand::ConnectDemoAccount)
+                    } else {
+                        form.set(Some(AccountForm::Connect));
+                    }
+                },
+            )
+            .test_id("accounts-connect-btn"),
+        )
+}
+
+fn account_form_view(ctrl: AppController, form: Signal<Option<AccountForm>>) -> impl IntoElement {
+    dynamic(move || match form.get() {
+        Some(mode) => drive_setup_form(ctrl.clone(), mode, form).into_element(),
+        None => view().into_element(),
+    })
+}
+
+fn drive_setup_form(
+    ctrl: AppController,
+    mode: AccountForm,
+    form: Signal<Option<AccountForm>>,
+) -> impl IntoElement {
+    let account_id = signal(String::new());
+    let display_name = signal(String::new());
+    let parent = signal(String::new());
+    let client_id = signal(String::new());
+    let secret = signal(SecretString::new(""));
+    let remote = signal(String::new());
+    let source = signal(None::<PathBuf>);
+    let p = Palette::current();
+    let is_import = mode == AccountForm::Import;
+    let mut body = card()
+        .child(card_title(if is_import {
+            "Import a Google Drive remote"
+        } else {
+            "Connect Google Drive"
+        }))
+        .child(
+            text(if is_import {
+                "Choose an unencrypted export containing the remote you want to import."
+            } else {
+                "Enter your desktop OAuth client details and the shared parent folder ID."
+            })
+            .text_color(p.muted),
+        )
+        .child(account_field("Account ID", account_id))
+        .child(account_field("Account display name", display_name))
+        .child(account_field(
+            if is_import {
+                "Shared parent folder ID (optional)"
+            } else {
+                "Shared parent folder ID"
+            },
+            parent,
+        ));
+    if is_import {
+        body = body.child(account_field("Remote name", remote)).child(
+            view()
                 .flex_row()
                 .flex_wrap()
                 .gap(px(8.0))
-                .pt(px(4.0))
+                .items_center()
                 .child(app_button(
-                    "Open the sign-in page again",
+                    "Choose configuration file…",
                     BtnKind::Default,
                     true,
                     false,
                     None,
                     None,
                     move || {
-                        c_open.send(UiCommand::OpenCloudUrl(format!(
-                            "https://accounts.google.com/?account={id_open}"
-                        )));
+                        let answer = pick_paths(
+                            OpenDialog::files().title("Choose exported configuration file"),
+                        );
+                        spawn(async move {
+                            if let Ok(Some(paths)) = answer.await {
+                                source.set(paths.into_iter().next());
+                            }
+                        });
                     },
-                ));
-            if is_demo {
-                btn_row = btn_row.child(
-                    app_button(
-                        "Simulate sign-in complete (demo)",
-                        BtnKind::Primary,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || {
-                            c_complete.send(UiCommand::CheckAccountAccess(id_complete.clone()));
-                        },
+                ))
+                .child(dynamic(move || {
+                    text(
+                        source
+                            .get()
+                            .and_then(|path| {
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or_else(|| "Choose a file".to_owned()),
                     )
-                    .test_id("accounts-simulate-signin-btn"),
-                );
-            }
-            btn_row = btn_row.child(
+                    .text_color(p.muted)
+                    .into_element()
+                })),
+        );
+    } else {
+        body = body
+            .child(account_field("OAuth client ID", client_id))
+            .child(kv_row(
+                "OAuth client secret",
+                input()
+                    .masked(true)
+                    .placeholder("OAuth client secret")
+                    .flex_1()
+                    .min_h(px(28.0))
+                    .px(px(8.0))
+                    .rounded(px(7.0))
+                    .bg(p.bg)
+                    .border_1()
+                    .border_color(p.border)
+                    .focus_visible(focus_ring)
+                    .on_change(move |value: &str| secret.set(SecretString::new(value)))
+                    .into_element(),
+            ));
+    }
+
+    body.child(dynamic(move || {
+        let have = |value: Signal<String>| !value.get().trim().is_empty();
+        let valid = have(account_id)
+            && have(display_name)
+            && if is_import {
+                have(remote) && source.get().is_some()
+            } else {
+                have(parent) && have(client_id) && !secret.with(|value| value.is_empty())
+            };
+        let c_submit = ctrl.clone();
+        view()
+            .flex_row()
+            .gap(px(8.0))
+            .child(app_button(
+                "Cancel",
+                BtnKind::Default,
+                true,
+                false,
+                None,
+                None,
+                move || {
+                    secret.set(SecretString::new(""));
+                    form.set(None);
+                },
+            ))
+            .child(app_button(
+                if is_import {
+                    "Import remote"
+                } else {
+                    "Open browser to sign in"
+                },
+                BtnKind::Primary,
+                true,
+                !valid,
+                None,
+                None,
+                move || {
+                    let id = AccountId::new(account_id.get_untracked().trim());
+                    let display_name = display_name.get_untracked().trim().to_owned();
+                    let parent = parent.get_untracked().trim().to_owned();
+                    if is_import {
+                        let Some(path) = source.get_untracked() else {
+                            return;
+                        };
+                        c_submit.send(UiCommand::ImportDrive {
+                            account_id: id,
+                            display_name,
+                            source_config_path: path,
+                            source_remote_name: remote.get_untracked().trim().to_owned(),
+                            root_folder_id: (!parent.is_empty()).then_some(parent),
+                        });
+                    } else {
+                        let client_secret = secret.get_untracked();
+                        secret.set(SecretString::new(""));
+                        c_submit.send(UiCommand::ConnectDrive {
+                            account_id: id,
+                            display_name,
+                            root_folder_id: parent,
+                            client_id: client_id.get_untracked().trim().to_owned(),
+                            client_secret,
+                        });
+                    }
+                    form.set(None);
+                },
+            ))
+            .into_element()
+    }))
+}
+
+fn account_field(label: &'static str, value: Signal<String>) -> View {
+    let p = Palette::current();
+    kv_row(
+        label,
+        input()
+            .placeholder(label)
+            .flex_1()
+            .min_h(px(28.0))
+            .px(px(8.0))
+            .rounded(px(7.0))
+            .bg(p.bg)
+            .border_1()
+            .border_color(p.border)
+            .focus_visible(focus_ring)
+            .on_change(move |text: &str| value.set(text.to_owned()))
+            .into_element(),
+    )
+}
+
+fn authorization_card(ctrl: AppController, snap: &UiSnapshot) -> View {
+    let p = Palette::current();
+    let Some(id) = &snap.reconnecting_account else {
+        return if snap.account_operation_pending {
+            card()
+                .child(card_title("Checking account access"))
+                .child(progress_bar(None, 6.0, "Checking account access"))
+        } else {
+            view()
+        };
+    };
+    let is_demo = snap.is_demo_mode;
+    let ready = is_demo || snap.can_reopen_authorization;
+    let demo_id = id.clone();
+    let c_open = ctrl.clone();
+    let mut buttons = view()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(8.0))
+        .pt(px(4.0))
+        .child(app_button(
+            "Open the sign-in page again",
+            BtnKind::Default,
+            true,
+            !ready,
+            None,
+            None,
+            move || c_open.send(UiCommand::ReopenDriveAuthorization),
+        ));
+    if is_demo {
+        let c_complete = ctrl.clone();
+        buttons = buttons
+            .child(
+                app_button(
+                    "Simulate sign-in complete (demo)",
+                    BtnKind::Primary,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || c_complete.send(UiCommand::CheckAccountAccess(demo_id.clone())),
+                )
+                .test_id("accounts-simulate-signin-btn"),
+            )
+            .child(
                 app_button(
                     "Cancel",
                     BtnKind::Default,
@@ -188,28 +447,27 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
                     false,
                     None,
                     None,
-                    move || c_cancel.send(UiCommand::CancelReconnect),
+                    move || ctrl.send(UiCommand::CancelReconnect),
                 )
                 .test_id("accounts-cancel-reconnect-btn"),
             );
-
-            root = root.child(
-                card()
-                    .border_color(p.run_bd)
-                    .child(card_title("Finish signing in in your browser"))
-                    .child(progress_bar(None, 6.0, "Waiting for browser sign-in"))
-                    .child(btn_row),
-            );
-        }
-
-        root.into_element()
-    })
+    }
+    card()
+        .border_color(p.run_bd)
+        .child(card_title(if ready {
+            "Finish signing in in your browser"
+        } else {
+            "Preparing Google Drive sign-in"
+        }))
+        .child(progress_bar(None, 6.0, "Waiting for browser sign-in"))
+        .child(buttons)
 }
 
-fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
+fn account_card(ctrl: AppController, acct: &AccountSnapshot, busy: bool) -> View {
     let p = Palette::current();
     let (pill_icon, pill_label, pill_tone, is_err) = match acct.status {
         AccountStatus::Connected => (IconKind::Check, "Connected", Tone::Ok, false),
+        AccountStatus::Unverified => (IconKind::Bang, "Access unverified", Tone::Attn, false),
         AccountStatus::SignInRequired => (IconKind::Key, "Sign-in required", Tone::Err, true),
         AccountStatus::KeychainLocked => (IconKind::Key, "Keychain locked", Tone::Err, true),
         AccountStatus::Reconnecting => (IconKind::Sync, "Reconnecting", Tone::Run, false),
@@ -231,7 +489,7 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
     } else {
         format!("Remove its {} mappings first.", acct.mapping_count)
     };
-    let remove_disabled = acct.mapping_count > 0;
+    let remove_disabled = acct.mapping_count > 0 || busy;
 
     let c_rec = ctrl.clone();
     let c_chk = ctrl.clone();
@@ -245,8 +503,9 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
         .flex_wrap()
         .items_center()
         .gap(px(8.0))
-        .mt(px(CARD_ACTION_MARGIN))
-        .child(app_button(
+        .mt(px(CARD_ACTION_MARGIN));
+    if acct.is_drive {
+        actions = actions.child(app_button(
             "Reconnect…",
             if is_err {
                 BtnKind::Primary
@@ -254,18 +513,19 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
                 BtnKind::Default
             },
             true,
-            false,
+            busy,
             None,
             None,
             move || c_rec.send(UiCommand::ReconnectAccount(id_rec.clone())),
         ));
+    }
 
-    if !is_err {
+    if acct.is_drive && acct.status != AccountStatus::SignInRequired {
         actions = actions.child(app_button(
             "Check access",
             BtnKind::Default,
             true,
-            false,
+            busy,
             None,
             None,
             move || c_chk.send(UiCommand::CheckAccountAccess(id_chk.clone())),
@@ -282,14 +542,14 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
             None,
             move || c_rm.send(UiCommand::RemoveAccount(id_rm.clone())),
         )
-        .accessibility_label(if remove_disabled {
+        .accessibility_label(if acct.mapping_count > 0 {
             format!("Remove account, disabled: {remove_reason}")
         } else {
             "Remove account".to_owned()
         }),
     );
 
-    if remove_disabled {
+    if acct.mapping_count > 0 {
         actions = actions.child(
             text(remove_reason)
                 .text_size(px(S_SMALL))
@@ -310,7 +570,14 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
         view()
             .flex_col()
             .gap(px(KV_ROW_GAP))
-            .child(kv_row("Google account", text(acct.email.clone())))
+            .child(kv_row(
+                if acct.is_drive {
+                    "Google account"
+                } else {
+                    "Account"
+                },
+                text(acct.email.clone()),
+            ))
             .child(kv_row(
                 "Shared parent folder",
                 text(acct.shared_parent_label.clone()),

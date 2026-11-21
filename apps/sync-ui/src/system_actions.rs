@@ -33,6 +33,10 @@ pub trait SystemActions: Send + Sync {
     /// Opens an allow-listed URL (`https://` or `x-apple.systempreferences:`).
     fn open_url(&self, url: &str) -> Result<(), String>;
 
+    fn open_drive_authorization(&self, url: &str) -> Result<(), String> {
+        self.open_url(url)
+    }
+
     /// Updates the system Launch-at-Login registration.
     fn set_launch_at_login(&self, enabled: bool) -> Result<LaunchAtLoginOutcome, String>;
 
@@ -44,6 +48,7 @@ pub trait SystemActions: Send + Sync {
 /// so platform desktop APIs run strictly on the main reactive thread (HIGH #8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemActionRequest {
+    OpenDriveAuthorization(sync_manager::SecretString),
     RevealPath(PathBuf),
     OpenUrl(String),
     SetLaunchAtLogin(bool),
@@ -82,6 +87,19 @@ pub async fn execute_system_action_on_main_thread(req: SystemActionRequest) -> S
                 ))),
             }
         }
+        SystemActionRequest::OpenDriveAuthorization(url) => {
+            let url = url.expose();
+            let opened = is_drive_authorization_url(url)
+                && nsh_core::prelude::open_url(url.to_owned()).await;
+            SystemActionOutcome::OpenUrl(if opened {
+                Ok(())
+            } else {
+                Err(
+                    "Could not open Google Drive sign-in. Try opening the sign-in page again."
+                        .to_owned(),
+                )
+            })
+        }
         SystemActionRequest::OpenUrl(url) => match validate_open_url(&url) {
             Ok(safe) => {
                 if nsh_core::prelude::open_url(safe.to_owned()).await {
@@ -115,6 +133,24 @@ pub async fn execute_system_action_on_main_thread(req: SystemActionRequest) -> S
     }
 }
 
+pub(crate) fn is_drive_authorization_url(url: &str) -> bool {
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return false;
+    }
+    if url.starts_with("https://accounts.google.com/o/oauth2/") {
+        return true;
+    }
+    url.strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split_once("/auth?state="))
+        .is_some_and(|(port, state)| {
+            port.parse::<u16>().is_ok_and(|port| port > 0)
+                && !state.is_empty()
+                && state
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_' | b'='))
+        })
+}
+
 /// Validates that `url` uses an explicit safe scheme before handing it to macOS.
 pub fn validate_open_url(url: &str) -> Result<&str, String> {
     let trimmed = url.trim();
@@ -131,6 +167,7 @@ pub fn validate_open_url(url: &str) -> Result<&str, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedSystemAction {
     RevealPath(PathBuf),
+    OpenDriveAuthorization,
     OpenUrl(String),
     SetLaunchAtLogin(bool),
     Notify {
@@ -192,6 +229,17 @@ impl SystemActions for RecordingSystemActions {
             .lock()
             .unwrap()
             .push(RecordedSystemAction::OpenUrl(safe.to_owned()));
+        Ok(())
+    }
+
+    fn open_drive_authorization(&self, url: &str) -> Result<(), String> {
+        if !is_drive_authorization_url(url) {
+            return Err("Invalid Google Drive sign-in address".to_owned());
+        }
+        self.calls
+            .lock()
+            .unwrap()
+            .push(RecordedSystemAction::OpenDriveAuthorization);
         Ok(())
     }
 

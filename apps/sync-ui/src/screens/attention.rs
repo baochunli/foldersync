@@ -195,11 +195,24 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                     }));
             }
         }
-        AttentionKind::VolumeMissing { .. } => {
+        AttentionKind::VolumeMissing { can_check_again } => {
             // Physical step ("Connect PhotoSSD") has no button; only optional Pause per §5.6
             if let (Some(mid), Some(name)) = (&item.mapping_id, &item.mapping_name) {
                 let c1 = ctrl.clone();
                 let id = mid.clone();
+                if *can_check_again {
+                    let c_check = ctrl.clone();
+                    let check_id = mid.clone();
+                    actions = actions.child(app_button(
+                        "Check again",
+                        BtnKind::Primary,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || c_check.send(UiCommand::CheckAgain(check_id.clone())),
+                    ));
+                }
                 actions = actions.child(app_button(
                     format!("Pause {name}"),
                     BtnKind::Default,

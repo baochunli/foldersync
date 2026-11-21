@@ -47,7 +47,29 @@ pub const CRATE_ASSETS: &[nsh_core::element::AssetFile] = assets!();
 
 #[native_module("sync-ui/native")]
 fn native(registry: &mut Registry) {
+    handle_credential_helper_invocation();
     registry.assets(CRATE_ASSETS).register::<App>();
+}
+
+/// The direct binary and the NSH launcher both enter here before starting the UI.
+#[doc(hidden)]
+pub fn handle_credential_helper_invocation() {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("credential-helper")) {
+        let key = match (args.next(), args.next(), args.next()) {
+            (Some(flag), Some(key), None) if flag == "--account" => key.into_string().ok(),
+            _ => None,
+        };
+        let ok = key.is_some_and(|key| {
+            sync_manager::run_credential_helper(
+                &sync_manager::SystemSecretStore,
+                &key,
+                &mut std::io::stdout().lock(),
+            )
+            .is_ok()
+        });
+        std::process::exit(if ok { 0 } else { 3 });
+    }
 }
 
 /// Returns `true` when in-memory demo mode is explicitly requested via
@@ -164,6 +186,10 @@ pub fn App() -> impl IntoElement {
                                 let outcome = execute_system_action_on_main_thread(request).await;
                                 mgr_reply.complete_system_action(request_id, outcome);
                             });
+                        }
+                        UiControlEvent::QuitDeferred => {
+                            c_updates.quitting.set(false);
+                            nsh_core::element::desktop::cancel_quit_request();
                         }
                         UiControlEvent::QuitReady(_outcome) => {
                             nsh_core::element::desktop::quit();
@@ -568,7 +594,7 @@ mod tests {
         let statuses: Vec<_> = snap
             .mappings
             .iter()
-            .map(|m| m.presented_status(snap.active_run.as_ref()))
+            .map(|m| m.presented_status(snap.active_run.as_ref(), snap.scheduling_paused))
             .collect();
 
         let has_line = |needle: &str| statuses.iter().any(|s| s.status_line.contains(needle));

@@ -4,6 +4,8 @@
 //! identifiers and user intent — never secrets, raw shell strings, or rclone
 //! command lines.
 
+use std::collections::BTreeSet;
+
 use sync_core::{
     AccountId, AvailableAction, Execution, Intent, LastRunSummary, MappingId, MappingState,
     Readiness, RunId, VolumeIdentity, VolumeKind, available_actions, status_text,
@@ -280,6 +282,8 @@ pub struct MappingSnapshot {
     /// Persistent unreviewed conflict notice (independent of Pause/Queued modifiers).
     pub unreviewed_conflicts: Option<UnreviewedConflicts>,
     pub available_actions: Vec<AvailableAction>,
+    pub scheduling_enabled: bool,
+    pub volume_issue: Option<String>,
     pub schedule_minutes: u32,
     pub next_check_label: String,
     pub included_subfolders: usize,
@@ -342,7 +346,11 @@ impl StatusLink {
 impl MappingSnapshot {
     /// Computes the exact status wording, icon shape, pill, and button enablement
     /// per `ui-spec.md` §6 and `sync_core::status_text` / `available_actions`.
-    pub fn presented_status(&self, active_run: Option<&ActiveRunSnapshot>) -> PresentedStatus {
+    pub fn presented_status(
+        &self,
+        active_run: Option<&ActiveRunSnapshot>,
+        scheduling_paused: bool,
+    ) -> PresentedStatus {
         let state = &self.state;
         let readiness = state.readiness();
         let execution = state.execution;
@@ -353,11 +361,9 @@ impl MappingSnapshot {
             &self.volume_name,
             self.last_run.as_ref(),
         );
-        // Never promise automatic retry when automatic scheduling is off (HIGH #4).
-        if self.next_check_label == "Manual runs only"
-            && core_text == "Last run failed — will retry"
-        {
-            core_text = "Last run failed — retry manually".to_owned();
+        let retry_held = scheduling_paused || !self.scheduling_enabled;
+        if retry_held && core_text == "Last run failed — will retry" {
+            core_text = "Last run failed".to_owned();
         }
         let actions = available_actions(state);
 
@@ -737,7 +743,11 @@ impl MappingSnapshot {
                 pill_label: None,
                 pill_tone: Tone::Attn,
                 icon: IconKind::Clock,
-                status_line: format!("Couldn't reach Google Drive · retrying at {retry_at}"),
+                status_line: if retry_held {
+                    "Couldn't reach Google Drive".to_owned()
+                } else {
+                    format!("Couldn't reach Google Drive · retrying at {retry_at}")
+                },
                 why_line: Some("Check the network connection. Nothing was changed.".to_owned()),
                 secondary_link: None,
                 sync_now_enabled,
@@ -819,7 +829,7 @@ pub enum AttentionKind {
         keychain_locked: bool,
     },
     VolumeMissing {
-        volume_name: String,
+        can_check_again: bool,
     },
     EndpointChanged {
         is_cloud: bool,
@@ -861,6 +871,7 @@ pub struct AttentionItem {
 pub enum AccountStatus {
     Connected,
     SignInRequired,
+    Unverified,
     KeychainLocked,
     Reconnecting,
 }
@@ -874,6 +885,7 @@ pub struct AccountSnapshot {
     pub status: AccountStatus,
     pub access_summary: String,
     pub mapping_count: usize,
+    pub is_drive: bool,
 }
 
 /// One bounded entry in the Activity recent-events list.
@@ -978,10 +990,28 @@ pub enum ReviewScenario {
     BothEmpty,
 }
 
+/// Advisory exclusion changes and the checks performed before initialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterReview {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub checks: Vec<LocationCheck>,
+}
+
+impl FilterReview {
+    pub fn can_apply(&self) -> bool {
+        (!self.added.is_empty() || !self.removed.is_empty())
+            && self.checks.iter().all(|check| check.ok)
+    }
+}
+
 /// Draft state for the 6-step Add-mapping flow.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WizardDraft {
     pub step: WizardStep,
+    pub changing_subfolders: bool,
+    pub filter_review: Option<FilterReview>,
+    pub volume_free_bytes: Option<u64>,
     /// Mapping ID when resuming an existing draft or finishing first sync (#3).
     pub editing_mapping_id: Option<MappingId>,
     pub selected_account: AccountId,
@@ -1033,25 +1063,29 @@ pub struct WizardDraft {
 }
 
 impl WizardDraft {
-    /// Sum of included subfolder sizes (GB) at depth 1, or cloud/local byte total if flat.
+    /// Estimated selection size, including files directly inside the root folder.
     pub fn included_gb(&self) -> f64 {
-        let sub_sum: f64 = self
+        let omitted = self
             .subfolders
             .iter()
-            .filter(|n| n.depth == 1 && n.included)
-            .map(|n| n.size_gb)
-            .sum();
-        if self.subfolders.iter().any(|n| n.depth == 1) {
-            sub_sum
-        } else if let Some(bytes) = self.cloud_total_bytes.or(self.local_total_bytes) {
-            (bytes as f64) / 1_000_000_000.0
-        } else {
-            self.subfolders
-                .iter()
-                .find(|n| n.depth == 0 && n.included)
-                .map(|n| n.size_gb)
-                .unwrap_or(0.0)
-        }
+            .filter(|node| node.depth == 1 && !node.included)
+            .map(|node| node.size_gb)
+            .sum::<f64>();
+        (self.total_gb_opt().unwrap_or_default() - omitted).max(0.0)
+    }
+
+    pub fn extra_exclusions(&self) -> BTreeSet<String> {
+        self.subfolders
+            .iter()
+            .filter(|node| node.depth == 1 && !node.included)
+            .map(|node| format!("/{}/**", node.name))
+            .chain(
+                self.custom_patterns
+                    .iter()
+                    .map(|pattern| pattern.trim().to_owned()),
+            )
+            .filter(|pattern| !pattern.is_empty())
+            .collect()
     }
 
     /// Total size of the folder (GB), returning `None` when unknown ("Measuring…").
@@ -1102,11 +1136,20 @@ impl WizardDraft {
         true
     }
 
+    pub fn download_exceeds_free_space(&self) -> bool {
+        self.review_scenario == ReviewScenario::CloudToLocal
+            && self
+                .cloud_total_bytes
+                .zip(self.volume_free_bytes)
+                .is_some_and(|(needed, free)| needed > free)
+    }
+
     /// Whether the Start first sync button may be enabled.
     pub fn can_start_first_sync(&self) -> bool {
         self.location_valid()
             && self.recovery_valid()
             && self.review_scenario != ReviewScenario::BothPopulated
+            && !self.download_exceeds_free_space()
             && self.no_other_sync_confirmed
     }
 }
@@ -1160,6 +1203,7 @@ pub struct UiSnapshot {
     pub active_run: Option<ActiveRunSnapshot>,
     /// Actual ordered queue of waiting mapping IDs (front first, #6).
     pub queue_order: Vec<MappingId>,
+    pub active_job_mapping_id: Option<MappingId>,
     pub attention_items: Vec<AttentionItem>,
     pub recent_events: Vec<ActivityEvent>,
     pub raw_log: Vec<String>,
@@ -1170,6 +1214,8 @@ pub struct UiSnapshot {
     pub wizard: WizardDraft,
     pub preferences: PreferencesSnapshot,
     pub reconnecting_account: Option<AccountId>,
+    pub account_operation_pending: bool,
+    pub can_reopen_authorization: bool,
     pub status_notice: Option<String>,
     /// Actionable manager error displayed prominently in the UI with a Dismiss control.
     pub action_error: Option<String>,
@@ -1288,11 +1334,29 @@ pub enum UiCommand {
     DiscardDraft(MappingId),
     ResumeDraft(MappingId),
     FinishSetup(MappingId),
+    ChangeSubfolders(MappingId),
+    PreviewFilterChange,
+    ApplyFilterChange,
     SetScheduleInterval {
         mapping_id: MappingId,
         minutes: u32,
     },
     ConnectDemoAccount,
+    ConnectDrive {
+        account_id: AccountId,
+        display_name: String,
+        root_folder_id: String,
+        client_id: String,
+        client_secret: sync_manager::SecretString,
+    },
+    ImportDrive {
+        account_id: AccountId,
+        display_name: String,
+        source_config_path: std::path::PathBuf,
+        source_remote_name: String,
+        root_folder_id: Option<String>,
+    },
+    ReopenDriveAuthorization,
     AddLocalFixtureAccount {
         id: String,
         display_name: String,
@@ -1360,7 +1424,7 @@ pub fn selected_sync_now_target(route: &ScreenRoute, snap: &UiSnapshot) -> Optio
         return None;
     };
     let m = snap.mapping(id)?;
-    let pres = m.presented_status(snap.active_run.as_ref());
+    let pres = m.presented_status(snap.active_run.as_ref(), snap.scheduling_paused);
     pres.sync_now_enabled.then(|| id.clone())
 }
 

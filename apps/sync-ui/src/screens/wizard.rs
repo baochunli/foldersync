@@ -14,10 +14,10 @@ use crate::contract::{
 };
 use crate::screens::AppController;
 use crate::theme::{
-    BtnKind, KV_ROW_GAP, Palette, S_CAPTION, S_CARD_TITLE, S_COMPACT, S_QUESTION, S_SMALL, S_TINY,
-    W_BODY, W_STRONG, W_TITLE, accented_card, app_button, capacity_meter, card, card_title,
-    emphasized_line, focus_ring, icon, kv_row, link_button, mono_text, page_title, progress_bar,
-    section_label, status_pill,
+    BLOCK_GAP, BtnKind, KV_ROW_GAP, Palette, S_CAPTION, S_CARD_TITLE, S_COMPACT, S_QUESTION,
+    S_SMALL, S_TINY, W_BODY, W_STRONG, W_TITLE, accented_card, app_button, capacity_meter, card,
+    card_title, emphasized_line, focus_ring, icon, kv_row, link_button, mono_text, page_title,
+    progress_bar, section_label, status_pill,
 };
 
 /// Renders the Add-mapping wizard inside the main content area (sidebar stays visible).
@@ -37,6 +37,10 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
             return render_first_sync(ctrl.clone(), &snap).into_element();
         }
 
+        if draft.changing_subfolders {
+            return render_filter_change(ctrl.clone(), draft, pattern_input).into_element();
+        }
+
         let (title, subtitle) = match draft.step {
             WizardStep::Account => ("Add mapping".to_owned(), None),
             WizardStep::Folder => (
@@ -46,11 +50,10 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
                         "Folders in {}:Data · about 10.4 TB in total. Pick one; add more afterwards.",
                         draft.selected_account
                     )
+                } else if snap.accounts.iter().any(|a| a.id == draft.selected_account && a.is_drive) {
+                    "Browsing Google Drive folders is unavailable in this build.".to_owned()
                 } else {
-                    format!(
-                        "Choose a folder from {}:Data, or pick a local test remote folder.",
-                        draft.selected_account
-                    )
+                    "Choose a folder from the local test account.".to_owned()
                 }),
             ),
             WizardStep::Location => (format!("Where should {} live?", draft.selected_folder), None),
@@ -89,7 +92,18 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
             WizardStep::FirstSync => render_first_sync(ctrl.clone(), &snap),
         };
 
-        let footer = render_wizard_footer(ctrl.clone(), draft, skip_account);
+        let account_ready = snap
+            .accounts
+            .iter()
+            .any(|a| a.id == draft.selected_account && a.status == AccountStatus::Connected);
+        let folder_ready = snap.is_demo_mode || draft.remote_folder_path.is_some();
+        let footer = render_wizard_footer(
+            ctrl.clone(),
+            draft,
+            skip_account,
+            account_ready,
+            folder_ready,
+        );
 
         view()
             .flex_col()
@@ -111,6 +125,135 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
             .child(footer)
             .into_element()
     })
+}
+
+fn render_filter_change(
+    ctrl: AppController,
+    draft: &WizardDraft,
+    pattern_input: Signal<String>,
+) -> View {
+    let Some(mapping_id) = draft.editing_mapping_id.clone() else {
+        return view();
+    };
+    let p = Palette::current();
+    let reviewing = draft.step == WizardStep::Review;
+    let mut content = view()
+        .w_full()
+        .flex_col()
+        .gap(px(BLOCK_GAP))
+        .child(page_title(if reviewing {
+            "Review subfolder changes"
+        } else {
+            "Change subfolders"
+        }));
+    let c_back = ctrl.clone();
+    let c_submit = ctrl.clone();
+    let mut footer = view()
+        .flex_row()
+        .gap(px(8.0))
+        .pt(px(14.0))
+        .border_t_1()
+        .border_color(p.hair)
+        .child(app_button(
+            "Cancel",
+            BtnKind::Default,
+            false,
+            false,
+            None,
+            None,
+            move || c_back.navigate(ScreenRoute::MappingDetail(mapping_id.clone())),
+        ))
+        .child(view().flex_1());
+    if let Some(review) = draft.filter_review.as_ref().filter(|_| reviewing) {
+        let mut body = card().child(card_title("Changes for this mapping"));
+        for (label, patterns) in [
+            ("New exclusions", &review.added),
+            ("Removed exclusions", &review.removed),
+        ] {
+            body = body.child(kv_row(
+                label,
+                text(if patterns.is_empty() {
+                    "None".to_owned()
+                } else {
+                    patterns.join(", ")
+                })
+                .text_color(p.fg)
+                .into_element(),
+            ));
+        }
+        body = body.child(text("Previous sync setup is kept. Local copies of newly excluded files stay in place. Applying these changes starts a new first sync.").text_color(p.fg));
+        let mut checks = card().child(card_title("Before first sync"));
+        for check in &review.checks {
+            checks = checks.child(check_row(
+                if check.ok {
+                    IconKind::Check
+                } else {
+                    IconKind::Octagon
+                },
+                if check.ok { p.ok } else { p.err },
+                &check.message,
+            ));
+        }
+        let can_apply = review.can_apply();
+        let c_consent = ctrl.clone();
+        if can_apply {
+            checks = checks.child(
+                checkbox()
+                    .checked(draft.no_other_sync_confirmed)
+                    .test_id("filter-change-consent")
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .focus_visible(focus_ring)
+                    .on_change(move |checked: &bool| {
+                        c_consent.send(UiCommand::WizardSetNoOtherSyncConfirmed(*checked))
+                    })
+                    .child(radio_circle(draft.no_other_sync_confirmed, false))
+                    .child(
+                        text("I’ve reviewed the changes and want to start a new first sync.")
+                            .text_color(p.fg),
+                    ),
+            );
+        }
+        footer = footer
+            .child(app_button(
+                "Back",
+                BtnKind::Default,
+                false,
+                false,
+                None,
+                None,
+                move || ctrl.send(UiCommand::WizardSetStep(WizardStep::Subfolders)),
+            ))
+            .child(
+                app_button(
+                    "Apply and start first sync",
+                    BtnKind::Primary,
+                    false,
+                    !can_apply || !draft.no_other_sync_confirmed,
+                    None,
+                    None,
+                    move || c_submit.send(UiCommand::ApplyFilterChange),
+                )
+                .test_id("filter-change-confirm"),
+            );
+        content = content.child(body).child(checks);
+    } else {
+        content = content.child(render_step_subfolders(ctrl, draft, pattern_input));
+        footer = footer.child(
+            app_button(
+                "Review changes",
+                BtnKind::Primary,
+                false,
+                false,
+                None,
+                None,
+                move || c_submit.send(UiCommand::PreviewFilterChange),
+            )
+            .test_id("filter-change-preview"),
+        );
+    }
+    content.child(footer)
 }
 
 fn step_indicator(ctrl: AppController, draft: &WizardDraft) -> View {
@@ -210,10 +353,10 @@ fn render_step_account(ctrl: AppController, snap: &UiSnapshot) -> View {
         let is_checked = !is_disabled && snap.wizard.selected_account == acct.id;
         let c = ctrl.clone();
         let id = acct.id.clone();
-        let sub = if is_disabled {
-            "Sign-in required. Reconnect it in Accounts first.".to_owned()
-        } else {
+        let sub = if snap.is_demo_mode && !is_disabled {
             "Connected · access checked today at 14:30".to_owned()
+        } else {
+            acct.access_summary.clone()
         };
 
         group = group.child(
@@ -259,20 +402,50 @@ fn render_step_account(ctrl: AppController, snap: &UiSnapshot) -> View {
                 .text_color(p.fg),
         )
         .child(group)
-        .child(view().pt(px(4.0)).child(app_button(
-            "Connect account…",
-            BtnKind::Default,
-            false,
-            false,
-            None,
-            None,
-            move || c_conn.navigate(ScreenRoute::Accounts),
-        )))
+        .child(if snap.is_demo_mode {
+            view()
+                .pt(px(4.0))
+                .child(app_button(
+                    "Connect account…",
+                    BtnKind::Default,
+                    false,
+                    false,
+                    None,
+                    None,
+                    move || c_conn.navigate(ScreenRoute::Accounts),
+                ))
+                .into_element()
+        } else {
+            super::accounts::wizard_account_controls(ctrl).into_element()
+        })
 }
 
 fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
     let p = Palette::current();
     let selected_folder = &snap.wizard.selected_folder;
+    if !snap.is_demo_mode
+        && snap
+            .accounts
+            .iter()
+            .any(|a| a.id == snap.wizard.selected_account && a.is_drive)
+    {
+        return card()
+            .child(
+                app_button(
+                    "New folder in Data…",
+                    BtnKind::Default,
+                    true,
+                    true,
+                    Some(IconKind::Plus),
+                    Some("Folder creation in Data is unavailable in this build"),
+                    || {},
+                )
+                .test_id("wizard-new-folder-btn"),
+            )
+            .child(
+                text("Folder creation in Data is unavailable in this build.").text_color(p.muted),
+            );
+    }
 
     let mut body = table_body().flex_col().w_full();
     for item in &snap.cloud_catalog {
@@ -383,9 +556,13 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
             .test_id("wizard-new-folder-btn"),
         )
         .child(
-            text("Only folders directly inside Data are offered, so collections never overlap.")
-                .text_size(px(S_CAPTION))
-                .text_color(p.muted),
+            text(if is_demo {
+                "Only folders directly inside Data are offered, so collections never overlap."
+            } else {
+                "Folder creation in Data is unavailable in this build."
+            })
+            .text_size(px(S_CAPTION))
+            .text_color(p.muted),
         );
 
     let folder_table_card = card()
@@ -744,7 +921,17 @@ fn render_step_subfolders(
                 .child(
                     table_cell().flex_1().child(
                         checkbox()
-                            .checked(node.included)
+                            .test_id(&format!("subfolder-{}", node.id))
+                            .disabled(node.depth == 0 && !node.has_children)
+                            .checked(if node.depth == 0 && node.has_children {
+                                draft
+                                    .subfolders
+                                    .iter()
+                                    .filter(|n| n.depth == 1)
+                                    .all(|n| n.included)
+                            } else {
+                                node.included
+                            })
                             .flex_row()
                             .items_center()
                             .gap(px(8.0))
@@ -824,7 +1011,24 @@ fn render_step_subfolders(
 
     let included_gb = draft.included_gb();
     let total_opt = draft.total_gb_opt();
-    let remaining_tb = (draft.volume_free_gb as f64 - included_gb).max(0.0) / 1000.0;
+    let free_gb = draft
+        .volume_free_bytes
+        .map(|bytes| bytes as f64 / 1_000_000_000.0);
+    let fit = match (free_gb, total_opt) {
+        (Some(free), Some(_)) if included_gb > free => format!(
+            "Free on {} · {free:.1} GB. The selection exceeds available space.",
+            draft.volume_name
+        ),
+        (Some(free), Some(_)) => format!(
+            "Free on {} · {free:.1} GB. The selection fits in the available space.",
+            draft.volume_name
+        ),
+        (Some(free), None) => format!(
+            "Free on {} · {free:.1} GB. Selection size unknown.",
+            draft.volume_name
+        ),
+        (None, _) => format!("Free space on {} is unknown.", draft.volume_name),
+    };
 
     let c_toggle_def = ctrl.clone();
     let c_add_pat = ctrl.clone();
@@ -858,14 +1062,7 @@ fn render_step_subfolders(
         .flex_none()
         .child(card_title("Will be on this Mac"))
         .child(size_headline)
-        .child(
-            text(format!(
-                "{} keeps about {remaining_tb:.2} TB free",
-                draft.volume_name
-            ))
-            .text_size(px(S_SMALL))
-            .text_color(p.muted),
-        )
+        .child(text(fit).text_size(px(S_SMALL)).text_color(p.muted))
         .child(view().pt(px(4.0)).child(section_label("Always excluded")))
         .child(
             view()
@@ -981,7 +1178,16 @@ fn render_step_subfolders(
         )
     };
 
-    let found_card = card()
+    let found_card = if draft.changing_subfolders {
+        card()
+            .flex_1()
+            .child(card_title("Before first sync"))
+            .child(
+                text("Review changes to check both folders and the recovery locations.")
+                    .text_color(p.muted),
+            )
+    } else {
+        card()
         .flex_1()
         .child(card_title("What was found"))
         .child(name_check)
@@ -990,7 +1196,8 @@ fn render_step_subfolders(
             IconKind::Alert,
             p.attn,
             "Google Docs, Sheets, Slides and Drive shortcuts are skipped. FolderSync can't list all of them, so it can't say how many there are.",
-        ));
+        ))
+    };
 
     let supported_card = card()
         .flex_1()
@@ -1483,6 +1690,16 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
         root = root.child(scenario_bar);
     }
     root = root.child(sides).child(direction_card).child(details);
+    if draft.download_exceeds_free_space() {
+        root = root.child(
+            accented_card(p.err_bd)
+                .child(card_title("The selection exceeds available space"))
+                .child(
+                    text("Leave out more subfolders or choose a volume with more free space.")
+                        .text_color(p.fg),
+                ),
+        );
+    }
 
     if draft.review_scenario != ReviewScenario::BothPopulated {
         let c_chk = ctrl.clone();
@@ -1602,16 +1819,19 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
 
     let mut progress_card = card().child(preflight_row).child(marker_row);
 
-    let finish_mode_done = if snap.is_demo_mode {
-        "Automatic sync is now on"
-    } else {
-        "First sync finished. Use Sync now to run manual syncs."
-    };
-    let finish_mode_pending = if snap.is_demo_mode {
-        "Turn on automatic sync"
-    } else {
-        "Ready for manual sync"
-    };
+    let completed_mapping = draft
+        .first_sync_mapping_id
+        .as_ref()
+        .and_then(|id| snap.mapping(id));
+    let finish_mode_done =
+        if completed_mapping.is_some_and(|m| m.state.intent == sync_core::Intent::Paused) {
+            "Automatic sync stays paused for this mapping"
+        } else if snap.scheduling_paused {
+            "Automatic sync is ready when scheduling resumes"
+        } else {
+            "Automatic sync is now on"
+        };
+    let finish_mode_pending = "Enable automatic sync after verification";
 
     if let Some(err) = &draft.first_sync_error {
         progress_card = progress_card.child(check_row(IconKind::Octagon, p.err, err));
@@ -1683,14 +1903,28 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         ));
 
     if draft.first_sync_error.is_some() {
+        let changed_mapping = draft
+            .first_sync_mapping_id
+            .clone()
+            .filter(|_| draft.changing_subfolders);
         footer_btns = footer_btns.child(app_button(
-            "Back to Review",
+            if changed_mapping.is_some() {
+                "Open mapping"
+            } else {
+                "Back to Review"
+            },
             BtnKind::Primary,
             true,
             false,
             None,
             None,
-            move || c_back_review.send(UiCommand::WizardSetStep(WizardStep::Review)),
+            move || {
+                if let Some(id) = &changed_mapping {
+                    c_back_review.navigate(ScreenRoute::MappingDetail(id.clone()));
+                } else {
+                    c_back_review.send(UiCommand::WizardSetStep(WizardStep::Review));
+                }
+            },
         ));
     }
 
@@ -1731,7 +1965,7 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             .flex_col()
             .gap(px(3.0))
             .child(page_title(format!(
-                "Setting up “{}”",
+                "First sync · {}",
                 draft.selected_folder
             )))
             .child(
@@ -1764,7 +1998,13 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         .child(progress_card)
 }
 
-fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: bool) -> View {
+fn render_wizard_footer(
+    ctrl: AppController,
+    draft: &WizardDraft,
+    skip_account: bool,
+    account_ready: bool,
+    folder_ready: bool,
+) -> View {
     let p = Palette::current();
     let c_cancel = ctrl.clone();
     let c_save = ctrl.clone();
@@ -1824,6 +2064,8 @@ fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: 
                 Some("Fix the failing location checks first")
             } else if !draft.recovery_valid() {
                 Some("Fix the failing recovery location checks first")
+            } else if draft.download_exceeds_free_space() {
+                Some("Leave out more subfolders or choose another volume")
             } else if !draft.no_other_sync_confirmed {
                 Some("Confirm the checkbox first")
             } else {
@@ -1844,7 +2086,9 @@ fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: 
         }
     } else if let Some(next) = draft.step.next() {
         let c_next = ctrl.clone();
-        let next_disabled = !draft.can_visit_step(next);
+        let next_disabled = !draft.can_visit_step(next)
+            || (draft.step == WizardStep::Account && !account_ready)
+            || (draft.step == WizardStep::Folder && !folder_ready);
         let tip = if draft.step == WizardStep::Location && !draft.location_valid() {
             Some("Fix the location checks first")
         } else if draft.step == WizardStep::Recovery && !draft.recovery_valid() {
