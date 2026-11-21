@@ -97,8 +97,51 @@ the real application directory.
     any missing `outcome.json` for committed terminal rows).
   - `finder/status.json` (or configured `--finder-dir`) — atomically written
     (temp + `sync_all` + rename) v1 Finder status snapshot matching ADR 0002.
-    Finder publication failures are logged as non-fatal warnings and never
-    suppress stop signals or undo committed state.
+    After every successful `status.json` write, `sync-manager` invokes an
+    injectable `FinderNotifier` (`DarwinFinderNotifier` posts the macOS Darwin
+    notification `dev.foldersync.finder.snapshot-updated`; tests inject
+    `RecordingFinderNotifier`). Finder publication failures are logged as
+    non-fatal warnings and never suppress stop signals or undo committed state.
+  - `finder/actions/*.json` — ADR 0002 v1 Finder action files (`sync_now`,
+    `pause`, `open_app`, `show_last_run`) drained by the manager/UI on a
+    background thread. Symlinks are refused (`symlink_metadata` / `O_NOFOLLOW`),
+    temporary/hidden files are ignored, unknown JSON fields and invalid IDs or
+    timestamps are rejected, and every processed `.json` file is removed.
+
+## Desktop UI wiring, recovery inspection, and controlled quit (`apps/sync-ui`)
+
+- **Real manager by default (`ManagerSource`):** `apps/sync-ui` defaults to
+  `ManagerSource`, which owns `SyncManager` strictly on a dedicated background
+  worker thread (`foldersync-ui-manager`). Immutable `StatusSnapshot` updates
+  flow through a coalescing latest-snapshot subscription (never dropping the
+  newest snapshot under load) and are marshaled onto the NSH main thread via
+  `run_on_main_thread`. The in-memory `DemoSource` remains available only when
+  explicitly requested with `FOLDERSYNC_DEMO=1` or `--demo`.
+- **Off-mutex & background preflight:** Initialization layout/inventory checks
+  and engine qualification run off the manager state mutex on the background
+  worker thread (`StartInitialize`) so the UI remains responsive and never
+  blocks on filesystem or rclone I/O. Snapshot rebuilds use bounded per-mapping
+  latest-run queries (`LIMIT 1`), and the exclusive OS `flock` stays held until
+  after the worker thread joins and SQLite closes.
+- **Run-specific inspection & safe recovery copies:** Each historical run opens
+  its own run-specific log (`output.ndjson`) and lists the recovery copies
+  preserved under that run's local and remote recovery directories. Copying a
+  recovery file (`Copy to inspection folder…`) writes with `create_new` into a
+  user-chosen separate folder and refuses any destination overlapping a live
+  synced mapping root or containing symlinks.
+- **Unreviewed conflict persistence:** `mappings.unreviewed_conflict_run_id`
+  (SQLite schema v2) tracks unreviewed conflicts independently of `Pause`,
+  `Resume`, or restart; acknowledging conflicts clears only the review notice
+  while preserving `RunOutcome::SuccessWithConflicts` in run history.
+- **Injectable `SystemActions`:** Reveal in Finder, Open URL (restricted to
+  `https://` and `x-apple.systempreferences:`), Launch at Login, and user
+  notifications go through an injectable `SystemActions` trait (`RealMacOsSystemActions`
+  in real app runs only; `RecordingSystemActions` in all tests and demo mode).
+- **Single controlled-stop Quit:** Tray Quit, ⌘Q, and `on_quit_request` share
+  one handler that prompts when a run is active, displays an honest `"Stopping…"`
+  state, pauses scheduling, requests graceful stop, waits up to the bounded
+  timeout, and persists `Interrupted` / `RecoveryRequired` if the child does
+  not exit before timeout.
 
 ## Run records, crash recovery, and orphan reconciliation
 
