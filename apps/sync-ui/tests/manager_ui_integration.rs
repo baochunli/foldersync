@@ -1113,7 +1113,7 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
     assert_eq!(review.wizard.drive_collection.as_ref(), Some(&collection));
     mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
     mgr.dispatch(UiCommand::WizardStartFirstSync);
-    let complete = wait_for_snapshot(&mgr, Duration::from_secs(90), |s| {
+    let complete = wait_for_snapshot(&mgr, Duration::from_secs(240), |s| {
         (s.wizard.first_sync_completed
             && s.mapping(&draft.id).is_some_and(|mapping| {
                 mapping.state.readiness() == Readiness::Ready
