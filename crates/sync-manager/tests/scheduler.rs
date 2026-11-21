@@ -300,6 +300,13 @@ fn retry_backoff_is_bounded_and_wake_revalidates_roots() {
     let fx = Fixture::new();
     fx.add("notes");
     fx.initialize("notes");
+    let initial = fx.manager.snapshot();
+    assert_eq!(
+        initial.mappings[0].next_poll_at,
+        Some(fx.epoch + TimeDelta::seconds(300))
+    );
+    assert_eq!(initial.mappings[0].retry_at, None);
+
     fx.launcher.push_script(FakeLaunchScript {
         exit_status: ExitStatusInfo {
             code: Some(5),
@@ -312,6 +319,10 @@ fn retry_backoff_is_bounded_and_wake_revalidates_roots() {
         fx.idle().mappings[0].last_run_outcome,
         Some(RunOutcome::RetryableFailure)
     );
+    let failed = fx.manager.snapshot();
+    let retry_at = failed.mappings[0].retry_at.unwrap();
+    assert!((30..=36).contains(&(retry_at - fx.epoch).num_seconds()));
+    assert_eq!(failed.mappings[0].next_poll_at, None);
     fx.tick(1, &[&fx.root("notes")]);
     fx.manager.notify_environment_changed();
     fx.tick(29, &[]);

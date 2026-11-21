@@ -450,6 +450,54 @@ pub fn validate_cloud_collection_pair(
     first: &DeviceCloudCollection,
     second: &DeviceCloudCollection,
 ) -> Result<(), ValidationError> {
+    validate_cloud_collection_identity_pair(first, second)?;
+    if first.collection.folder_id == second.collection.folder_id {
+        return Ok(());
+    }
+
+    let first_segments = first.collection.normalized_segments();
+    let second_segments = second.collection.normalized_segments();
+
+    if first_segments == second_segments {
+        let normalized = first_segments.join("/");
+        return Err(ValidationError::new(
+            ValidationErrorKind::CloudDuplicateDisplayPath {
+                display_path: normalized.clone(),
+                first_folder_id: first.collection.folder_id.clone(),
+                second_folder_id: second.collection.folder_id.clone(),
+            },
+            format!(
+                "Two distinct Google Drive folders (`{}` and `{}`) share the same path `{}`.",
+                first.collection.folder_id, second.collection.folder_id, normalized
+            ),
+            "Rename or consolidate the duplicate folder in Google Drive before syncing.",
+        ));
+    }
+
+    if is_segment_prefix(&first_segments, &second_segments)
+        || is_segment_prefix(&second_segments, &first_segments)
+    {
+        return Err(ValidationError::new(
+            ValidationErrorKind::CloudCollectionNesting {
+                first_folder_id: first.collection.folder_id.clone(),
+                second_folder_id: second.collection.folder_id.clone(),
+            },
+            format!(
+                "Cloud collections `{}` and `{}` have nested paths.",
+                first.collection.display_path, second.collection.display_path
+            ),
+            "Use sibling collections under Data rather than nested cloud folders.",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Checks identity and ancestry across accounts whose display paths may have different roots.
+pub fn validate_cloud_collection_identity_pair(
+    first: &DeviceCloudCollection,
+    second: &DeviceCloudCollection,
+) -> Result<(), ValidationError> {
     validate_single_cloud_assignment(first)?;
     validate_single_cloud_assignment(second)?;
 
@@ -495,41 +543,6 @@ pub fn validate_cloud_collection_pair(
                 second.collection.folder_id,
             ),
             "Define sibling collections under the shared Data parent instead of mapping both a parent folder and one of its subfolders.",
-        ));
-    }
-
-    let first_segments = first.collection.normalized_segments();
-    let second_segments = second.collection.normalized_segments();
-
-    if first_segments == second_segments {
-        let normalized = first_segments.join("/");
-        return Err(ValidationError::new(
-            ValidationErrorKind::CloudDuplicateDisplayPath {
-                display_path: normalized.clone(),
-                first_folder_id: first.collection.folder_id.clone(),
-                second_folder_id: second.collection.folder_id.clone(),
-            },
-            format!(
-                "Two distinct Google Drive folders (`{}` and `{}`) share the same path `{}`.",
-                first.collection.folder_id, second.collection.folder_id, normalized
-            ),
-            "Rename or consolidate the duplicate folder in Google Drive before syncing.",
-        ));
-    }
-
-    if is_segment_prefix(&first_segments, &second_segments)
-        || is_segment_prefix(&second_segments, &first_segments)
-    {
-        return Err(ValidationError::new(
-            ValidationErrorKind::CloudCollectionNesting {
-                first_folder_id: first.collection.folder_id.clone(),
-                second_folder_id: second.collection.folder_id.clone(),
-            },
-            format!(
-                "Cloud collections `{}` and `{}` have nested paths.",
-                first.collection.display_path, second.collection.display_path
-            ),
-            "Use sibling collections under Data rather than nested cloud folders.",
         ));
     }
 

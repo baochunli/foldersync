@@ -638,6 +638,8 @@ mod tests {
             intent,
             scheduling_enabled: false,
             schedule_interval_secs: 300,
+            next_poll_at: None,
+            retry_at: None,
             active_generation_id: None,
             active_generation_fingerprint: None,
             last_run_id: None,

@@ -282,6 +282,34 @@ See the [physical unplug qualification](qualification.md#2-physical-external-dis
   `status.json`. A manual request moves the mapping to the front of the queue
   and lets the current job finish.
 
+### Drive mappings and first sync
+
+The manager verifies the selected Drive folder ID and its ancestry through
+the ready account before saving a mapping. Collections in different
+accounts are checked against each other by ID and ancestry. Scheduled runs
+and manual runs recheck the folder identity, the cloud access marker, and the
+recovery path. A renamed, moved, ambiguous, or replaced folder requires
+review. Drive paths are resolved by name after these checks. Keep the tree
+quiet during setup and avoid moving or renaming it during a run.
+
+Drive shares the same generation and initial-direction workflow as local
+mappings. The local folder is Path1 and Drive is Path2. Use an empty
+destination to upload or download. When both sides hold data, first sync
+requires reconciliation. Preflight checks the names rclone exposes and
+excludes native Google documents and shortcuts. A truncated inventory or an
+inventory that exceeds its two-minute engine deadline blocks first sync.
+Transfer estimates omit excluded files and rely on backend-reported sizes.
+
+First sync establishes a disjoint recovery path on the same account remote
+at `Recovery/<folder-id>/<device-id>`. Each run uses a separate directory
+under that path. A recognized cloud `RCLONE_TEST` marker identifies the
+collection by folder ID and its exact bytes are reused on a joining device.
+When the collection has no marker, the manager stages one in Recovery,
+moves it within the same remote, and checks the result before creating the
+local marker. An unrecognized or ambiguous cloud marker blocks first sync.
+If a failed or concurrent setup leaves a staged marker in Recovery, it is
+available for inspection there.
+
 ## Automatic scheduling
 
 The manager schedules verified mappings when they are Ready and Enabled. Active
@@ -300,6 +328,9 @@ Only engine outcomes classified as retryable enter backoff. The next attempt is
 due in 30 to 36 seconds at first, doubling the base delay up to a 30-minute
 maximum with jitter. The manager restores retry timing from classified run
 history on restart. Readiness holds block runs until their checks pass.
+The mapping snapshot exposes `next_poll_at` for its regular poll or
+`retry_at` during backoff. Times are available for eligible idle mappings.
+Local change hints can queue a run before its regular poll.
 
 Global **Pause scheduling** survives restart, holds automatic work, and leaves
 **Sync now** available for enabled mappings. Per-mapping **Pause** survives
