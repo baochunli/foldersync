@@ -293,9 +293,6 @@ fn demo_switcher_box(ctrl: AppController) -> impl IntoElement {
             .test_id(tid)
         };
 
-        let c_sched = ctrl.clone();
-        let paused = snap.scheduling_paused;
-
         view()
             .border_t_1()
             .border_color(p.hair)
@@ -331,26 +328,6 @@ fn demo_switcher_box(ctrl: AppController) -> impl IntoElement {
                         DemoPreset::WelcomeNoMappings,
                         "demo-welcome-connected",
                     )),
-            )
-            .child(
-                app_button(
-                    if paused {
-                        "Resume scheduling"
-                    } else {
-                        "Pause scheduling"
-                    },
-                    BtnKind::Default,
-                    true,
-                    false,
-                    Some(if paused {
-                        IconKind::Play
-                    } else {
-                        IconKind::Pause
-                    }),
-                    None,
-                    move || c_sched.send(UiCommand::SetSchedulingPaused(!paused)),
-                )
-                .test_id("demo-toggle-scheduling"),
             )
             .into_element()
     })

@@ -34,11 +34,12 @@ use sync_core::{
 };
 use sync_manager::{
     AccountError, AccountRecord, AccountService, AccountServiceConfig, AddDriveAccountRequest,
-    AddMappingCommand, BisyncLauncher, ControlledShutdownOutcome, DarwinFinderNotifier,
-    FilterChangePreview, FinderActionDispatch, FinderNotifier, ImportAccountRequest,
-    InitializeCommand, ManagerConfig, ManagerError, ManagerEvent, MappingStatusSnapshot,
-    NoopFinderNotifier, RecoveryCopySide, RunRecord, SecretString, SideClassification,
-    StatusSnapshot, SyncManager, ValidatedFinderAction, detect_volume_identity,
+    AddMappingCommand, BisyncLauncher, CollectionCandidate, ControlledShutdownOutcome,
+    DarwinFinderNotifier, DriveAuthorization, FilterChangePreview, FinderActionDispatch,
+    FinderNotifier, FolderSizeSnapshot, FolderSizeStatus, ImportAccountRequest, InitializeCommand,
+    ManagerConfig, ManagerError, ManagerEvent, MappingStatusSnapshot, NoopFinderNotifier,
+    OperationHandle, RecoveryCopySide, RunRecord, SecretString, SideClassification,
+    SkippedCollection, StatusSnapshot, SyncManager, ValidatedFinderAction, detect_volume_identity,
     disk_space_for_path, inspect_local_endpoint_detailed,
 };
 
@@ -46,10 +47,11 @@ use crate::{
     contract::{
         AccountSnapshot, AccountStatus, ActiveRunSnapshot, ActivityEvent, AttentionItem,
         AttentionKind, AttentionPriority, CloudFolderCandidate, DemoPreset, FilterReview,
-        FinderExtensionStatus, IconKind, InspectedRunSnapshot, LocationCheck, MappingSnapshot,
-        PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem,
-        ReviewScenario, RunPhase, RunRecordSnapshot, ScreenRoute, StatusModifier, SubfolderNode,
-        Tone, UiCommand, UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardDraft, WizardStep,
+        FinderExtensionStatus, FolderSize, IconKind, InspectedRunSnapshot, LocationCheck,
+        MappingSnapshot, PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData,
+        RecoveryCopyItem, ReviewScenario, RunPhase, RunRecordSnapshot, ScheduledCheck, ScreenRoute,
+        StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts,
+        VolumeSnapshot, WizardDraft, WizardStep, format_bytes,
     },
     system_actions::{
         LaunchAtLoginOutcome, SystemActionOutcome, SystemActionRequest, SystemActions,
@@ -174,6 +176,8 @@ pub struct ManagerSourceConfig {
     pub launcher: Option<Arc<dyn BisyncLauncher>>,
     /// Tests can supply the service with a fake credential store and process runner.
     pub account_service: Option<Arc<AccountService>>,
+    /// Overrides the manager's account dependencies for tests.
+    pub manager_accounts: Option<AccountServiceConfig>,
     pub finder_notifier: Option<Arc<dyn FinderNotifier>>,
     pub finder_heartbeat_interval: Option<Duration>,
     pub shutdown_timeout: Duration,
@@ -188,6 +192,7 @@ impl Default for ManagerSourceConfig {
             finder_status_dir: None,
             launcher: None,
             account_service: None,
+            manager_accounts: None,
             // Real interactive desktop app uses DarwinFinderNotifier; tests explicitly pass Noop/Recording (HIGH #15).
             finder_notifier: Some(Arc::new(DarwinFinderNotifier)),
             finder_heartbeat_interval: Some(Duration::from_secs(60)),
@@ -200,7 +205,7 @@ impl Default for ManagerSourceConfig {
 enum WorkerCmd {
     Command(UiCommand),
     AuthorizationReady(SecretString),
-    AccountOperationFinished(Result<AccountRecord, AccountError>),
+    AccountOperationFinished(Result<AccountRecord, String>),
     SystemActionCompleted {
         _request_id: u64,
         outcome: SystemActionOutcome,
@@ -432,10 +437,16 @@ struct LiveRunProgress {
 }
 
 enum AccountOperation {
-    Connect(AddDriveAccountRequest),
+    Authorize(DriveAuthorization),
     Import(ImportAccountRequest),
-    Reconnect(AccountId),
     Check(AccountId),
+}
+
+struct PendingFolderSize {
+    account: AccountId,
+    folder_id: String,
+    handle: OperationHandle<FolderSizeSnapshot>,
+    canceled: bool,
 }
 
 struct WorkerState {
@@ -457,7 +468,11 @@ struct WorkerState {
     filter_preview: Option<FilterChangePreview>,
     wizard: WizardDraft,
     cloud_catalog: Vec<CloudFolderCandidate>,
-    cloud_catalog_measured_at: String,
+    skipped_cloud_folders: Vec<SkippedCollection>,
+    cloud_catalog_error: Option<String>,
+    refresh_catalog_after_size: bool,
+    pending_folder_size: Option<PendingFolderSize>,
+    requested_folder_size: Option<String>,
     inspected_run: Option<InspectedRunSnapshot>,
     recovery_checklist: Option<RecoveryChecklistData>,
     preferences: PreferencesSnapshot,
@@ -518,7 +533,11 @@ fn manager_worker_main(
         filter_preview: None,
         wizard: default_real_wizard(),
         cloud_catalog: Vec::new(),
-        cloud_catalog_measured_at: "not measured yet".to_owned(),
+        skipped_cloud_folders: Vec::new(),
+        cloud_catalog_error: None,
+        refresh_catalog_after_size: false,
+        pending_folder_size: None,
+        requested_folder_size: None,
         inspected_run: None,
         recovery_checklist: None,
         preferences: default_real_preferences(),
@@ -535,7 +554,12 @@ fn manager_worker_main(
     let mut finder_poll_handle = None;
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    match SyncManager::open(mgr_cfg) {
+    let account_config = config.manager_accounts.unwrap_or_else(|| {
+        let mut config = AccountServiceConfig::with_state_dir("");
+        config.process_runner = Arc::new(DriveAccountProcessRunner);
+        config
+    });
+    match SyncManager::open_with_account_config(mgr_cfg, account_config) {
         Ok(mgr) => {
             // Restore persisted local-fixture account parent paths across restarts (HIGH #3).
             if let Ok(accounts) = mgr.list_accounts() {
@@ -586,7 +610,12 @@ fn manager_worker_main(
                 }));
             }
             state.mgr = Some(Arc::new(mgr));
-            refresh_real_catalog(&mut state);
+            if state
+                .local_account_parents
+                .contains_key(&state.wizard.selected_account)
+            {
+                refresh_real_catalog(&mut state);
+            }
             emit_snapshot(&mut state, None, &ui_slot, &latest_cached);
         }
         Err(err) => {
@@ -634,7 +663,7 @@ fn manager_worker_main(
                         let _ = worker.join();
                     }
                     let operation_id = state.account_operation_id.take();
-                    state.reconnecting_account = None;
+                    let was_authorizing = state.reconnecting_account.take().is_some();
                     state.authorization_url = None;
                     match result {
                         Ok(account) => {
@@ -658,7 +687,7 @@ fn manager_worker_main(
                             } else {
                                 format!("Imported the configuration for {}.", account.id)
                             });
-                            if let Some(mgr) = &state.mgr {
+                            if !was_authorizing && let Some(mgr) = &state.mgr {
                                 for mapping in &mgr.snapshot().mappings {
                                     if mapping.account_id == account.id
                                         && mapping.readiness == Readiness::AuthenticationRequired
@@ -674,7 +703,7 @@ fn manager_worker_main(
                             if let Some(id) = operation_id {
                                 state.unverified_accounts.insert(id);
                             }
-                            state.action_error = Some(account_error_text(&err).to_owned());
+                            state.action_error = Some(err);
                         }
                     }
                     need_emit = true;
@@ -757,7 +786,7 @@ fn manager_worker_main(
                     }
                 }
                 WorkerCmd::ControlledShutdown { timeout } => {
-                    if state.account_worker.is_some() {
+                    if state.account_worker.is_some() && state.reconnecting_account.is_none() {
                         state.action_error = Some(
                             "Finish the account operation before quitting FolderSync.".to_owned(),
                         );
@@ -773,7 +802,18 @@ fn manager_worker_main(
                                     outcome,
                                     ControlledShutdownOutcome::TimedOutInterrupted { .. }
                                 );
-                                if timed_out {
+                                // The manager already requested cancellation and gave sign-in a
+                                // bounded cleanup window. A slow credential backend must not hold Quit.
+                                let authorization_still_finishing =
+                                    state.reconnecting_account.is_some()
+                                        && state
+                                            .account_worker
+                                            .as_ref()
+                                            .is_some_and(|worker| !worker.is_finished());
+                                if authorization_still_finishing {
+                                    drop(state.account_worker.take());
+                                }
+                                if timed_out || authorization_still_finishing {
                                     timed_out_shutdown.store(true, Ordering::SeqCst);
                                     skip_helper_joins = true;
                                 }
@@ -800,6 +840,11 @@ fn manager_worker_main(
                 }
                 WorkerCmd::ShutdownNow => {
                     stop_flag.store(true, Ordering::Relaxed);
+                    if state.reconnecting_account.is_some()
+                        && let Some(mgr) = &state.mgr
+                    {
+                        let _ = mgr.controlled_shutdown(config.shutdown_timeout);
+                    }
                     if let Some(worker) = state.account_worker.take() {
                         let _ = worker.join();
                     }
@@ -820,6 +865,7 @@ fn manager_worker_main(
 
         // 3. Apply the single newest manager snapshot (coalesced, never stale).
         if let Some(snap) = latest_mgr_snap {
+            update_folder_size(&mut state);
             if let Some(ref mid) = state.wizard.first_sync_mapping_id
                 && let Some(m) = snap.mappings.iter().find(|m| &m.id == mid)
             {
@@ -1132,8 +1178,8 @@ fn handle_ui_command(
     state: &mut WorkerState,
     cmd: UiCommand,
 ) -> (Option<ScreenRoute>, Option<(u64, SystemActionRequest)>) {
-    state.status_notice = None;
-    if !matches!(cmd, UiCommand::DismissError) {
+    if !matches!(cmd, UiCommand::WizardLeave) {
+        state.status_notice = None;
         state.action_error = None;
     }
 
@@ -1383,7 +1429,7 @@ fn handle_ui_command(
         } => {
             start_account_operation(
                 state,
-                AccountOperation::Connect(AddDriveAccountRequest {
+                AccountOperation::Authorize(DriveAuthorization::Connect(AddDriveAccountRequest {
                     remote_name: account_id.to_string(),
                     id: account_id,
                     display_name,
@@ -1392,7 +1438,7 @@ fn handle_ui_command(
                     client_secret,
                     scope: "drive".to_owned(),
                     run_oauth_flow: true,
-                }),
+                })),
             );
             (None, None)
         }
@@ -1459,7 +1505,10 @@ fn handle_ui_command(
             (None, None)
         }
         UiCommand::ReconnectAccount(id) => {
-            start_account_operation(state, AccountOperation::Reconnect(id));
+            start_account_operation(
+                state,
+                AccountOperation::Authorize(DriveAuthorization::Reconnect(id)),
+            );
             (None, None)
         }
         UiCommand::CheckAccountAccess(id) => {
@@ -1499,6 +1548,7 @@ fn handle_ui_command(
             (None, None)
         }
         UiCommand::WizardReset => {
+            cancel_folder_size(state);
             state.filter_preview = None;
             state.wizard = default_real_wizard();
             state.first_sync_started_at = None;
@@ -1517,7 +1567,14 @@ fn handle_ui_command(
                     }
                 }
             }
-            refresh_real_catalog(state);
+            clear_cloud_catalog(state);
+            if state.wizard.step == WizardStep::Folder
+                || state
+                    .local_account_parents
+                    .contains_key(&state.wizard.selected_account)
+            {
+                refresh_real_catalog(state);
+            }
             recompute_real_wizard_inventory(state);
             (None, None)
         }
@@ -1530,7 +1587,6 @@ fn handle_ui_command(
                 }
                 return (None, None);
             }
-            recompute_real_wizard_inventory(state);
             if state.wizard.can_visit_step(step)
                 && (step < WizardStep::Folder
                     || state
@@ -1544,44 +1600,82 @@ fn handle_ui_command(
                                     && !state.unverified_accounts.contains(&account.id)
                             })
                         }))
-                && (step < WizardStep::Location || state.wizard.remote_folder_path.is_some())
+                && (step < WizardStep::Location || state.wizard.has_cloud_folder())
             {
+                let entering_folder = step == WizardStep::Folder && state.wizard.step != step;
+                if step != WizardStep::Folder {
+                    cancel_folder_size(state);
+                }
                 state.wizard.step = step;
-                if step >= WizardStep::Location {
-                    let _ = persist_real_draft_if_ready(state, false);
+                if entering_folder && state.cloud_catalog.is_empty() {
+                    refresh_real_catalog(state);
+                } else if step >= WizardStep::Location {
+                    recompute_real_wizard_inventory(state);
+                    if !drive_size_holds_wizard_account(state)
+                        && let Err(err) = persist_real_draft_if_ready(state, false)
+                    {
+                        state.action_error = Some(err);
+                    }
                 }
             }
             (None, None)
         }
         UiCommand::WizardSelectAccount(acct) => {
             if state.wizard.selected_account != acct {
+                cancel_folder_size(state);
+                clear_cloud_catalog(state);
                 state.wizard.selected_folder.clear();
                 state.wizard.remote_folder_path = None;
+                state.wizard.drive_collection = None;
                 state.wizard.subfolders.clear();
             }
             state.wizard.selected_account = acct;
+            if state
+                .local_account_parents
+                .contains_key(&state.wizard.selected_account)
+            {
+                refresh_real_catalog(state);
+            }
             invalidate_wizard_confirmation(&mut state.wizard);
-            refresh_real_catalog(state);
-            recompute_real_wizard_inventory(state);
             (None, None)
         }
         UiCommand::WizardSelectFolder(folder) => {
-            state.wizard.selected_folder = folder.clone();
-            if let Some(parent) = state
-                .local_account_parents
-                .get(&state.wizard.selected_account)
+            if let Some(candidate) = state
+                .cloud_catalog
+                .iter()
+                .find(|item| item.name == folder)
+                .cloned()
+                && candidate.on_this_mac.is_none()
             {
-                let candidate = parent.join(&folder);
-                state.wizard.remote_folder_path = Some(candidate.to_string_lossy().into_owned());
+                select_cloud_folder(state, candidate);
             }
-            invalidate_wizard_confirmation(&mut state.wizard);
-            recompute_real_wizard_inventory(state);
             (None, None)
         }
-        UiCommand::WizardCreateNewFolder(_) => {
-            state.action_error = Some(
-                "Creating new folders inside Data is not available in this build yet.".to_owned(),
-            );
+        UiCommand::WizardCreateNewFolder(name) => {
+            if state.wizard.step == WizardStep::Folder
+                && state.pending_folder_size.is_none()
+                && let Some(mgr) = &state.mgr
+            {
+                match mgr.create_collection_folder(&state.wizard.selected_account, name.trim()) {
+                    Ok(candidate) => {
+                        let item = project_drive_candidate(state, candidate);
+                        state.cloud_catalog.push(item.clone());
+                        state.cloud_catalog.sort_by(|a, b| a.name.cmp(&b.name));
+                        select_cloud_folder(state, item);
+                    }
+                    Err(err) => {
+                        state.action_error = Some(format!("{} {}", err.cause(), err.next_step()))
+                    }
+                }
+            }
+            (None, None)
+        }
+        UiCommand::WizardRefreshFolders => {
+            refresh_real_catalog(state);
+            (None, None)
+        }
+        UiCommand::WizardCancelFolderSize | UiCommand::WizardLeave => {
+            cancel_folder_size(state);
             (None, None)
         }
         UiCommand::WizardSetRemotePath(path) => {
@@ -1640,11 +1734,13 @@ fn handle_ui_command(
                     .join(name)
                     .to_string_lossy()
                     .into_owned();
-                state.wizard.cloud_recovery_path = parent
-                    .join("FolderSyncRecovery-Remote")
-                    .join(name)
-                    .to_string_lossy()
-                    .into_owned();
+                if state.wizard.drive_collection.is_none() {
+                    state.wizard.cloud_recovery_path = parent
+                        .join("FolderSyncRecovery-Remote")
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned();
+                }
             }
             invalidate_wizard_confirmation(&mut state.wizard);
             recompute_real_wizard_inventory(state);
@@ -1695,7 +1791,7 @@ fn handle_ui_command(
             recompute_real_wizard_inventory(state);
             (None, None)
         }
-        UiCommand::WizardSetReviewScenario(_) => (None, None),
+        UiCommand::WizardSetReviewScenario(_) | UiCommand::DemoFailFolderSize => (None, None),
         UiCommand::WizardSetNoOtherSyncConfirmed(confirmed) => {
             state.wizard.no_other_sync_confirmed = confirmed;
             state.wizard.reviewed_fingerprint = if confirmed {
@@ -1870,59 +1966,74 @@ fn start_account_operation(state: &mut WorkerState, operation: AccountOperation)
         state.action_error = Some("Wait for the current account operation to finish.".to_owned());
         return;
     }
-    // Keep the manager and its state lock alive while the account service uses the same database.
-    let (id, authorization) = match &operation {
-        AccountOperation::Connect(request) => (request.id.clone(), true),
-        AccountOperation::Import(request) => (request.id.clone(), false),
-        AccountOperation::Reconnect(id) => (id.clone(), true),
-        AccountOperation::Check(id) => (id.clone(), false),
+    let id = match &operation {
+        AccountOperation::Authorize(DriveAuthorization::Connect(request)) => request.id.clone(),
+        AccountOperation::Authorize(DriveAuthorization::Reconnect(id))
+        | AccountOperation::Check(id) => id.clone(),
+        AccountOperation::Import(request) => request.id.clone(),
     };
-    state.account_operation_id = Some(id.clone());
-    state.reconnecting_account = authorization.then_some(id);
     let inbox = state.inbox.clone();
-    let injected_service = state.account_service.clone();
-    state.account_worker = Some(thread::spawn(move || {
+    if let AccountOperation::Authorize(authorization) = operation {
         let callback_inbox = inbox.clone();
         let callback: rclone_adapter::AuthUrlCallback = Box::new(move |url| {
             if is_drive_authorization_url(url) {
                 callback_inbox.push_cmd(WorkerCmd::AuthorizationReady(SecretString::new(url)));
             }
         });
+        match mgr.start_drive_authorization(authorization, Some(callback)) {
+            Ok(handle) => {
+                state.account_operation_id = Some(id.clone());
+                state.reconnecting_account = Some(id);
+                state.account_worker = Some(thread::spawn(move || {
+                    let result = handle
+                        .wait()
+                        .map(|outcome| outcome.account)
+                        .map_err(|err| err.cause());
+                    inbox.push_cmd(WorkerCmd::AccountOperationFinished(result));
+                }));
+            }
+            Err(err) => state.action_error = Some(format!("{} {}", err.cause(), err.next_step())),
+        }
+        return;
+    }
+
+    state.account_operation_id = Some(id);
+    let injected_service = state.account_service.clone();
+    state.account_worker = Some(thread::spawn(move || {
+        // Hold the manager lock while AccountService uses the same database.
         let service = injected_service.map(Ok).unwrap_or_else(|| {
-            let mut config = AccountServiceConfig::with_state_dir(mgr.state_dir());
-            config.process_runner = Arc::new(DriveAccountProcessRunner);
-            AccountService::for_locked_manager(config).map(Arc::new)
+            AccountService::for_locked_manager(AccountServiceConfig::with_state_dir(
+                mgr.state_dir(),
+            ))
+            .map(Arc::new)
         });
-        let result = service.and_then(|service| match operation {
-            AccountOperation::Connect(request) => service
-                .add_drive_account(request, Some(callback))
-                .map(|r| r.account),
-            AccountOperation::Import(request) => service.import_account(request),
-            AccountOperation::Reconnect(id) => service
-                .reconnect_drive_account(&id, Some(callback))
-                .map(|r| r.account),
-            AccountOperation::Check(id) => service.check_account(&id).map(|r| r.account),
-        });
+        let result = service
+            .and_then(|service| match operation {
+                AccountOperation::Import(request) => service.import_account(request),
+                AccountOperation::Check(id) => service.check_account(&id).map(|r| r.account),
+                AccountOperation::Authorize(_) => unreachable!(),
+            })
+            .map_err(|err| account_error_text(&err).to_owned());
         inbox.push_cmd(WorkerCmd::AccountOperationFinished(result));
     }));
 }
 
-/// Route browser launch through the UI for the pinned engine's reconnect child.
+/// Match rclone's environment key convention for hyphenated remote names.
 struct DriveAccountProcessRunner;
 
 impl ProcessRunner for DriveAccountProcessRunner {
     fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
-        if let [command, action, remote, ..] = spec.args.as_slice()
-            && command == "config"
-            && action == "reconnect"
-            && let Some(name) = remote.to_str().and_then(|remote| remote.strip_suffix(':'))
-        {
+        if let Some((key, _)) = spec.env.iter().find(|(key, _)| {
+            key.to_str().is_some_and(|name| {
+                name.starts_with("RCLONE_CONFIG_")
+                    && name.ends_with("_CONFIG_AUTH_NO_BROWSER")
+                    && name.contains('-')
+            })
+        }) {
             let mut spec = spec.clone();
-            let key = format!(
-                "RCLONE_CONFIG_{}_CONFIG_AUTH_NO_BROWSER",
-                name.to_uppercase()
-            );
-            spec.env.insert(key.into(), "1".into());
+            let value = spec.env.remove(key).expect("key came from the environment");
+            spec.env
+                .insert(key.to_string_lossy().replace('-', "_").into(), value);
             return RealProcessRunner.spawn(&spec, options);
         }
         RealProcessRunner.spawn(spec, options)
@@ -1932,7 +2043,7 @@ impl ProcessRunner for DriveAccountProcessRunner {
 fn account_error_text(err: &AccountError) -> &'static str {
     match err {
         AccountError::AuthenticationRequired { .. } => {
-            "FolderSync couldn’t verify access. Unlock Keychain or reconnect the Google account and check again."
+            "FolderSync couldn’t verify access. If Keychain is locked, unlock it and choose Check access. If your sign-in expired, choose Reconnect."
         }
         AccountError::GlobalDefaultConfigRefused { .. } => {
             "Choose a separate exported configuration file."
@@ -2341,7 +2452,12 @@ fn load_mapping_into_wizard(
         });
     }
 
+    if rec.remote_endpoint_kind == "drive_remote" {
+        wizard.drive_collection = Some(rec.collection.clone());
+    }
     let snapshot = mgr.snapshot();
+    cancel_folder_size(state);
+    clear_cloud_catalog(state);
     state.wizard = wizard;
     state.filter_preview = None;
     state.first_sync_started_at = None;
@@ -2362,7 +2478,6 @@ fn load_mapping_into_wizard(
             set_subfolder_inventory(&mut state.wizard, &inventory);
         }
     } else {
-        refresh_real_catalog(state);
         recompute_real_wizard_inventory(state);
         state.wizard.step = if state.wizard.can_visit_step(requested_step) {
             requested_step
@@ -2442,7 +2557,7 @@ fn build_add_mapping_from_wizard(state: &WorkerState) -> Result<AddMappingComman
         .as_deref()
         .map(str::trim)
         .unwrap_or("");
-    if folder.is_empty() || local_str.is_empty() || remote_str.is_empty() {
+    if folder.is_empty() || local_str.is_empty() || !state.wizard.has_cloud_folder() {
         return Err(
             "Choose a folder in Data, a local folder on this Mac, and a recovery folder first."
                 .to_owned(),
@@ -2462,6 +2577,18 @@ fn build_add_mapping_from_wizard(state: &WorkerState) -> Result<AddMappingComman
     } else {
         PathBuf::from(state.wizard.local_recovery_path.trim())
     };
+    if let Some(collection) = &state.wizard.drive_collection {
+        let mut cmd = AddMappingCommand::drive(
+            mapping_id,
+            state.wizard.selected_account.clone(),
+            collection.clone(),
+            PathBuf::from(local_str),
+            local_rec,
+        )
+        .map_err(|err| format!("{} {}", err.cause(), err.next_step()))?;
+        cmd.extra_exclusions = state.wizard.extra_exclusions();
+        return Ok(cmd);
+    }
     let remote_rec = if state.wizard.cloud_recovery_path.trim().is_empty() {
         PathBuf::from(remote_str)
             .parent()
@@ -2486,13 +2613,38 @@ fn build_add_mapping_from_wizard(state: &WorkerState) -> Result<AddMappingComman
     Ok(cmd)
 }
 
-fn refresh_real_catalog(state: &mut WorkerState) {
+fn clear_cloud_catalog(state: &mut WorkerState) {
     state.cloud_catalog.clear();
+    state.skipped_cloud_folders.clear();
+    state.cloud_catalog_error = None;
+    state.refresh_catalog_after_size = false;
+}
+
+fn refresh_real_catalog(state: &mut WorkerState) {
+    clear_cloud_catalog(state);
     let Some(parent) = state
         .local_account_parents
         .get(&state.wizard.selected_account)
         .cloned()
     else {
+        if drive_size_holds_wizard_account(state) {
+            state.refresh_catalog_after_size = true;
+        } else if let Some(mgr) = &state.mgr {
+            match mgr.list_collection_candidates(&state.wizard.selected_account) {
+                Ok(listing) => {
+                    state.cloud_catalog = listing
+                        .candidates
+                        .into_iter()
+                        .map(|candidate| project_drive_candidate(state, candidate))
+                        .collect();
+                    state.skipped_cloud_folders = listing.skipped;
+                }
+                Err(err) => {
+                    state.cloud_catalog_error =
+                        Some(format!("{} {}", err.cause(), err.next_step()));
+                }
+            }
+        }
         return;
     };
     let existing_mappings = state
@@ -2502,6 +2654,7 @@ fn refresh_real_catalog(state: &mut WorkerState) {
         .unwrap_or_default();
 
     let Ok(entries) = fs::read_dir(&parent) else {
+        state.cloud_catalog_error = Some("Can’t read the local test account folder.".to_owned());
         return;
     };
     let mut items = Vec::new();
@@ -2523,25 +2676,212 @@ fn refresh_real_catalog(state: &mut WorkerState) {
             ancestor_ids: vec!["local-root".to_owned()],
         };
         let inv = inspect_local_endpoint_detailed(&path, &dummy_col, &BTreeSet::new()).ok();
-        let bytes = inv.as_ref().map(|i| i.total_bytes);
         let used_by_other = path.join(ACCESS_MARKER_FILENAME).is_file();
         let on_this_mac = existing_mappings
             .iter()
-            .find(|m| m.display_name.eq_ignore_ascii_case(&name))
+            .find(|m| {
+                m.account_id == state.wizard.selected_account
+                    && Some(&m.id) != state.wizard.editing_mapping_id.as_ref()
+                    && m.display_name.eq_ignore_ascii_case(&name)
+            })
             .map(|m| m.volume_name.clone());
         items.push(CloudFolderCandidate {
             name,
-            size_gb: bytes.map(|b| (b as f64) / 1_000_000_000.0),
-            size_label: bytes
-                .map(format_bytes)
-                .unwrap_or_else(|| "Can't check".to_owned()),
+            collection: None,
+            size: inv.map_or_else(
+                || FolderSize::Failed {
+                    cause: "Can’t check this test folder.".to_owned(),
+                },
+                |inv| FolderSize::Known {
+                    bytes: inv.total_bytes,
+                    files: Some(inv.file_count as u64),
+                    measured_at: None,
+                },
+            ),
             on_this_mac,
             used_by_other_computer: used_by_other,
         });
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
     state.cloud_catalog = items;
-    state.cloud_catalog_measured_at = "just now".to_owned();
+}
+
+fn project_drive_candidate(
+    state: &WorkerState,
+    candidate: CollectionCandidate,
+) -> CloudFolderCandidate {
+    let on_this_mac = state.mgr.as_ref().and_then(|mgr| {
+        mgr.snapshot()
+            .mappings
+            .iter()
+            .find(|mapping| {
+                mapping.collection_folder_id == candidate.collection.folder_id
+                    && Some(&mapping.id) != state.wizard.editing_mapping_id.as_ref()
+            })
+            .map(|mapping| format!("On {}", mapping.volume_name))
+    });
+    CloudFolderCandidate {
+        name: candidate.name,
+        collection: Some(candidate.collection),
+        size: FolderSize::Unmeasured,
+        on_this_mac,
+        used_by_other_computer: false,
+    }
+}
+
+fn select_cloud_folder(state: &mut WorkerState, candidate: CloudFolderCandidate) {
+    let same_folder = state.wizard.selected_folder == candidate.name;
+    if same_folder && candidate.size == FolderSize::Calculating {
+        return;
+    }
+    cancel_folder_size(state);
+    if !same_folder {
+        state.wizard.subfolders.clear();
+    }
+    state.wizard.selected_folder = candidate.name;
+    state.wizard.drive_collection = candidate.collection;
+    state.wizard.remote_folder_path = state
+        .local_account_parents
+        .get(&state.wizard.selected_account)
+        .map(|parent| {
+            parent
+                .join(&state.wizard.selected_folder)
+                .to_string_lossy()
+                .into_owned()
+        });
+    if let Some(collection) = &state.wizard.drive_collection {
+        let remote = state
+            .mgr
+            .as_ref()
+            .and_then(|mgr| mgr.list_accounts().ok())
+            .and_then(|accounts| {
+                accounts
+                    .into_iter()
+                    .find(|acct| acct.id == state.wizard.selected_account)
+            })
+            .map_or_else(
+                || state.wizard.selected_account.to_string(),
+                |acct| acct.remote_name,
+            );
+        state.wizard.cloud_recovery_path = format!("{remote}:Recovery/{}", collection.folder_id);
+        state.requested_folder_size = Some(collection.folder_id.clone());
+        if let Some(item) = state
+            .cloud_catalog
+            .iter_mut()
+            .find(|item| item.name == state.wizard.selected_folder)
+        {
+            item.size = FolderSize::Calculating;
+        }
+        update_folder_size(state);
+    }
+    invalidate_wizard_confirmation(&mut state.wizard);
+}
+
+fn cancel_folder_size(state: &mut WorkerState) {
+    state.requested_folder_size = None;
+    if let Some(pending) = &mut state.pending_folder_size
+        && !pending.canceled
+    {
+        pending.handle.cancel();
+        pending.canceled = true;
+    }
+    for item in &mut state.cloud_catalog {
+        if item.size == FolderSize::Calculating {
+            item.size = FolderSize::Unmeasured;
+        }
+    }
+}
+
+fn drive_size_holds_wizard_account(state: &WorkerState) -> bool {
+    state
+        .pending_folder_size
+        .as_ref()
+        .is_some_and(|pending| pending.account == state.wizard.selected_account)
+}
+
+fn update_folder_size(state: &mut WorkerState) {
+    let Some(mgr) = state.mgr.clone() else { return };
+    if let Some(pending) = &state.pending_folder_size {
+        let snapshot = mgr.snapshot();
+        let Some(result) = snapshot.folder_sizes.iter().find(|size| {
+            size.account_id == pending.account
+                && size.folder_id == pending.folder_id
+                && size.status != FolderSizeStatus::Calculating
+        }) else {
+            return;
+        };
+        let pending = state.pending_folder_size.take().expect("size was pending");
+        if !pending.canceled && pending.account == state.wizard.selected_account {
+            set_folder_size(state, &pending.folder_id, project_folder_size(result));
+        }
+        if state.refresh_catalog_after_size {
+            if state.wizard.step == WizardStep::Folder {
+                refresh_real_catalog(state);
+            } else {
+                state.refresh_catalog_after_size = false;
+            }
+        }
+        if state.wizard.step == WizardStep::Location
+            && pending.account == state.wizard.selected_account
+        {
+            recompute_real_wizard_inventory(state);
+        }
+    }
+
+    let Some(folder_id) = state.requested_folder_size.take() else {
+        return;
+    };
+    let account = state.wizard.selected_account.clone();
+    match mgr.request_folder_size(&account, &folder_id) {
+        Ok(handle) => {
+            let snapshot = mgr.snapshot();
+            if let Some(result) = snapshot.folder_sizes.iter().find(|size| {
+                size.account_id == account
+                    && size.folder_id == folder_id
+                    && size.status != FolderSizeStatus::Calculating
+            }) {
+                set_folder_size(state, &folder_id, project_folder_size(result));
+            } else {
+                state.pending_folder_size = Some(PendingFolderSize {
+                    account,
+                    folder_id,
+                    handle,
+                    canceled: false,
+                });
+            }
+        }
+        Err(err) => set_folder_size(state, &folder_id, FolderSize::Failed { cause: err.cause() }),
+    }
+}
+
+fn set_folder_size(state: &mut WorkerState, id: &str, size: FolderSize) {
+    if let Some(item) = state.cloud_catalog.iter_mut().find(|item| {
+        item.collection
+            .as_ref()
+            .is_some_and(|collection| collection.folder_id == id)
+    }) {
+        item.size = size;
+    }
+}
+
+fn project_folder_size(result: &FolderSizeSnapshot) -> FolderSize {
+    match &result.status {
+        FolderSizeStatus::Calculating => FolderSize::Calculating,
+        FolderSizeStatus::Known { bytes, files } => FolderSize::Known {
+            bytes: *bytes,
+            files: Some(*files),
+            measured_at: Some(
+                result
+                    .updated_at
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M")
+                    .to_string(),
+            ),
+        },
+        FolderSizeStatus::Failed { cause } => FolderSize::Failed {
+            cause: cause.clone(),
+        },
+    }
 }
 
 /// Runs the manager's single preflight preview function so wizard checks and
@@ -2636,7 +2976,12 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
     let mut remote_inv_res = None;
     let mut layout_err = None;
 
-    if let Some(mgr) = &state.mgr
+    if state.wizard.drive_collection.is_some() && drive_size_holds_wizard_account(state) {
+        loc_checks.push(LocationCheck {
+            ok: false,
+            message: "Finishing the canceled size check before checking setup…".to_owned(),
+        });
+    } else if let Some(mgr) = &state.mgr
         && let Ok(cmd) = build_add_mapping_from_wizard(state)
     {
         let editing_id = state.wizard.editing_mapping_id.as_ref();
@@ -2772,12 +3117,7 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
             None
         }
         None => {
-            if state
-                .wizard
-                .remote_folder_path
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            {
+            if !state.wizard.has_cloud_folder() {
                 loc_checks.push(LocationCheck {
                     ok: false,
                     message: "Choose a folder from the account before continuing.".to_owned(),
@@ -3151,13 +3491,16 @@ fn project_ui_snapshot(
             volume_issue: (m.readiness == Readiness::VolumeUnavailable)
                 .then(|| m.status_text.trim_end_matches(" (paused)").to_owned()),
             schedule_minutes: (m.schedule_interval_secs / 60).max(1) as u32,
-            next_check_label: if m.execution == Execution::Queued {
-                "Queued".to_owned()
-            } else if matches!(m.execution, Execution::Running | Execution::Stopping) {
-                "Run in progress".to_owned()
-            } else {
-                "Time not available".to_owned()
-            },
+            next_check_label: match m.execution {
+                Execution::Queued => "Queued",
+                Execution::Running | Execution::Stopping => "Run in progress",
+                _ => "Time not available",
+            }
+            .to_owned(),
+            next_check: m.retry_at.or(m.next_poll_at).map(|at| ScheduledCheck {
+                at,
+                retry: m.retry_at.is_some(),
+            }),
             included_subfolders: 0,
             total_subfolders: excluded_subfolders.len(),
             included_size_label: "measured on sync".to_owned(),
@@ -3199,7 +3542,9 @@ fn project_ui_snapshot(
         inspected_run: state.inspected_run.clone(),
         recovery_checklist: state.recovery_checklist.clone(),
         cloud_catalog: state.cloud_catalog.clone(),
-        cloud_catalog_measured_at: state.cloud_catalog_measured_at.clone(),
+        skipped_cloud_folders: state.skipped_cloud_folders.clone(),
+        cloud_catalog_error: state.cloud_catalog_error.clone(),
+        folder_size_pending: state.pending_folder_size.is_some(),
         wizard: state.wizard.clone(),
         preferences: state.preferences.clone(),
         reconnecting_account: state.reconnecting_account.clone(),
@@ -3300,6 +3645,7 @@ fn build_volume_snapshot(
         connected,
         total_gb,
         free_gb,
+        free_bytes: mapping.volume_space.map(|space| space.free_bytes),
         free_label,
         total_label,
         used_percent,
@@ -3425,47 +3771,7 @@ fn build_real_attention_items(
                     },
                 });
             }
-            Readiness::VolumeUnavailable => {
-                let issue = m.volume_issue.as_deref().unwrap_or_default();
-                let wrong_disk = issue.starts_with("A different disk named ");
-                let inaccessible = issue.starts_with("Can’t access ");
-                let (title, cause, next_step) = if wrong_disk {
-                    (
-                        issue.to_owned(),
-                        "The connected disk doesn’t match this mapping.".to_owned(),
-                        "Connect the disk selected during setup.".to_owned(),
-                    )
-                } else if inaccessible {
-                    (
-                        format!("Can’t access {}", m.volume_name),
-                        format!("{issue}."),
-                        "Check disk permissions, then choose Check again.".to_owned(),
-                    )
-                } else {
-                    (
-                        format!("Waiting for {}", m.volume_name),
-                        format!("{} isn’t connected right now.", m.volume_name),
-                        format!("Connect {}.", m.volume_name),
-                    )
-                };
-                items.push(AttentionItem {
-                    id: format!("attn-vol-{}", m.id),
-                    priority: AttentionPriority::VolumeMissing,
-                    mapping_id: Some(m.id.clone()),
-                    mapping_name: Some(m.display_name.clone()),
-                    pill_label: "Waiting".to_owned(),
-                    pill_tone: Tone::Attn,
-                    icon: IconKind::DriveMissing,
-                    is_error_accent: false,
-                    title,
-                    cause,
-                    what_did: "Nothing is deleted in the cloud while the drive is away.".to_owned(),
-                    next_step,
-                    kind: AttentionKind::VolumeMissing {
-                        can_check_again: inaccessible,
-                    },
-                });
-            }
+            Readiness::VolumeUnavailable => items.push(m.volume_attention()),
             Readiness::Ready => {
                 if let Some(unrev) = &m.unreviewed_conflicts {
                     items.push(AttentionItem {
@@ -3605,25 +3911,6 @@ fn sanitize_id(raw: &str) -> String {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: f64 = 1_000.0;
-    const MB: f64 = 1_000_000.0;
-    const GB: f64 = 1_000_000_000.0;
-    const TB: f64 = 1_000_000_000_000.0;
-    let b = bytes as f64;
-    if b >= TB {
-        format!("{:.2} TB", b / TB)
-    } else if b >= GB {
-        format!("{:.1} GB", b / GB)
-    } else if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.0} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 fn format_short_timestamp(rfc3339: &str) -> String {
     DateTime::parse_from_rfc3339(rfc3339)
         .map(|dt| {
@@ -3655,6 +3942,7 @@ fn default_real_wizard() -> WizardDraft {
         selected_account: AccountId::new("local-1"),
         selected_folder: String::new(),
         remote_folder_path: None,
+        drive_collection: None,
         local_path: String::new(),
         volume_name: "unknown".to_owned(),
         volume_kind: VolumeKind::Internal,
@@ -3729,7 +4017,9 @@ fn empty_loading_snapshot() -> UiSnapshot {
         inspected_run: None,
         recovery_checklist: None,
         cloud_catalog: Vec::new(),
-        cloud_catalog_measured_at: "not measured yet".to_owned(),
+        skipped_cloud_folders: Vec::new(),
+        cloud_catalog_error: None,
+        folder_size_pending: false,
         wizard: default_real_wizard(),
         preferences: default_real_preferences(),
         reconnecting_account: None,

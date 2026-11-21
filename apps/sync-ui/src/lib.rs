@@ -393,6 +393,12 @@ pub fn App() -> impl IntoElement {
         cleanup(move || tick_task.cancel());
     }
 
+    let schedule_clock = ctrl.schedule_clock;
+    let schedule_tick = set_interval(Duration::from_secs(30), move || {
+        schedule_clock.set(chrono::Utc::now());
+    });
+    cleanup(move || schedule_tick.cancel());
+
     let c_content = ctrl.clone();
     let c_banners = ctrl.clone();
     let c_sidebar = ctrl.clone();
