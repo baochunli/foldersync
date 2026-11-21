@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Package FolderSync.app for macOS into target/ using NSH 0.6.1, embedding:
+# Package FolderSync.app for macOS into <repo>/target/ using NSH 0.6.1, embedding:
 #   (a) the pinned rclone binary (from .tools, verified against packaging/qualification-manifest.toml)
 #       at Contents/Helpers/rclone, plus its SHA-256 manifest at Contents/Resources/rclone-manifest.json
 #   (b) the Finder Sync extension at Contents/PlugIns/FolderSyncFinder.appex
-#   (c) third-party license/NOTICE files at Contents/Resources/Notices/
+#   (c) verbatim third-party license/NOTICE files at Contents/Resources/Notices/
 # Then sign strictly inner -> outer (default ad hoc "-"; --sign <identity> for Developer ID)
 # and verify with `codesign --verify --deep --strict`.
 #
-# Never installs to /Applications, never registers with pluginkit, and never touches
-# real application state or the Keychain.
+# Never writes or deletes outside <repo>/target/, never installs to /Applications,
+# never registers with pluginkit, and never touches real application state or Keychain.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 MANIFEST="${REPO_ROOT}/packaging/qualification-manifest.toml"
 
 OUT_DIR="${REPO_ROOT}/target/package"
@@ -21,23 +21,23 @@ BUNDLE_ID="dev.foldersync.app"
 SIGN_IDENTITY="-"
 ARCH="$(uname -m)"
 NSH_BIN="${NSH_BIN:-$HOME/.local/bin/nsh}"
-SHARED_DIR=""
+DEV_SHARED_DIR=0
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
 
 Options:
-  --out <dir>         Output directory for FolderSync.app (default: <repo>/target/package)
+  --out <dir>         Output directory for FolderSync.app; must resolve physically inside
+                      <repo>/target/ with no symlinked components (default: <repo>/target/package)
   --bundle-id <id>    Host app bundle identifier (default: dev.foldersync.app;
                       extension uses <id>.finder-extension)
   --sign <identity>   codesign identity (default: "-" for ad hoc signing;
                       non-"-" enables --options runtime --timestamp)
   --arch <arch>       Target architecture: arm64 or x86_64 (default: host arch)
   --nsh-bin <path>    Path to pinned NSH 0.6.1 CLI (default: \$HOME/.local/bin/nsh)
-  --shared-dir <dir>  Optional dev override for Finder extension shared handoff dir
-                      (default: ~/Library/Application Support/FolderSync/finder via
-                      home-relative temporary file exception)
+  --dev-shared-dir    Create a fresh disposable Finder handoff directory via mktemp under
+                      <repo>/target/ instead of using the production home-relative exception
   -h, --help          Show this help
 EOF
 }
@@ -49,18 +49,15 @@ while [[ $# -gt 0 ]]; do
     --sign) SIGN_IDENTITY="$2"; shift 2 ;;
     --arch) ARCH="$2"; shift 2 ;;
     --nsh-bin) NSH_BIN="$2"; shift 2 ;;
-    --shared-dir) SHARED_DIR="$2"; shift 2 ;;
+    --dev-shared-dir) DEV_SHARED_DIR=1; shift ;;
+    --shared-dir)
+      echo "Error: arbitrary --shared-dir paths are not permitted; use --dev-shared-dir to create a fresh directory under target/." >&2
+      exit 2
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
-
-case "$OUT_DIR" in
-  /Applications|/Applications/*|/System|/System/*|/Library|/Library/*|"$HOME/Applications"|"$HOME/Applications"/*)
-    echo "Error: refusing to package directly into a system/Applications directory: $OUT_DIR" >&2
-    exit 2
-    ;;
-esac
 
 case "$ARCH" in
   arm64) RCLONE_PLATFORM="osx-arm64" ;;
@@ -74,6 +71,76 @@ for tool in codesign plutil shasum swiftc xcrun python3; do
     exit 1
   fi
 done
+
+# Physically validate --out inside <repo>/target/ with zero symlinked components
+# BEFORE any mkdir, mktemp, copy, or rm.
+resolve_contained_in_target() {
+  python3 - "$REPO_ROOT" "$1" <<'PY'
+import os
+import stat
+import sys
+
+repo_root = os.path.realpath(sys.argv[1])
+raw_out = sys.argv[2]
+
+if not raw_out or "\x00" in raw_out:
+    sys.stderr.write("Error: --out must be a non-empty valid path inside target/.\n")
+    sys.exit(2)
+
+target_root = os.path.join(repo_root, "target")
+if os.path.lexists(target_root):
+    st = os.lstat(target_root)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        sys.stderr.write(f"Error: refusing symlinked or non-directory target root: {target_root}\n")
+        sys.exit(2)
+
+abs_out = os.path.abspath(raw_out)
+# Walk up to deepest existing ancestor without following symlinks on absent tail.
+cur = abs_out
+tail = []
+while not os.path.lexists(cur):
+    parent, name = os.path.split(cur)
+    if parent == cur:
+        sys.stderr.write(f"Error: cannot resolve ancestor for --out {raw_out}\n")
+        sys.exit(2)
+    tail.append(name)
+    cur = parent
+
+real_ancestor = os.path.realpath(cur)
+phys_out = os.path.join(real_ancestor, *reversed(tail)) if tail else real_ancestor
+
+if phys_out != target_root and not phys_out.startswith(target_root + os.sep):
+    sys.stderr.write(f"Error: refusing --out outside {target_root}: {raw_out} (resolved: {phys_out})\n")
+    sys.exit(2)
+
+# Verify no component from target_root down (in raw path or resolved path) is a symlink.
+rel = os.path.relpath(phys_out, target_root)
+if rel != ".":
+    parts = rel.split(os.sep)
+    check = target_root
+    for part in parts:
+        check = os.path.join(check, part)
+        if os.path.lexists(check):
+            st = os.lstat(check)
+            if stat.S_ISLNK(st.st_mode):
+                sys.stderr.write(f"Error: refusing symlinked path component inside target/: {check}\n")
+                sys.exit(2)
+
+# Also check the raw abs_out directly in case abs_out itself was a symlink inside target/
+if abs_out.startswith(target_root + os.sep):
+    rel_raw = os.path.relpath(abs_out, target_root)
+    check = target_root
+    for part in rel_raw.split(os.sep):
+        check = os.path.join(check, part)
+        if os.path.lexists(check) and stat.S_ISLNK(os.lstat(check).st_mode):
+            sys.stderr.write(f"Error: refusing symlinked --out component: {check}\n")
+            sys.exit(2)
+
+print(phys_out)
+PY
+}
+
+OUT_DIR="$(resolve_contained_in_target "$OUT_DIR")"
 
 if [[ ! -x "$NSH_BIN" ]]; then
   echo "Error: pinned NSH binary not found or not executable at $NSH_BIN" >&2
@@ -162,15 +229,15 @@ EXT_ARGS=(
   --out "$EXT_STAGE"
   --entitlements-out "$EXT_ENTITLEMENTS"
 )
-if [[ -n "$SHARED_DIR" ]]; then
-  EXT_ARGS+=(--shared-dir "$SHARED_DIR")
+if [[ "$DEV_SHARED_DIR" -eq 1 ]]; then
+  EXT_ARGS+=(--dev-shared-dir)
 fi
 bash "${REPO_ROOT}/apps/finder-extension/build.sh" "${EXT_ARGS[@]}"
 
 mkdir -p "${STAGED_APP}/Contents/PlugIns"
 cp -R "${EXT_STAGE}/FolderSyncFinder.appex" "${STAGED_APP}/Contents/PlugIns/FolderSyncFinder.appex"
 
-echo "==> Embedding third-party NOTICE and license files in Contents/Resources/Notices/"
+echo "==> Embedding verbatim third-party NOTICE and license files in Contents/Resources/Notices/"
 NOTICES_DIR="${STAGED_APP}/Contents/Resources/Notices"
 mkdir -p "$NOTICES_DIR"
 cp "${REPO_ROOT}/NOTICE" "${NOTICES_DIR}/NOTICE.txt"
@@ -233,12 +300,14 @@ codesign "${SIGN_ARGS[@]}" \
 # 3. Sign outer FolderSync.app bundle last (without --deep so inner entitlements stay intact).
 codesign "${SIGN_ARGS[@]}" "$STAGED_APP"
 
-FINAL_APP="${OUT_DIR}/FolderSync.app"
+echo "==> Verifying staged bundle signature (codesign --verify --deep --strict)"
+codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+
+FINAL_APP="$(resolve_contained_in_target "${OUT_DIR}/FolderSync.app")"
 rm -rf "$FINAL_APP"
 mv "$STAGED_APP" "$FINAL_APP"
 
-echo "==> Verifying code signature (codesign --verify --deep --strict)"
-codesign --verify --deep --strict --verbose=2 "$FINAL_APP"
+codesign --verify --deep --strict "$FINAL_APP"
 
 echo "==> Bundle contents:"
 find "$FINAL_APP" -maxdepth 4 | sort
