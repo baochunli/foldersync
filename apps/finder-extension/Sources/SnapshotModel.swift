@@ -104,12 +104,27 @@ public enum SnapshotReadResult: Equatable {
 
 public enum SnapshotEvaluation: Equatable {
     case fresh(StatusSnapshot)
-    case stale(StatusSnapshot?, reason: String)
+    case stale(StatusSnapshot?, reason: String, readSucceeded: Bool)
 
-    public var snapshot: StatusSnapshot? {
+    /// Returns the snapshot ONLY when it came from a successful read.
+    /// Used for menu mappings and watch-list (`directoryURLs`) updates.
+    public var successfulSnapshot: StatusSnapshot? {
         switch self {
-        case .fresh(let snap): return snap
-        case .stale(let snap, _): return snap
+        case .fresh(let snap):
+            return snap
+        case .stale(let snap, _, let readSucceeded):
+            return readSucceeded ? snap : nil
+        }
+    }
+
+    /// Returns the snapshot (including a failed-read cached fallback) strictly for
+    /// displaying `.stale` root badges.
+    public var badgeRootsSnapshot: StatusSnapshot? {
+        switch self {
+        case .fresh(let snap):
+            return snap
+        case .stale(let snap, _, _):
+            return snap
         }
     }
 }
@@ -142,21 +157,7 @@ public struct ActionRequest: Codable, Equatable {
     public let action: ActionKind
     public let mappingId: String?
 
-    public init(
-        version: Int = snapshotSchemaVersion,
-        id: String = UUID().uuidString,
-        requestedAt: String,
-        action: ActionKind,
-        mappingId: String?
-    ) {
-        self.version = version
-        self.id = id
-        self.requestedAt = requestedAt
-        self.action = action
-        self.mappingId = mappingId
-    }
-
-    public var isValid: Bool {
+    public static func isValid(version: Int, action: ActionKind, mappingId: String?) -> Bool {
         guard version == snapshotSchemaVersion else {
             return false
         }
@@ -167,6 +168,46 @@ public struct ActionRequest: Codable, Equatable {
             }
         }
         return true
+    }
+
+    /// Failable initializer enforcing the v1 action contract at construction:
+    /// only `open_app` may omit `mappingId`.
+    public init?(
+        version: Int = snapshotSchemaVersion,
+        id: String = UUID().uuidString,
+        requestedAt: String,
+        action: ActionKind,
+        mappingId: String?
+    ) {
+        guard Self.isValid(version: version, action: action, mappingId: mappingId) else {
+            return nil
+        }
+        self.version = version
+        self.id = id
+        self.requestedAt = requestedAt
+        self.action = action
+        self.mappingId = mappingId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let version = try container.decode(Int.self, forKey: .version)
+        let id = try container.decode(String.self, forKey: .id)
+        let requestedAt = try container.decode(String.self, forKey: .requestedAt)
+        let action = try container.decode(ActionKind.self, forKey: .action)
+        let mappingId = try container.decodeIfPresent(String.self, forKey: .mappingId)
+        guard Self.isValid(version: version, action: action, mappingId: mappingId) else {
+            throw ActionValidationError.invalidActionRequest
+        }
+        self.version = version
+        self.id = id
+        self.requestedAt = requestedAt
+        self.action = action
+        self.mappingId = mappingId
+    }
+
+    public var isValid: Bool {
+        Self.isValid(version: version, action: action, mappingId: mappingId)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -222,7 +263,7 @@ public enum SnapshotEvaluator {
         hostAppRunning: Bool
     ) -> SnapshotEvaluation {
         guard let snapshot else {
-            return .stale(nil, reason: "Status unavailable")
+            return .stale(nil, reason: "Status unavailable", readSucceeded: false)
         }
         return evaluate(
             readResult: .valid(snapshot),
@@ -233,8 +274,8 @@ public enum SnapshotEvaluator {
     }
 
     /// Evaluates the latest snapshot read outcome. When reading or decoding fails,
-    /// always returns `.stale` while preserving `lastKnownSnapshot` solely so
-    /// previously known mapping roots display the stale badge.
+    /// returns `.stale(..., readSucceeded: false)` so `lastKnownSnapshot` is used
+    /// strictly for stale root badges and never supplies menu mappings or watch-list changes.
     public static func evaluate(
         readResult: SnapshotReadResult,
         lastKnownSnapshot: StatusSnapshot?,
@@ -243,18 +284,18 @@ public enum SnapshotEvaluator {
     ) -> SnapshotEvaluation {
         switch readResult {
         case .failed(let reason):
-            return .stale(lastKnownSnapshot, reason: reason)
+            return .stale(lastKnownSnapshot, reason: reason, readSucceeded: false)
         case .valid(let snapshot):
             guard hostAppRunning else {
-                return .stale(snapshot, reason: "FolderSync is not running")
+                return .stale(snapshot, reason: "FolderSync is not running", readSucceeded: true)
             }
             guard let generatedDate = parseISO8601(snapshot.generatedAt) else {
-                return .stale(snapshot, reason: "Status timestamp is invalid")
+                return .stale(snapshot, reason: "Status timestamp is invalid", readSucceeded: true)
             }
             let maxAge = TimeInterval(max(1, snapshot.staleAfterSeconds ?? defaultStaleAfterSeconds))
             let age = now.timeIntervalSince(generatedDate)
             if age > maxAge {
-                return .stale(snapshot, reason: "Status is outdated")
+                return .stale(snapshot, reason: "Status is outdated", readSucceeded: true)
             }
             return .fresh(snapshot)
         }
@@ -294,6 +335,29 @@ public enum SnapshotEvaluator {
         return nil
     }
 
+    /// Resolves the mapping for context/toolbar menu actions. Returns `nil` after a
+    /// failed snapshot read so mapping-scoped actions are disabled and Open FolderSync
+    /// carries no mapping ID.
+    public static func menuMapping(
+        for url: URL,
+        evaluation: SnapshotEvaluation
+    ) -> MappingSnapshot? {
+        guard let snapshot = evaluation.successfulSnapshot else {
+            return nil
+        }
+        return owningMapping(for: url, in: snapshot)
+    }
+
+    /// Derives `directoryURLs` updates only from successful snapshot reads.
+    public static func directoryRootURLs(for evaluation: SnapshotEvaluation) -> Set<URL>? {
+        guard let snapshot = evaluation.successfulSnapshot else {
+            return nil
+        }
+        return Set(snapshot.mappings.map {
+            URL(fileURLWithPath: canonicalPath($0.rootPath))
+        })
+    }
+
     public static func badgeState(
         for url: URL,
         evaluation: SnapshotEvaluation
@@ -304,7 +368,7 @@ public enum SnapshotEvaluator {
                 return nil
             }
             return mapping.state.badgeState
-        case .stale(let snapshot, _):
+        case .stale(let snapshot, _, _):
             guard let snapshot, rootMapping(for: url, in: snapshot) != nil else {
                 return nil
             }

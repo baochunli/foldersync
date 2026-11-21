@@ -81,31 +81,32 @@ do {
     }
 
     let expiredEval = SnapshotEvaluator.evaluate(snapshot: snap, now: parseISO("2026-11-20T18:05:01Z"), hostAppRunning: true)
-    if case .stale(let s, _) = expiredEval, s != nil {
+    if case .stale(let s, _, let readOk) = expiredEval, s != nil, readOk {
         passed += 1
     } else {
         failed += 1
-        fputs("FAIL: snapshot 301s old should be stale while preserving last known roots\n", stderr)
+        fputs("FAIL: snapshot 301s old should be stale with readSucceeded=true\n", stderr)
     }
 
     let hostDeadEval = SnapshotEvaluator.evaluate(snapshot: snap, now: parseISO("2026-11-20T18:00:10Z"), hostAppRunning: false)
-    if case .stale(let s, _) = hostDeadEval, s != nil {
+    if case .stale(let s, _, let readOk) = hostDeadEval, s != nil, readOk {
         passed += 1
     } else {
         failed += 1
-        fputs("FAIL: snapshot when host app is not running should be stale\n", stderr)
+        fputs("FAIL: snapshot when host app is not running should be stale with readSucceeded=true\n", stderr)
     }
 
     let nilEval = SnapshotEvaluator.evaluate(snapshot: nil, now: parseISO("2026-11-20T18:00:10Z"), hostAppRunning: true)
-    if case .stale(nil, _) = nilEval {
+    if case .stale(nil, _, let readOk) = nilEval, !readOk {
         passed += 1
     } else {
         failed += 1
-        fputs("FAIL: nil snapshot should evaluate to stale(nil)\n", stderr)
+        fputs("FAIL: nil snapshot should evaluate to stale(nil, readSucceeded: false)\n", stderr)
     }
 }
 
-// 3b. Valid-to-invalid transition (deleted/corrupt/unsupported snapshot while host runs and prior timestamp is still fresh)
+// 3b. Valid-to-invalid transition: failed read keeps cached snapshot ONLY for stale root badges;
+// menu mappings and directoryURLs updates come strictly from successful reads.
 do {
     let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("fs-transition-\(UUID().uuidString)")
     let mappedDir = tempRoot.appendingPathComponent("Research")
@@ -123,8 +124,9 @@ do {
         ]
     )
     let stillFreshNow = parseISO("2026-11-20T18:00:30Z")
+    let expiredNow = parseISO("2026-11-20T18:10:00Z")
 
-    // Initially valid & fresh -> synced badge
+    // Initially valid & fresh -> synced badge, menu mapping present, directoryURLs present
     let initialEval = SnapshotEvaluator.evaluate(
         readResult: .valid(priorSnap),
         lastKnownSnapshot: priorSnap,
@@ -132,23 +134,39 @@ do {
         hostAppRunning: true
     )
     expect(SnapshotEvaluator.badgeState(for: mappedDir, evaluation: initialEval) == .synced, "initial valid snapshot should badge synced")
+    expect(SnapshotEvaluator.menuMapping(for: mappedDir, evaluation: initialEval)?.id == "research", "initial valid snapshot should supply menu mapping")
+    expect(SnapshotEvaluator.directoryRootURLs(for: initialEval)?.count == 1, "initial valid snapshot should supply directoryURLs")
 
-    // Next read fails (e.g., deleted or replaced with unsupported version) while host is running
+    // Next read fails (deleted / corrupt / unsupported version) while host runs and prior TTL hasn't elapsed
     let failedEval = SnapshotEvaluator.evaluate(
         readResult: .failed(reason: "Status unavailable (invalid snapshot)"),
         lastKnownSnapshot: priorSnap,
         now: stillFreshNow,
         hostAppRunning: true
     )
-    if case .stale(let retained, let reason) = failedEval {
-        expect(retained == priorSnap, "failed read must retain lastKnownSnapshot only for root stale badging")
+    if case .stale(let retained, let reason, let readOk) = failedEval {
+        expect(retained == priorSnap, "failed read must retain lastKnownSnapshot only for stale root badges")
         expect(reason == "Status unavailable (invalid snapshot)", "failed read reason should propagate to menu")
+        expect(!readOk, "failed read must mark readSucceeded=false")
     } else {
         failed += 1
         fputs("FAIL: failed snapshot read must NOT evaluate as fresh even when prior snapshot is within TTL\n", stderr)
     }
     expect(SnapshotEvaluator.badgeState(for: mappedDir, evaluation: failedEval) == .stale, "valid-to-invalid transition must badge mapped root as stale")
     expect(SnapshotEvaluator.badgeState(for: childFile, evaluation: failedEval) == nil, "valid-to-invalid transition must still NOT badge child files")
+    expect(SnapshotEvaluator.menuMapping(for: mappedDir, evaluation: failedEval) == nil, "failed read must supply NO mapping to Finder menu (only Open FolderSync without mapping ID)")
+    expect(SnapshotEvaluator.directoryRootURLs(for: failedEval) == nil, "failed read must NOT supply directoryURLs updates")
+
+    // Contrast: a valid-but-expired read still succeeded, so menuMapping and directoryURLs come from that successful read
+    let validExpiredEval = SnapshotEvaluator.evaluate(
+        readResult: .valid(priorSnap),
+        lastKnownSnapshot: priorSnap,
+        now: expiredNow,
+        hostAppRunning: true
+    )
+    expect(SnapshotEvaluator.badgeState(for: mappedDir, evaluation: validExpiredEval) == .stale, "expired valid snapshot should badge root as stale")
+    expect(SnapshotEvaluator.menuMapping(for: mappedDir, evaluation: validExpiredEval)?.id == "research", "successful expired read may supply menu mapping")
+    expect(SnapshotEvaluator.directoryRootURLs(for: validExpiredEval)?.count == 1, "successful expired read may supply directoryURLs")
 }
 
 // 4. Root-only badge rule: mapped root gets badge; child file/subfolder gets nil (no badge)
@@ -172,7 +190,7 @@ do {
         ]
     )
     let freshEval = SnapshotEvaluation.fresh(snap)
-    let staleEval = SnapshotEvaluation.stale(snap, reason: "Outdated")
+    let staleEval = SnapshotEvaluation.stale(snap, reason: "Outdated", readSucceeded: true)
 
     // Resolve /var -> /private/var to verify symlink equivalence
     let resolvedRoot = mappedDir.resolvingSymlinksInPath()
@@ -198,7 +216,7 @@ do {
     }
 }
 
-// 6. Action contract validation & atomic serialization (only open_app may omit mapping_id)
+// 6. Action contract enforced at construction, serialization, and decoding (only open_app may omit mapping_id)
 do {
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("fs-act-\(UUID().uuidString)")
     try! FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -212,16 +230,18 @@ do {
         action: .syncNow,
         mappingId: "research"
     )
-    expect(req.isValid, "sync_now with mapping_id should be valid")
-    do {
-        let writtenURL = try SnapshotEvaluator.writeActionRequest(req, toDirectory: tempDir)
-        let data = try Data(contentsOf: writtenURL)
-        let decoded = SnapshotEvaluator.decodeValidActionRequest(data: data)
-        expect(decoded == req, "valid action request should round-trip via decodeValidActionRequest")
-        expect(writtenURL.pathExtension == "json", "written action file should be .json")
-    } catch {
-        failed += 1
-        fputs("FAIL: writeActionRequest threw error for valid sync_now: \(error)\n", stderr)
+    expect(req != nil, "sync_now with mapping_id should construct")
+    if let req {
+        do {
+            let writtenURL = try SnapshotEvaluator.writeActionRequest(req, toDirectory: tempDir)
+            let data = try Data(contentsOf: writtenURL)
+            let decoded = SnapshotEvaluator.decodeValidActionRequest(data: data)
+            expect(decoded == req, "valid action request should round-trip via decodeValidActionRequest")
+            expect(writtenURL.pathExtension == "json", "written action file should be .json")
+        } catch {
+            failed += 1
+            fputs("FAIL: writeActionRequest threw error for valid sync_now: \(error)\n", stderr)
+        }
     }
 
     // Valid open_app without mapping_id
@@ -232,46 +252,51 @@ do {
         action: .openApp,
         mappingId: nil
     )
-    expect(openReq.isValid, "open_app without mapping_id should be valid")
-    do {
-        let writtenURL = try SnapshotEvaluator.writeActionRequest(openReq, toDirectory: tempDir)
-        let data = try Data(contentsOf: writtenURL)
-        expect(SnapshotEvaluator.decodeValidActionRequest(data: data) == openReq, "open_app without mapping_id should decode as valid")
-    } catch {
-        failed += 1
-        fputs("FAIL: writeActionRequest threw error for valid open_app: \(error)\n", stderr)
+    expect(openReq != nil, "open_app without mapping_id should construct")
+    if let openReq {
+        do {
+            let writtenURL = try SnapshotEvaluator.writeActionRequest(openReq, toDirectory: tempDir)
+            let data = try Data(contentsOf: writtenURL)
+            expect(SnapshotEvaluator.decodeValidActionRequest(data: data) == openReq, "open_app without mapping_id should decode as valid")
+        } catch {
+            failed += 1
+            fputs("FAIL: writeActionRequest threw error for valid open_app: \(error)\n", stderr)
+        }
     }
 
-    // Invalid mapping-only actions with nil or whitespace mapping_id must be rejected on write and receive
-    let invalidCases: [(ActionKind, String?)] = [
-        (.syncNow, nil),
-        (.syncNow, "   "),
-        (.pause, nil),
-        (.showLastRun, nil),
-        (.showLastRun, ""),
+    // Mapping-required actions without mapping_id (or wrong version) CANNOT be constructed
+    let invalidCtorCases: [(Int, ActionKind, String?)] = [
+        (1, .syncNow, nil),
+        (1, .syncNow, "   "),
+        (1, .pause, nil),
+        (1, .showLastRun, nil),
+        (1, .showLastRun, ""),
+        (2, .openApp, nil),
     ]
-    for (idx, (kind, badMapping)) in invalidCases.enumerated() {
-        let badReq = ActionRequest(
-            version: 1,
+    for (idx, (ver, kind, badMapping)) in invalidCtorCases.enumerated() {
+        let constructed = ActionRequest(
+            version: ver,
             id: "req-bad-\(idx)",
             requestedAt: "2026-11-20T18:01:10Z",
             action: kind,
             mappingId: badMapping
         )
-        expect(!badReq.isValid, "\(kind.rawValue) without mapping_id must be invalid")
+        expect(constructed == nil, "ActionRequest init must reject v\(ver) \(kind.rawValue) with invalid mapping_id")
+    }
 
-        var rejectedOnWrite = false
-        do {
-            _ = try SnapshotEvaluator.writeActionRequest(badReq, toDirectory: tempDir)
-        } catch let err as ActionValidationError where err == .invalidActionRequest {
-            rejectedOnWrite = true
-        } catch {
-            rejectedOnWrite = false
-        }
-        expect(rejectedOnWrite, "writeActionRequest must reject \(kind.rawValue) without mapping_id")
-
-        let encoded = try! JSONEncoder().encode(badReq)
-        expect(SnapshotEvaluator.decodeValidActionRequest(data: encoded) == nil, "host drain decoder must reject \(kind.rawValue) without mapping_id")
+    // Raw JSON payloads violating the contract must fail both JSONDecoder and decodeValidActionRequest
+    let invalidRawPayloads: [String] = [
+        #"{"version":1,"id":"r1","requested_at":"2026-11-20T18:01:10Z","action":"sync_now","mapping_id":null}"#,
+        #"{"version":1,"id":"r2","requested_at":"2026-11-20T18:01:10Z","action":"sync_now","mapping_id":"  "}"#,
+        #"{"version":1,"id":"r3","requested_at":"2026-11-20T18:01:10Z","action":"pause"}"#,
+        #"{"version":1,"id":"r4","requested_at":"2026-11-20T18:01:10Z","action":"show_last_run","mapping_id":""}"#,
+        #"{"version":2,"id":"r5","requested_at":"2026-11-20T18:01:10Z","action":"open_app"}"#,
+    ]
+    for (idx, raw) in invalidRawPayloads.enumerated() {
+        let data = Data(raw.utf8)
+        let directDecode = try? JSONDecoder().decode(ActionRequest.self, from: data)
+        expect(directDecode == nil, "JSONDecoder must reject invalid action payload #\(idx)")
+        expect(SnapshotEvaluator.decodeValidActionRequest(data: data) == nil, "decodeValidActionRequest must reject invalid payload #\(idx)")
     }
 }
 

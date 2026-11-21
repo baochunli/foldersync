@@ -9,7 +9,7 @@
     <key>CFBundleExecutable</key>
     <string>FolderSyncHost</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.foldersync.app</string>
+    <string>dev.foldersync.spike.host</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

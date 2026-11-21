@@ -16,7 +16,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     private var lastReadResult: SnapshotReadResult = .failed(reason: "Status unavailable")
     private var lastKnownSnapshot: StatusSnapshot?
-    private var lastEvaluation: SnapshotEvaluation = .stale(nil, reason: "Status unavailable")
+    private var lastEvaluation: SnapshotEvaluation = .stale(nil, reason: "Status unavailable", readSucceeded: false)
     private var currentDirectoryURLs: Set<URL> = []
     private var observedRootURLs: Set<URL> = []
     private var refreshTimer: DispatchSourceTimer?
@@ -68,7 +68,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     private static func derivedHostBundleIdentifier() -> String {
         guard let extId = Bundle.main.bundleIdentifier else {
-            return "dev.foldersync.app"
+            return "dev.foldersync.spike.host"
         }
         let parts = extId.split(separator: ".")
         if parts.count > 1 {
@@ -175,12 +175,9 @@ final class FolderSyncFinderExtension: FIFinderSync {
         stateLock.unlock()
 
         let controller = FIFinderSyncController.default()
-        if updateDirectoryURLs, let snapshotForRoots = evaluation.snapshot {
-            // Do not probe arbitrary user paths with FileManager inside the app sandbox;
-            // Finder resolves directoryURLs directly in the host process.
-            let newRootURLs = Set(snapshotForRoots.mappings.map {
-                URL(fileURLWithPath: SnapshotEvaluator.canonicalPath($0.rootPath))
-            })
+        if updateDirectoryURLs, let newRootURLs = SnapshotEvaluator.directoryRootURLs(for: evaluation) {
+            // Derive watch-list updates only from successful reads; do not probe
+            // arbitrary user paths with FileManager inside the app sandbox.
             if newRootURLs != previousDirectoryURLs {
                 stateLock.lock()
                 currentDirectoryURLs = newRootURLs
@@ -256,15 +253,15 @@ final class FolderSyncFinderExtension: FIFinderSync {
         stateLock.unlock()
 
         let mapping: MappingSnapshot?
-        if let targetURL, let snap = evaluation.snapshot {
-            mapping = SnapshotEvaluator.owningMapping(for: targetURL, in: snap)
+        if let targetURL {
+            mapping = SnapshotEvaluator.menuMapping(for: targetURL, evaluation: evaluation)
         } else {
             mapping = nil
         }
 
         let menu = NSMenu(title: "FolderSync")
         // Disable AppKit auto-enablement so explicit `isEnabled` flags are respected
-        // (including toolbar clicks outside watched folders).
+        // (including toolbar clicks outside watched folders and failed snapshot reads).
         menu.autoenablesItems = false
 
         // Always communicate status in plain text, not color alone.
@@ -276,7 +273,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
             } else {
                 statusTitle = "FolderSync"
             }
-        case .stale(_, let reason):
+        case .stale(_, let reason, _):
             statusTitle = "Status: \(reason)"
         }
         let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
@@ -331,16 +328,14 @@ final class FolderSyncFinderExtension: FIFinderSync {
     }
 
     private func dispatchAction(_ action: ActionKind, mappingId: String?, wakeHostIfNeeded: Bool) {
-        let request = ActionRequest(
+        guard let request = ActionRequest(
             version: snapshotSchemaVersion,
             id: UUID().uuidString,
             requestedAt: SnapshotEvaluator.formatISO8601(Date()),
             action: action,
             mappingId: mappingId
-        )
-
-        guard request.isValid else {
-            logger.warning("Refused to dispatch invalid action=\(action.rawValue, privacy: .public) without required mapping_id")
+        ) else {
+            logger.warning("Refused to construct/dispatch invalid action=\(action.rawValue, privacy: .public) without required mapping_id")
             return
         }
 

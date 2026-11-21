@@ -4,9 +4,9 @@ Small Swift `FIFinderSync` extension that shows sync status badges on mapped-fol
 
 The extension owns no sync state, holds no OAuth credentials, and never launches `rclone`. It reads an atomically written JSON status snapshot and sends narrow action requests back to the host app.
 
-> **Note:** The bundled `FolderSyncHost.app` built by `build.sh` is a **throwaway mock host** for this feasibility spike. It only validates incoming action JSON files, logs them, and deletes them; it does not execute sync runs. Both the extension and the mock host default to the same disposable shared directory (`<out>/spike-shared`) and never touch `~/Library/Application Support/FolderSync`.
+> **Note:** The bundled `FolderSyncHost.app` built by `build.sh` is a **throwaway mock host** (`dev.foldersync.spike.host`) for this feasibility spike. It only validates incoming action JSON files, logs them, and deletes them; it does not execute sync runs. Both the extension and the mock host default to the same disposable shared directory (`<out>/spike-shared`) and never touch any real application state directory.
 
-See [docs/decisions/0002-finder-extension.md](../../docs/decisions/0002-finder-extension.md) for the feasibility findings, exact probe commands, snapshot/action contracts, entitlement tradeoffs, and NSH packaging guidance.
+See [docs/decisions/0002-finder-extension.md](../../docs/decisions/0002-finder-extension.md) for the feasibility findings, snapshot/action contracts, entitlement tradeoffs, and NSH packaging guidance.
 
 ## Build and Unit Tests (Xcode Command Line Tools only)
 
@@ -19,7 +19,7 @@ WORK="$(mktemp -d)"
   --test \
   --out "$WORK/out" \
   --shared-dir "$WORK/shared" \
-  --bundle-id dev.foldersync.spike
+  --bundle-id dev.foldersync.spike.host
 ```
 
 ## Local Verification (Temp Directory Only) and Cleanup
@@ -51,7 +51,7 @@ WORK="$(mktemp -d)"
    HOST_PID=$!
 
    pluginkit -a "$WORK/out/FolderSyncHost.app/Contents/PlugIns/FolderSyncFinder.appex"
-   pluginkit -e use -i dev.foldersync.spike.finder-extension
+   pluginkit -e use -i dev.foldersync.spike.host.finder-extension
    open "$WORK/watched"
    ```
 3. Push an atomic status update and notify the extension via Darwin notification:
@@ -62,10 +62,10 @@ WORK="$(mktemp -d)"
    mv "$WORK/shared/status.json.tmp" "$WORK/shared/status.json"
    "$WORK/out/FolderSyncHost.app/Contents/MacOS/FolderSyncHost" --notify-snapshot
    ```
-4. Always stop the mock host and clean up afterwards (never run `killall Finder`):
+4. Always stop the mock host (`dev.foldersync.spike.host` only) and clean up afterwards (never run `killall Finder`):
    ```bash
-   kill "$HOST_PID" 2>/dev/null || osascript -e 'tell application id "dev.foldersync.spike" to quit' 2>/dev/null || true
-   pluginkit -e ignore -i dev.foldersync.spike.finder-extension
+   kill "$HOST_PID" 2>/dev/null || osascript -e 'tell application id "dev.foldersync.spike.host" to quit' 2>/dev/null || true
+   pluginkit -e ignore -i dev.foldersync.spike.host.finder-extension
    pluginkit -r "$WORK/out/FolderSyncHost.app/Contents/PlugIns/FolderSyncFinder.appex"
    rm -rf "$WORK"
    ```

@@ -12,7 +12,7 @@ FolderSync v1 includes Finder status badges on **mapped-folder roots only** (`sy
 - The extension owns no sync state, holds no OAuth credentials, and never launches `rclone`.
 - Development machines may have only **Xcode Command Line Tools** (no full `Xcode.app`) and **no code-signing identities** (ad hoc signing only).
 
-This spike tests what works end-to-end with CLT-only tooling and ad hoc signing on macOS, records the exact probe commands and observed results, identifies boundaries requiring a Developer ID or full Xcode, and defines the v1 snapshot/action contracts.
+This spike tests what works end-to-end with CLT-only tooling and ad hoc signing on macOS, identifies boundaries requiring a Developer ID or full Xcode, and defines the v1 snapshot/action contracts.
 
 ## Test Environment
 
@@ -24,119 +24,53 @@ This spike tests what works end-to-end with CLT-only tooling and ad hoc signing 
 
 ### 1. Can a Swift Finder Sync extension be built with CLT only, ad hoc signed, embedded, and registered locally?
 
-**Yes.** Verified end-to-end via `apps/finder-extension/build.sh`.
+**Yes.** Verified end-to-end via `apps/finder-extension/build.sh` (see `apps/finder-extension/README.md` for full runnable commands).
 
-- **Compilation (no Xcode):**
-  ```bash
-  swiftc -parse-as-library -application-extension \
-    -target arm64-apple-macos14.0 -sdk "$(xcrun --show-sdk-path)" \
-    -framework Cocoa -framework FinderSync -framework Foundation \
-    -Xlinker -e -Xlinker _NSExtensionMain \
-    -o FolderSyncHost.app/Contents/PlugIns/FolderSyncFinder.appex/Contents/MacOS/FolderSyncFinder \
-    Sources/SnapshotModel.swift Sources/BadgeRenderer.swift Sources/FinderSyncExtension.swift
-  ```
+- **Compilation (no Xcode):** `swiftc` compiles a `FIFinderSync` subclass directly into an app extension Mach-O binary using `-parse-as-library -application-extension -target arm64-apple-macos14.0 -Xlinker -e -Xlinker _NSExtensionMain` linked against `Cocoa`, `FinderSync`, and `Foundation`.
 - **No Asset Catalog required:** Badge images are rendered programmatically with macOS SF Symbols (`NSImage(systemSymbolName:accessibilityDescription:)`) and a CoreGraphics fallback, avoiding `actool` (which requires full `Xcode.app`).
-- **Bundle assembly & inner-to-outer ad hoc signing:**
-  ```bash
-  codesign --force --sign - --entitlements FinderExtension.generated.entitlements \
-    FolderSyncHost.app/Contents/PlugIns/FolderSyncFinder.appex
-  codesign --force --sign - FolderSyncHost.app
-  codesign --verify --deep --strict FolderSyncHost.app
-  ```
+- **Bundle assembly & inner-to-outer ad hoc signing:** `build.sh` embeds `Contents/PlugIns/FolderSyncFinder.appex` inside a throwaway mock host bundle (`FolderSyncHost.app`, bundle ID `dev.foldersync.spike.host`), signs inner `.appex` with entitlements then outer `.app` with `codesign --force --sign -`, and verifies with `codesign --verify --deep --strict`.
 - **Local registration & execution:** `pluginkit -a <appex>` and `pluginkit -e use -i <bundle-id>` succeed. When Finder opens a watched directory's parent, `pkd`/RunningBoard launches the ad hoc signed `.appex` (`amfid` logs informational `Code=-423` for ad hoc signing, and AppleSystemPolicy permits local execution).
 
 ### 2. Where can a sandboxed extension read the status snapshot with ad hoc signing?
 
-Finder Sync extensions must run inside the macOS App Sandbox (`com.apple.security.app-sandbox = true`). Two entitlement candidates were tested live inside an ad hoc signed Finder Sync probe (`ProbeHost` / `ProbeExt`, bundle ID `dev.foldersync.probe.ext`) registered via `pluginkit`:
+Finder Sync extensions must run inside the macOS App Sandbox (`com.apple.security.app-sandbox = true`). Before writing the shipped spike bundle, we ran **exploratory throwaway probes** (temporary Swift `FIFinderSync` extensions compiled with `swiftc`, ad hoc signed with `codesign --force --sign -`, registered via `pluginkit`, triggered by opening temp directories in Finder, inspected via `/usr/bin/log show`, and cleaned up; those throwaway probe sources were not committed).
 
-**Exact probe commands (run inside a `mktemp -d` directory, cleaned up via `pluginkit -e ignore` / `pluginkit -r`):**
+**Observed exploratory probe results (macOS 27.2.1, ad hoc signed):**
 
-```bash
-# Variant A (App Group): ent-a.plist contains com.apple.security.app-sandbox=true
-# and com.apple.security.application-groups=["group.dev.foldersync.probe"]
-codesign --force --sign - --entitlements "$PROBE_DIR/ent-a.plist" "$APPEX_PATH"
-codesign --force --sign - "$APP_PATH"
-pluginkit -a "$APPEX_PATH" && pluginkit -e use -i dev.foldersync.probe.ext
-open "$WATCH_PARENT" && open "$ROOT_A"
-/usr/bin/log show --start "$START_TIME" --info --style compact \
-  --predicate 'subsystem == "dev.foldersync.probe" OR (process == "sandboxd" AND eventMessage CONTAINS[c] "ProbeExt")'
-
-# Variant B (Temporary file exceptions): ent-b.plist contains com.apple.security.app-sandbox=true,
-# com.apple.security.temporary-exception.files.absolute-path.read-only=["$SNAP_DIR/", "/private$SNAP_DIR/"],
-# and com.apple.security.temporary-exception.files.home-relative-path.read-only=["/$REL_FROM_HOME/"]
-# (followed by a second probe with absolute-path.read-write for command file writes)
-codesign --force --sign - --entitlements "$PROBE_DIR/ent-b.plist" "$APPEX_PATH"
-codesign --force --sign - "$APP_PATH"
-pluginkit -a "$APPEX_PATH" && pluginkit -e use -i dev.foldersync.probe.ext
-open "$WATCH_PARENT" && open "$ROOT_A"
-```
-
-**Observed results (macOS 27.2.1, ad hoc signed):**
-
-| Candidate | Entitlement | Observed Result | Unified Log Evidence |
+| Candidate | Entitlement Tested (Exploratory Probe) | Observed Result | Unified Log Evidence |
 | --- | --- | --- | --- |
 | **App Group container (`group.*`)** | `com.apple.security.application-groups = ["group.dev.foldersync.probe"]` | **Failed** | `containerURL(forSecurityApplicationGroupIdentifier:)` returned `~/Library/Group Containers/group.dev.foldersync.probe`, but writing `probe.txt` failed with permission error (`sandboxd`: `kTCCServiceSystemPolicyAppDataDetailed denied by TCC for ProbeExt`). Without a Team ID or provisioning profile, macOS App Data Protection blocks access to `group.*` containers. |
-| **Temporary file exception (read-only / read-write)** | `com.apple.security.temporary-exception.files.absolute-path.*` and `home-relative-path.read-only` | **Succeeded** | Extension logged `PROBE_ABS_READ_OK len=212`, `PROBE_HOMEREL_READ_OK len=12`, and in the read-write probe `P2_CMD_WRITE_OK` with zero TCC denials. |
+| **Temporary file exception (read-only / read-write)** | `com.apple.security.temporary-exception.files.absolute-path.*` (temp dir) and `home-relative-path.read-only` (throwaway temp subdir) | **Succeeded** | Extension logged `PROBE_ABS_READ_OK len=212`, `PROBE_HOMEREL_READ_OK len=12`, and in a follow-up read-write exploratory probe `P2_CMD_WRITE_OK` with zero TCC denials. |
 
 **Decision:**
-- For **local development and this spike**, `build.sh` scopes the generated entitlements strictly to a disposable `--shared-dir` (defaulting to `<out>/spike-shared`) via `com.apple.security.temporary-exception.files.absolute-path.read-write`, and both the extension and throwaway mock host default to that same disposable path. Real `~/Library/Application Support/FolderSync/` is never touched by the spike.
-- For **future v1 production packaging** (outside the Mac App Store per plan §19), use `com.apple.security.temporary-exception.files.home-relative-path.read-write` scoped narrowly to `/Library/Application Support/FolderSync/finder/`, or migrate to a `<TEAM_ID>.dev.foldersync.shared` macOS App Group once a Developer ID certificate is available (see documented expectations in the capability matrix below).
+- For **this spike and local development**, `build.sh` scopes generated entitlements strictly to a disposable `--shared-dir` (defaulting to `<out>/spike-shared`) via `com.apple.security.temporary-exception.files.absolute-path.read-write`, and both the extension and throwaway mock host (`dev.foldersync.spike.host`) default to that same disposable path. The spike never touches any real FolderSync state directory.
+- For **future v1 production packaging** (outside the Mac App Store per plan §19), either scope a narrow `com.apple.security.temporary-exception.files.home-relative-path.read-write` entitlement to the app's own Finder handoff subdirectory, or migrate to a `<TEAM_ID>.*` macOS App Group once a Developer ID certificate is available (see documented expectations in the capability matrix below).
 
 ### 3. Can root-level badges be driven live by an atomically written snapshot, with staleness handling?
 
-**Yes.** Verified live with the shipped `apps/finder-extension/build.sh` bundle (`dev.foldersync.spike.finder-extension`) in a `mktemp -d` directory:
+**Yes.** Verified live with the shipped `apps/finder-extension/build.sh` bundle in a `mktemp -d` directory using the exact build, fixture, atomic `status.json` replacement, `--notify-snapshot`, and cleanup commands documented in `apps/finder-extension/README.md`.
 
-**Exact verification commands:**
-
-```bash
-VERIFY_DIR="$(mktemp -d)"
-./apps/finder-extension/build.sh --test --out "$VERIFY_DIR/out" --shared-dir "$VERIFY_DIR/shared" --bundle-id dev.foldersync.spike
-# Wrote atomic status.json with Research=synced, Family=syncing, Docs=attention, Archive=paused, UnmountedDisk/Photos=disk_missing
-"$VERIFY_DIR/out/FolderSyncHost.app/Contents/MacOS/FolderSyncHost" &
-pluginkit -a "$VERIFY_DIR/out/FolderSyncHost.app/Contents/PlugIns/FolderSyncFinder.appex"
-pluginkit -e use -i dev.foldersync.spike.finder-extension
-open "$VERIFY_DIR/watched"
-open "$VERIFY_DIR/watched/Research"
-# Atomically updated Research -> attention, then ran:
-"$VERIFY_DIR/out/FolderSyncHost.app/Contents/MacOS/FolderSyncHost" --notify-snapshot
-# Atomically updated generated_at -> 2020-01-01T00:00:00Z, then ran:
-"$VERIFY_DIR/out/FolderSyncHost.app/Contents/MacOS/FolderSyncHost" --notify-snapshot
-/usr/bin/log show --start "$START_TIME" --info --style compact \
-  --predicate 'subsystem == "dev.foldersync.app.finder-extension" OR subsystem == "dev.foldersync.app"'
-```
-
-**Observed results:**
+**Observed live Finder results (unified log `subsystem == "dev.foldersync.app.finder-extension"`):**
 
 1. Opening `<tmp>/watched` caused Finder to invoke `requestBadgeIdentifier(for:)` for all four existing mapped roots (`Archive`, `Docs`, `Family`, `Research`) and set their distinct badges (`paused`, `attention`, `syncing`, `synced`).
 2. Opening `<tmp>/watched/Research` triggered `beginObservingDirectory(at:)` and requested badges for child `notes.txt`; the extension returned `""` (empty string) for all non-root descendants, enforcing the v1 roots-only rule.
-3. Atomically replacing `status.json` (`Research`: `synced` → `attention`) and posting `dev.foldersync.finder.snapshot-updated` updated all observed root badges immediately (`Updated badge root=.../Research badge=attention`).
-4. Replacing `generated_at` with an expired timestamp (`2020-01-01T00:00:00Z`) and notifying switched all four observed roots to `stale`.
+3. Atomically replacing `status.json` (`Research`: `synced` → `attention`) and running `FolderSyncHost --notify-snapshot` updated all observed root badges immediately (`Updated badge root=.../Research badge=attention`).
+4. Replacing `generated_at` with an expired timestamp (`2020-01-01T00:00:00Z`) and running `--notify-snapshot` switched all four observed roots to `stale`.
 5. `NSRunningApplication.runningApplications(withBundleIdentifier:)` succeeded inside the sandboxed extension (`count=1` when running), enabling host-liveness staleness detection alongside timestamp expiry.
-6. Failed snapshot reads or decodes (deleted, corrupt, or unsupported-version `status.json`) are carried into both badge and menu evaluation as `.stale` while retaining `lastKnownSnapshot` solely to show the `stale` badge on previously known roots (verified in `SnapshotModelTests` valid-to-invalid transition test).
 
-**Implementation lessons learned during verification:**
+**Unit-tested model guarantees (not live-verified in Finder):**
+- Deleting `status.json` or replacing it with corrupt/unsupported-version JSON while the host app is running and the prior snapshot is still within TTL evaluates as `.stale(..., readSucceeded: false)`. The cached snapshot is retained strictly for stale root badges; `menuMapping` and `directoryRootURLs` return `nil`, so the menu disables mapping actions (`Sync now`, `Pause`, `Show last run`) and exposes only `Open FolderSync` with no mapping ID. Verified in `apps/finder-extension/Tests/SnapshotModelTests.swift` (section `3b`), not exercised interactively in Finder.
+
+**Implementation lessons learned during live verification:**
 - **Canonical path normalization is mandatory:** Finder passes resolved paths (`/private/var/...`), whereas callers often write symlinked paths (`/var/...`). Both snapshot roots and Finder callback URLs must be canonicalized via `standardizedFileURL.resolvingSymlinksInPath()`.
 - **Do not pre-badge unrequested URLs:** Calling `setBadgeIdentifier(_:for:)` during `init()` before Finder calls `requestBadgeIdentifier(for:)` suppresses Finder's initial badge callbacks (documented in `FinderSync.h`). Push updates only to URLs previously seen in `requestBadgeIdentifier(for:)`.
 - **Do not probe arbitrary user folders inside the sandbox:** Pass snapshot mapping roots directly to `FIFinderSyncController.default().directoryURLs` rather than gating them on `FileManager.fileExists(atPath:)` inside the extension sandbox.
 
 ### 4. How should narrow actions be sent back to the host app?
 
-Two sandbox-compatible mechanisms were evaluated in a standalone live probe (`ProbeExt2` / `ProbeHost2`, bundle ID `dev.foldersync.probe2.ext`, where `ProbeExt2.init()` executed both IPC paths against a running `ProbeHost2` launched via `open -g -a "$APP_PATH"` with `CFBundleURLTypes` registering `foldersync-probe2://`):
+Two sandbox-compatible mechanisms were evaluated in an **exploratory throwaway probe** (`ProbeExt2` / `ProbeHost2` in a `mktemp -d` directory, where `ProbeExt2.init()` exercised both IPC mechanisms against a running `ProbeHost2` launched with `open -g -a` and `CFBundleURLTypes` registering `foldersync-probe2://`; those throwaway probe sources were not committed, and the shipped Finder context menu was not clicked interactively):
 
-**Exact IPC probe commands:**
-
-```bash
-# Built ProbeHost2.app (with CFBundleURLSchemes=["foldersync-probe2"]) and ProbeExt2.appex
-# (with temporary-exception.files.absolute-path.read-write for $SNAP_DIR/)
-codesign --force --sign - --entitlements "$PROBE_DIR/ent2.plist" "$APPEX_PATH"
-codesign --force --sign - "$APP_PATH"
-open -g -a "$APP_PATH"
-pluginkit -a "$APPEX_PATH" && pluginkit -e use -i dev.foldersync.probe2.ext
-open "$WATCH_PARENT"
-/usr/bin/log show --start "$START_TIME" --info --style compact --predicate 'subsystem == "dev.foldersync.probe2"'
-```
-
-**Observed probe results (from `ProbeExt2` / `ProbeHost2`, NOT interactive clicks on the shipped Finder menu):**
+**Observed exploratory probe results (`ProbeExt2` / `ProbeHost2`, NOT interactive clicks on the shipped Finder menu):**
 
 | Candidate | Observed Result (ad hoc temp bundle) | Unified Log Evidence & Tradeoffs |
 | --- | --- | --- |
@@ -145,13 +79,16 @@ open "$WATCH_PARENT"
 
 **Decision & distinction between spike mock host and future v1 manager:**
 - Use **atomic action JSON files + Darwin notification** (`dev.foldersync.finder.action-requested`) for all four context menu actions (`sync_now`, `pause`, `open_app`, `show_last_run`).
-- The shipped extension enforces the action contract at three layers: `menu.autoenablesItems = false` disables mapping-only items (`Sync now`, `Pause`, `Show last run`) whenever no mapping owns the target (such as toolbar clicks outside watched folders); the sender (`dispatchAction` / `writeActionRequest`) rejects invalid requests; and the receiver validates via `decodeValidActionRequest`.
-- **Mock vs. v1 manager:** The bundled `FolderSyncHost.app` in `apps/finder-extension/Sources/HostAppMain.swift` is a **throwaway mock host** that only validates, logs, and deletes queued action files. In v1 (Group 3/4), the Rust manager will own draining `actions/*.json` and dispatching validated commands into the manager command channel.
+- The shipped extension enforces the action contract at construction, menu, sender, and receiver layers:
+  - `menu.autoenablesItems = false` disables mapping-only items (`Sync now`, `Pause`, `Show last run`) whenever no successful-read mapping owns the target (such as toolbar clicks outside watched folders or after a failed snapshot read).
+  - `ActionRequest`'s failable initializer and `Decodable` implementation make it impossible to construct or decode a mapping-required action without a non-empty `mapping_id`.
+  - Both `writeActionRequest` and `decodeValidActionRequest` enforce the same rule.
+- **Mock vs. v1 manager:** The bundled `FolderSyncHost.app` (`dev.foldersync.spike.host`) in `apps/finder-extension/Sources/HostAppMain.swift` is a **throwaway mock host** that only validates, logs, and deletes queued action files. In v1 (Group 3/4), the Rust manager will own draining `actions/*.json` and dispatching validated commands into the manager command channel.
 
 ## Status Snapshot & Action Contracts (v1)
 
-- **Spike default shared directory:** `<out>/spike-shared` (via `build.sh`, or `--shared-dir <tmp>`).
-- **Planned v1 production shared directory:** `~/Library/Application Support/FolderSync/finder/` (never touched by this spike).
+- **Spike shared directory:** Disposable directory `<out>/spike-shared` (default in `build.sh`) or `--shared-dir <tmp>`.
+- **Future v1 production handoff directory:** Chosen during Group 4 packaging (either a Developer ID `<TEAM_ID>.*` App Group container or a dedicated Finder handoff subdirectory under the app's macOS application-support state).
 
 ### Snapshot File: `status.json` (Host → Extension)
 
@@ -178,7 +115,7 @@ Written atomically (`status.json.tmp` → rename to `status.json`), followed by 
 - `generated_at`: RFC 3339 / ISO 8601 UTC timestamp.
 - `stale_after_seconds`: Optional integer (default `300` seconds / 5 minutes).
 - `mappings[].state`: One of `synced`, `syncing`, `attention`, `paused`, `disk_missing`.
-- **Staleness rule:** If `status.json` is missing, unreadable, corrupt, has an unsupported version, is older than `stale_after_seconds`, or the host app bundle ID is not running, all known mapping roots display the `stale` badge (`FolderSync unavailable`) and the context menu shows plain-text stale status.
+- **Staleness rule:** If `status.json` is missing, unreadable, corrupt, has an unsupported version, is older than `stale_after_seconds`, or the host app bundle ID is not running, all known mapping roots display the `stale` badge (`FolderSync unavailable`) and the context menu shows plain-text stale status. After a failed read/decode, menu mappings and watch-list updates are cleared (only `Open FolderSync` remains enabled, with no mapping ID).
 - **Accessibility:** Every badge registers a distinct symbol shape, color, and text label; the context menu always begins with a disabled plain-text status line (`Status: ...`).
 
 ### Action Files: `actions/action-<uuid>.json` (Extension → Host)
@@ -196,8 +133,8 @@ Written atomically by the extension, followed by posting Darwin notification `de
 ```
 
 - `action`: Strictly one of `sync_now`, `pause`, `open_app`, `show_last_run`.
-- `mapping_id`: Required (non-empty string) for `sync_now`, `pause`, and `show_last_run`; nullable only for `open_app`. No paths, rclone flags, or credentials ever cross this boundary.
-- **Consumption:** The spike's mock host validates, logs, and deletes each file; the future v1 Rust manager will validate, dispatch the manager command, and delete each file.
+- `mapping_id`: Required (non-empty string) for `sync_now`, `pause`, and `show_last_run`; nullable only for `open_app`. Enforced at `ActionRequest` construction, JSON decoding, writing, and receiving. No paths, rclone flags, or credentials ever cross this boundary.
+- **Consumption:** The spike's mock host (`dev.foldersync.spike.host`) validates, logs, and deletes each file; the future v1 Rust manager will validate, dispatch the manager command, and delete each file.
 
 ## What Requires Full Xcode vs. Developer ID / Provisioning Profile
 
@@ -207,7 +144,7 @@ Cells marked **Expected (unverified)** reflect Apple's macOS signing/app-group d
 | --- | --- | --- | --- |
 | Compile Swift `FIFinderSync` `.appex` | **Verified** | Expected (unverified; same `swiftc` step) | Optional |
 | Badge rendering (SF Symbols / CoreGraphics) | **Verified** (code + registration; not visually inspected) | Expected (unverified) | Optional (only needed for `.xcassets` / `actool`) |
-| Standalone Swift unit tests (`SnapshotModelTests`) | **Verified** (54/54 assertions) | Expected (unverified) | Optional (only needed for `XCTest` / `xcodebuild test`) |
+| Standalone Swift unit tests (`SnapshotModelTests`) | **Verified** (63/63 assertions) | Expected (unverified) | Optional (only needed for `XCTest` / `xcodebuild test`) |
 | Local dev registration (`pluginkit -a` / `-e use`) | **Verified** | Expected (unverified) | Not required |
 | Shared snapshot via temporary file exception | **Verified** (temp dir) | Expected (unverified; permitted outside Mac App Store per Apple docs) | Not required |
 | `<TEAM_ID>.*` macOS App Group (no profile) | **Verified blocked** (no Team ID) | Expected (unverified; Apple documents `<TEAM_ID>.*` for Developer ID macOS apps) | Not required |
@@ -220,8 +157,8 @@ Cells marked **Expected (unverified)** reflect Apple's macOS signing/app-group d
 
 Keep the extension as a small CLT-built Swift target under `apps/finder-extension/` and integrate it as a post-packaging step on `nsh package --target macos`:
 
-1. Build the Rust desktop app via `nsh package --target macos --id dev.foldersync.app` to produce `FolderSync.app`.
-2. Build `FolderSyncFinder.appex` from `apps/finder-extension/` matching `FolderSync.app`'s bundle ID (`dev.foldersync.app.finder-extension`) and production entitlements (`home-relative-path.read-write` for `/Library/Application Support/FolderSync/finder/`, or `<TEAM_ID>.*` App Group once Developer ID signing is qualified).
+1. Build the Rust desktop app via `nsh package --target macos --id dev.foldersync.app` to produce `FolderSync.app` (distinct from this spike's mock host ID `dev.foldersync.spike.host`).
+2. Build `FolderSyncFinder.appex` from `apps/finder-extension/` matching `FolderSync.app`'s bundle ID (`dev.foldersync.app.finder-extension`) and v1 production entitlements (`<TEAM_ID>.*` App Group once Developer ID signing is qualified, or a narrow home-relative temporary file exception scoped to the app's Finder handoff directory).
 3. Embed `FolderSyncFinder.appex` at `FolderSync.app/Contents/PlugIns/FolderSyncFinder.appex` (alongside the pinned `rclone` binary per plan §19).
 4. Sign strictly **inner to outer**:
    1. Embedded `rclone` binary
@@ -232,7 +169,7 @@ Keep the extension as a small CLT-built Swift target under `apps/finder-extensio
 
 ## What Was NOT Verified in This Spike
 
-- **Visual rendering & interactive Finder context menu clicks:** `screencapture -x` failed with `could not create image from display` in this terminal session (no Screen Recording permission). Badge assignment and live updates were verified via Finder callbacks and unified logs (`requestBadgeIdentifier(for:)` and `setBadgeIdentifier(_:for:)`), not visually on screen. Interactive right-click menu rendering, toolbar menu enablement, and clicking menu items inside Finder were not automated (IPC delivery was verified via the standalone `ProbeExt2`/`ProbeHost2` probe, and action-contract enforcement was verified in `SnapshotModelTests`).
+- **Visual rendering, interactive Finder context menu clicks, and live failed-read transitions in Finder:** `screencapture -x` failed with `could not create image from display` in this terminal session (no Screen Recording permission). Badge assignment and live updates were verified via Finder callbacks and unified logs (`requestBadgeIdentifier(for:)` and `setBadgeIdentifier(_:for:)`), not visually on screen. Interactive right-click menu rendering, toolbar menu enablement, clicking menu items inside Finder, and deleting/corrupting `status.json` live in Finder were not automated (IPC delivery was verified via the exploratory `ProbeExt2`/`ProbeHost2` probe, and failed-read/action-contract rules were verified in `SnapshotModelTests`).
 - **Host relaunch on closed app:** The `NSWorkspace.shared.openApplication(at:)` fallback for `Open FolderSync` / `Show last run` when the host app is stopped was not exercised interactively.
 - **Installed-bundle behavior & NSH `.app` embedding:** All live runs used throwaway bundles in `$TMPDIR`; embedding into actual `nsh package --target macos` output and running from `/Applications` remain to be verified in Group 4 packaging.
 - **Developer ID signing, notarization, `<TEAM_ID>.*` App Groups, and multi-Mac Gatekeeper checks:** No signing identities exist on this machine and the Keychain was not touched; all release-signing rows in the table above are documented expectations pending owner qualification.

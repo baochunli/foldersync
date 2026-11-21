@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 OUT_DIR="${REPO_ROOT}/target/finder-extension"
 SHARED_DIR=""
-HOST_BUNDLE_ID="dev.foldersync.app"
+HOST_BUNDLE_ID="dev.foldersync.spike.host"
 SIGN_IDENTITY="-"
 ARCH="$(uname -m)"
 MIN_MACOS="14.0"
@@ -25,7 +25,8 @@ Options:
   --shared-dir <dir>  Disposable shared snapshot/action directory used by BOTH
                       the extension and the mock host app
                       (default: <out>/spike-shared; never touches real app state)
-  --bundle-id <id>    Host bundle identifier (default: dev.foldersync.app;
+  --bundle-id <id>    Spike mock host bundle identifier
+                      (default: dev.foldersync.spike.host;
                       extension uses <id>.finder-extension)
   --sign <identity>   codesign identity (default: "-" for ad hoc signing)
   --arch <arch>       Target architecture (default: host arch, e.g. arm64)
@@ -63,7 +64,9 @@ mkdir -p "$OUT_DIR"
 CREATED_DEFAULT_SHARED=0
 if [[ -z "$SHARED_DIR" ]]; then
   SHARED_DIR="${OUT_DIR}/spike-shared"
-  CREATED_DEFAULT_SHARED=1
+  if [[ ! -e "$SHARED_DIR" ]]; then
+    CREATED_DEFAULT_SHARED=1
+  fi
 fi
 mkdir -p "$SHARED_DIR"
 REAL_SHARED_DIR="$(cd "$SHARED_DIR" && pwd -P)"
