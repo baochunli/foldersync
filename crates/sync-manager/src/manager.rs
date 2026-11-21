@@ -2,9 +2,10 @@
 //! job execution, crash/orphan reconciliation, snapshots, and Finder output.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::Write,
+    io::{self, Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
@@ -42,14 +43,15 @@ use crate::{
     },
     init::{
         DetailedEndpointInventory, DetectedVolume, decide_init_direction, detect_volume_identity,
-        establish_local_pair_markers, inspect_local_endpoint, inspect_local_endpoint_detailed,
-        render_filters_file, verify_endpoint_access_marker,
+        detect_volume_with, establish_local_pair_markers, inspect_local_endpoint,
+        inspect_local_endpoint_detailed, render_filters_file, verify_endpoint_access_marker,
     },
     launcher::{BisyncLauncher, LaunchPlan, LaunchStopper, RealBisyncLauncher},
     platform::{
-        OsProcessInspector, ProcessInspector, ProcessProbeResult, StateLock, ensure_contained_path,
-        ensure_private_dir_under, open_private_write_file_under, reject_symlinks_under_root,
-        resolve_absolute_path, resolve_state_dir, validate_safe_path_id,
+        DiskSpaceInfo, MountedVolume, OsProcessInspector, OsVolumeProbe, ProcessInspector,
+        ProcessProbeResult, StateLock, VolumeProbe, ensure_private_dir_under,
+        open_private_write_file_under, reject_symlinks_under_root, resolve_absolute_path,
+        resolve_state_dir, space_and_writability, validate_safe_path_id,
         write_private_file_atomic_under, write_private_file_under,
     },
     snapshot::{
@@ -63,6 +65,8 @@ use crate::{
 };
 
 const ENGINE_PROFILE_VERSION: &str = "v1";
+const VOLUME_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const MIN_FREE_BYTES: u64 = 100 * 1024 * 1024;
 
 fn plain_readiness_label(readiness: Readiness) -> &'static str {
     match readiness {
@@ -91,7 +95,9 @@ fn plain_recovery_reason_label(reason_kind: &str) -> &'static str {
         "orphan_running" => "earlier sync still running",
         "orphan_ambiguous" => "unresolved earlier sync process",
         "deletion_guard_aborted" => "stopped by the deletion limit",
-        "interrupted" | "force_stopped" | "shutdown_timeout" => "interrupted sync",
+        "interrupted" | "force_stopped" | "shutdown_timeout" | "volume_disconnected" => {
+            "interrupted sync"
+        }
         _ => "recovery required",
     }
 }
@@ -896,12 +902,14 @@ struct ActiveRunControl {
     run_id: RunId,
     stopper: Option<Arc<dyn LaunchStopper>>,
     stop_requested: bool,
+    volume_lost: bool,
     force_stopped: bool,
     timed_out_during_shutdown: bool,
 }
 
 struct SharedState {
     store: SqliteStateStore,
+    volumes: BTreeMap<MappingId, BoundVolume>,
     device: DeviceRecord,
     snapshot_seq: u64,
     latest_snapshot: Arc<StatusSnapshot>,
@@ -925,6 +933,7 @@ struct ManagerInner {
     timed_out_shutdown: AtomicBool,
     clock: Arc<dyn Clock>,
     process_inspector: Arc<dyn ProcessInspector>,
+    volume_probe: Arc<dyn VolumeProbe>,
     launcher: Arc<dyn BisyncLauncher>,
     event_bus: EventBus,
     state: Mutex<SharedState>,
@@ -935,11 +944,12 @@ struct ManagerInner {
 /// Single-process FolderSync manager owning the state lock, SQLite store,
 /// single global sync worker, snapshot stream, and Finder status writer.
 ///
-/// Field drop order is deliberate: `worker_thread` joins first, then `inner`
-/// (which owns the SQLite connection) closes, and `_lock` releases the OS
+/// Shutdown joins the volume watcher and worker before `inner`
+/// closes the SQLite connection. `_lock` releases the OS
 /// `flock` LAST so no second instance can open SQLite during teardown.
 pub struct SyncManager {
     worker_thread: Mutex<Option<JoinHandle<()>>>,
+    volume_thread: Mutex<Option<JoinHandle<()>>>,
     inner: Arc<ManagerInner>,
     _lock: StateLock,
 }
@@ -949,6 +959,14 @@ impl SyncManager {
     /// unfinished runs from a previous crash, publishes the initial snapshot
     /// (including Finder `status.json`), and starts the background worker.
     pub fn open(config: ManagerConfig) -> Result<Self, ManagerError> {
+        Self::open_with_volume_probe(config, Arc::new(OsVolumeProbe))
+    }
+
+    /// Opens a manager with an injectable mounted-volume probe.
+    pub fn open_with_volume_probe(
+        config: ManagerConfig,
+        volume_probe: Arc<dyn VolumeProbe>,
+    ) -> Result<Self, ManagerError> {
         let state_dir = resolve_state_dir(config.state_dir.as_deref())?;
 
         let lock = StateLock::acquire(&state_dir)?;
@@ -1015,17 +1033,14 @@ impl SyncManager {
             &event_bus,
         )?;
 
-        let initial_snapshot = Arc::new(build_snapshot(
-            &store,
-            1,
-            None,
-            Vec::new(),
-            false,
-            config.clock.as_ref(),
-        )?);
-        if let Err(err) = finder_writer.write_snapshot(&initial_snapshot) {
-            eprintln!("Warning: failed to write initial Finder status snapshot: {err}");
-        }
+        let initial_snapshot = Arc::new(StatusSnapshot {
+            sequence: 0,
+            generated_at: config.clock.now_rfc3339(),
+            active_job_mapping_id: None,
+            queue_order: Vec::new(),
+            scheduling_paused: false,
+            mappings: Vec::new(),
+        });
 
         let inner = Arc::new(ManagerInner {
             state_dir,
@@ -1034,13 +1049,15 @@ impl SyncManager {
             timed_out_shutdown: AtomicBool::new(false),
             clock: config.clock,
             process_inspector: config.process_inspector,
+            volume_probe,
             launcher: config.launcher,
             event_bus,
             state: Mutex::new(SharedState {
                 store,
+                volumes: BTreeMap::new(),
                 device,
-                snapshot_seq: 1,
-                latest_snapshot: Arc::clone(&initial_snapshot),
+                snapshot_seq: 0,
+                latest_snapshot: initial_snapshot,
                 job_queue: VecDeque::new(),
                 active_run: None,
                 preflight_mapping: None,
@@ -1057,6 +1074,13 @@ impl SyncManager {
             idle_cv: Condvar::new(),
         });
 
+        {
+            let mut guard = inner.state.lock().unwrap();
+            for mut mapping in guard.store.list_mappings()? {
+                refresh_mapping_volume_locked(&inner, &mut guard, &mut mapping)?;
+            }
+            publish_updated_snapshot(&inner, &mut guard)?;
+        }
         let worker_inner = Arc::clone(&inner);
         let handle = thread::Builder::new()
             .name("foldersync-worker".to_string())
@@ -1066,11 +1090,22 @@ impl SyncManager {
                 next_step: "Check system thread limits and retry.".to_string(),
             })?;
 
-        Ok(Self {
+        let manager = Self {
             worker_thread: Mutex::new(Some(handle)),
+            volume_thread: Mutex::new(None),
             inner,
             _lock: lock,
-        })
+        };
+        let volume_inner = Arc::clone(&manager.inner);
+        let watcher = thread::Builder::new()
+            .name("foldersync-volumes".to_owned())
+            .spawn(move || volume_watch_loop(&volume_inner))
+            .map_err(|err| ManagerError::Io {
+                cause: format!("Failed to start the disk watcher: {err}."),
+                next_step: "Check system thread limits and retry.".to_owned(),
+            })?;
+        *manager.volume_thread.lock().unwrap() = Some(watcher);
+        Ok(manager)
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -1174,7 +1209,8 @@ impl SyncManager {
         editing_id: Option<&MappingId>,
     ) -> Result<PreflightPreview, ManagerError> {
         let local_path = cmd.local_binding.resolved_path();
-        let detected_volume = detect_volume_identity(&local_path).map_err(|e| e.cause());
+        let detected_volume = detect_volume_with(self.inner.volume_probe.as_ref(), &local_path)
+            .map_err(|e| e.cause());
 
         let (existing, device_id) = {
             let guard = self.inner.state.lock().unwrap();
@@ -1888,7 +1924,9 @@ impl SyncManager {
                 }
             }
 
-            let stopper = if let Some(active) = guard.active_run.as_mut() {
+            let stopper = if let Some(active) = guard.active_run.as_mut()
+                && !active.stop_requested
+            {
                 active.stop_requested = true;
                 let active_mid = active.mapping_id.clone();
                 let st = active.stopper.as_ref().map(Arc::clone);
@@ -2006,6 +2044,7 @@ impl SyncManager {
             }
         };
 
+        self.join_volume_watcher();
         if let Some((mapping_id, run_id)) = timed_out_info {
             return Ok(ControlledShutdownOutcome::TimedOutInterrupted { mapping_id, run_id });
         }
@@ -2023,12 +2062,20 @@ impl SyncManager {
         Ok(())
     }
 
+    fn join_volume_watcher(&self) {
+        if let Some(handle) = self.volume_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+
     fn shutdown_internal(&self) {
         let stopper = {
             let mut guard = self.inner.state.lock().unwrap();
             guard.shutdown = true;
             guard.job_queue.clear();
-            let stopper = if let Some(active) = guard.active_run.as_mut() {
+            let stopper = if let Some(active) = guard.active_run.as_mut()
+                && !active.stop_requested
+            {
                 active.stop_requested = true;
                 active.stopper.as_ref().map(Arc::clone)
             } else {
@@ -2040,6 +2087,7 @@ impl SyncManager {
         if let Some(stopper) = stopper {
             let _ = stopper.request_stop();
         }
+        self.join_volume_watcher();
         // If controlled_shutdown already timed out on a hung child, do NOT block indefinitely on join (HIGH #6).
         if !self.inner.timed_out_shutdown.load(Ordering::SeqCst)
             && let Some(handle) = self.worker_thread.lock().unwrap().take()
@@ -2105,6 +2153,8 @@ impl SyncManager {
         };
 
         let mut guard = self.inner.state.lock().unwrap();
+        let volume = observe_binding(self.inner.volume_probe.as_ref(), &cmd.local_binding);
+        volume.check(&cmd.id, &cmd.local_binding)?;
         let existing_same = guard.store.get_mapping(&cmd.id)?;
         let updating_draft = match &existing_same {
             Some(m) if m.state.readiness() == Readiness::Unconfigured => true,
@@ -2217,6 +2267,7 @@ impl SyncManager {
         } else {
             guard.store.insert_mapping(&record)?;
         }
+        guard.volumes.insert(record.id.clone(), volume);
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         self.inner
             .event_bus
@@ -2527,6 +2578,7 @@ impl SyncManager {
 
         let gen_id = preflight.gen_record.id.clone();
         let direction = preflight.direction;
+        write_binding_marker(&self.inner.state_dir, &preflight.gen_record)?;
         guard.store.insert_generation(&preflight.gen_record)?;
 
         mapping.state.execution = Execution::Queued;
@@ -2590,6 +2642,12 @@ impl SyncManager {
                     next_step: "Check the mapping list and try again.".to_string(),
                 })?;
 
+        if refresh_mapping_volume_locked(&self.inner, &mut guard, &mut mapping)? {
+            publish_updated_snapshot(&self.inner, &mut guard)?;
+        }
+        if let Some(volume) = guard.volumes.get(&mapping.id) {
+            volume.check(&mapping.id, &mapping.local_binding)?;
+        }
         if mapping.state.intent == Intent::Paused {
             return Err(ManagerError::InvalidState {
                 mapping_id,
@@ -2677,11 +2735,11 @@ impl SyncManager {
                 })?;
 
         // Re-verify both roots and access-marker contents against stored generation before queueing (§9, §11).
-        if let Err((event, err)) = verify_endpoints_for_generation(&mapping, &generation) {
-            mapping.state = apply_event(mapping.state, event).state;
-            mapping.updated_at = self.inner.clock.now_rfc3339();
-            guard.store.update_mapping_runtime(&mapping)?;
-            let _ = publish_updated_snapshot(&self.inner, &mut guard)?;
+        if let Err((event, err)) =
+            verify_endpoints_for_generation(&self.inner, &mapping, &generation)
+        {
+            record_preflight_check_failure(&self.inner, &mut guard, &mut mapping, event, &err)?;
+            publish_updated_snapshot(&self.inner, &mut guard)?;
             return Err(*err);
         }
 
@@ -2752,10 +2810,10 @@ impl SyncManager {
             let Some(generation) = guard.store.get_generation(&gen_id)? else {
                 continue;
             };
-            if let Err((event, _)) = verify_endpoints_for_generation(&mapping, &generation) {
-                mapping.state = apply_event(mapping.state, event).state;
-                mapping.updated_at = now.clone();
-                guard.store.update_mapping_runtime(&mapping)?;
+            if let Err((event, err)) =
+                verify_endpoints_for_generation(&self.inner, &mapping, &generation)
+            {
+                record_preflight_check_failure(&self.inner, &mut guard, &mut mapping, event, &err)?;
                 continue;
             }
             let transition = apply_user_action(mapping.state, UserAction::RunNow);
@@ -2836,6 +2894,9 @@ impl SyncManager {
                     cause: format!("Mapping `{mapping_id}` does not exist."),
                     next_step: "Check the mapping list and try again.".to_string(),
                 })?;
+        if refresh_mapping_volume_locked(&self.inner, &mut guard, &mut mapping)? {
+            publish_updated_snapshot(&self.inner, &mut guard)?;
+        }
         let Some(gen_id) = mapping.active_generation_id.clone() else {
             return Err(ManagerError::InvalidState {
                 mapping_id,
@@ -2853,7 +2914,9 @@ impl SyncManager {
                 })?;
 
         // Only clear identity/volume holds when verification ACTUALLY passes!
-        if let Err((_event, err)) = verify_endpoints_for_generation(&mapping, &generation) {
+        if let Err((_event, err)) =
+            verify_endpoints_for_generation(&self.inner, &mapping, &generation)
+        {
             return Err(*err);
         }
 
@@ -2925,6 +2988,9 @@ impl SyncManager {
                     cause: format!("Mapping `{mapping_id}` does not exist."),
                     next_step: "Check the mapping list and try again.".to_string(),
                 })?;
+        if refresh_mapping_volume_locked(&self.inner, &mut guard, &mut mapping)? {
+            publish_updated_snapshot(&self.inner, &mut guard)?;
+        }
         if mapping.state.readiness() != Readiness::RecoveryRequired {
             return Err(ManagerError::InvalidState {
                 mapping_id,
@@ -2946,7 +3012,9 @@ impl SyncManager {
                         cause: format!("Active generation `{gen_id}` is missing."),
                         next_step: "Export diagnostics before trying again.".to_string(),
                     })?;
-            if let Err((_ev, err)) = verify_endpoints_for_generation(&mapping, &generation) {
+            if let Err((_ev, err)) =
+                verify_endpoints_for_generation(&self.inner, &mapping, &generation)
+            {
                 return Err(*err);
             }
             sync_core::PostRecoveryReadiness::Ready
@@ -3081,6 +3149,7 @@ impl SyncManager {
         guard.storage_blocked_mappings.remove(&mapping.id);
         // Deletes only DB records; local folder, cloud folder, and recovery copies stay untouched (§7).
         guard.store.delete_mapping_cascade(&mapping.id)?;
+        guard.volumes.remove(&mapping.id);
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         self.inner.idle_cv.notify_all();
 
@@ -3467,28 +3536,29 @@ impl SyncManager {
             .map(inspect_workdir_readonly)
             .unwrap_or_default();
 
-        let (identities_verified, identity_check_detail) = if let Some(gid) =
-            mapping.active_generation_id.as_ref()
-        {
-            match guard.store.get_generation(gid)? {
-                Some(generation) => match verify_endpoints_for_generation(&mapping, &generation) {
-                    Ok(()) => (
-                        true,
-                        "Local and destination folders match setup.".to_string(),
+        let (identities_verified, identity_check_detail) =
+            if let Some(gid) = mapping.active_generation_id.as_ref() {
+                match guard.store.get_generation(gid)? {
+                    Some(generation) => {
+                        match verify_endpoints_for_generation(&self.inner, &mapping, &generation) {
+                            Ok(()) => (
+                                true,
+                                "Local and destination folders match setup.".to_string(),
+                            ),
+                            Err((_ev, err)) => (false, err.cause()),
+                        }
+                    }
+                    None => (
+                        false,
+                        format!("Active setup generation `{gid}` is missing."),
                     ),
-                    Err((_ev, err)) => (false, err.cause()),
-                },
-                None => (
+                }
+            } else {
+                (
                     false,
-                    format!("Active setup generation `{gid}` is missing."),
-                ),
-            }
-        } else {
-            (
-                false,
-                "First sync has not established folder identities yet.".to_string(),
-            )
-        };
+                    "First sync has not established folder identities yet.".to_string(),
+                )
+            };
 
         let report = RecoveryReport {
             mapping_id: mapping.id,
@@ -3515,143 +3585,432 @@ impl Drop for SyncManager {
     }
 }
 
-/// Verifies both roots against the stored generation and checks access-marker
-/// contents on both sides immediately before launch (HIGH #4).
-fn verify_endpoints_for_generation(
-    mapping: &MappingRecord,
-    generation: &GenerationRecord,
-) -> Result<(), (ObservedEvent, Box<ManagerError>)> {
-    let local_root = mapping.local_binding.resolved_path();
-    let local_meta = match fs::symlink_metadata(&local_root) {
-        Ok(m) => m,
-        Err(_) => {
-            return Err((
-                ObservedEvent::VolumeLost,
-                Box::new(ManagerError::InvalidState {
-                    mapping_id: mapping.id.clone(),
-                    cause: format!(
-                        "Bound local folder `{}` is missing or its volume is unavailable.",
-                        local_root.display()
-                    ),
-                    next_step:
-                        "Mount the expected volume and confirm the folder exists (FolderSync never auto-creates missing roots)."
-                            .to_string(),
-                }),
-            ));
+#[derive(Debug, PartialEq, Eq)]
+enum BoundVolume {
+    Present(MountedVolume),
+    Missing,
+    WrongDisk(String),
+    Moved(MountedVolume),
+    Legacy,
+}
+
+impl BoundVolume {
+    fn mounted(&self) -> Option<&MountedVolume> {
+        match self {
+            Self::Present(volume) | Self::Moved(volume) => Some(volume),
+            Self::Missing | Self::WrongDisk(_) | Self::Legacy => None,
+        }
+    }
+
+    fn message(&self, binding: &LocalBinding) -> String {
+        match self {
+            Self::Present(volume) => volume.display_name.clone(),
+            Self::Missing => format!("Waiting for {}", binding.volume_display_name()),
+            Self::WrongDisk(name) => format!("A different disk named {name} is connected"),
+            Self::Moved(volume) => format!(
+                "{} is mounted at a new location. Review the local folder before syncing.",
+                volume.display_name
+            ),
+            Self::Legacy => "Review the local folder to verify its disk identity.".to_owned(),
+        }
+    }
+
+    fn check(
+        &self,
+        id: &MappingId,
+        binding: &LocalBinding,
+    ) -> Result<&MountedVolume, ManagerError> {
+        match self {
+            Self::Present(volume) => Ok(volume),
+            _ => Err(ManagerError::InvalidState {
+                mapping_id: id.clone(),
+                cause: self.message(binding),
+                next_step: match self {
+                    Self::Moved(_) => "Reconnect the disk at its original mount or review setup.",
+                    Self::Legacy => "Verify the drive and set up the mapping again.",
+                    _ => "Connect the disk selected during setup.",
+                }
+                .to_owned(),
+            }),
+        }
+    }
+}
+
+fn observe_binding(probe: &dyn VolumeProbe, binding: &LocalBinding) -> BoundVolume {
+    let expected = binding.volume.stable_id.as_str();
+    // OS-assigned device numbers recorded by earlier versions cannot identify a disk.
+    if expected == "unknown"
+        || expected.starts_with("vol-")
+        || expected.starts_with("dev-")
+        || !binding.mount_path.is_absolute()
+        || binding.relative_dir.as_os_str().is_empty()
+        || binding
+            .relative_dir
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return BoundVolume::Legacy;
+    }
+    let root = binding.resolved_path();
+    // A deleted folder can have a still-mounted volume. Stop at the recorded mount
+    // so a parent filesystem cannot masquerade as the missing disk.
+    for path in root
+        .ancestors()
+        .take_while(|path| path.starts_with(&binding.mount_path))
+    {
+        match probe.probe(path) {
+            Ok(volume) if volume.identity.stable_id == expected => {
+                return if volume.binding_mount(&root) == binding.mount_path {
+                    BoundVolume::Present(volume)
+                } else {
+                    BoundVolume::Moved(volume)
+                };
+            }
+            Ok(volume) if volume.binding_mount(&root).starts_with(&binding.mount_path) => {
+                return BoundVolume::WrongDisk(volume.display_name);
+            }
+            Ok(_) => break,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => break,
+        }
+    }
+    match probe.find(binding) {
+        Ok(Some(volume)) if volume.binding_mount(&root) != binding.mount_path => {
+            BoundVolume::Moved(volume)
+        }
+        _ => BoundVolume::Missing,
+    }
+}
+
+/// Returns true when a new snapshot is needed. The caller holds the manager lock
+/// across probing, the durable state transition, and any graceful stop request.
+fn refresh_mapping_volume_locked(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    mapping: &mut MappingRecord,
+) -> Result<bool, ManagerError> {
+    let observation = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+    let old_state = mapping.state;
+    let mut stop = false;
+    let next = match &observation {
+        BoundVolume::Present(_) => {
+            let available = apply_event(old_state, ObservedEvent::VolumeAvailable).state;
+            if available != old_state
+                && let Some(id) = &mapping.active_generation_id
+            {
+                let generation =
+                    guard
+                        .store
+                        .get_generation(id)?
+                        .ok_or_else(|| ManagerError::Storage {
+                            cause: format!("Active setup generation `{id}` is missing."),
+                            next_step: "Open recovery details before syncing.".to_owned(),
+                        })?;
+                if verify_generation_paths(&inner.state_dir, mapping, &generation).is_err() {
+                    apply_event(available, ObservedEvent::EndpointChanged).state
+                } else {
+                    available
+                }
+            } else {
+                available
+            }
+        }
+        BoundVolume::Legacy => apply_event(old_state, ObservedEvent::EndpointChanged).state,
+        unavailable => {
+            let lost = apply_event(old_state, ObservedEvent::VolumeLost);
+            stop = lost.effect == TransitionEffect::RequestGracefulStop;
+            if matches!(unavailable, BoundVolume::Moved(_)) {
+                apply_event(lost.state, ObservedEvent::EndpointChanged).state
+            } else {
+                lost.state
+            }
         }
     };
-    if local_meta.file_type().is_symlink() || !local_meta.is_dir() {
-        return Err((
-            ObservedEvent::EndpointChanged,
-            Box::new(ManagerError::InvalidState {
-                mapping_id: mapping.id.clone(),
-                cause: format!(
-                    "Local path `{}` is no longer an ordinary directory.",
-                    local_root.display()
-                ),
-                next_step: "Inspect the local folder before resuming synchronization.".to_string(),
-            }),
-        ));
+    let changed = guard.volumes.get(&mapping.id) != Some(&observation);
+    let is_present = matches!(observation, BoundVolume::Present(_));
+
+    if next != old_state {
+        mapping.state = next;
+        mapping.updated_at = inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(mapping)?;
+        if old_state.execution == Execution::Queued && next.execution == Execution::Idle {
+            guard.job_queue.retain(|job| job.mapping_id != mapping.id);
+            if let Some((id, attempt)) = &guard.active_init_attempt
+                && id == &mapping.id
+            {
+                guard.cancelled_init_attempts.insert(*attempt);
+                guard.active_init_attempt = None;
+            }
+            inner.idle_cv.notify_all();
+        }
     }
 
-    let canonical_local = fs::canonicalize(&local_root).map_err(|err| {
-        (
-            ObservedEvent::EndpointChanged,
-            Box::new(ManagerError::Io {
-                cause: format!(
-                    "Could not canonicalize local folder `{}` before launch: {err}.",
-                    local_root.display()
-                ),
-                next_step: "Verify the local volume and folder identity.".to_string(),
-            }),
-        )
-    })?;
-    if canonical_local != generation.config.path1 {
-        return Err((
-            ObservedEvent::EndpointChanged,
-            Box::new(ManagerError::InvalidState {
-                mapping_id: mapping.id.clone(),
-                cause: format!(
-                    "Local folder `{}` resolved to `{}`, which does not match stored generation root `{}`.",
-                    local_root.display(),
-                    canonical_local.display(),
-                    generation.config.path1.display()
-                ),
-                next_step: "Review the endpoint change before syncing.".to_string(),
-            }),
-        ));
-    }
-    if let Err(err) = verify_endpoint_access_marker(&canonical_local, &mapping.collection) {
-        return Err((ObservedEvent::EndpointChanged, Box::new(err)));
+    if !is_present
+        && let Some(active) = guard.active_run.as_mut()
+        && active.mapping_id == mapping.id
+    {
+        active.volume_lost = true;
+        if stop && !active.stop_requested {
+            active.stop_requested = true;
+            if let Some(stopper) = &active.stopper
+                && let Err(err) = stopper.request_stop()
+            {
+                eprintln!("Failed to stop the sync for a disconnected disk: {err}");
+            }
+        }
     }
 
-    let remote_ep = RemoteEndpoint::from_db_cols(
+    if changed {
+        guard.volumes.insert(mapping.id.clone(), observation);
+    }
+    Ok(changed || next != old_state)
+}
+
+fn volume_watch_loop(inner: &ManagerInner) {
+    let mut guard = inner.state.lock().unwrap();
+    while !guard.shutdown {
+        guard = inner
+            .worker_cv
+            .wait_timeout_while(guard, VOLUME_POLL_INTERVAL, |state| !state.shutdown)
+            .unwrap()
+            .0;
+        if guard.shutdown {
+            break;
+        }
+        let mappings = match guard.store.list_mappings() {
+            Ok(mappings) => mappings,
+            Err(err) => {
+                eprintln!("Failed to load mappings for disk checks: {err}");
+                continue;
+            }
+        };
+        let mut changed = false;
+        for mut mapping in mappings {
+            match refresh_mapping_volume_locked(inner, &mut guard, &mut mapping) {
+                Ok(updated) => changed |= updated,
+                Err(err) => eprintln!("Failed to save disk status for `{}`: {err}", mapping.id),
+            }
+        }
+        if changed && let Err(err) = publish_updated_snapshot(inner, &mut guard) {
+            eprintln!("Failed to publish disk status: {err}");
+        }
+    }
+}
+
+fn record_preflight_check_failure(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    mapping: &mut MappingRecord,
+    event: Option<ObservedEvent>,
+    err: &ManagerError,
+) -> Result<(), ManagerError> {
+    if let Some(event) = event {
+        mapping.state = apply_event(mapping.state, event).state;
+    }
+    let now = inner.clock.now_rfc3339();
+    mapping.updated_at = now.clone();
+    mapping.last_run_summary_text = Some(err.cause());
+    guard.store.update_mapping_runtime(mapping)?;
+    if event.is_some() {
+        refresh_mapping_volume_locked(inner, guard, mapping)?;
+    }
+    inner
+        .event_bus
+        .publish_event(ManagerEvent::PreflightFailed {
+            mapping_id: mapping.id.clone(),
+            cause: err.cause(),
+            next_step: err.next_step(),
+            timestamp: now,
+        });
+    Ok(())
+}
+
+type EndpointCheckError = (Option<ObservedEvent>, Box<ManagerError>);
+
+fn verify_endpoints_for_generation(
+    inner: &ManagerInner,
+    mapping: &MappingRecord,
+    generation: &GenerationRecord,
+) -> Result<(), EndpointCheckError> {
+    let observation = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+    let volume = observation
+        .check(&mapping.id, &mapping.local_binding)
+        .map_err(|err| {
+            let event = match observation {
+                BoundVolume::Moved(_) | BoundVolume::Legacy => ObservedEvent::EndpointChanged,
+                _ => ObservedEvent::VolumeLost,
+            };
+            (Some(event), Box::new(err))
+        })?;
+    verify_generation_paths(&inner.state_dir, mapping, generation)
+        .map_err(|err| (Some(ObservedEvent::EndpointChanged), Box::new(err)))?;
+    require_free_space(&volume.display_name, volume.space.free_bytes)
+        .and_then(|()| writable_directory_space(&generation.config.path1))
+        .and_then(|_| verify_recovery_root(&mapping.local_recovery_root))
+        .and_then(|()| {
+            if mapping.remote_endpoint_kind == "local_dir" {
+                writable_directory_space(Path::new(&generation.config.path2))?;
+                verify_recovery_root(Path::new(&mapping.cloud_recovery_path))?;
+            }
+            Ok(())
+        })
+        .map_err(|err| (None, Box::new(err)))
+}
+
+fn verify_generation_paths(
+    state_dir: &Path,
+    mapping: &MappingRecord,
+    generation: &GenerationRecord,
+) -> Result<(), ManagerError> {
+    if mapping.local_binding != generation.config.local_binding {
+        return Err(ManagerError::PreflightRejected {
+            cause: "The disk binding does not match the saved sync setup.".to_owned(),
+            next_step: "Review the local folder selected for this mapping.".to_owned(),
+        });
+    }
+    let local_root = mapping.local_binding.resolved_path();
+    verify_marked_root(&local_root, &generation.config.path1, &mapping.collection)?;
+    verify_binding_marker(state_dir, generation)?;
+    let remote = RemoteEndpoint::from_db_cols(
         &mapping.remote_endpoint_kind,
         &mapping.remote_endpoint_value,
-    )
-    .map_err(|err| (ObservedEvent::EndpointChanged, Box::new(err)))?;
+    )?;
+    if let RemoteEndpoint::LocalDir(remote_root) = remote {
+        verify_marked_root(
+            &remote_root,
+            Path::new(&generation.config.path2),
+            &mapping.collection,
+        )?;
+    }
+    Ok(())
+}
 
-    if let RemoteEndpoint::LocalDir(remote_root) = remote_ep {
-        let remote_meta = fs::symlink_metadata(&remote_root).map_err(|err| {
-            (
-                ObservedEvent::EndpointChanged,
-                Box::new(ManagerError::Io {
-                    cause: format!(
-                        "Remote destination `{}` is missing or inaccessible before launch: {err}.",
-                        remote_root.display()
-                    ),
-                    next_step: "Confirm the remote destination exists and is accessible."
-                        .to_string(),
-                }),
-            )
-        })?;
-        if remote_meta.file_type().is_symlink() || !remote_meta.is_dir() {
-            return Err((
-                ObservedEvent::EndpointChanged,
-                Box::new(ManagerError::InvalidState {
-                    mapping_id: mapping.id.clone(),
-                    cause: format!(
-                        "Remote destination `{}` is no longer an ordinary directory.",
-                        remote_root.display()
-                    ),
-                    next_step: "Review the remote destination before syncing.".to_string(),
-                }),
-            ));
+fn verify_marked_root(
+    root: &Path,
+    expected: &Path,
+    collection: &CloudCollection,
+) -> Result<(), ManagerError> {
+    let valid = fs::symlink_metadata(root).is_ok_and(|meta| meta.is_dir())
+        && fs::canonicalize(root).is_ok_and(|path| path == expected);
+    if !valid {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Folder `{}` is missing or has changed since setup.",
+                root.display()
+            ),
+            next_step: "Review the folder selected for this mapping.".to_owned(),
+        });
+    }
+    verify_endpoint_access_marker(expected, collection)
+}
+
+fn writable_directory_space(path: &Path) -> Result<DiskSpaceInfo, ManagerError> {
+    let is_directory = fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+        && fs::canonicalize(path).is_ok_and(|canonical| canonical == path);
+    if is_directory && let Ok((space, true)) = space_and_writability(path) {
+        return Ok(space);
+    }
+    Err(ManagerError::PreflightRejected {
+        cause: format!(
+            "Folder `{}` is unavailable or cannot be written to.",
+            path.display()
+        ),
+        next_step: "Confirm the folder is mounted, accessible, and writable.".to_owned(),
+    })
+}
+
+fn verify_recovery_root(path: &Path) -> Result<(), ManagerError> {
+    let space = writable_directory_space(path).map_err(|err| ManagerError::PreflightRejected {
+        cause: format!("Recovery destination is unavailable. {}", err.cause()),
+        next_step: err.next_step(),
+    })?;
+    require_free_space(
+        &format!("the recovery destination at `{}`", path.display()),
+        space.free_bytes,
+    )
+}
+
+fn require_free_space(label: &str, free_bytes: u64) -> Result<(), ManagerError> {
+    if free_bytes >= MIN_FREE_BYTES {
+        return Ok(());
+    }
+    Err(ManagerError::PreflightRejected {
+        cause: format!("FolderSync requires at least 100 MiB free on {label}."),
+        next_step: "Free up disk space and try again.".to_owned(),
+    })
+}
+
+fn binding_marker_path(state_dir: &Path, generation: &GenerationRecord) -> PathBuf {
+    state_dir
+        .join("mappings")
+        .join(generation.mapping_id.as_str())
+        .join(format!("generation-{}", generation.generation_number))
+        .join("volume-binding")
+}
+
+fn binding_marker_contents(generation: &GenerationRecord) -> String {
+    format!(
+        "{}\n{}\n",
+        generation.id,
+        generation.config.fingerprint().to_hex()
+    )
+}
+
+fn write_binding_marker(
+    state_dir: &Path,
+    generation: &GenerationRecord,
+) -> Result<(), ManagerError> {
+    let path = binding_marker_path(state_dir, generation);
+    let path = reject_symlinks_under_root("volume binding marker", state_dir, &path)?;
+    let write = || -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.write_all(binding_marker_contents(generation).as_bytes())?;
+        file.sync_all()
+    };
+    match write() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            verify_binding_marker(state_dir, generation)
         }
-        let canonical_remote = fs::canonicalize(&remote_root).map_err(|err| {
-            (
-                ObservedEvent::EndpointChanged,
-                Box::new(ManagerError::Io {
-                    cause: format!(
-                        "Could not canonicalize remote destination `{}`: {err}.",
-                        remote_root.display()
-                    ),
-                    next_step: "Review the remote destination before syncing.".to_string(),
-                }),
-            )
-        })?;
-        let expected_remote = PathBuf::from(&generation.config.path2);
-        if canonical_remote != expected_remote {
-            return Err((
-                ObservedEvent::EndpointChanged,
-                Box::new(ManagerError::InvalidState {
-                    mapping_id: mapping.id.clone(),
-                    cause: format!(
-                        "Remote destination `{}` resolved to `{}`, which does not match stored generation root `{}`.",
-                        remote_root.display(),
-                        canonical_remote.display(),
-                        expected_remote.display()
-                    ),
-                    next_step: "Review the endpoint change before syncing.".to_string(),
-                }),
-            ));
-        }
-        if let Err(err) = verify_endpoint_access_marker(&canonical_remote, &mapping.collection) {
-            return Err((ObservedEvent::EndpointChanged, Box::new(err)));
+        Err(err) => Err(ManagerError::Io {
+            cause: format!("Could not create the disk binding marker: {err}."),
+            next_step: "Check FolderSync's local state directory before retrying setup.".to_owned(),
+        }),
+    }
+}
+
+fn verify_binding_marker(
+    state_dir: &Path,
+    generation: &GenerationRecord,
+) -> Result<(), ManagerError> {
+    let path = binding_marker_path(state_dir, generation);
+    let path = reject_symlinks_under_root("volume binding marker", state_dir, &path)?;
+    let expected = binding_marker_contents(generation);
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file())
+        && let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    {
+        let mut contents = Vec::new();
+        if file
+            .take(expected.len() as u64 + 1)
+            .read_to_end(&mut contents)
+            .is_ok()
+            && contents == expected.as_bytes()
+        {
+            return Ok(());
         }
     }
-
-    Ok(())
+    Err(ManagerError::PreflightRejected {
+        cause: "The saved disk binding marker is missing or has changed.".to_owned(),
+        next_step: "Review the mapping's saved disk and setup before syncing.".to_owned(),
+    })
 }
 
 /// Probes whether a recorded orphan PID is still the exact same process:
@@ -4053,6 +4412,7 @@ fn reconcile_startup_state(
 
 fn build_snapshot(
     store: &SqliteStateStore,
+    volumes: &BTreeMap<MappingId, BoundVolume>,
     sequence: u64,
     active_job_mapping_id: Option<MappingId>,
     queue_order: Vec<MappingId>,
@@ -4103,7 +4463,13 @@ fn build_snapshot(
         };
 
         let display_name = m.collection.display_name().to_string();
-        let volume_name = m.local_binding.volume_display_name();
+        let observed_volume = volumes.get(&m.id);
+        let mounted = observed_volume.and_then(BoundVolume::mounted);
+        let volume_name = mounted
+            .map(|volume| volume.display_name.clone())
+            .unwrap_or_else(|| m.local_binding.volume_display_name());
+        let volume_space = mounted.map(|volume| volume.space);
+        let volume_filesystem = mounted.map(|volume| volume.filesystem.clone());
         let volume_kind = m.local_binding.volume.kind;
         let volume_stable_id = m.local_binding.volume.stable_id.clone();
         let mut text = status_text(
@@ -4112,6 +4478,22 @@ fn build_snapshot(
             &volume_name,
             last_run_summary.as_ref(),
         );
+        if !matches!(m.state.execution, Execution::Running | Execution::Stopping)
+            && let Some(observed) = observed_volume
+            && matches!(
+                (m.state.readiness(), observed),
+                (Readiness::VolumeUnavailable, BoundVolume::WrongDisk(_))
+                    | (
+                        Readiness::EndpointChanged,
+                        BoundVolume::Moved(_) | BoundVolume::Legacy
+                    )
+            )
+        {
+            text = observed.message(&m.local_binding);
+            if m.state.intent == Intent::Paused {
+                text.push_str(" (paused)");
+            }
+        }
         // Never promise automatic retry while scheduling is disabled (HIGH #11).
         if !m.scheduling_enabled && text == "Last run failed — will retry" {
             text = "Last run failed — retry manually".to_string();
@@ -4142,6 +4524,8 @@ fn build_snapshot(
             volume_name,
             volume_kind,
             volume_stable_id,
+            volume_space,
+            volume_filesystem,
             readiness: m.state.readiness(),
             execution: m.state.execution,
             intent: m.state.intent,
@@ -4190,6 +4574,7 @@ fn publish_updated_snapshot(
     let scheduling_paused = guard.scheduling_paused;
     let snap = Arc::new(build_snapshot(
         &guard.store,
+        &guard.volumes,
         guard.snapshot_seq,
         active,
         queue_order,
@@ -4233,6 +4618,12 @@ fn run_init_preflight_unlocked(
     if is_cancelled() {
         return Ok(None);
     }
+    let verify_local_disk = || -> Result<(), ManagerError> {
+        let observed = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+        let volume = observed.check(&mapping.id, &mapping.local_binding)?;
+        require_free_space(&volume.display_name, volume.space.free_bytes)
+    };
+    verify_local_disk()?;
     let canonical_local = validate_local_binding(&mapping.local_binding, &StdPathResolver)?;
     validate_complete_layout(
         all_mappings,
@@ -4286,6 +4677,9 @@ fn run_init_preflight_unlocked(
                 return Ok(None);
             }
 
+            verify_local_disk()?;
+            writable_directory_space(&canonical_local)?;
+            writable_directory_space(remote_root)?;
             fs::create_dir_all(&mapping.local_recovery_root).map_err(|err| ManagerError::Io {
                 cause: format!(
                     "Failed to create local recovery directory `{}`: {err}.",
@@ -4304,6 +4698,9 @@ fn run_init_preflight_unlocked(
             if is_cancelled() {
                 return Ok(None);
             }
+            verify_local_disk()?;
+            verify_recovery_root(&mapping.local_recovery_root)?;
+            verify_recovery_root(&remote_recovery_dir)?;
             establish_local_pair_markers(
                 &canonical_local,
                 remote_root,
@@ -4634,7 +5031,12 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                             Ok(Some(out)) => {
                                 let gen_id = out.gen_record.id.clone();
                                 let mode = RunMode::Initialize(out.direction);
-                                if let Err(err) = guard.store.insert_generation(&out.gen_record) {
+                                let save_generation =
+                                    write_binding_marker(&inner.state_dir, &out.gen_record)
+                                        .and_then(|()| {
+                                            guard.store.insert_generation(&out.gen_record)
+                                        });
+                                if let Err(err) = save_generation {
                                     record_init_preflight_failure_locked(
                                         &inner,
                                         &mut guard,
@@ -4841,12 +5243,10 @@ fn claim_and_prepare_locked(
         })?;
 
     // Fast pre-claim verification (re-run again as the VERY LAST step right before spawn!).
-    if let Err((event, _err)) = verify_endpoints_for_generation(&mapping, &generation) {
-        mapping.state = apply_event(mapping.state, event).state;
+    if let Err((event, err)) = verify_endpoints_for_generation(inner, &mapping, &generation) {
         mapping.state.execution = Execution::Idle;
-        mapping.updated_at = inner.clock.now_rfc3339();
-        guard.store.update_mapping_runtime(&mapping)?;
-        let _ = publish_updated_snapshot(inner, guard);
+        record_preflight_check_failure(inner, guard, &mut mapping, event, &err)?;
+        publish_updated_snapshot(inner, guard)?;
         return Ok(None);
     }
 
@@ -4864,7 +5264,7 @@ fn claim_and_prepare_locked(
         &mapping.remote_endpoint_kind,
         &mapping.remote_endpoint_value,
     )?;
-    let backup_dir1 = ensure_contained_path(
+    let backup_dir1 = reject_symlinks_under_root(
         "backup_dir1",
         &mapping.local_recovery_root,
         &mapping
@@ -4875,7 +5275,7 @@ fn claim_and_prepare_locked(
     let (backup_dir2, backup_dir2_str) = match &remote_ep {
         RemoteEndpoint::LocalDir(_) => {
             let rec_root = PathBuf::from(&mapping.cloud_recovery_path);
-            let p = ensure_contained_path(
+            let p = reject_symlinks_under_root(
                 "backup_dir2",
                 &rec_root,
                 &rec_root
@@ -4957,6 +5357,7 @@ fn claim_and_prepare_locked(
         run_id: run_id.clone(),
         stopper: None,
         stop_requested: false,
+        volume_lost: false,
         force_stopped: false,
         timed_out_during_shutdown: false,
     });
@@ -5127,14 +5528,14 @@ fn abort_endpoint_check_failed_locked(
     inner: &ManagerInner,
     guard: &mut SharedState,
     mut run: RunRecord,
-    event: ObservedEvent,
+    event: Option<ObservedEvent>,
     err: ManagerError,
 ) {
     let now = inner.clock.now_rfc3339();
-    guard.active_run = None;
     let (outcome_kind, run_outcome) = match event {
-        ObservedEvent::VolumeLost => ("volume_mismatch", RunOutcome::VolumeMismatch),
-        _ => ("endpoint_mismatch", RunOutcome::EndpointMismatch),
+        Some(ObservedEvent::VolumeLost) => ("volume_mismatch", RunOutcome::VolumeMismatch),
+        Some(_) => ("endpoint_mismatch", RunOutcome::EndpointMismatch),
+        None => ("preflight_failed", RunOutcome::RetryableFailure),
     };
     run.status = "failed".to_string();
     run.finished_at = Some(now.clone());
@@ -5144,7 +5545,9 @@ fn abort_endpoint_check_failed_locked(
 
     let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
         Ok(Some(mut mapping)) => {
-            mapping.state = apply_event(mapping.state, event).state;
+            if let Some(event) = event {
+                mapping.state = apply_event(mapping.state, event).state;
+            }
             mapping.state.execution = Execution::Idle;
             mapping.last_run_id = Some(run.id.clone());
             mapping.last_run_outcome = Some(run_outcome);
@@ -5157,6 +5560,7 @@ fn abort_endpoint_check_failed_locked(
         Err(db_err) => {
             eprintln!("Error loading mapping for pre-spawn endpoint check failure: {db_err}");
             record_terminal_db_error_locked(guard, &run.mapping_id, db_err);
+            guard.active_run = None;
             inner.idle_cv.notify_all();
             return;
         }
@@ -5172,10 +5576,16 @@ fn abort_endpoint_check_failed_locked(
             run.id
         );
         record_terminal_db_error_locked(guard, &run.mapping_id, db_err);
+        guard.active_run = None;
         inner.idle_cv.notify_all();
         return;
     }
 
+    guard.active_run = None;
+    if let Some(mapping) = &updated_mapping {
+        let volume = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+        guard.volumes.insert(mapping.id.clone(), volume);
+    }
     let _ = publish_updated_snapshot(inner, guard);
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
         mapping_id: run.mapping_id,
@@ -5379,9 +5789,25 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
 
         // VERY LAST step immediately before spawn: re-verify both roots and
         // access-marker contents against the stored generation (HIGH #4).
-        if let Err((event, err)) =
-            verify_endpoints_for_generation(&prepared.mapping, &prepared.generation)
-        {
+        let verify_backups = || {
+            reject_symlinks_under_root(
+                "backup_dir1",
+                &prepared.mapping.local_recovery_root,
+                &run.backup_dir1,
+            )?;
+            if prepared.mapping.remote_endpoint_kind == "local_dir" {
+                reject_symlinks_under_root(
+                    "backup_dir2",
+                    Path::new(&prepared.mapping.cloud_recovery_path),
+                    Path::new(&run.backup_dir2),
+                )?;
+            }
+            Ok(())
+        };
+        let verification =
+            verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation)
+                .and_then(|()| verify_backups().map_err(|err| (None, Box::new(err))));
+        if let Err((event, err)) = verification {
             drop(prepared_launch);
             drop(line_tx);
             abort_endpoint_check_failed_locked(inner, &mut guard, run, event, *err);
@@ -5484,7 +5910,7 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
 
     match wait_res {
         Ok(run_out) => {
-            finalize_completed_run(inner, run, prepared.is_init, run_out);
+            finalize_completed_run(inner, run, &prepared.mapping, prepared.is_init, run_out);
         }
         Err(err) => {
             finish_with_launch_error(inner, run, err);
@@ -5751,6 +6177,7 @@ fn map_adapter_outcome(
 fn finalize_completed_run(
     inner: &ManagerInner,
     mut run: RunRecord,
+    mapping: &MappingRecord,
     is_init: bool,
     run_out: rclone_adapter::RunOutput,
 ) {
@@ -5800,8 +6227,44 @@ fn finalize_completed_run(
     }
 
     let classified = classify_run_outcome(&run_out);
+    let mut guard = inner.state.lock().unwrap();
+    let already_timed_out = guard
+        .active_run
+        .as_ref()
+        .is_some_and(|a| a.timed_out_during_shutdown);
+    let already_force_stopped = guard.active_run.as_ref().is_some_and(|a| a.force_stopped);
+    let observed_loss = guard
+        .active_run
+        .as_ref()
+        .is_some_and(|active| active.volume_lost);
+    guard.active_run = None;
+    if already_timed_out {
+        // Never overwrite a persisted shutdown-timeout record (HIGH #6).
+        inner.idle_cv.notify_all();
+        return;
+    }
+
+    let volume = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+    let volume_lost = observed_loss || !matches!(volume, BoundVolume::Present(_));
     let (core_outcome, outcome_kind, outcome_detail, conflict_paths, recovery_seed) =
-        map_adapter_outcome(&classified);
+        if volume_lost && !already_force_stopped {
+            let cause = "The local disk disconnected while synchronization was active.".to_owned();
+            (
+                RunOutcome::Interrupted,
+                "interrupted",
+                cause.clone(),
+                Vec::new(),
+                Some(RecoverySeed {
+                    reason_kind: "volume_disconnected",
+                    cause,
+                    next_step:
+                        "Reconnect the disk and review the preserved sync state before resuming."
+                            .to_owned(),
+                }),
+            )
+        } else {
+            map_adapter_outcome(&classified)
+        };
 
     let now = inner.clock.now_rfc3339();
     run.status = match core_outcome {
@@ -5833,21 +6296,15 @@ fn finalize_completed_run(
         _ => outcome_detail.clone(),
     };
 
-    let mut guard = inner.state.lock().unwrap();
-    let already_timed_out = guard
-        .active_run
-        .as_ref()
-        .is_some_and(|a| a.timed_out_during_shutdown);
-    let already_force_stopped = guard.active_run.as_ref().is_some_and(|a| a.force_stopped);
-    guard.active_run = None;
-    if already_timed_out {
-        // Never overwrite a persisted shutdown-timeout record (HIGH #6).
-        inner.idle_cv.notify_all();
-        return;
-    }
-
     let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
         Ok(Some(mut mapping)) => {
+            if !matches!(volume, BoundVolume::Present(_)) {
+                mapping.state = apply_event(mapping.state, ObservedEvent::VolumeLost).state;
+                if matches!(volume, BoundVolume::Moved(_) | BoundVolume::Legacy) {
+                    mapping.state =
+                        apply_event(mapping.state, ObservedEvent::EndpointChanged).state;
+                }
+            }
             if already_force_stopped {
                 let next = apply_event(
                     mapping.state,
@@ -5920,6 +6377,7 @@ fn finalize_completed_run(
         return;
     }
 
+    guard.volumes.insert(run.mapping_id.clone(), volume);
     let _ = publish_updated_snapshot(inner, &mut guard);
     if let Some(c) = case {
         inner.event_bus.publish_event(ManagerEvent::RecoveryOpened {

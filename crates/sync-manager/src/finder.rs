@@ -633,6 +633,8 @@ mod tests {
             volume_name: "WorkSSD".to_string(),
             volume_kind: VolumeKind::External,
             volume_stable_id: "vol-1".to_string(),
+            volume_space: None,
+            volume_filesystem: None,
             readiness,
             execution,
             intent,

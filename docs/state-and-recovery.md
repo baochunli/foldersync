@@ -86,6 +86,9 @@ the real application directory.
     newer schema version fails rather than downgrading silently.
   - `accounts/<id>/rclone.conf` — app-owned per-account configuration.
   - `mappings/<id>/generation-<N>/filters.txt` — frozen exclusion filters.
+  - `mappings/<id>/generation-<N>/volume-binding` — private local marker
+    recording the generation ID and fingerprint. The fingerprint includes the
+    mounted filesystem identity and the mount-relative folder.
   - `mappings/<id>/generation-<N>/bisync/` — opaque rclone bisync workdir.
   - `runs/<run-id>/` — `argv.json` (sanitized argv + engine identity, written
     only after child identity is committed), `output.ndjson` (valid NDJSON
@@ -166,15 +169,10 @@ the real application directory.
    `last_verified_phase = "pre_spawn"`) with workdir and per-run
    `backup_dir1`/`backup_dir2` recovery paths, and qualifies the rclone engine
    and `BisyncRequest`. Immediately before spawn—holding the manager state
-   mutex across the final stop/force-stop/shutdown check, final root and
-   `RCLONE_TEST` access-marker content verification, child spawn, and child
-   identity commit—it aborts without spawning if stopped or if either root or
-   marker changed.
-   - *Known limitation (plan §11 residual race):* Filename-based access-marker
-     checks (`RCLONE_TEST`) cannot detect an atomic same-path directory
-     replacement that carries a copy of the recognized marker content, nor an
-     OS-level swap racing after spawn starts; external volume UUID/identity
-     probing in Group 4+ narrows this further.
+   mutex across the final stop/force-stop/shutdown check, volume and endpoint
+   checks, child spawn, and child identity commit—it aborts if stopped or if
+   the disk identity, roots, markers, recovery destinations, or capacity fail
+   preflight.
 2. **Post-spawn child identity:** Immediately after spawn, `sync-manager`
    commits `child_pid`, OS process start time (`proc_pidinfo(PROC_PIDTBSDINFO)`
    on macOS, `/proc/<pid>/stat` on Linux), executable path (`proc_pidpath` /
@@ -217,6 +215,44 @@ the real application directory.
    `StatusSnapshot` updates and a bounded event stream without assuming any UI
    async runtime.
 
+## Bound volumes and reconnect
+
+FolderSync records the filesystem identity, the mount path reviewed during
+setup, and the folder relative to that mount. macOS uses `statfs` for the
+mount and capacity and Disk Arbitration for the volume UUID, display name,
+and connection type. For startup APFS Data paths such as `/Users`, the
+generation keeps the user-visible path and verifies the underlying Data
+volume UUID. Linux uses `statfs` and the mount ID in `/proc/self/mountinfo`,
+with the filesystem UUID from `/dev/disk/by-uuid` when available. Without a
+filesystem UUID, Linux needs a unique kernel mount ID and binds it to the
+current boot, so remounting or restarting requires review. Earlier
+device-number bindings need setup review before another run.
+
+- A missing disk displays **Waiting for <volume>**. A replacement at the same
+  mount displays **A different disk named <volume> is connected**. Mounting
+  the expected UUID at a new location requires endpoint review. FolderSync
+  keeps the saved path until the user reviews setup.
+- The manager rechecks mounts every three seconds, including while rclone
+  runs. It records a disk loss before requesting a graceful stop. If a child
+  was running when the loss was detected, the run enters recovery even if
+  rclone reports success. The manager preserves the workdir and logs.
+  Reconnect revalidates the saved roots and markers. Manual pause and recovery
+  holds persist independently of disk availability.
+- Launch requires the saved local binding marker, the collection's
+  `RCLONE_TEST` access marker, writable local directories, and at least
+  **100 MiB available** on the sync volume and each local recovery
+  destination. FolderSync establishes recovery roots and access markers
+  during first setup. Ordinary launches refuse missing roots or markers.
+  A directory containing only the recognized access marker can still sync.
+- Manager snapshots provide `volume_space` (available and total bytes) and
+  `volume_filesystem` for the observed matching volume. These fields are
+  absent when the disk identity cannot be verified.
+
+The free-space floor is a preflight check. Transfers or recovery copies can
+need more space. A disk can also disconnect after the launch check or between
+polls, and rclone may already have sent requests before it receives the stop.
+See the [physical unplug qualification](qualification.md#2-physical-external-disk--unplug-tests-owner-only--plan-11-20).
+
 ## Initialization and manual Run once
 
 - **Initialization (`Initialize` / `sync-cli init <mapping> --state-dir <dir>`):**
@@ -232,9 +268,8 @@ the real application directory.
   `rclone-adapter`; and marks the mapping `Ready` on success while keeping
   automatic scheduling disabled (scheduling lands in Group 4).
 - **Run once (`RunNow` / `sync-cli run-once <mapping> --state-dir <dir>`):**
-  Re-verifies both roots against the stored generation and checks `RCLONE_TEST`
-  contents on both sides right before launch (never auto-creating missing roots
-  or markers), launches a validated normal bisync run with per-run backup
+  Rechecks the bound volume, saved roots, markers, recovery destinations, and
+  available space before launch, starts a validated normal bisync run with per-run backup
   directories, feeds the classified `rclone-adapter` outcome into `sync-core`,
   commits atomically, and updates both `StatusSnapshot` and Finder
   `status.json` (reporting `"Last run failed — retry manually"` rather than
@@ -256,6 +291,6 @@ non-zero on any failure outcome (including retryable failures):
 
 ## Remaining verification TODO
 
-Real Google Drive initialization, encrypted credential helpers, external-volume
-mount/unmount probing, and automatic scheduling remain to be wired and
-qualified in Group 4+.
+Physical removable-volume behavior still needs the owner-run unplug matrix.
+Real Google Drive initialization and automatic scheduling require their own
+integration and qualification.

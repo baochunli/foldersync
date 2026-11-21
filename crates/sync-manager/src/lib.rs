@@ -45,8 +45,8 @@ pub use manager::{
     SyncManager,
 };
 pub use platform::{
-    FakeProcessInspector, LiveProcessInfo, OsProcessInspector, ProcessInspector,
-    ProcessProbeResult, StateLock, resolve_state_dir,
+    FakeProcessInspector, LiveProcessInfo, MountedVolume, OsProcessInspector, OsVolumeProbe,
+    ProcessInspector, ProcessProbeResult, StateLock, VolumeProbe, resolve_state_dir,
 };
 #[cfg(target_os = "macos")]
 pub use secrets::KeychainSecretStore;
