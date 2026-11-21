@@ -276,7 +276,8 @@ mapping, use the assigned ID printed by the CLI.
 `pause research` blocks manual and scheduled runs for that mapping.
 `resume research` clears that hold. `scheduling pause` still permits manual
 runs on ready, resumed mappings. `scheduling resume` restores automatic
-scheduling for the state directory.
+scheduling for the state directory. The `scheduling` command requires either
+`pause` or `resume`.
 
 ## Step 4: Owner qualification checks (real Google Drive)
 

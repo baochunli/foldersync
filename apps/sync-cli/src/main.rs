@@ -908,51 +908,54 @@ fn cmd_collections(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Res
         None
     };
     let mgr = rt.open_manager(state_dir, finder_dir)?;
-    if let Some(folder_id) = folder_id {
-        let size = mgr.request_folder_size(&account_id, folder_id)?.wait()?;
-        let FolderSizeStatus::Known { bytes, files } = size.status else {
-            return Err(CliError::Failed(
-                "Folder size could not be verified.".into(),
-            ));
-        };
-        if json {
-            writeln!(
-                out,
-                "{}",
-                serde_json::to_string_pretty(&size).expect("Folder size serializes")
-            )?;
-        } else {
-            writeln!(out, "{folder_id} | {bytes} bytes | {files} files")?;
-        }
-    } else {
-        let listing = mgr.list_collection_candidates(&account_id)?;
-        if json {
-            writeln!(
-                out,
-                "{}",
-                serde_json::to_string_pretty(&listing).expect("Collection listing serializes")
-            )?;
-        } else if listing.candidates.is_empty() && listing.skipped.is_empty() {
-            writeln!(out, "No collections found under Data.")?;
-        } else {
-            for candidate in listing.candidates {
+    let result = (|| {
+        if let Some(folder_id) = folder_id {
+            let size = mgr.request_folder_size(&account_id, folder_id)?.wait()?;
+            let FolderSizeStatus::Known { bytes, files } = size.status else {
+                return Err(CliError::Failed(
+                    "Folder size could not be verified.".into(),
+                ));
+            };
+            if json {
                 writeln!(
                     out,
-                    "{} | {}",
-                    candidate.collection.folder_id, candidate.collection.display_path
+                    "{}",
+                    serde_json::to_string_pretty(&size).expect("Folder size serializes")
                 )?;
+            } else {
+                writeln!(out, "{folder_id} | {bytes} bytes | {files} files")?;
             }
-            for skipped in listing.skipped {
-                let reason = match skipped.reason {
-                    CollectionSkipReason::Duplicate => "duplicate",
-                    CollectionSkipReason::UnsupportedName => "unsupported name",
-                };
-                writeln!(out, "Skipped {} ({reason}).", skipped.name)?;
+        } else {
+            let listing = mgr.list_collection_candidates(&account_id)?;
+            if json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&listing).expect("Collection listing serializes")
+                )?;
+            } else if listing.candidates.is_empty() && listing.skipped.is_empty() {
+                writeln!(out, "No collections found under Data.")?;
+            } else {
+                for candidate in listing.candidates {
+                    writeln!(
+                        out,
+                        "{} | {}",
+                        candidate.collection.folder_id, candidate.collection.display_path
+                    )?;
+                }
+                for skipped in listing.skipped {
+                    let reason = match skipped.reason {
+                        CollectionSkipReason::Duplicate => "duplicate",
+                        CollectionSkipReason::UnsupportedName => "unsupported name",
+                    };
+                    writeln!(out, "Skipped {} ({reason}).", skipped.name)?;
+                }
             }
         }
-    }
+        Ok(())
+    })();
     mgr.shutdown()?;
-    Ok(())
+    result
 }
 
 fn required_text<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str, CliError> {
@@ -1044,28 +1047,33 @@ fn cmd_add_mapping(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Res
         let local = Path::new(required_text(drive_local, "--local <dir>")?);
         let recovery = Path::new(required_text(drive_recovery, "--local-recovery <dir>")?);
         let mgr = rt.open_manager(Some(state_dir), finder_dir)?;
-        let mut candidates = mgr
-            .list_collection_candidates(&account_id)?
-            .candidates
-            .into_iter()
-            .filter(|candidate| candidate.collection.folder_id == folder_id);
-        let candidate = candidates.next()
-            .filter(|_| candidates.next().is_none())
-            .ok_or_else(|| CliError::Failed(format!(
-                "Folder ID `{folder_id}` is not selectable for `{account_id}`. List the account's collections and choose a current folder ID."
-            )))?;
-        let id = match id {
-            Some(id) => id,
-            None => {
-                let snapshot = mgr.snapshot();
-                (1..)
-                    .map(|n| format!("drive-{n}"))
-                    .find(|id| snapshot.mappings.iter().all(|m| m.id.as_str() != id))
-                    .expect("A finite set of mappings cannot exhaust mapping IDs")
-            }
-        };
-        let cmd = AddMappingCommand::drive(id, account_id, candidate.collection, local, recovery)?;
-        return save_mapping(mgr, cmd, max_delete_percent, out);
+        let result = (|| {
+            let mut candidates = mgr
+                .list_collection_candidates(&account_id)?
+                .candidates
+                .into_iter()
+                .filter(|candidate| candidate.collection.folder_id == folder_id);
+            let candidate = candidates.next()
+                .filter(|_| candidates.next().is_none())
+                .ok_or_else(|| CliError::Failed(format!(
+                    "Folder ID `{folder_id}` is not selectable for `{account_id}`. List the account's collections and choose a current folder ID."
+                )))?;
+            let id = match id {
+                Some(id) => id,
+                None => {
+                    let snapshot = mgr.snapshot();
+                    (1..)
+                        .map(|n| format!("drive-{n}"))
+                        .find(|id| snapshot.mappings.iter().all(|m| m.id.as_str() != id))
+                        .expect("A finite set of mappings cannot exhaust mapping IDs")
+                }
+            };
+            let cmd =
+                AddMappingCommand::drive(id, account_id, candidate.collection, local, recovery)?;
+            save_mapping(&mgr, cmd, max_delete_percent, out)
+        })();
+        mgr.shutdown()?;
+        return result;
     }
 
     let id = required_text(id.as_deref(), "--id <mapping-id>")?;
@@ -1105,11 +1113,13 @@ fn cmd_add_mapping(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Res
         recovery_dir,
         remote_recovery_dir,
     )?;
-    save_mapping(mgr, cmd, max_delete_percent, out)
+    save_mapping(&mgr, cmd, max_delete_percent, out)?;
+    mgr.shutdown()?;
+    Ok(())
 }
 
 fn save_mapping(
-    mgr: SyncManager,
+    mgr: &SyncManager,
     mut cmd: AddMappingCommand,
     max_delete_percent: Option<u8>,
     out: &mut dyn Write,
@@ -1122,20 +1132,16 @@ fn save_mapping(
     if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id == id) {
         writeln!(out, "Added mapping `{}` ({}).", m.id, m.status_text)?;
     }
-    mgr.shutdown()?;
     Ok(())
 }
 
 fn cmd_scheduling(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
-    let (action, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
+    const EXPECTED_ACTION: &str = "Expected scheduling pause or resume.";
+    let (action, state_dir, finder_dir) = parse_positional_and_flags(args, EXPECTED_ACTION)?;
     let paused = match action.as_str() {
         "pause" => true,
         "resume" => false,
-        _ => {
-            return Err(CliError::Usage(
-                "Expected scheduling pause or resume.".into(),
-            ));
-        }
+        _ => return Err(CliError::Usage(EXPECTED_ACTION.into())),
     };
     let mgr = rt.open_manager(state_dir, finder_dir)?;
     mgr.set_scheduling_paused(paused)?;
@@ -1151,9 +1157,16 @@ fn cmd_scheduling(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Resu
 fn parse_mapping_and_flags(
     args: &[String],
 ) -> Result<(String, Option<PathBuf>, Option<PathBuf>), CliError> {
+    parse_positional_and_flags(args, "Missing <mapping> argument.")
+}
+
+fn parse_positional_and_flags(
+    args: &[String],
+    missing_positional: &str,
+) -> Result<(String, Option<PathBuf>, Option<PathBuf>), CliError> {
     let mut state_dir = None;
     let mut finder_dir = None;
-    let mut mapping_id = None;
+    let mut positional_arg = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1167,19 +1180,19 @@ fn parse_mapping_and_flags(
                 return Err(CliError::Usage(format!("Unknown argument `{other}`.")));
             }
             positional => {
-                if mapping_id.is_some() {
+                if positional_arg.is_some() {
                     return Err(CliError::Usage(format!(
                         "Unexpected extra argument `{positional}`."
                     )));
                 }
-                mapping_id = Some(positional.to_string());
+                positional_arg = Some(positional.to_string());
             }
         }
         i += 1;
     }
-    let id =
-        mapping_id.ok_or_else(|| CliError::Usage("Missing <mapping> argument.".to_string()))?;
-    Ok((id, state_dir, finder_dir))
+    let positional_arg =
+        positional_arg.ok_or_else(|| CliError::Usage(missing_positional.into()))?;
+    Ok((positional_arg, state_dir, finder_dir))
 }
 
 fn default_remote_recovery_dir(local_recovery_dir: &Path) -> Result<PathBuf, CliError> {

@@ -41,6 +41,7 @@ REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 DRIVE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,255}")
 CLI_TIMEOUT = 750  # Manager allows up to 600 s for a sync plus Drive preflight.
 DRIVE_TIMEOUT = 180
+COLLECTION_VISIBILITY_TIMEOUT = 60
 BATCH_COUNT = 24
 
 SCENARIOS = {
@@ -343,14 +344,14 @@ class DriveRunner:
             raise RuntimeError(f"{client.name} {tool} {' '.join(args[:2])} exited {proc.returncode}: {entry['stderr']}")
         return output
 
-    def cli(self, client: Client, *args: str, check: bool = True) -> tuple[int, str]:
+    def cli(self, client: Client, *args: str, check: bool = True, timeout: float = CLI_TIMEOUT) -> tuple[int, str]:
         command = [str(self.sync_cli), "--state-dir", str(client.state), *args]
         proc = subprocess.Popen(
             command, env=client.env(self.rclone), start_new_session=True, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
         )
         try:
-            stdout, stderr = proc.communicate(timeout=CLI_TIMEOUT)
+            stdout, stderr = proc.communicate(timeout=timeout)
         except BaseException:
             stop_owned_process(proc)
             raise
@@ -505,8 +506,8 @@ class DriveQualification:
         self.truth_dir = private_dir(root / "truth")
         self.evidence: ScenarioEvidence
 
-    def cli_json(self, client: Client, *args: str) -> Any:
-        return json.loads(self.runner.cli(client, *args, "--json")[1])
+    def cli_json(self, client: Client, *args: str, timeout: float = CLI_TIMEOUT) -> Any:
+        return json.loads(self.runner.cli(client, *args, "--json", timeout=timeout)[1])
 
     def preflight(self, export: Path, root_id: str) -> None:
         identities = {}
@@ -535,6 +536,35 @@ class DriveQualification:
             "sources": {client.name: client.remote for client in self.clients},
         })
 
+    def collection_matches(self, client: Client, name: str, *, timeout: float = CLI_TIMEOUT) -> list[dict[str, Any]]:
+        listing = self.cli_json(client, "collections", "list", "--account", "qual", timeout=timeout)
+        return [row["collection"] for row in listing["candidates"] if row["name"] == name]
+
+    def wait_for_collection(self, client: Client, name: str, path: str) -> list[dict[str, Any]]:
+        started = time.monotonic()
+        deadline = started + COLLECTION_VISIBILITY_TIMEOUT
+        delay = 1.0
+        attempts = 0
+        try:
+            while (remaining := deadline - time.monotonic()) > 0:
+                attempts += 1
+                matches = self.collection_matches(client, name, timeout=remaining)
+                if matches:
+                    return matches
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 8.0)
+        except subprocess.TimeoutExpired:
+            pass  # The listing used the remaining visibility budget.
+        finally:
+            elapsed = time.monotonic() - started
+            self.evidence.outcomes["collection_visibility"] = {
+                "client": client.name, "collection": path,
+                "attempts": attempts, "elapsed_seconds": round(elapsed, 3),
+            }
+        raise RuntimeError(f"{client.name} could not see {path} after {attempts} listings in {elapsed:.1f} s.")
+
     def make_collection(self, key: str, clients: list[Client]) -> None:
         first = clients[0]
         name = f"{self.prefix}-{key}"
@@ -544,8 +574,10 @@ class DriveQualification:
             raise RuntimeError(f"Refused to reuse existing Drive fixture {path}.")
         self.runner.cloud(first, "mkdir", f"{first.remote}:{path}")
         for client in clients:
-            listing = self.cli_json(client, "collections", "list", "--account", "qual")
-            matches = [row["collection"] for row in listing["candidates"] if row["name"] == name]
+            if first.name == "client-a" and client.name == "client-b":
+                matches = self.wait_for_collection(client, name, path)
+            else:
+                matches = self.collection_matches(client, name)
             if len(matches) != 1 or matches[0]["display_path"] != path:
                 raise RuntimeError(f"{client.name} could not unambiguously see {path}.")
             folder_id = matches[0]["folder_id"]

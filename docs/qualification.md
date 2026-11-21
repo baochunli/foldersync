@@ -126,10 +126,14 @@ and local trees.
 
 The suite pauses automatic scheduling before importing accounts or adding
 mappings. It checks folder identity from each participating client before
-initialization. Clients run distinct edits, same-file edits, edit/delete, and a
-stale third-client return after two paused cycles. Each reconciliation scenario
-checks local and Drive paths and bytes after two follow-up cycles. Separate
-collections exercise the 10% deletion guard and SIGINT during a transfer.
+initialization. Client B has up to 60 seconds to see collections Client A creates.
+The suite retries the listing with backoff and records the attempt count and
+elapsed time in `outcomes.collection_visibility`.
+
+Clients run distinct edits, same-file edits, edit/delete, and a stale third-client
+return after two paused cycles. Each reconciliation scenario checks local and
+Drive paths and bytes after two follow-up cycles. Separate collections exercise
+the 10% deletion guard and SIGINT during a transfer.
 The interruption check requires a partial batch, the run's recorded outcome, a
 preserved workdir, and stable hashes while the interrupted mapping stays in
 `RecoveryRequired`. The optional two-account scenario downloads the first

@@ -34,6 +34,80 @@ fn scheduling_pause_and_resume_persist_without_using_environment_state() {
 }
 
 #[test]
+fn scheduling_requires_a_pause_or_resume_action() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    let path = state.to_str().unwrap();
+    for args in [
+        &["scheduling"][..],
+        &["--state-dir", path, "scheduling"],
+        &["scheduling", "--state-dir", path],
+        &["scheduling", "unknown"],
+    ] {
+        let output = cli_cmd(tmp.path()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("Expected scheduling pause or resume."),
+            "{stderr}"
+        );
+    }
+    assert!(!state.exists());
+    assert!(!tmp.path().join("environment-state").exists());
+}
+
+#[test]
+fn drive_command_errors_release_the_state_lock() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    let local = tmp.path().join("local");
+    let recovery = tmp.path().join("recovery");
+    let cli = |args: &[&str]| {
+        cli_cmd(tmp.path())
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["collections", "list", "--account", "unknown"][..],
+        &[
+            "collections",
+            "size",
+            "--account",
+            "unknown",
+            "--folder-id",
+            "folder",
+        ],
+        &[
+            "add-mapping",
+            "--account",
+            "unknown",
+            "--folder-id",
+            "folder",
+            "--local",
+            local.to_str().unwrap(),
+            "--local-recovery",
+            recovery.to_str().unwrap(),
+        ],
+    ] {
+        let output = cli(args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown"),
+            "{output:?}"
+        );
+        let status = cli(&["status", "--json"]);
+        assert!(status.status.success(), "{status:?}");
+        let snapshot: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(snapshot["mappings"], serde_json::json!([]));
+    }
+}
+
+#[test]
 fn drive_commands_require_explicit_state_and_reject_mixed_endpoints() {
     let tmp = TempDir::new().unwrap();
     for args in [

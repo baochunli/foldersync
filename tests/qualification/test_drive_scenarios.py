@@ -8,14 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from common import TruthSet, compute_overall_status
+from common import ScenarioEvidence, TruthSet, compute_overall_status
 from run_drive_qualification import Client, DriveQualification, read_export, transfer_progress
 
 
 class FakeRunner:
     """Implement only the fixture operations the suite needs, without launching a process."""
 
-    def __init__(self) -> None:
+    def __init__(self, client_b_visible_on=1) -> None:
         self.commands = []
         self.accounts = {}
         self.paused = set()
@@ -25,12 +25,14 @@ class FakeRunner:
         self.run_id = 0
         self.runs = {}
         self.skip_signal = False
+        self.client_b_visible_on = client_b_visible_on
+        self.client_b_collection_attempts = 0
 
     @staticmethod
     def device_id(client):
         return f"device-{client.name[-1]}"
 
-    def cli(self, client, *args, check=True):
+    def cli(self, client, *args, check=True, timeout=None):
         self.commands.append({"client": client.name, "args": args})
         verb = args[0]
         if verb == "scheduling":
@@ -43,6 +45,13 @@ class FakeRunner:
         elif verb == "account" and args[1] == "list":
             return 0, json.dumps(self.accounts[client.name])
         elif verb == "collections":
+            if client.name == "client-b" and self.folders:
+                self.client_b_collection_attempts += 1
+                if (
+                    self.client_b_visible_on is None
+                    or self.client_b_collection_attempts < self.client_b_visible_on
+                ):
+                    return 0, json.dumps({"candidates": []})
             return 0, json.dumps({"candidates": [
                 {"name": name.split("/")[1], "collection": {"display_path": name, "folder_id": folder_id}}
                 for folder_id, (name, _) in self.folders.items()
@@ -168,6 +177,52 @@ class FakeRunner:
 
 
 class DriveScenarioTests(unittest.TestCase):
+    def collection_fixture(self, visible_on):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        clients = [Client(f"client-{name}", root / name, f"drive-{name}") for name in ("a", "b")]
+        for client in clients:
+            (client.root / "data").mkdir(parents=True)
+            (client.root / "recovery").mkdir()
+        suite = DriveQualification(FakeRunner(visible_on), clients, root, "Fixture", 42, "drive-b")
+        suite.evidence = ScenarioEvidence("visibility", "", "", "", "", False, "")
+        clock_patch = patch("run_drive_qualification.time")
+        clock = clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+        now = 0.0
+
+        def sleep(seconds):
+            nonlocal now
+            now += seconds
+
+        clock.monotonic.side_effect = lambda: now
+        clock.sleep.side_effect = sleep
+        return suite
+
+    def test_client_b_proceeds_when_collection_appears_on_third_listing(self):
+        suite = self.collection_fixture(visible_on=3)
+        suite.make_collection("visibility", suite.clients)
+
+        self.assertEqual(suite.runner.client_b_collection_attempts, 3)
+        self.assertEqual(suite.runner.mappings["client-b", "visibility"]["folder_id"], "folder-0")
+        visibility = suite.evidence.outcomes["collection_visibility"]
+        self.assertEqual(visibility["attempts"], 3)
+        self.assertEqual(visibility["elapsed_seconds"], 3.0)
+
+    def test_client_b_aborts_when_collection_never_appears(self):
+        suite = self.collection_fixture(visible_on=None)
+        with self.assertRaisesRegex(
+            RuntimeError, r"client-b could not see Data/Fixture-visibility after .* listings"
+        ):
+            suite.make_collection("visibility", suite.clients)
+
+        self.assertNotIn(("client-b", "visibility"), suite.runner.mappings)
+        visibility = suite.evidence.outcomes["collection_visibility"]
+        self.assertGreater(visibility["attempts"], 1)
+        self.assertEqual(visibility["attempts"], suite.runner.client_b_collection_attempts)
+        self.assertEqual(visibility["elapsed_seconds"], 60.0)
+
     def run_suite(self, *, account_b="drive-b", skip_signal=False, lose_recovery=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
