@@ -67,7 +67,7 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 mkdir "$scratch/home" "$scratch/state"
 export HOME="$scratch/home" FOLDERSYNC_STATE_DIR="$scratch/state"
-packaging/build-app.sh --nsh-bin "$NSH_BIN" --dev-shared-dir
+packaging/build-app.sh --nsh-bin "$NSH_BIN"
 codesign --verify --deep --strict target/package/FolderSync.app
 cargo test --locked -p rclone-adapter --lib qualifies_ad_hoc_packaged_helper -- --ignored
 )
@@ -76,8 +76,90 @@ cargo test --locked -p rclone-adapter --lib qualifies_ad_hoc_packaged_helper -- 
 ### Finder Extension Entitlements
 
 - **Dev / ad hoc / initial Developer ID builds (outside the Mac App Store):** `apps/finder-extension/FinderExtension.entitlements` enables `com.apple.security.app-sandbox` and grants a narrow home-relative temporary file exception (`com.apple.security.temporary-exception.files.home-relative-path.read-write`) scoped strictly to `/Library/Application Support/FolderSync/finder/`. Inside the sandbox, the extension resolves the real user home via `getpwuid(getuid())`, validates every path component from the state root down via `fstatat(..., AT_SYMLINK_NOFOLLOW)` + `openat(..., O_DIRECTORY | O_NOFOLLOW)`, and opens `status.json` with `O_NONBLOCK | O_NOFOLLOW` requiring a regular file.
-- **Isolated dev override:** Passing `--dev-shared-dir` to `packaging/build-app.sh` or `apps/finder-extension/build.sh` creates a fresh directory via `mktemp` under `<repo>/target/` and scopes a generated absolute-path temporary exception strictly to that directory (arbitrary user paths are rejected).
+- **Isolated dev override:** Passing `--dev-shared-dir` to `packaging/build-app.sh` or `apps/finder-extension/build.sh` creates a fresh private state directory under `<repo>/target/`. The generated absolute-path exception grants access to its `finder/` child. Use the printed `State dir` as `FOLDERSYNC_STATE_DIR` so the manager writes `finder/status.json` directly into the signed handoff.
 - **Future `<TEAM_ID>.*` App Group option:** Once Developer ID signing is qualified by the owner, the Finder handoff directory may optionally migrate to a `<TEAM_ID>.*` macOS App Group container (see `docs/decisions/0002-finder-extension.md`).
+
+### Packaged app and Finder qualification (2026-11-21)
+
+The default ad hoc bundle and a disposable bundle with ID `dev.foldersync.pkgcheck`
+both passed `codesign --verify --deep --strict --verbose=2` on macOS 27.2.1
+arm64. The disposable ID isolates the Finder registration from the production ID.
+
+The qualification used a private scratch directory under `target/`, an isolated
+`HOME`, and the generated state directory. The following commands show the
+build and fixture setup, with `scratch` set to that scratch directory and
+`NSH_BIN` set to the installed NSH 0.6.1 executable before changing `HOME`.
+
+```bash
+scripts/fetch-rclone.sh
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+mkdir -p "$scratch/home" "$scratch/build-state"
+export HOME="$scratch/home" FOLDERSYNC_STATE_DIR="$scratch/build-state"
+unset FOLDERSYNC_DEMO FOLDERSYNC_RCLONE
+packaging/build-app.sh --out "$scratch/package" --nsh-bin "$NSH_BIN" \
+  --bundle-id dev.foldersync.pkgcheck --dev-shared-dir
+app="$scratch/package/FolderSync.app"
+appex="$app/Contents/PlugIns/FolderSyncFinder.appex"
+codesign --verify --deep --strict --verbose=2 "$app"
+shared=$(plutil -extract FolderSyncSharedDir raw "$appex/Contents/Info.plist")
+state=$(dirname "$shared")
+export FOLDERSYNC_STATE_DIR="$state"
+cargo build --locked -p sync-cli
+mkdir -p "$scratch/watched/Docs" "$scratch/remote"
+printf 'Local fixture\n' > "$scratch/watched/Docs/baseline.txt"
+target/debug/sync-cli --state-dir "$state" add-mapping --id docs \
+  --local-dir "$scratch/watched/Docs" --remote-dir "$scratch/remote" \
+  --recovery-dir "$scratch/recovery" --remote-recovery-dir "$scratch/remote-recovery"
+target/debug/sync-cli --state-dir "$state" init docs
+```
+
+After initialization, the check removed the CLI's `finder/status.json` and
+started `"$app/Contents/MacOS/FolderSync"` with the same isolated environment
+and demo mode unset. The packaged app recreated the snapshot and held the
+exclusive manager lock. A second pass launched the bundle in Finder's GUI
+session using `open -n -W --env "HOME=$HOME" --env "FOLDERSYNC_STATE_DIR=$state" "$app"`.
+Each pass added a fresh local file and atomically queued an ADR 0002
+`sync_now` action for `docs` in `"$shared/actions"`. The packaged manager
+consumed the request and copied the new file to the local fixture.
+
+```bash
+sqlite3 -readonly "$state/state.sqlite" \
+  "SELECT mode, status, outcome_kind, exit_code, child_executable,
+          engine_version, engine_platform, engine_sha256
+     FROM runs WHERE mapping_id = 'docs' ORDER BY rowid;"
+shasum -a 256 "$app/Contents/Helpers/rclone"
+```
+
+Both normal runs recorded `completed`, `success`, and exit code `0`.
+The database and each run's `argv.json` identified bundled
+`FolderSync.app/Contents/Helpers/rclone` v1.76.0 (`osx-arm64`). The recorded
+digest matched the signed helper bytes and the sealed manifest's
+`bundled_sha256` (`e3d56f1e6f4b28e0d42222ca6ab4e813fc704d9f3a5637f4bd8099a6e1f8295e`).
+The recorded arguments pointed `--config` at the throwaway
+`accounts/local-fixture/rclone.conf` under the generated state directory.
+
+```bash
+id=dev.foldersync.pkgcheck.finder-extension
+pluginkit -a "$appex"
+pluginkit -e use -i "$id"
+open -a Finder "$scratch/watched/Docs"
+open -R "$scratch/watched/Docs"
+/usr/bin/log show --last 2m --style compact \
+  --predicate 'subsystem == "dev.foldersync.app.finder-extension"'
+pluginkit -e ignore -i "$id"
+pluginkit -r "$appex"
+pluginkit -m -A -D -v -i "$id"
+```
+
+The packaged extension decoded the manager's snapshot, registered one watched
+root, and received Finder's directory observation callback for that root.
+The console was locked during the check, and the log did not show a root
+badge request. Root badge assignment and interactive menu clicks in Finder
+remain unverified for the packaged build. See
+[ADR 0002](decisions/0002-finder-extension.md#packaged-manager-qualification-2026-11-21)
+for the log excerpt. The check unregistered the extension, terminated the
+packaged app by PID, and removed the disposable bundles and state.
 
 ## Owner Notarization Steps (Apple Developer Account)
 
