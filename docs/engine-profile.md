@@ -26,8 +26,10 @@ sync:
 3. Return an immutable `EngineIdentity` (private fields with read-only getters)
    bound to the host platform and verified digest.
 4. Re-hash the executable on disk at the launch boundary of every sync run
-   (`BisyncRequest::spawn` / `verify_binary_integrity`) and refuse to spawn if
-   the bytes changed after qualification.
+   (`BisyncRequest::spawn`, with `RealProcessRunner::spawn` also re-hashing
+   immediately before `exec`) against the checked-in manifest pin and refuse to
+   spawn if the bytes changed after qualification. Custom-manifest and
+   spec-builder hooks are restricted to crate-internal tests.
 
 `rclone selfupdate` and `rclone` on `PATH` are never used.
 
@@ -145,16 +147,19 @@ and always combines exit status with pinned-prefix `--use-json-log` diagnostics:
 - Signal termination, exit `130`/`137`/`143`, or a non-zero exit after
   `request_stop()` / interrupt log markers → `Interrupted { graceful, needs_recovery, reason }`.
 - Holds that never auto-retry take precedence over resilient-retry notices and
-  coarse exit codes: `DeletionGuardAborted`, `AccessCheckFailed`, `AuthFailure`,
+  coarse exit codes: `DeletionGuardAborted`, `AccessCheckFailed`, `AuthFailure`
+  (including listing-time OAuth token expiry and `invalid_grant`),
   `InvalidConfig` (and exit `2`), `EndpointMismatch` (and exit `3`), and
-  `Critical { requires_resync: true }` (unusable baseline / missing listings /
-  changed filters hash / explicit `Must run --resync`).
-- When none of those hold conditions are present, rclone's explicit
-  `--resilient` retryable notice (e.g. transient listing failure exiting `7`)
-  classifies as `Outcome::Retryable`.
-- Exit `5` (`RetryError`) or `stats.retryError` (without holds) → `Retryable`.
-- Exit `6` is `NoRetryError` in rclone `v1.76.0` and is **not** classified as
+  `Critical { requires_resync: true }` (unusable baseline: missing, unreadable,
+  or out-of-sync prior listings, changed filters hash, or explicit
+  `Must run --resync`).
+- When none of those hold conditions are present (and exit code is not `6`),
+  rclone's explicit `--resilient` retryable notice (e.g. transient listing
+  failure exiting `7`) classifies as `Outcome::Retryable`.
+- Exit `5` (`RetryError`) or `stats.retryError` (without holds or exit `6`) →
   `Retryable`.
+- Exit `6` is `NoRetryError` in rclone `v1.76.0` and is **never** classified as
+  `Retryable`, regardless of `stats.retryError`.
 - When diagnostic events are dropped or lines are truncated,
   `classify_run_outcome` returns `Outcome::IncompleteDiagnosis` wrapping the
   preliminary outcome.
