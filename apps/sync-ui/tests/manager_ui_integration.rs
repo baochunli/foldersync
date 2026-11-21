@@ -37,7 +37,10 @@ fn wait_for_snapshot(
     timeout: Duration,
     mut pred: impl FnMut(&UiSnapshot) -> bool,
 ) -> UiSnapshot {
-    let deadline = Instant::now() + timeout;
+    // Polling helper: hosted CI runners are 2–3× slower than a developer Mac (engine
+    // verification alone can take tens of seconds), so never wait less than 120 s.
+    // Passing predicates still return immediately.
+    let deadline = Instant::now() + timeout.max(Duration::from_secs(120));
     loop {
         let current = mgr.snapshot();
         if pred(&current) {
