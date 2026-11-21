@@ -165,76 +165,123 @@ pub fn strip_ansi_codes(input: &str) -> String {
     out
 }
 
-fn extract_trailing_dash_field(plain_msg: &str) -> Option<String> {
-    let (_, rhs) = plain_msg.rsplit_once(" - ")?;
-    let trimmed = rhs.trim();
-    if trimmed.is_empty() {
+/// Matches pinned rclone v1.76.0 bisync tabular diagnostic lines of the form:
+/// `- <tag><spaces><action><spaces>- <path>`
+/// and returns `<path>` verbatim (preserving any ` - ` inside `<path>`).
+fn extract_bisync_row_path(plain_msg: &str, tag: &str, action: &str) -> Option<String> {
+    let rest = plain_msg.strip_prefix("- ")?;
+    let rest = rest.strip_prefix(tag)?;
+    let rest = rest.trim_start_matches(' ');
+    let rest = rest.strip_prefix(action)?;
+    let rest = rest.trim_start_matches(' ');
+    let path = rest.strip_prefix("- ")?;
+    if path.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(path.to_string())
     }
+}
+
+fn is_error_or_notice(level: &LogLevel) -> bool {
+    matches!(
+        level,
+        LogLevel::Error | LogLevel::Critical | LogLevel::Notice
+    )
+}
+
+fn is_error_or_critical(level: &LogLevel) -> bool {
+    matches!(level, LogLevel::Error | LogLevel::Critical)
 }
 
 fn detect_marker(plain_msg: &str, object: Option<&str>, level: &LogLevel) -> Option<BisyncMarker> {
     let trimmed = plain_msg.trim();
-    let lower = trimmed.to_ascii_lowercase();
 
-    // Conflict markers.
-    if lower.contains("renaming path1 copy")
-        && let Some(path) = extract_trailing_dash_field(trimmed)
-    {
-        return Some(BisyncMarker::ConflictCopyCreated {
-            side: Some(ConflictSide::Path1),
-            path,
-        });
-    }
-    if lower.contains("renaming path2 copy")
-        && let Some(path) = extract_trailing_dash_field(trimmed)
-    {
-        return Some(BisyncMarker::ConflictCopyCreated {
-            side: Some(ConflictSide::Path2),
-            path,
-        });
-    }
-    if lower.contains("new or changed in both paths")
-        && let Some(path) = extract_trailing_dash_field(trimmed)
-    {
-        return Some(BisyncMarker::ConflictDetected { path });
+    // Conflict markers (rclone v1.76.0 cmd/bisync/resolve.go & cmd/bisync/deltas.go).
+    if matches!(level, LogLevel::Notice | LogLevel::Info) {
+        if let Some(path) = extract_bisync_row_path(trimmed, "Path1", "Renaming Path1 copy") {
+            return Some(BisyncMarker::ConflictCopyCreated {
+                side: Some(ConflictSide::Path1),
+                path,
+            });
+        }
+        if let Some(path) = extract_bisync_row_path(trimmed, "Path2", "Renaming Path2 copy") {
+            return Some(BisyncMarker::ConflictCopyCreated {
+                side: Some(ConflictSide::Path2),
+                path,
+            });
+        }
+        if let Some(path) =
+            extract_bisync_row_path(trimmed, "WARNING", "New or changed in both paths")
+        {
+            return Some(BisyncMarker::ConflictDetected { path });
+        }
     }
 
-    // Deletion guard abort.
-    if lower.contains("too many deletes") || object == Some("Safety abort") {
+    // Deletion guard abort (cmd/bisync/deltas.go:572 & cmd/cmd.go:334).
+    if is_error_or_notice(level)
+        && (trimmed.starts_with("too many deletes")
+            || trimmed == "Failed to bisync: too many deletes"
+            || object == Some("Safety abort"))
+    {
         return Some(BisyncMarker::MaxDeleteAborted {
             detail: trimmed.to_string(),
         });
     }
 
-    // Access check failure (check before generic Bisync critical error).
-    if lower.contains("access test failed") || lower.contains("check file check failed") {
+    // Access check failure (cmd/bisync/operations.go:535,541,216).
+    if is_error_or_critical(level)
+        && (trimmed.starts_with("Access test failed:")
+            || trimmed.starts_with("Bisync critical error: check file check failed")
+            || trimmed
+                .strip_prefix("- ")
+                .is_some_and(|rest| rest.trim_start().starts_with("Access test failed:")))
+    {
         return Some(BisyncMarker::AccessCheckFailed {
             detail: trimmed.to_string(),
         });
     }
 
-    // Resync-required errors (check before generic Bisync critical error and resilient note).
-    if lower.contains("must run --resync")
-        || lower.contains("cannot find prior path1 or path2 listings")
+    // Unusable baseline / must-resync diagnostics (cmd/bisync/operations.go:216,225,226).
+    // Matched strictly by pinned diagnostic prefixes so filenames containing "must run --resync"
+    // in ordinary INFO lines never trigger recovery.
+    if is_error_or_critical(level)
+        && (trimmed == "Bisync aborted. Must run --resync to recover."
+            || trimmed
+                .starts_with("Bisync critical error: cannot find prior Path1 or Path2 listings")
+            || trimmed.starts_with("Bisync critical error: filters file md5 hash not found")
+            || trimmed.starts_with("Bisync critical error: filters file has changed")
+            || trimmed.starts_with("Bisync critical error: prior lock file found")
+            || trimmed.starts_with("Bisync critical error: empty listing")
+            || trimmed
+                .strip_prefix("Bisync critical error:")
+                .is_some_and(|body| {
+                    // Check only the fixed message segment before any path separator `: `.
+                    let header = body.split(": ").next().unwrap_or(body);
+                    header.to_ascii_lowercase().contains("must run --resync")
+                }))
     {
         return Some(BisyncMarker::MustResync {
             detail: trimmed.to_string(),
         });
     }
 
-    // Authentication / encrypted config password-command errors.
-    if lower.contains("password command failed")
-        || lower.contains("using --password-command returned")
-        || lower.contains("unable to decrypt configuration")
-        || lower.contains("oauth2: cannot fetch token")
-        || lower.contains("couldn't fetch token")
-        || lower.contains("invalid_grant")
-        || lower.contains("401 unauthorized")
-        || lower.contains("invalid credentials")
-        || lower.contains("token expired")
+    // Authentication / encrypted config password-command errors (fs/config/crypt.go & config.go).
+    if is_error_or_notice(level)
+        && (trimmed.starts_with("Using --password-command returned:")
+            || trimmed.starts_with("--password-command stderr:")
+            || (trimmed.starts_with("Failed to load config file")
+                && trimmed.contains("password command failed"))
+            || trimmed.starts_with("Unable to decrypt configuration")
+            || trimmed.starts_with("Failed to configure token")
+            || (trimmed.starts_with("Failed to create file system") && {
+                let lower = trimmed.to_ascii_lowercase();
+                lower.contains("oauth2: cannot fetch token")
+                    || lower.contains("couldn't fetch token")
+                    || lower.contains("invalid_grant")
+                    || lower.contains("401 unauthorized")
+                    || lower.contains("invalid credentials")
+                    || lower.contains("token expired")
+            }))
     {
         return Some(BisyncMarker::AuthFailure {
             detail: trimmed.to_string(),
@@ -242,10 +289,12 @@ fn detect_marker(plain_msg: &str, object: Option<&str>, level: &LogLevel) -> Opt
     }
 
     // Invalid configuration / arguments.
-    if lower.contains("didn't find section in config file")
-        || lower.contains("failed to load config file")
-        || lower.contains("unknown flag:")
-        || lower.contains("must not overlap")
+    if is_error_or_notice(level)
+        && ((trimmed.starts_with("Failed to create file system")
+            && trimmed.contains("didn't find section in config file"))
+            || trimmed.starts_with("Failed to load config file")
+            || trimmed.starts_with("Error: unknown flag:")
+            || (trimmed.starts_with("Failed to bisync:") && trimmed.contains("must not overlap")))
     {
         return Some(BisyncMarker::InvalidConfig {
             detail: trimmed.to_string(),
@@ -253,46 +302,50 @@ fn detect_marker(plain_msg: &str, object: Option<&str>, level: &LogLevel) -> Opt
     }
 
     // Endpoint / path mismatch or duplicate names.
-    if lower.contains("directory not found")
-        || lower.contains("duplicate object found")
-        || lower.contains("duplicate directory found")
+    if is_error_or_notice(level)
+        && ((trimmed.starts_with("Failed to create file system")
+            && trimmed.to_ascii_lowercase().contains("directory not found"))
+            || trimmed.starts_with("Duplicate object found")
+            || trimmed.starts_with("Duplicate directory found"))
     {
         return Some(BisyncMarker::EndpointMismatch {
             detail: trimmed.to_string(),
         });
     }
 
-    // Generic Bisync critical error.
-    if lower.contains("bisync critical error")
-        || (*level == LogLevel::Critical && lower.contains("bisync"))
-    {
+    // Generic Bisync critical error (cmd/bisync/operations.go:216).
+    if is_error_or_critical(level) && trimmed.starts_with("Bisync critical error:") {
         return Some(BisyncMarker::CriticalError {
             detail: trimmed.to_string(),
         });
     }
 
-    // Resilient retryable notice.
-    if lower.contains("error is retryable without --resync due to --resilient") {
+    // Explicit resilient-retry notice (cmd/bisync/operations.go:217).
+    if is_error_or_notice(level)
+        && trimmed.starts_with(
+            "Bisync aborted. Error is retryable without --resync due to --resilient mode.",
+        )
+    {
         return Some(BisyncMarker::RetryableDueToResilient {
             detail: trimmed.to_string(),
         });
     }
 
-    // Interrupt / graceful shutdown markers.
-    if lower.contains("signal received:") {
+    // Interrupt / graceful shutdown markers (lib/atexit/atexit.go & cmd/bisync/operations.go).
+    if trimmed.starts_with("Signal received:") {
         return Some(BisyncMarker::SignalReceived {
             detail: trimmed.to_string(),
         });
     }
-    if lower.contains("attempting to gracefully shutdown") {
+    if trimmed.starts_with("Attempting to gracefully shutdown.") {
         return Some(BisyncMarker::GracefulShutdownStarted);
     }
-    if lower.contains("graceful shutdown completed successfully") {
+    if trimmed == "Graceful shutdown completed successfully." {
         return Some(BisyncMarker::GracefulShutdownCompleted);
     }
 
-    // Success marker.
-    if lower == "bisync successful" {
+    // Success marker (cmd/bisync/operations.go:234).
+    if trimmed == "Bisync successful" {
         return Some(BisyncMarker::BisyncSuccessful);
     }
 
@@ -441,6 +494,42 @@ mod tests {
         assert_eq!(
             parse_log_line(partial_json),
             LogEvent::Raw(partial_json.to_string())
+        );
+    }
+
+    #[test]
+    fn benign_filename_containing_diagnostic_phrase_does_not_trigger_must_resync() {
+        let line = r#"{"time":"2026-11-20T19:01:56Z","level":"info","msg":"- \u001b[36mPath1\u001b[0m    \u001b[35m\u001b[33mFile changed: \u001b[35msize (larger)\u001b[0m\u001b[0m\u001b[0m - \u001b[36mnotes/must run --resync.txt\u001b[0m","source":"bisync/deltas.go:227"}"#;
+        let LogEvent::Structured(ev) = parse_log_line(line) else {
+            panic!("expected structured event");
+        };
+        assert_eq!(ev.marker, None);
+    }
+
+    #[test]
+    fn preserves_full_conflict_paths_containing_dash_separator() {
+        let warn = r#"{"level":"notice","msg":"- \u001b[34mWARNING\u001b[0m  \u001b[35mNew or changed in both paths\u001b[0m       - \u001b[36mnotes/draft - final.txt\u001b[0m","source":"bisync/deltas.go:386"}"#;
+        let rename1 = r#"{"level":"notice","msg":"- \u001b[36mPath1\u001b[0m    \u001b[35mRenaming Path1 copy\u001b[0m                - \u001b[36m/tmp/p1/notes/draft - final.txt.conflict1\u001b[0m","source":"bisync/resolve.go:318"}"#;
+
+        let LogEvent::Structured(ew) = parse_log_line(warn) else {
+            panic!()
+        };
+        assert_eq!(
+            ew.marker,
+            Some(BisyncMarker::ConflictDetected {
+                path: "notes/draft - final.txt".to_string()
+            })
+        );
+
+        let LogEvent::Structured(er) = parse_log_line(rename1) else {
+            panic!()
+        };
+        assert_eq!(
+            er.marker,
+            Some(BisyncMarker::ConflictCopyCreated {
+                side: Some(ConflictSide::Path1),
+                path: "/tmp/p1/notes/draft - final.txt.conflict1".to_string()
+            })
         );
     }
 }

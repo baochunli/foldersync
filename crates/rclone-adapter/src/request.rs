@@ -5,14 +5,19 @@
 
 use std::{
     ffi::OsString,
+    fs,
     path::{Component, Path, PathBuf},
 };
 
 use thiserror::Error;
 
 use crate::{
-    process::ProcessSpec,
-    qualification::{EngineIdentity, QualificationManifest},
+    process::{
+        ProcessError, ProcessRunner, ProcessSpec, RunHandle, SpawnOptions, minimal_isolated_env,
+    },
+    qualification::{
+        EngineIdentity, QualificationError, QualificationManifest, verify_binary_integrity,
+    },
 };
 
 const DEFAULT_CHECK_FILENAME: &str = "RCLONE_TEST";
@@ -81,8 +86,17 @@ pub enum RunMode {
     Initialize(InitPreference),
 }
 
-/// Validated credential helper argv passed to rclone `--password-command`.
-/// Stores only the executable path and non-secret helper arguments, never a password.
+/// Validated credential-helper argv passed to rclone `--password-command`.
+///
+/// ## Non-secret helper contract
+/// - `program` must be an absolute path to a dedicated credential helper binary
+///   (shell interpreters such as `sh`, `bash`, `zsh`, `cmd`, or `powershell` are
+///   rejected so inline secrets cannot be passed as shell scripts).
+/// - `args` must contain only non-secret lookup selectors (for example
+///   `["--account", "a1"]`), never passwords, passphrases, or OAuth tokens.
+/// - The helper prints the configuration password solely to stdout on success
+///   and must not print secret material to stderr; `rclone-adapter` additionally
+///   redacts `--password-command stderr:` payloads at the capture boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswordCommand {
     program: PathBuf,
@@ -96,7 +110,9 @@ pub enum RequestError {
     MissingField(&'static str),
     #[error("unqualified rclone engine version `{version}` (expected `{expected}`)")]
     UnqualifiedEngineVersion { version: String, expected: String },
-    #[error("unqualified rclone engine SHA-256 `{sha256}` is not present in the manifest")]
+    #[error("unqualified rclone engine platform `{actual}` (expected host `{expected}`)")]
+    UnqualifiedEnginePlatform { actual: String, expected: String },
+    #[error("unqualified rclone engine SHA-256 `{sha256}` does not match host platform pin")]
     UnqualifiedEngineHash { sha256: String },
     #[error("{field} must be an absolute path, got: {path}")]
     RelativePath { field: &'static str, path: PathBuf },
@@ -106,6 +122,16 @@ pub enum RequestError {
     InvalidCharacters {
         field: &'static str,
         reason: &'static str,
+    },
+    #[error(
+        "password_command.program must be a dedicated helper binary, not a shell interpreter: {0}"
+    )]
+    ShellPasswordCommand(PathBuf),
+    #[error("could not resolve ancestor for {field} ({path}): {reason}")]
+    UnresolvablePath {
+        field: &'static str,
+        path: PathBuf,
+        reason: String,
     },
     #[error(
         "paths must not be identical or nested: {left_field} ({left}) overlaps {right_field} ({right})"
@@ -133,8 +159,37 @@ pub enum RequestError {
     InvalidCheckFilename(String),
 }
 
+/// Errors raised when verifying and launching a [`BisyncRequest`].
+#[derive(Debug, Error)]
+pub enum LaunchError {
+    #[error("engine integrity check failed before launch: {0}")]
+    Qualification(#[from] QualificationError),
+    #[error("failed to spawn bisync process: {0}")]
+    Process(#[from] ProcessError),
+}
+
 fn contains_control_breaks(s: &str) -> bool {
     s.chars().any(|c| matches!(c, '\0' | '\r' | '\n'))
+}
+
+fn is_shell_interpreter(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "fish"
+            | "ksh"
+            | "csh"
+            | "tcsh"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "pwsh"
+    )
 }
 
 fn format_space_sep_token(token: &str) -> String {
@@ -160,6 +215,9 @@ impl PasswordCommand {
                 field: "password_command.program",
                 path: program,
             });
+        }
+        if is_shell_interpreter(&program) {
+            return Err(RequestError::ShellPasswordCommand(program));
         }
         let Some(prog_str) = program.to_str() else {
             return Err(RequestError::InvalidCharacters {
@@ -370,13 +428,49 @@ impl BisyncRequest {
         args
     }
 
-    /// Converts this validated request into a [`ProcessSpec`] targeting the qualified binary.
-    pub fn to_process_spec(&self) -> ProcessSpec {
-        ProcessSpec {
-            program: self.engine.path.clone(),
+    /// Re-verifies the qualified binary's SHA-256 on disk against the embedded
+    /// qualification manifest and builds an isolated [`ProcessSpec`].
+    pub fn to_verified_process_spec(&self) -> Result<ProcessSpec, QualificationError> {
+        let manifest = QualificationManifest::embedded()?;
+        self.to_verified_process_spec_with_manifest(&manifest)
+    }
+
+    /// Re-verifies the qualified binary's SHA-256 on disk against `manifest`
+    /// and builds an isolated [`ProcessSpec`].
+    pub fn to_verified_process_spec_with_manifest(
+        &self,
+        manifest: &QualificationManifest,
+    ) -> Result<ProcessSpec, QualificationError> {
+        verify_binary_integrity(&self.engine, manifest)?;
+        Ok(ProcessSpec {
+            program: self.engine.path().to_path_buf(),
             args: self.to_args(),
             current_dir: None,
-        }
+            env: minimal_isolated_env(Some(&self.workdir)),
+        })
+    }
+
+    /// Re-hashes the binary on disk at the launch boundary against the embedded
+    /// qualification manifest and spawns the process with a cleared, allowlisted
+    /// environment.
+    pub fn spawn(
+        &self,
+        runner: &dyn ProcessRunner,
+        options: SpawnOptions,
+    ) -> Result<RunHandle, LaunchError> {
+        let spec = self.to_verified_process_spec()?;
+        Ok(runner.spawn(&spec, options)?)
+    }
+
+    /// Launch boundary variant accepting an explicit manifest (useful for tests).
+    pub fn spawn_with_manifest(
+        &self,
+        runner: &dyn ProcessRunner,
+        options: SpawnOptions,
+        manifest: &QualificationManifest,
+    ) -> Result<RunHandle, LaunchError> {
+        let spec = self.to_verified_process_spec_with_manifest(manifest)?;
+        Ok(runner.spawn(&spec, options)?)
     }
 }
 
@@ -484,18 +578,61 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-fn local_paths_overlap(a: &Path, b: &Path) -> bool {
-    let na = lexical_normalize(a);
-    let nb = lexical_normalize(b);
-    if na.starts_with(&nb) || nb.starts_with(&na) {
-        return true;
+/// Resolves the longest existing ancestor via `canonicalize` and appends the
+/// remaining non-existing tail components. Rejects broken symlinks or paths
+/// whose ancestors cannot be resolved safely.
+fn resolve_with_existing_ancestor(
+    field: &'static str,
+    path: &Path,
+) -> Result<PathBuf, RequestError> {
+    let normalized = lexical_normalize(path);
+    let mut current = normalized.as_path();
+    let mut tail: Vec<OsString> = Vec::new();
+
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => {
+                let mut resolved =
+                    fs::canonicalize(current).map_err(|err| RequestError::UnresolvablePath {
+                        field,
+                        path: path.to_path_buf(),
+                        reason: format!(
+                            "existing ancestor `{}` cannot be canonicalized: {err}",
+                            current.display()
+                        ),
+                    })?;
+                for part in tail.into_iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(file_name) = current.file_name() else {
+                    return Err(RequestError::UnresolvablePath {
+                        field,
+                        path: path.to_path_buf(),
+                        reason: "no existing ancestor found".to_string(),
+                    });
+                };
+                tail.push(file_name.to_os_string());
+                let Some(parent) = current.parent() else {
+                    return Err(RequestError::UnresolvablePath {
+                        field,
+                        path: path.to_path_buf(),
+                        reason: "no existing ancestor found".to_string(),
+                    });
+                };
+                current = parent;
+            }
+            Err(err) => {
+                return Err(RequestError::UnresolvablePath {
+                    field,
+                    path: path.to_path_buf(),
+                    reason: format!("cannot inspect `{}`: {err}", current.display()),
+                });
+            }
+        }
     }
-    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize())
-        && (ca.starts_with(&cb) || cb.starts_with(&ca))
-    {
-        return true;
-    }
-    false
 }
 
 fn remote_paths_overlap(a: &str, b: &str) -> bool {
@@ -510,7 +647,20 @@ fn reject_local_overlap(
     right_field: &'static str,
     right: &Path,
 ) -> Result<(), RequestError> {
-    if local_paths_overlap(left, right) {
+    let left_lex = lexical_normalize(left);
+    let right_lex = lexical_normalize(right);
+    if left_lex.starts_with(&right_lex) || right_lex.starts_with(&left_lex) {
+        return Err(RequestError::OverlappingPaths {
+            left_field,
+            left: left.display().to_string(),
+            right_field,
+            right: right.display().to_string(),
+        });
+    }
+
+    let left_resolved = resolve_with_existing_ancestor(left_field, left)?;
+    let right_resolved = resolve_with_existing_ancestor(right_field, right)?;
+    if left_resolved.starts_with(&right_resolved) || right_resolved.starts_with(&left_resolved) {
         return Err(RequestError::OverlappingPaths {
             left_field,
             left: left.display().to_string(),
@@ -584,8 +734,19 @@ impl BisyncRequestBuilder {
         self
     }
 
-    /// Validates all fields and constructs a [`BisyncRequest`].
+    /// Validates all fields against the embedded qualification manifest and
+    /// constructs a [`BisyncRequest`].
     pub fn build(self) -> Result<BisyncRequest, RequestError> {
+        let manifest =
+            QualificationManifest::embedded().expect("checked-in qualification manifest is valid");
+        self.build_with_manifest(&manifest)
+    }
+
+    /// Validates all fields against an explicit qualification manifest.
+    pub fn build_with_manifest(
+        self,
+        manifest: &QualificationManifest,
+    ) -> Result<BisyncRequest, RequestError> {
         let engine = self.engine.ok_or(RequestError::MissingField("engine"))?;
         let mode = self.mode.ok_or(RequestError::MissingField("mode"))?;
         let path1 = self.path1.ok_or(RequestError::MissingField("path1"))?;
@@ -610,21 +771,28 @@ impl BisyncRequestBuilder {
             .max_delete_percent
             .unwrap_or(DEFAULT_MAX_DELETE_PERCENT);
 
-        // Enforce pinned engine qualification.
-        let manifest =
-            QualificationManifest::embedded().expect("checked-in qualification manifest is valid");
-        if engine.version != manifest.rclone_version {
+        // Enforce host-platform pinned engine qualification.
+        let (host_platform, host_pin) = manifest
+            .host_platform_pin()
+            .expect("host platform is defined in qualification manifest");
+        if engine.version() != manifest.rclone_version {
             return Err(RequestError::UnqualifiedEngineVersion {
-                version: engine.version,
-                expected: manifest.rclone_version,
+                version: engine.version().to_string(),
+                expected: manifest.rclone_version.clone(),
             });
         }
-        if !manifest.contains_binary_sha256(&engine.sha256) {
+        if engine.platform() != host_platform {
+            return Err(RequestError::UnqualifiedEnginePlatform {
+                actual: engine.platform().to_string(),
+                expected: host_platform.to_string(),
+            });
+        }
+        if engine.sha256() != host_pin.binary_sha256 {
             return Err(RequestError::UnqualifiedEngineHash {
-                sha256: engine.sha256,
+                sha256: engine.sha256().to_string(),
             });
         }
-        validate_local_path("engine.path", &engine.path)?;
+        validate_local_path("engine.path", engine.path())?;
 
         // Validate mandatory local paths.
         validate_local_path("path1", &path1)?;
@@ -713,44 +881,74 @@ impl BisyncRequestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qualification::QualificationManifest;
+    use crate::{
+        process::{FakeProcessRunner, FakeRunScript, OutputLine, StreamKind},
+        qualification::{host_platform_key, qualify_binary_with_runner, sha256_file},
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_engine() -> EngineIdentity {
-        let manifest = QualificationManifest::embedded().unwrap();
-        let sha = manifest
-            .platform_pin("osx-arm64")
-            .unwrap()
-            .binary_sha256
-            .clone();
-        EngineIdentity {
-            version: crate::PINNED_RCLONE_VERSION.to_string(),
-            sha256: sha,
-            path: PathBuf::from("/opt/foldersync/rclone"),
+    static REQ_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestFixtureDir {
+        root: PathBuf,
+    }
+
+    impl TestFixtureDir {
+        fn new(label: &str) -> Self {
+            let seq = REQ_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "foldersync-req-test-{label}-{}-{seq}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn path(&self, rel: &str) -> PathBuf {
+            self.root.join(rel)
         }
     }
 
-    fn base_drive_builder() -> BisyncRequestBuilder {
+    impl Drop for TestFixtureDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_engine(root: &TestFixtureDir) -> EngineIdentity {
+        let manifest = QualificationManifest::embedded().unwrap();
+        let (platform, pin) = manifest.host_platform_pin().unwrap();
+        EngineIdentity::for_unit_test(
+            crate::PINNED_RCLONE_VERSION,
+            pin.binary_sha256.clone(),
+            root.path("bin/rclone"),
+            platform,
+        )
+    }
+
+    fn base_drive_builder(root: &TestFixtureDir) -> BisyncRequestBuilder {
         BisyncRequest::builder()
-            .engine(test_engine())
+            .engine(test_engine(root))
             .mode(RunMode::Normal)
-            .path1("/Volumes/WorkSSD/Research")
+            .path1(root.path("data/Research"))
             .path2(Path2::DriveRemote {
                 remote: "household".to_string(),
                 path: "Data/Research".to_string(),
             })
-            .config_path("/var/lib/foldersync/accounts/a1/rclone.conf")
+            .config_path(root.path("state/accounts/a1/rclone.conf"))
             .password_command(
                 PasswordCommand::new(
-                    "/opt/foldersync/cred-helper",
+                    root.path("bin/cred-helper"),
                     vec!["--account".to_string(), "a1".to_string()],
                 )
                 .unwrap(),
             )
-            .workdir("/var/lib/foldersync/mappings/m1/generation-1/bisync")
-            .filters_file("/var/lib/foldersync/mappings/m1/generation-1/filters.txt")
+            .workdir(root.path("state/mappings/m1/generation-1/bisync"))
+            .filters_file(root.path("state/mappings/m1/generation-1/filters.txt"))
             .check_filename("RCLONE_TEST")
             .max_delete_percent(10)
-            .backup_dir1("/Volumes/WorkSSD/FolderSyncRecovery/m1/run-1")
+            .backup_dir1(root.path("recovery/m1/run-1"))
             .backup_dir2(BackupDir2::Remote {
                 remote: "household".to_string(),
                 path: "Recovery/research/dev-1/run-1".to_string(),
@@ -766,35 +964,40 @@ mod tests {
 
     #[test]
     fn builds_exact_normal_drive_argv_without_forbidden_or_resync_flags() {
-        let req = base_drive_builder().build().unwrap();
+        let root = TestFixtureDir::new("normal-drive");
+        let req = base_drive_builder(&root).build().unwrap();
         let args = args_as_strings(&req);
 
+        let p1 = root.path("data/Research").display().to_string();
+        let cfg = root
+            .path("state/accounts/a1/rclone.conf")
+            .display()
+            .to_string();
+        let helper = format!("{} --account a1", root.path("bin/cred-helper").display());
+        let wd = root
+            .path("state/mappings/m1/generation-1/bisync")
+            .display()
+            .to_string();
+        let filters = root
+            .path("state/mappings/m1/generation-1/filters.txt")
+            .display()
+            .to_string();
+        let b1 = root.path("recovery/m1/run-1").display().to_string();
+
         assert_eq!(args[0], "bisync");
-        assert_eq!(args[1], "/Volumes/WorkSSD/Research");
+        assert_eq!(args[1], p1);
         assert_eq!(args[2], "household:Data/Research");
+        assert!(args.windows(2).any(|w| w == ["--config", cfg.as_str()]));
         assert!(
             args.windows(2)
-                .any(|w| w == ["--config", "/var/lib/foldersync/accounts/a1/rclone.conf"])
+                .any(|w| w == ["--password-command", helper.as_str()])
         );
-        assert!(args.windows(2).any(|w| {
-            w == [
-                "--password-command",
-                "/opt/foldersync/cred-helper --account a1",
-            ]
-        }));
         assert!(args.contains(&"--ask-password=false".to_string()));
-        assert!(args.windows(2).any(|w| {
-            w == [
-                "--workdir",
-                "/var/lib/foldersync/mappings/m1/generation-1/bisync",
-            ]
-        }));
-        assert!(args.windows(2).any(|w| {
-            w == [
-                "--filters-file",
-                "/var/lib/foldersync/mappings/m1/generation-1/filters.txt",
-            ]
-        }));
+        assert!(args.windows(2).any(|w| w == ["--workdir", wd.as_str()]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--filters-file", filters.as_str()])
+        );
         assert!(args.contains(&"--check-access".to_string()));
         assert!(
             args.windows(2)
@@ -807,12 +1010,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--check-sync", "true"]));
         assert!(args.contains(&"--resilient".to_string()));
         assert!(args.contains(&"--recover".to_string()));
-        assert!(args.windows(2).any(|w| {
-            w == [
-                "--backup-dir1",
-                "/Volumes/WorkSSD/FolderSyncRecovery/m1/run-1",
-            ]
-        }));
+        assert!(args.windows(2).any(|w| w == ["--backup-dir1", b1.as_str()]));
         assert!(
             args.windows(2)
                 .any(|w| { w == ["--backup-dir2", "household:Recovery/research/dev-1/run-1",] })
@@ -842,11 +1040,12 @@ mod tests {
 
     #[test]
     fn initialization_mode_carries_resync_mode_and_omits_resilient_recover() {
+        let root = TestFixtureDir::new("init-mode");
         for (pref, expected_mode) in [
             (InitPreference::Path1, "path1"),
             (InitPreference::Path2, "path2"),
         ] {
-            let req = base_drive_builder()
+            let req = base_drive_builder(&root)
                 .mode(RunMode::Initialize(pref))
                 .build()
                 .unwrap();
@@ -863,16 +1062,17 @@ mod tests {
 
     #[test]
     fn omits_drive_skip_options_for_local_and_non_drive_remotes() {
+        let root = TestFixtureDir::new("non-drive");
         let local_req = BisyncRequest::builder()
-            .engine(test_engine())
+            .engine(test_engine(&root))
             .mode(RunMode::Normal)
-            .path1("/tmp/sync-a")
-            .path2(Path2::LocalDir(PathBuf::from("/tmp/sync-b")))
-            .config_path("/tmp/rclone.conf")
-            .workdir("/tmp/workdir")
-            .filters_file("/tmp/filters.txt")
-            .backup_dir1("/tmp/b1")
-            .backup_dir2(BackupDir2::LocalDir(PathBuf::from("/tmp/b2")))
+            .path1(root.path("sync-a"))
+            .path2(Path2::LocalDir(root.path("sync-b")))
+            .config_path(root.path("rclone.conf"))
+            .workdir(root.path("workdir"))
+            .filters_file(root.path("filters.txt"))
+            .backup_dir1(root.path("b1"))
+            .backup_dir2(BackupDir2::LocalDir(root.path("b2")))
             .build()
             .unwrap();
         let args = args_as_strings(&local_req);
@@ -881,7 +1081,7 @@ mod tests {
         assert!(!args.contains(&"--password-command".to_string()));
         assert!(args.contains(&"--ask-password=false".to_string()));
 
-        let other_remote_req = base_drive_builder()
+        let other_remote_req = base_drive_builder(&root)
             .path2(Path2::OtherRemote {
                 remote: "household".to_string(),
                 path: "Data/Research".to_string(),
@@ -895,7 +1095,8 @@ mod tests {
 
     #[test]
     fn rejects_relative_paths_and_empty_filters_path() {
-        let err = base_drive_builder()
+        let root = TestFixtureDir::new("relative");
+        let err = base_drive_builder(&root)
             .path1("relative/path")
             .build()
             .unwrap_err();
@@ -904,7 +1105,10 @@ mod tests {
             RequestError::RelativePath { field: "path1", .. }
         ));
 
-        let err = base_drive_builder().filters_file("").build().unwrap_err();
+        let err = base_drive_builder(&root)
+            .filters_file("")
+            .build()
+            .unwrap_err();
         assert!(matches!(
             err,
             RequestError::EmptyPath {
@@ -912,7 +1116,7 @@ mod tests {
             }
         ));
 
-        let err = base_drive_builder()
+        let err = base_drive_builder(&root)
             .filters_file("filters.txt")
             .build()
             .unwrap_err();
@@ -924,7 +1128,7 @@ mod tests {
             }
         ));
 
-        let err = base_drive_builder()
+        let err = base_drive_builder(&root)
             .workdir("rel/workdir")
             .build()
             .unwrap_err();
@@ -939,22 +1143,23 @@ mod tests {
 
     #[test]
     fn rejects_identical_or_nested_paths() {
+        let root = TestFixtureDir::new("overlaps");
         let base_local = || {
             BisyncRequest::builder()
-                .engine(test_engine())
+                .engine(test_engine(&root))
                 .mode(RunMode::Normal)
-                .config_path("/tmp/rclone.conf")
-                .workdir("/tmp/workdir")
-                .filters_file("/tmp/filters.txt")
-                .backup_dir1("/tmp/b1")
-                .backup_dir2(BackupDir2::LocalDir(PathBuf::from("/tmp/b2")))
+                .config_path(root.path("rclone.conf"))
+                .workdir(root.path("workdir"))
+                .filters_file(root.path("filters.txt"))
+                .backup_dir1(root.path("b1"))
+                .backup_dir2(BackupDir2::LocalDir(root.path("b2")))
         };
 
         // path1 == path2
         assert!(matches!(
             base_local()
-                .path1("/tmp/tree")
-                .path2(Path2::LocalDir(PathBuf::from("/tmp/tree")))
+                .path1(root.path("tree"))
+                .path2(Path2::LocalDir(root.path("tree")))
                 .build()
                 .unwrap_err(),
             RequestError::OverlappingPaths { .. }
@@ -963,8 +1168,8 @@ mod tests {
         // path2 nested inside path1
         assert!(matches!(
             base_local()
-                .path1("/tmp/tree")
-                .path2(Path2::LocalDir(PathBuf::from("/tmp/tree/sub")))
+                .path1(root.path("tree"))
+                .path2(Path2::LocalDir(root.path("tree/sub")))
                 .build()
                 .unwrap_err(),
             RequestError::OverlappingPaths { .. }
@@ -973,8 +1178,8 @@ mod tests {
         // path1 nested inside path2 via ..
         assert!(matches!(
             base_local()
-                .path1("/tmp/tree/a/../sub")
-                .path2(Path2::LocalDir(PathBuf::from("/tmp/tree")))
+                .path1(root.path("tree/a/../sub"))
+                .path2(Path2::LocalDir(root.path("tree")))
                 .build()
                 .unwrap_err(),
             RequestError::OverlappingPaths { .. }
@@ -983,9 +1188,9 @@ mod tests {
         // backup_dir1 nested inside path1
         assert!(matches!(
             base_local()
-                .path1("/tmp/tree")
-                .path2(Path2::LocalDir(PathBuf::from("/tmp/other")))
-                .backup_dir1("/tmp/tree/recovery")
+                .path1(root.path("tree"))
+                .path2(Path2::LocalDir(root.path("other")))
+                .backup_dir1(root.path("tree/recovery"))
                 .build()
                 .unwrap_err(),
             RequestError::OverlappingPaths { .. }
@@ -994,9 +1199,9 @@ mod tests {
         // workdir nested inside path1
         assert!(matches!(
             base_local()
-                .path1("/tmp/tree")
-                .path2(Path2::LocalDir(PathBuf::from("/tmp/other")))
-                .workdir("/tmp/tree/.bisync")
+                .path1(root.path("tree"))
+                .path2(Path2::LocalDir(root.path("other")))
+                .workdir(root.path("tree/.bisync"))
                 .build()
                 .unwrap_err(),
             RequestError::OverlappingPaths { .. }
@@ -1004,7 +1209,7 @@ mod tests {
 
         // remote backup_dir2 nested inside remote path2
         assert!(matches!(
-            base_drive_builder()
+            base_drive_builder(&root)
                 .backup_dir2(BackupDir2::Remote {
                     remote: "household".to_string(),
                     path: "Data/Research/Recovery".to_string(),
@@ -1017,8 +1222,8 @@ mod tests {
         // sibling names with common string prefix must NOT be rejected
         assert!(
             base_local()
-                .path1("/tmp/tree")
-                .path2(Path2::LocalDir(PathBuf::from("/tmp/tree2")))
+                .path1(root.path("tree"))
+                .path2(Path2::LocalDir(root.path("tree2")))
                 .build()
                 .is_ok()
         );
@@ -1026,51 +1231,231 @@ mod tests {
 
     #[test]
     fn rejects_max_delete_outside_1_to_100() {
+        let root = TestFixtureDir::new("max-delete");
         assert_eq!(
-            base_drive_builder()
+            base_drive_builder(&root)
                 .max_delete_percent(0)
                 .build()
                 .unwrap_err(),
             RequestError::InvalidMaxDeletePercent(0)
         );
         assert_eq!(
-            base_drive_builder()
+            base_drive_builder(&root)
                 .max_delete_percent(101)
                 .build()
                 .unwrap_err(),
             RequestError::InvalidMaxDeletePercent(101)
         );
-        assert!(base_drive_builder().max_delete_percent(1).build().is_ok());
-        assert!(base_drive_builder().max_delete_percent(100).build().is_ok());
+        assert!(
+            base_drive_builder(&root)
+                .max_delete_percent(1)
+                .build()
+                .is_ok()
+        );
+        assert!(
+            base_drive_builder(&root)
+                .max_delete_percent(100)
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]
-    fn rejects_unqualified_engine_version_or_hash() {
-        let mut bad_ver = test_engine();
-        bad_ver.version = "1.75.0".to_string();
+    fn rejects_unqualified_engine_version_platform_or_hash() {
+        let root = TestFixtureDir::new("unqualified-engine");
+        let manifest = QualificationManifest::embedded().unwrap();
+        let (host_platform, host_pin) = manifest.host_platform_pin().unwrap();
+
+        let bad_ver = EngineIdentity::for_unit_test(
+            "1.75.0",
+            host_pin.binary_sha256.clone(),
+            root.path("rclone"),
+            host_platform,
+        );
         assert!(matches!(
-            base_drive_builder().engine(bad_ver).build().unwrap_err(),
+            base_drive_builder(&root)
+                .engine(bad_ver)
+                .build()
+                .unwrap_err(),
             RequestError::UnqualifiedEngineVersion { .. }
         ));
 
-        let mut bad_hash = test_engine();
-        bad_hash.sha256 = "0".repeat(64);
+        let bad_hash = EngineIdentity::for_unit_test(
+            crate::PINNED_RCLONE_VERSION,
+            "0".repeat(64),
+            root.path("rclone"),
+            host_platform,
+        );
         assert!(matches!(
-            base_drive_builder().engine(bad_hash).build().unwrap_err(),
+            base_drive_builder(&root)
+                .engine(bad_hash)
+                .build()
+                .unwrap_err(),
             RequestError::UnqualifiedEngineHash { .. }
+        ));
+
+        // Digest copied from another platform must be rejected on this host.
+        let other_platform = if host_platform == "osx-arm64" {
+            "linux-amd64"
+        } else {
+            "osx-arm64"
+        };
+        let other_pin = manifest.platform_pin(other_platform).unwrap();
+        let wrong_platform = EngineIdentity::for_unit_test(
+            crate::PINNED_RCLONE_VERSION,
+            other_pin.binary_sha256.clone(),
+            root.path("rclone"),
+            other_platform,
+        );
+        assert!(matches!(
+            base_drive_builder(&root)
+                .engine(wrong_platform)
+                .build()
+                .unwrap_err(),
+            RequestError::UnqualifiedEnginePlatform { .. }
         ));
     }
 
     #[test]
-    fn formats_password_command_with_csv_space_sep_escaping() {
+    fn formats_password_command_with_csv_space_sep_escaping_and_rejects_shells() {
+        let root = TestFixtureDir::new("pw-cmd");
         let cmd = PasswordCommand::new(
-            "/opt/My App/cred helper",
+            root.path("My App/cred helper"),
             vec!["--profile".to_string(), "a \"quoted\" val".to_string()],
         )
         .unwrap();
+        let expected_prog = root.path("My App/cred helper").display().to_string();
         assert_eq!(
             cmd.to_rclone_space_sep_list(),
-            "\"/opt/My App/cred helper\" --profile \"a \"\"quoted\"\" val\""
+            format!("\"{expected_prog}\" --profile \"a \"\"quoted\"\" val\"")
+        );
+
+        assert!(matches!(
+            PasswordCommand::new("/bin/sh", vec!["-c".to_string(), "echo pw".to_string()]),
+            Err(RequestError::ShellPasswordCommand(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_absent_backup_dir_overlapping_live_tree_via_symlink_alias() {
+        use std::os::unix::fs::symlink;
+        let root = TestFixtureDir::new("symlink-overlap");
+        let tree = root.path("tree");
+        let alias = root.path("alias");
+        let other = root.path("other");
+        let workdir = root.path("workdir");
+        let b2 = root.path("b2");
+        let cfg = root.path("rclone.conf");
+        let filters = root.path("filters.txt");
+        fs::create_dir_all(&tree).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&workdir).unwrap();
+        fs::write(&cfg, b"").unwrap();
+        fs::write(&filters, b"").unwrap();
+        symlink(&tree, &alias).unwrap();
+
+        // alias/run-1 does NOT exist yet, but its existing ancestor `alias` resolves to `tree`.
+        let err = BisyncRequest::builder()
+            .engine(test_engine(&root))
+            .mode(RunMode::Normal)
+            .path1(&tree)
+            .path2(Path2::LocalDir(other.clone()))
+            .config_path(&cfg)
+            .workdir(&workdir)
+            .filters_file(&filters)
+            .backup_dir1(alias.join("run-1"))
+            .backup_dir2(BackupDir2::LocalDir(b2.clone()))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, RequestError::OverlappingPaths { .. }));
+
+        // Absent path2 under symlink alias also overlaps path1.
+        let err2 = BisyncRequest::builder()
+            .engine(test_engine(&root))
+            .mode(RunMode::Normal)
+            .path1(&tree)
+            .path2(Path2::LocalDir(alias.join("sub")))
+            .config_path(&cfg)
+            .workdir(&workdir)
+            .filters_file(&filters)
+            .backup_dir1(root.path("b1"))
+            .backup_dir2(BackupDir2::LocalDir(b2))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err2, RequestError::OverlappingPaths { .. }));
+
+        // Dangling symlink ancestor must be rejected as unresolvable.
+        let dangling = root.path("dangling");
+        symlink(root.path("does-not-exist-target"), &dangling).unwrap();
+        let err3 = BisyncRequest::builder()
+            .engine(test_engine(&root))
+            .mode(RunMode::Normal)
+            .path1(&tree)
+            .path2(Path2::LocalDir(other))
+            .config_path(&cfg)
+            .workdir(&workdir)
+            .filters_file(&filters)
+            .backup_dir1(dangling.join("run-1"))
+            .backup_dir2(BackupDir2::LocalDir(root.path("b2-ok")))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err3, RequestError::UnresolvablePath { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_boundary_rehashes_binary_and_refuses_replacement_after_qualification() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TestFixtureDir::new("launch-rehash");
+        let bin = root.path("rclone");
+        fs::write(&bin, b"qualified binary bytes").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let digest = sha256_file(&bin).unwrap();
+        let platform = host_platform_key().unwrap();
+        let manifest = QualificationManifest::from_toml_str(&format!(
+            "[rclone]\nversion = \"1.76.0\"\n[rclone.{platform}]\nurl = \"https://example.invalid/rclone.zip\"\narchive_sha256 = \"{digest}\"\nbinary_sha256 = \"{digest}\"\n"
+        ))
+        .unwrap();
+
+        let qual_runner = FakeProcessRunner::new();
+        qual_runner.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stdout,
+                text: "rclone v1.76.0".to_string(),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        let engine = qualify_binary_with_runner(&bin, &manifest, &qual_runner).unwrap();
+
+        let req = BisyncRequest::builder()
+            .engine(engine)
+            .mode(RunMode::Normal)
+            .path1(root.path("p1"))
+            .path2(Path2::LocalDir(root.path("p2")))
+            .config_path(root.path("rclone.conf"))
+            .workdir(root.path("workdir"))
+            .filters_file(root.path("filters.txt"))
+            .backup_dir1(root.path("b1"))
+            .backup_dir2(BackupDir2::LocalDir(root.path("b2")))
+            .build_with_manifest(&manifest)
+            .unwrap();
+
+        // Replace binary on disk AFTER qualification and request creation.
+        fs::write(&bin, b"tampered after qualification").unwrap();
+        let launch_runner = FakeProcessRunner::new();
+        let err = req
+            .spawn_with_manifest(&launch_runner, SpawnOptions::default(), &manifest)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LaunchError::Qualification(QualificationError::Sha256Mismatch { .. })
+        ));
+        assert!(
+            launch_runner.spawned_specs().is_empty(),
+            "replaced binary must never be launched"
         );
     }
 }

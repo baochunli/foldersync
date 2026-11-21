@@ -1,11 +1,13 @@
-//! Process spawning, bounded output capture, OS process identity, and graceful
-//! signal handling without assuming a specific async runtime.
+//! Process spawning, environment isolation, bounded output capture, secret
+//! redaction, OS process identity, and graceful signal handling without
+//! assuming a specific async runtime.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
+    env,
     ffi::OsString,
     io::{BufRead, BufReader, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Condvar, Mutex,
@@ -18,12 +20,38 @@ use std::{
 
 use thiserror::Error;
 
-/// Specification of a child process spawned directly by argv (never via a shell).
+use crate::log_parser::{LogEvent, LogLevel, parse_log_line, strip_ansi_codes};
+
+const ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "LANG", "LC_ALL", "TZ"];
+const PW_CMD_STDERR_PREFIX: &str = "--password-command stderr:";
+
+/// Builds a minimal isolated environment for child processes: starts from an
+/// empty environment, forwards only a small allowlist (`PATH`, `TMPDIR`,
+/// `LANG`, `LC_ALL`, `TZ`) from the parent if present, and optionally points
+/// `HOME` to a lane- or run-owned directory. Ambient `RCLONE_*` and `XDG_*`
+/// variables are never inherited.
+pub fn minimal_isolated_env(home_dir: Option<&Path>) -> BTreeMap<OsString, OsString> {
+    let mut env_map = BTreeMap::new();
+    for key in ENV_ALLOWLIST {
+        if let Some(val) = env::var_os(key) {
+            env_map.insert(OsString::from(key), val);
+        }
+    }
+    if let Some(home) = home_dir {
+        env_map.insert(OsString::from("HOME"), home.as_os_str().to_os_string());
+    }
+    env_map
+}
+
+/// Specification of a child process spawned directly by argv (never via a shell)
+/// with an explicit isolated environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
+    /// Exact environment applied after `Command::env_clear()`.
+    pub env: BTreeMap<OsString, OsString>,
 }
 
 /// Which standard stream produced a captured line.
@@ -41,15 +69,18 @@ pub struct OutputLine {
     pub truncated: bool,
 }
 
-/// Memory bounds for line-by-line stdout/stderr capture.
+/// Memory bounds for line-by-line stdout/stderr capture and retained diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputLimits {
-    /// Maximum total retained bytes across all stored lines.
+    /// Maximum total retained bytes across all stored ordinary lines.
     pub max_total_bytes: usize,
-    /// Maximum number of retained lines.
+    /// Maximum number of retained ordinary lines.
     pub max_lines: usize,
     /// Maximum bytes retained for any individual line.
     pub max_line_bytes: usize,
+    /// Maximum number of recognized diagnostic events retained separately from
+    /// ordinary lines so early conflicts/errors survive ring-buffer eviction.
+    pub max_diagnostic_events: usize,
 }
 
 impl Default for OutputLimits {
@@ -58,18 +89,67 @@ impl Default for OutputLimits {
             max_total_bytes: 4 * 1024 * 1024,
             max_lines: 20_000,
             max_line_bytes: 64 * 1024,
+            max_diagnostic_events: 4_096,
         }
     }
 }
 
-/// Spawn options combining memory bounds with an optional live line observer.
+/// Spawn options combining memory bounds with an optional bounded, nonblocking
+/// live line observer (`SyncSender`).
 #[derive(Debug, Default)]
 pub struct SpawnOptions {
     pub limits: OutputLimits,
-    pub line_observer: Option<mpsc::Sender<OutputLine>>,
+    /// Bounded, nonblocking observer channel. Lines that cannot be sent
+    /// immediately via `try_send` are dropped without blocking and counted in
+    /// [`CapturedOutput::observer_dropped_lines`].
+    pub line_observer: Option<mpsc::SyncSender<OutputLine>>,
 }
 
-/// Bounded ring buffer of captured output lines with drop/truncation counters.
+/// Redacts credential-helper stderr payloads emitted by rclone's
+/// `--password-command` error logger before any storage or observer delivery.
+pub(crate) fn sanitize_captured_line(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{')
+        && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(obj) = value.as_object_mut()
+        && let Some(msg) = obj.get("msg").and_then(|v| v.as_str())
+    {
+        let plain = strip_ansi_codes(msg);
+        if plain.contains(PW_CMD_STDERR_PREFIX) {
+            obj.insert(
+                "msg".to_string(),
+                serde_json::Value::String(format!("{PW_CMD_STDERR_PREFIX} [REDACTED]")),
+            );
+            if let Ok(serialized) = serde_json::to_string(&value) {
+                return serialized;
+            }
+        }
+    }
+
+    if let Some(idx) = text.find(PW_CMD_STDERR_PREFIX) {
+        let prefix = &text[..idx + PW_CMD_STDERR_PREFIX.len()];
+        return format!("{prefix} [REDACTED]");
+    }
+
+    text.to_string()
+}
+
+fn is_diagnostic_event(event: &LogEvent) -> bool {
+    match event {
+        LogEvent::Raw(raw) => !raw.trim().is_empty(),
+        LogEvent::Structured(ev) => {
+            ev.marker.is_some()
+                || matches!(ev.level, LogLevel::Error | LogLevel::Critical)
+                || ev
+                    .stats
+                    .as_ref()
+                    .is_some_and(|s| s.fatal_error || s.retry_error || s.errors > 0)
+        }
+    }
+}
+
+/// Bounded ring buffer of captured output lines plus separate bounded retention
+/// of recognized diagnostic events and drop/truncation counters.
 #[derive(Debug, Clone)]
 pub struct BoundedLineBuffer {
     limits: OutputLimits,
@@ -78,6 +158,9 @@ pub struct BoundedLineBuffer {
     dropped_lines: u64,
     dropped_bytes: u64,
     truncated_lines: u64,
+    diagnostic_events: Vec<LogEvent>,
+    dropped_diagnostic_events: u64,
+    observer_dropped_lines: u64,
 }
 
 fn truncate_utf8(s: &mut String, max_bytes: usize) -> bool {
@@ -101,15 +184,36 @@ impl BoundedLineBuffer {
             dropped_lines: 0,
             dropped_bytes: 0,
             truncated_lines: 0,
+            diagnostic_events: Vec::new(),
+            dropped_diagnostic_events: 0,
+            observer_dropped_lines: 0,
         }
     }
 
+    pub fn record_observer_drop(&mut self) {
+        self.observer_dropped_lines += 1;
+    }
+
     pub fn push(&mut self, mut line: OutputLine) {
+        line.text = sanitize_captured_line(&line.text);
         if truncate_utf8(&mut line.text, self.limits.max_line_bytes) {
             line.truncated = true;
         }
         if line.truncated {
             self.truncated_lines += 1;
+        }
+
+        // Retain recognized diagnostics separately before ordinary-line eviction
+        // so early conflicts/critical errors survive high-volume INFO output.
+        if line.stream == StreamKind::Stderr {
+            let parsed = parse_log_line(&line.text);
+            if is_diagnostic_event(&parsed) {
+                if self.diagnostic_events.len() < self.limits.max_diagnostic_events {
+                    self.diagnostic_events.push(parsed);
+                } else {
+                    self.dropped_diagnostic_events += 1;
+                }
+            }
         }
 
         let line_len = line.text.len();
@@ -143,18 +247,25 @@ impl BoundedLineBuffer {
             dropped_lines: self.dropped_lines,
             dropped_bytes: self.dropped_bytes,
             truncated_lines: self.truncated_lines,
+            diagnostic_events: self.diagnostic_events,
+            dropped_diagnostic_events: self.dropped_diagnostic_events,
+            observer_dropped_lines: self.observer_dropped_lines,
         }
     }
 }
 
-/// Bounded stdout/stderr lines and accounting counters captured from a run.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Bounded stdout/stderr lines, separately retained diagnostics, and accounting
+/// counters captured from a run.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CapturedOutput {
     pub lines: Vec<OutputLine>,
     pub retained_bytes: usize,
     pub dropped_lines: u64,
     pub dropped_bytes: u64,
     pub truncated_lines: u64,
+    pub diagnostic_events: Vec<LogEvent>,
+    pub dropped_diagnostic_events: u64,
+    pub observer_dropped_lines: u64,
 }
 
 impl CapturedOutput {
@@ -176,6 +287,12 @@ impl CapturedOutput {
             .map(|l| l.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Returns `true` when diagnostic capture was incomplete (recognized
+    /// diagnostic events were dropped or lines were truncated).
+    pub fn diagnosis_incomplete(&self) -> bool {
+        self.dropped_diagnostic_events > 0 || self.truncated_lines > 0
     }
 }
 
@@ -226,7 +343,7 @@ impl ExitStatusInfo {
 }
 
 /// Final result returned by [`RunHandle::wait`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunOutput {
     pub identity: ChildIdentity,
     pub exit_status: ExitStatusInfo,
@@ -310,8 +427,9 @@ pub trait ProcessRunner: Send + Sync {
     fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError>;
 }
 
-/// Real OS process runner using `std::process::Command`, `Stdio::null()` stdin,
-/// and dedicated reader threads for bounded stdout/stderr capture.
+/// Real OS process runner using `std::process::Command`, `env_clear()`,
+/// `Stdio::null()` stdin, and dedicated reader threads for bounded stdout/stderr
+/// capture.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealProcessRunner;
 
@@ -350,7 +468,6 @@ impl RealChildControl {
         let Some(child) = child_guard.as_mut() else {
             return Ok(false);
         };
-        // Re-check before signaling so we never signal a zombie we are about to reap.
         match child.try_wait() {
             Ok(Some(status)) => {
                 *self.exit_status.lock().unwrap() = Some(ExitStatusInfo::from_std(status));
@@ -416,8 +533,6 @@ impl StopBackend for RealChildControl {
                 return Ok(());
             }
             if prev == 0 {
-                // First SIGINT starts graceful shutdown; deliver a second SIGINT briefly
-                // afterward to trigger rclone's immediate un-graceful shutdown path.
                 thread::sleep(Duration::from_millis(50));
                 if self.poll_reaped()?.is_some() {
                     return Ok(());
@@ -459,7 +574,7 @@ fn spawn_stream_reader<R: Read + Send + 'static>(
     stream: StreamKind,
     max_line_bytes: usize,
     buffer: Arc<Mutex<BoundedLineBuffer>>,
-    observer: Option<mpsc::Sender<OutputLine>>,
+    observer: Option<mpsc::SyncSender<OutputLine>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut buf_reader = BufReader::new(reader);
@@ -524,12 +639,12 @@ fn emit_line(
     truncated: &mut bool,
     stream: StreamKind,
     buffer: &Arc<Mutex<BoundedLineBuffer>>,
-    observer: &Option<mpsc::Sender<OutputLine>>,
+    observer: &Option<mpsc::SyncSender<OutputLine>>,
 ) {
     if raw.last() == Some(&b'\r') {
         raw.pop();
     }
-    let text = String::from_utf8_lossy(raw).into_owned();
+    let text = sanitize_captured_line(&String::from_utf8_lossy(raw));
     let line = OutputLine {
         stream,
         text,
@@ -538,10 +653,17 @@ fn emit_line(
     raw.clear();
     *truncated = false;
 
-    if let Some(tx) = observer {
-        let _ = tx.send(line.clone());
+    let mut observer_dropped = false;
+    if let Some(tx) = observer
+        && tx.try_send(line.clone()).is_err()
+    {
+        observer_dropped = true;
     }
-    buffer.lock().unwrap().push(line);
+    let mut guard = buffer.lock().unwrap();
+    if observer_dropped {
+        guard.record_observer_drop();
+    }
+    guard.push(line);
 }
 
 struct RealRunHandleBackend {
@@ -597,6 +719,8 @@ impl ProcessRunner for RealProcessRunner {
     fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
+            .env_clear()
+            .envs(&spec.env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -825,7 +949,7 @@ impl StopBackend for FakeChildControl {
 struct FakeRunHandleBackend {
     script: FakeRunScript,
     limits: OutputLimits,
-    line_observer: Option<mpsc::Sender<OutputLine>>,
+    line_observer: Option<mpsc::SyncSender<OutputLine>>,
     control: Arc<FakeChildControl>,
 }
 
@@ -842,9 +966,12 @@ impl RunHandleBackend for FakeRunHandleBackend {
 
     fn wait(self: Box<Self>) -> Result<RunOutput, ProcessError> {
         let mut buf = BoundedLineBuffer::new(self.limits);
-        for line in self.script.lines {
-            if let Some(tx) = &self.line_observer {
-                let _ = tx.send(line.clone());
+        for mut line in self.script.lines {
+            line.text = sanitize_captured_line(&line.text);
+            if let Some(tx) = &self.line_observer
+                && tx.try_send(line.clone()).is_err()
+            {
+                buf.record_observer_drop();
             }
             buf.push(line);
         }
@@ -933,9 +1060,134 @@ impl ProcessRunner for FakeProcessRunner {
     }
 }
 
+// Atomic flag used by the test child's SIGINT handler (no shell scripts anywhere).
+#[cfg(all(test, unix))]
+static TEST_CHILD_GOT_SIGINT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(test, unix))]
+extern "C" fn test_child_sigint_handler(_sig: libc::c_int) {
+    TEST_CHILD_GOT_SIGINT.fetch_add(1, Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// Helper entry point launched directly by argv (`current_exe()`) by runner
+    /// unit tests so no `/bin/sh -c` shell strings are ever used.
+    #[test]
+    fn child_helper_entry() {
+        let Ok(mode) = env::var("FOLDERSYNC_TEST_CHILD_MODE") else {
+            return;
+        };
+        match mode.as_str() {
+            "stdin_and_lines" => {
+                let mut buf = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut buf);
+                if !buf.is_empty() {
+                    println!("GOT_STDIN");
+                }
+                eprintln!("err1");
+                eprintln!("err2");
+                eprintln!("err3");
+                eprintln!("err4");
+                std::process::exit(0);
+            }
+            #[cfg(unix)]
+            "graceful_sigint" => {
+                TEST_CHILD_GOT_SIGINT.store(0, Ordering::SeqCst);
+                unsafe {
+                    libc::signal(
+                        libc::SIGINT,
+                        test_child_sigint_handler as *const () as libc::sighandler_t,
+                    );
+                }
+                eprintln!("READY");
+                let _ = std::io::stderr().flush();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while TEST_CHILD_GOT_SIGINT.load(Ordering::SeqCst) == 0 && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let count = TEST_CHILD_GOT_SIGINT.load(Ordering::SeqCst);
+                eprintln!("GOT_SIGINT:{count}");
+                std::process::exit(if count == 1 { 42 } else { 99 });
+            }
+            #[cfg(unix)]
+            "stubborn_sigint" => {
+                unsafe {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                }
+                eprintln!("STUBBORN_READY");
+                let _ = std::io::stderr().flush();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                std::process::exit(0);
+            }
+            "dump_env" => {
+                for (k, v) in env::vars() {
+                    eprintln!("ENV:{k}={v}");
+                }
+                std::process::exit(0);
+            }
+            "verify_env_cleared_in_subproc" => {
+                let runner = RealProcessRunner;
+                let mut child_env = minimal_isolated_env(None);
+                child_env.insert(
+                    OsString::from("FOLDERSYNC_TEST_CHILD_MODE"),
+                    OsString::from("dump_env"),
+                );
+                let spec = ProcessSpec {
+                    program: env::current_exe().unwrap(),
+                    args: vec![
+                        OsString::from("--exact"),
+                        OsString::from("process::tests::child_helper_entry"),
+                        OsString::from("--nocapture"),
+                    ],
+                    current_dir: None,
+                    env: child_env,
+                };
+                let out = runner
+                    .spawn(&spec, SpawnOptions::default())
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                let stderr = out.output.stderr_text();
+                assert!(out.exit_status.is_success());
+                assert!(
+                    !stderr.contains("RCLONE_FORCE"),
+                    "RCLONE_FORCE leaked: {stderr}"
+                );
+                assert!(
+                    !stderr.contains("RCLONE_RESYNC"),
+                    "RCLONE_RESYNC leaked: {stderr}"
+                );
+                std::process::exit(0);
+            }
+            other => panic!("unknown FOLDERSYNC_TEST_CHILD_MODE: {other}"),
+        }
+    }
+
+    fn helper_spec(mode: &str) -> ProcessSpec {
+        let mut child_env = minimal_isolated_env(None);
+        child_env.insert(
+            OsString::from("FOLDERSYNC_TEST_CHILD_MODE"),
+            OsString::from(mode),
+        );
+        ProcessSpec {
+            program: env::current_exe().unwrap(),
+            args: vec![
+                OsString::from("--exact"),
+                OsString::from("process::tests::child_helper_entry"),
+                OsString::from("--nocapture"),
+            ],
+            current_dir: None,
+            env: child_env,
+        }
+    }
 
     #[test]
     fn bounded_buffer_caps_lines_and_bytes_and_counts_drops() {
@@ -943,6 +1195,7 @@ mod tests {
             max_total_bytes: 20,
             max_lines: 3,
             max_line_bytes: 10,
+            max_diagnostic_events: 10,
         });
         for i in 0..5 {
             buf.push(OutputLine {
@@ -952,13 +1205,81 @@ mod tests {
             });
         }
         let captured = buf.into_captured();
-        // 20 bytes holds at most two 7-byte lines (14 bytes <= 20; 3 lines = 21 > 20).
         assert!(captured.retained_bytes <= 20);
         assert_eq!(captured.lines.len(), 2);
         assert_eq!(captured.lines[0].text, "line-03");
         assert_eq!(captured.lines[1].text, "line-04");
         assert_eq!(captured.dropped_lines, 3);
         assert_eq!(captured.dropped_bytes, 21);
+    }
+
+    #[test]
+    fn retains_early_conflict_diagnostics_even_when_ordinary_lines_are_evicted() {
+        let mut buf = BoundedLineBuffer::new(OutputLimits {
+            max_total_bytes: 4096,
+            max_lines: 5,
+            max_line_bytes: 1024,
+            max_diagnostic_events: 10,
+        });
+        buf.push(OutputLine {
+            stream: StreamKind::Stderr,
+            text: r#"{"level":"notice","msg":"- Path1    Renaming Path1 copy - /tmp/p1/a.txt.conflict1","source":"bisync/resolve.go:318"}"#.to_string(),
+            truncated: false,
+        });
+        for i in 0..25 {
+            buf.push(OutputLine {
+                stream: StreamKind::Stderr,
+                text: format!(r#"{{"level":"info","msg":"ordinary info line {i}"}}"#),
+                truncated: false,
+            });
+        }
+        let captured = buf.into_captured();
+        assert_eq!(captured.lines.len(), 5);
+        assert_eq!(captured.dropped_lines, 21);
+        assert_eq!(captured.diagnostic_events.len(), 1);
+        assert_eq!(captured.dropped_diagnostic_events, 0);
+        assert!(!captured.diagnosis_incomplete());
+    }
+
+    #[test]
+    fn bounded_nonblocking_observer_drops_without_blocking_and_counts_drops() {
+        let runner = FakeProcessRunner::new();
+        let lines: Vec<OutputLine> = (0..10)
+            .map(|i| OutputLine {
+                stream: StreamKind::Stderr,
+                text: format!(r#"{{"level":"info","msg":"line {i}"}}"#),
+                truncated: false,
+            })
+            .collect();
+        runner.push_run(FakeRunScript {
+            lines,
+            ..Default::default()
+        });
+        let (tx, rx) = mpsc::sync_channel(1);
+        let spec = ProcessSpec {
+            program: PathBuf::from("/fake/rclone"),
+            args: vec![OsString::from("bisync")],
+            current_dir: None,
+            env: BTreeMap::new(),
+        };
+        // Never drain `rx` while `wait()` runs: must not block and must count 9 drops.
+        let out = runner
+            .spawn(
+                &spec,
+                SpawnOptions {
+                    limits: OutputLimits::default(),
+                    line_observer: Some(tx),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(out.output.observer_dropped_lines, 9);
+        assert_eq!(
+            rx.try_recv().unwrap().text,
+            r#"{"level":"info","msg":"line 0"}"#
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -986,6 +1307,7 @@ mod tests {
             program: PathBuf::from("/fake/rclone"),
             args: vec![OsString::from("version")],
             current_dir: None,
+            env: BTreeMap::new(),
         };
         let handle = runner.spawn(&spec, SpawnOptions::default()).unwrap();
         let stopper = handle.stop_handle();
@@ -999,21 +1321,36 @@ mod tests {
         assert_eq!(runner.stop_calls(), 1);
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn real_runner_clears_ambient_rclone_env_variables() {
+        // Spawn a subprocess whose parent env explicitly contains RCLONE_FORCE and RCLONE_RESYNC;
+        // inside that subprocess, RealProcessRunner spawns a child with minimal_isolated_env and
+        // asserts neither variable reaches the child.
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::tests::child_helper_entry",
+                "--nocapture",
+            ])
+            .env("RCLONE_FORCE", "true")
+            .env("RCLONE_RESYNC", "true")
+            .env(
+                "FOLDERSYNC_TEST_CHILD_MODE",
+                "verify_env_cleared_in_subproc",
+            )
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "child env isolation check failed with status {status:?}"
+        );
+    }
+
     #[test]
     fn real_runner_closes_stdin_captures_bounded_output_and_reports_identity() {
         let runner = RealProcessRunner;
-        // `sh -c` is used ONLY with `/bin/sh` in this unit test to test stdin EOF + bounded capture.
-        let spec = ProcessSpec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec![
-                OsString::from("-c"),
-                OsString::from(
-                    "read x && echo GOT_STDIN; echo out1; echo err1 >&2; echo err2 >&2; echo err3 >&2",
-                ),
-            ],
-            current_dir: None,
-        };
+        let spec = helper_spec("stdin_and_lines");
         let handle = runner
             .spawn(
                 &spec,
@@ -1022,6 +1359,7 @@ mod tests {
                         max_total_bytes: 1024,
                         max_lines: 2,
                         max_line_bytes: 64,
+                        max_diagnostic_events: 16,
                     },
                     line_observer: None,
                 },
@@ -1033,7 +1371,7 @@ mod tests {
         assert!(out.exit_status.is_success());
         assert!(!out.output.stdout_text().contains("GOT_STDIN"));
         assert_eq!(out.output.lines.len(), 2);
-        assert_eq!(out.output.dropped_lines, 2);
+        assert!(out.output.dropped_lines >= 2);
     }
 
     #[cfg(unix)]
@@ -1041,18 +1379,8 @@ mod tests {
     fn real_runner_request_stop_sends_sigint_once_and_force_stop_kills_stubborn_child() {
         let runner = RealProcessRunner;
 
-        // Child traps SIGINT once and exits with code 42 on first SIGINT.
-        let spec_graceful = ProcessSpec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec![
-                OsString::from("-c"),
-                OsString::from(
-                    "trap 'echo GOT_SIGINT; exit 42' INT; echo READY; while true; do sleep 1; done",
-                ),
-            ],
-            current_dir: None,
-        };
-        let (tx, rx) = mpsc::channel();
+        let spec_graceful = helper_spec("graceful_sigint");
+        let (tx, rx) = mpsc::sync_channel(64);
         let handle = runner
             .spawn(
                 &spec_graceful,
@@ -1062,9 +1390,12 @@ mod tests {
                 },
             )
             .unwrap();
-        // Wait until child prints READY so trap is installed.
-        let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(line.text, "READY");
+        loop {
+            let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if line.text == "READY" {
+                break;
+            }
+        }
 
         handle.request_stop().unwrap();
         // Second call must be idempotent (does not send a second SIGINT).
@@ -1073,16 +1404,8 @@ mod tests {
         assert_eq!(out.exit_status.code, Some(42));
         assert!(out.stop_requested);
 
-        // Stubborn child ignores SIGINT completely; force_stop must escalate to SIGKILL.
-        let spec_stubborn = ProcessSpec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec![
-                OsString::from("-c"),
-                OsString::from("trap '' INT; echo STUBBORN_READY; while true; do sleep 1; done"),
-            ],
-            current_dir: None,
-        };
-        let (tx2, rx2) = mpsc::channel();
+        let spec_stubborn = helper_spec("stubborn_sigint");
+        let (tx2, rx2) = mpsc::sync_channel(64);
         let handle2 = runner
             .spawn(
                 &spec_stubborn,
@@ -1092,12 +1415,84 @@ mod tests {
                 },
             )
             .unwrap();
-        let line2 = rx2.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(line2.text, "STUBBORN_READY");
+        loop {
+            let line2 = rx2.recv_timeout(Duration::from_secs(5)).unwrap();
+            if line2.text == "STUBBORN_READY" {
+                break;
+            }
+        }
 
         handle2.force_stop(Duration::from_millis(150)).unwrap();
         let out2 = handle2.wait().unwrap();
         assert_eq!(out2.exit_status.signal, Some(libc::SIGKILL));
         assert!(out2.stop_requested);
+    }
+
+    #[test]
+    fn redacts_password_command_stderr_payloads_from_capture_and_observer() {
+        let runner = FakeProcessRunner::new();
+        runner.push_run(FakeRunScript {
+            lines: vec![
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: r#"{"level":"error","msg":"--password-command stderr: SUPER_SECRET_PASS","source":"config/crypt.go:199"}"#.to_string(),
+                    truncated: false,
+                },
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: "2026/11/20 19:00:00 ERROR : --password-command stderr: RAW_SECRET_999"
+                        .to_string(),
+                    truncated: false,
+                },
+            ],
+            exit_status: ExitStatusInfo {
+                code: Some(1),
+                signal: None,
+            },
+            ..Default::default()
+        });
+        let (tx, rx) = mpsc::sync_channel(8);
+        let spec = ProcessSpec {
+            program: PathBuf::from("/fake/rclone"),
+            args: vec![OsString::from("bisync")],
+            current_dir: None,
+            env: BTreeMap::new(),
+        };
+        let out = runner
+            .spawn(
+                &spec,
+                SpawnOptions {
+                    limits: OutputLimits::default(),
+                    line_observer: Some(tx),
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        let all_stderr = out.output.stderr_text();
+        assert!(
+            !all_stderr.contains("SUPER_SECRET_PASS"),
+            "secret leaked to capture: {all_stderr}"
+        );
+        assert!(
+            !all_stderr.contains("RAW_SECRET_999"),
+            "secret leaked to capture: {all_stderr}"
+        );
+        assert!(all_stderr.contains("[REDACTED]"));
+
+        // Verify live observer also received redacted lines only.
+        let observed: Vec<String> = rx.try_iter().map(|l| l.text).collect();
+        assert_eq!(observed.len(), 2);
+        for line in &observed {
+            assert!(
+                !line.contains("SUPER_SECRET_PASS"),
+                "secret leaked to observer: {line}"
+            );
+            assert!(
+                !line.contains("RAW_SECRET_999"),
+                "secret leaked to observer: {line}"
+            );
+            assert!(line.contains("[REDACTED]"));
+        }
     }
 }

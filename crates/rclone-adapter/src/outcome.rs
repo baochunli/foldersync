@@ -1,29 +1,33 @@
 //! Outcome classification combining the pinned rclone exit-code table with
 //! parsed diagnostic log events (§14).
+//!
+//! Exit-code definitions follow pinned rclone `v1.76.0`:
+//! <https://github.com/rclone/rclone/blob/v1.76.0/lib/exitcode/exitcode.go#L13-L18>
 
 use crate::{
-    log_parser::{BisyncMarker, LogEvent, LogLevel},
-    process::ExitStatusInfo,
+    log_parser::{BisyncMarker, LogEvent, LogLevel, parse_log_line},
+    process::{ExitStatusInfo, RunOutput, StreamKind},
 };
 
 /// Rclone version that the exit-code table below is qualified against.
 pub const EXIT_CODE_TABLE_VERSION: &str = crate::PINNED_RCLONE_VERSION;
 
-/// Engine-specific exit code meanings for pinned rclone v1.76.0.
-/// Kept in one table so engine upgrades require auditing a single place.
+/// Engine-specific exit code meanings for pinned rclone `v1.76.0`
+/// (`lib/exitcode/exitcode.go`). Kept in one table so engine upgrades require
+/// auditing a single place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RcloneExitCode {
-    Success,            // 0
-    Error,              // 1: Error not otherwise categorised
+    Success,            // 0: Success
+    Error,              // 1: Uncategorized error
     SyntaxOrUsage,      // 2: Syntax or usage error
     DirectoryNotFound,  // 3: Directory not found
     FileNotFound,       // 4: File not found
-    TemporaryError,     // 5: Temporary error (retries might fix)
-    LessSeriousError,   // 6: Less serious errors
-    FatalError,         // 7: Fatal error
-    TransferLimit,      // 8: --max-transfer reached
-    NoFilesTransferred, // 9: Successful, no files transferred
-    DurationLimit,      // 10: --max-duration reached
+    TemporaryError,     // 5: RetryError (temporary error that retries might fix)
+    NoRetryError,       // 6: NoRetryError (less serious / non-retryable error)
+    FatalError,         // 7: FatalError
+    TransferLimit,      // 8: TransferExceeded (--max-transfer reached)
+    NoFilesTransferred, // 9: NoFilesTransferred (successful, no files transferred)
+    DurationLimit,      // 10: DurationExceeded (--max-duration reached)
     InterruptedSigint,  // 130: 128 + SIGINT (2)
     KilledSigkill,      // 137: 128 + SIGKILL (9)
     TerminatedSigterm,  // 143: 128 + SIGTERM (15)
@@ -64,13 +68,22 @@ pub enum Outcome {
         needs_recovery: bool,
         reason: String,
     },
+    /// Diagnostic capture dropped recognized diagnostic events or truncated
+    /// lines, so the preliminary outcome cannot be treated as complete proof.
+    IncompleteDiagnosis {
+        preliminary: Box<Outcome>,
+        dropped_diagnostic_events: u64,
+        truncated_lines: u64,
+        reason: String,
+    },
     Unknown {
         exit_status: ExitStatusInfo,
         reason: String,
     },
 }
 
-/// Maps a numeric rclone exit code using the pinned v1.76.0 table.
+/// Maps a numeric rclone exit code using the pinned `v1.76.0` table
+/// (`lib/exitcode/exitcode.go`).
 pub fn classify_exit_code(code: i32) -> RcloneExitCode {
     match code {
         0 => RcloneExitCode::Success,
@@ -79,7 +92,7 @@ pub fn classify_exit_code(code: i32) -> RcloneExitCode {
         3 => RcloneExitCode::DirectoryNotFound,
         4 => RcloneExitCode::FileNotFound,
         5 => RcloneExitCode::TemporaryError,
-        6 => RcloneExitCode::LessSeriousError,
+        6 => RcloneExitCode::NoRetryError,
         7 => RcloneExitCode::FatalError,
         8 => RcloneExitCode::TransferLimit,
         9 => RcloneExitCode::NoFilesTransferred,
@@ -241,7 +254,7 @@ pub fn classify_outcome(
         || diag.graceful_shutdown_started
         || diag.graceful_shutdown_completed;
 
-    // 1. Interruption / cancellation (never report non-zero cancelled run as generic error).
+    // 1. Interruption / cancellation.
     if killed_by_signal
         || exit_indicates_interrupt
         || (!exit_status.is_success() && (stop_requested || log_indicates_interrupt))
@@ -282,7 +295,8 @@ pub fn classify_outcome(
         };
     }
 
-    // 3. Specific diagnostic markers override coarse exit codes (e.g. exit 1 / exit 7).
+    // 3. Holds that must NEVER be overridden by resilient-retry or generic exit codes:
+    // deletion guard, access check, auth, invalid config, endpoint mismatch, unusable baseline.
     if let Some(reason) = &diag.max_delete {
         return Outcome::DeletionGuardAborted {
             reason: reason.clone(),
@@ -325,14 +339,26 @@ pub fn classify_outcome(
             reason: diag.fallback_reason(exit_status),
         };
     }
-
-    // 4. Critical / must-resync states take precedence over `--resilient` retry notices (§10).
     if let Some(reason) = &diag.must_resync {
         return Outcome::Critical {
             requires_resync: true,
             reason: reason.clone(),
         };
     }
+
+    // 4. Honor rclone's explicit resilient-retry diagnostic when no hold condition
+    // (access, identity/endpoint, auth, deletion guard, config, or unusable baseline)
+    // is present — e.g. transient listing failures that exit 7 with a generic
+    // Bisync critical error plus the resilient retryable notice (§14).
+    if let Some(resilient_msg) = &diag.resilient_retryable {
+        let reason = diag
+            .critical_error
+            .clone()
+            .unwrap_or_else(|| resilient_msg.clone());
+        return Outcome::Retryable { reason };
+    }
+
+    // 5. Non-resilient critical / fatal errors.
     if let Some(reason) = &diag.critical_error {
         return Outcome::Critical {
             requires_resync: false,
@@ -346,32 +372,62 @@ pub fn classify_outcome(
         };
     }
 
-    // 5. Retryable transient / less-serious failures.
-    if matches!(
-        mapped_code,
-        Some(RcloneExitCode::TemporaryError | RcloneExitCode::LessSeriousError)
-    ) || diag.stats_retry_error
-        || diag.resilient_retryable.is_some()
-    {
+    // 6. Retryable transient errors (exit 5 RetryError or stats.retry_error).
+    // Exit 6 is NoRetryError in rclone v1.76.0 and is deliberately NOT retryable.
+    if matches!(mapped_code, Some(RcloneExitCode::TemporaryError)) || diag.stats_retry_error {
         return Outcome::Retryable {
-            reason: diag
-                .resilient_retryable
-                .clone()
-                .unwrap_or_else(|| diag.fallback_reason(exit_status)),
+            reason: diag.fallback_reason(exit_status),
         };
     }
 
-    // 6. Unclassified failure — retain exit status and best diagnostic text.
+    // 7. Unclassified / non-retryable failure — retain exit status and best diagnostic text.
     Outcome::Unknown {
         exit_status,
         reason: diag.fallback_reason(exit_status),
     }
 }
 
+/// Classifies a completed [`RunOutput`] using its separately retained
+/// diagnostic events plus retained stderr lines, and reports
+/// [`Outcome::IncompleteDiagnosis`] whenever diagnostic events were dropped or
+/// lines were truncated.
+pub fn classify_run_outcome(run: &RunOutput) -> Outcome {
+    let mut events = run.output.diagnostic_events.clone();
+    // Append parsed retained stderr lines so non-diagnostic lines like final
+    // clean stats or BisyncSuccessful are also visible when diagnostic_events is empty.
+    for line in &run.output.lines {
+        if line.stream == StreamKind::Stderr {
+            let parsed = parse_log_line(&line.text);
+            if !events.contains(&parsed) {
+                events.push(parsed);
+            }
+        }
+    }
+
+    let preliminary = classify_outcome(run.exit_status, &events, run.stop_requested);
+    if run.output.diagnosis_incomplete() {
+        Outcome::IncompleteDiagnosis {
+            preliminary: Box::new(preliminary),
+            dropped_diagnostic_events: run.output.dropped_diagnostic_events,
+            truncated_lines: run.output.truncated_lines,
+            reason: format!(
+                "diagnostic capture incomplete (dropped_diagnostic_events={}, truncated_lines={})",
+                run.output.dropped_diagnostic_events, run.output.truncated_lines
+            ),
+        }
+    } else {
+        preliminary
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_parser::parse_log_stream;
+    use crate::{
+        log_parser::parse_log_stream,
+        process::{BoundedLineBuffer, ChildIdentity, OutputLimits, OutputLine},
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn maps_pinned_rclone_exit_codes() {
@@ -380,6 +436,7 @@ mod tests {
         assert_eq!(classify_exit_code(2), RcloneExitCode::SyntaxOrUsage);
         assert_eq!(classify_exit_code(3), RcloneExitCode::DirectoryNotFound);
         assert_eq!(classify_exit_code(5), RcloneExitCode::TemporaryError);
+        assert_eq!(classify_exit_code(6), RcloneExitCode::NoRetryError);
         assert_eq!(classify_exit_code(7), RcloneExitCode::FatalError);
         assert_eq!(classify_exit_code(9), RcloneExitCode::NoFilesTransferred);
         assert_eq!(classify_exit_code(130), RcloneExitCode::InterruptedSigint);
@@ -545,6 +602,119 @@ mod tests {
                 false
             ),
             Outcome::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn exit_6_is_not_retryable_and_resilient_listing_failure_is_retryable() {
+        let exit6 = classify_outcome(
+            ExitStatusInfo {
+                code: Some(6),
+                signal: None,
+            },
+            &[],
+            false,
+        );
+        assert!(
+            !matches!(exit6, Outcome::Retryable { .. }),
+            "exit 6 (NoRetryError) must not be classified as Retryable, got {exit6:?}"
+        );
+
+        let transient_events = parse_log_stream([
+            r#"{"level":"error","msg":"\u001b[31mBisync critical error: error listing Path2: temporary network failure\u001b[0m","source":"bisync/operations.go:216"}"#,
+            r#"{"level":"error","msg":"\u001b[33mBisync aborted. Error is retryable without --resync due to --resilient mode.\u001b[0m","source":"bisync/operations.go:217"}"#,
+        ]);
+        let outcome = classify_outcome(
+            ExitStatusInfo {
+                code: Some(7),
+                signal: None,
+            },
+            &transient_events,
+            false,
+        );
+        assert!(
+            matches!(outcome, Outcome::Retryable { .. }),
+            "resilient transient listing failure should be Retryable, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn classify_run_outcome_preserves_evicted_conflicts_and_flags_incomplete_diagnosis() {
+        // Case 1: Early conflict followed by many INFO lines that evict the ordinary buffer.
+        let mut buf = BoundedLineBuffer::new(OutputLimits {
+            max_total_bytes: 2048,
+            max_lines: 4,
+            max_line_bytes: 512,
+            max_diagnostic_events: 16,
+        });
+        buf.push(OutputLine {
+            stream: StreamKind::Stderr,
+            text: r#"{"level":"notice","msg":"- Path1    Renaming Path1 copy - /tmp/p1/a.txt.conflict1","source":"bisync/resolve.go:318"}"#.to_string(),
+            truncated: false,
+        });
+        for i in 0..20 {
+            buf.push(OutputLine {
+                stream: StreamKind::Stderr,
+                text: format!(r#"{{"level":"info","msg":"copied file {i}"}}"#),
+                truncated: false,
+            });
+        }
+        let run = RunOutput {
+            identity: ChildIdentity {
+                pid: 1,
+                start_time: None,
+                executable: PathBuf::from("/fake/rclone"),
+            },
+            exit_status: ExitStatusInfo {
+                code: Some(0),
+                signal: None,
+            },
+            output: buf.into_captured(),
+            stop_requested: false,
+        };
+        assert_eq!(
+            classify_run_outcome(&run),
+            Outcome::SuccessWithConflicts {
+                paths: vec!["/tmp/p1/a.txt.conflict1".to_string()]
+            }
+        );
+
+        // Case 2: Diagnostic capacity exceeded -> IncompleteDiagnosis (never silent plain Success).
+        let mut buf2 = BoundedLineBuffer::new(OutputLimits {
+            max_total_bytes: 4096,
+            max_lines: 10,
+            max_line_bytes: 512,
+            max_diagnostic_events: 1,
+        });
+        buf2.push(OutputLine {
+            stream: StreamKind::Stderr,
+            text: r#"{"level":"notice","msg":"- Path1    Renaming Path1 copy - /tmp/p1/a.txt.conflict1"}"#.to_string(),
+            truncated: false,
+        });
+        buf2.push(OutputLine {
+            stream: StreamKind::Stderr,
+            text: r#"{"level":"notice","msg":"- Path2    Renaming Path2 copy - /tmp/p2/a.txt.conflict2"}"#.to_string(),
+            truncated: false,
+        });
+        let run2 = RunOutput {
+            identity: ChildIdentity {
+                pid: 2,
+                start_time: None,
+                executable: PathBuf::from("/fake/rclone"),
+            },
+            exit_status: ExitStatusInfo {
+                code: Some(0),
+                signal: None,
+            },
+            output: buf2.into_captured(),
+            stop_requested: false,
+        };
+        assert!(matches!(
+            classify_run_outcome(&run2),
+            Outcome::IncompleteDiagnosis {
+                dropped_diagnostic_events: 1,
+                ..
+            }
         ));
     }
 }

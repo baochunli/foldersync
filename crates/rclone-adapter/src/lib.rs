@@ -15,21 +15,22 @@ pub use log_parser::{
 };
 pub use outcome::{
     EXIT_CODE_TABLE_VERSION, Outcome, RcloneExitCode, classify_exit_code, classify_outcome,
+    classify_run_outcome,
 };
 pub use process::{
     BoundedLineBuffer, CapturedOutput, ChildIdentity, ExitStatusInfo, FakeProcessRunner,
     FakeRunScript, OutputLimits, OutputLine, ProcessError, ProcessRunner, ProcessSpec,
     ProcessStartTime, RealProcessRunner, RunHandle, RunOutput, SpawnOptions, StopHandle,
-    StreamKind, read_process_start_time,
+    StreamKind, minimal_isolated_env, read_process_start_time,
 };
 pub use qualification::{
     EngineIdentity, PlatformPin, QualificationError, QualificationManifest, host_platform_key,
     parse_rclone_version, qualify_binary, qualify_binary_with_runner, qualify_pinned_binary,
-    sha256_file,
+    sha256_file, verify_binary_integrity,
 };
 pub use request::{
-    BackupDir2, BisyncRequest, BisyncRequestBuilder, InitPreference, PasswordCommand, Path2,
-    RequestError, RunMode,
+    BackupDir2, BisyncRequest, BisyncRequestBuilder, InitPreference, LaunchError, PasswordCommand,
+    Path2, RequestError, RunMode,
 };
 
 /// Exact rclone release pinned in `packaging/qualification-manifest.toml`.

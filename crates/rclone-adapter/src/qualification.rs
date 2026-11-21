@@ -7,22 +7,63 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::process::{ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner, SpawnOptions};
+use crate::process::{
+    ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner, SpawnOptions, minimal_isolated_env,
+};
 
 const EMBEDDED_MANIFEST_TOML: &str = include_str!("../../../packaging/qualification-manifest.toml");
+static PROBE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Verified identity of the pinned rclone executable, stored with each run.
+///
+/// Fields are private so callers cannot forge or mutate an identity after
+/// qualification; launch boundaries also re-verify the binary's SHA-256 on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineIdentity {
-    pub version: String,
-    pub sha256: String,
-    pub path: PathBuf,
+    version: String,
+    sha256: String,
+    path: PathBuf,
+    platform: String,
+}
+
+impl EngineIdentity {
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_unit_test(
+        version: impl Into<String>,
+        sha256: impl Into<String>,
+        path: impl Into<PathBuf>,
+        platform: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: version.into(),
+            sha256: sha256.into(),
+            path: path.into(),
+            platform: platform.into(),
+        }
+    }
 }
 
 /// Platform-specific rclone release archive and binary digests.
@@ -55,10 +96,14 @@ pub enum QualificationError {
     UnsupportedPlatform { os: String, arch: String },
     #[error("missing platform pin `{platform}` in qualification manifest")]
     MissingPlatformPin { platform: String },
+    #[error("engine identity platform `{actual}` does not match host platform `{expected}`")]
+    PlatformMismatch { expected: String, actual: String },
     #[error("rclone binary not found or not a regular file: {0}")]
     BinaryNotFound(PathBuf),
     #[error("rclone binary is not executable: {0}")]
     NotExecutable(PathBuf),
+    #[error("failed to create isolated throwaway config for version probe: {0}")]
+    ProbeTempDir(#[source] std::io::Error),
     #[error("failed to read rclone binary {path} for SHA-256 verification: {source}")]
     HashIo {
         path: PathBuf,
@@ -176,11 +221,11 @@ impl QualificationManifest {
             })
     }
 
-    /// Returns `true` if `sha256` matches any platform's pinned `binary_sha256`.
-    pub fn contains_binary_sha256(&self, sha256: &str) -> bool {
-        self.platforms
-            .values()
-            .any(|pin| pin.binary_sha256 == sha256)
+    /// Returns the pin for the current host platform.
+    pub fn host_platform_pin(&self) -> Result<(&'static str, &PlatformPin), QualificationError> {
+        let platform = host_platform_key()?;
+        let pin = self.platform_pin(platform)?;
+        Ok((platform, pin))
     }
 }
 
@@ -247,6 +292,98 @@ pub fn parse_rclone_version(stdout: &str) -> Result<String, QualificationError> 
     Ok(version.to_string())
 }
 
+struct ProbeTempDir {
+    dir: PathBuf,
+    config_path: PathBuf,
+}
+
+impl ProbeTempDir {
+    fn create() -> Result<Self, QualificationError> {
+        let base = std::env::temp_dir();
+        for _ in 0..64 {
+            let seq = PROBE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = base.join(format!(
+                "foldersync-rclone-probe-{}-{seq}",
+                std::process::id()
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => {
+                    let config_path = dir.join("rclone.conf");
+                    if let Err(err) = File::create(&config_path) {
+                        let _ = fs::remove_dir_all(&dir);
+                        return Err(QualificationError::ProbeTempDir(err));
+                    }
+                    return Ok(Self { dir, config_path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(QualificationError::ProbeTempDir(err)),
+            }
+        }
+        Err(QualificationError::ProbeTempDir(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted temporary directory attempts",
+        )))
+    }
+}
+
+impl Drop for ProbeTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Re-hashes the binary referenced by `identity` on disk and confirms its
+/// version, platform, executable metadata, and SHA-256 still match the host
+/// platform's pin in `manifest` (replacement detection at the launch boundary, §19).
+pub fn verify_binary_integrity(
+    identity: &EngineIdentity,
+    manifest: &QualificationManifest,
+) -> Result<(), QualificationError> {
+    let (host_platform, pin) = manifest.host_platform_pin()?;
+    if identity.platform != host_platform {
+        return Err(QualificationError::PlatformMismatch {
+            expected: host_platform.to_string(),
+            actual: identity.platform.clone(),
+        });
+    }
+    if identity.version != manifest.rclone_version {
+        return Err(QualificationError::VersionMismatch {
+            expected: manifest.rclone_version.clone(),
+            actual: identity.version.clone(),
+        });
+    }
+    if identity.sha256 != pin.binary_sha256 {
+        return Err(QualificationError::Sha256Mismatch {
+            path: identity.path.clone(),
+            expected: pin.binary_sha256.clone(),
+            actual: identity.sha256.clone(),
+        });
+    }
+
+    let meta = fs::metadata(&identity.path)
+        .map_err(|_| QualificationError::BinaryNotFound(identity.path.clone()))?;
+    if !meta.is_file() {
+        return Err(QualificationError::BinaryNotFound(identity.path.clone()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(QualificationError::NotExecutable(identity.path.clone()));
+        }
+    }
+
+    let actual_sha256 = sha256_file(&identity.path)?;
+    if actual_sha256 != pin.binary_sha256 {
+        return Err(QualificationError::Sha256Mismatch {
+            path: identity.path.clone(),
+            expected: pin.binary_sha256.clone(),
+            actual: actual_sha256,
+        });
+    }
+    Ok(())
+}
+
 /// Verifies binary SHA-256 and `<binary> version` against the manifest using
 /// the real process runner.
 pub fn qualify_binary(
@@ -257,7 +394,8 @@ pub fn qualify_binary(
 }
 
 /// Verifies binary SHA-256 (before execution) and `<binary> version` using a
-/// supplied [`ProcessRunner`].
+/// supplied [`ProcessRunner`] with an explicit throwaway `--config` and cleared
+/// isolated environment.
 pub fn qualify_binary_with_runner(
     binary_path: &Path,
     manifest: &QualificationManifest,
@@ -280,8 +418,7 @@ pub fn qualify_binary_with_runner(
         }
     }
 
-    let platform = host_platform_key()?;
-    let pin = manifest.platform_pin(platform)?;
+    let (platform, pin) = manifest.host_platform_pin()?;
 
     // Compute and verify SHA-256 BEFORE executing the binary so a replaced binary is never run.
     let actual_sha256 = sha256_file(&canonical)?;
@@ -293,10 +430,19 @@ pub fn qualify_binary_with_runner(
         });
     }
 
+    // Always isolate startup and pass an explicit throwaway --config so rclone never probes
+    // or creates ~/.config/rclone during the version probe.
+    let probe_tmp = ProbeTempDir::create()?;
     let spec = ProcessSpec {
         program: canonical.clone(),
-        args: vec![OsString::from("version")],
+        args: vec![
+            OsString::from("version"),
+            OsString::from("--config"),
+            probe_tmp.config_path.as_os_str().to_os_string(),
+            OsString::from("--ask-password=false"),
+        ],
         current_dir: None,
+        env: minimal_isolated_env(Some(&probe_tmp.dir)),
     };
     let handle = runner
         .spawn(&spec, SpawnOptions::default())
@@ -330,6 +476,7 @@ pub fn qualify_binary_with_runner(
         version: actual_version,
         sha256: actual_sha256,
         path: canonical,
+        platform: platform.to_string(),
     })
 }
 
@@ -412,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mismatched_version_even_when_hash_matches_custom_manifest() {
+    fn rejects_mismatched_version_and_isolates_version_probe_with_throwaway_config() {
         let dir = unique_temp_dir("ver-mismatch");
         let fake_bin = dir.join("rclone");
         fs::write(&fake_bin, b"custom test binary").unwrap();
@@ -454,6 +601,66 @@ mod tests {
             } if expected == "1.76.0" && actual == "1.75.0"
         ));
 
+        let specs = runner.spawned_specs();
+        assert_eq!(specs.len(), 1);
+        let args: Vec<String> = specs[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "version");
+        assert!(
+            args.contains(&"--config".to_string()),
+            "version probe must pass explicit throwaway --config, got {args:?}"
+        );
+        assert!(args.contains(&"--ask-password=false".to_string()));
+        assert!(
+            specs[0].env.contains_key(&OsString::from("HOME")),
+            "version probe must isolate HOME to throwaway temp dir"
+        );
+        assert!(
+            !specs[0]
+                .env
+                .keys()
+                .any(|k| k.to_string_lossy().starts_with("RCLONE_")),
+            "version probe must not pass ambient RCLONE_* variables"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_binary_integrity_detects_replacement_after_qualification() {
+        let dir = unique_temp_dir("post-qual-replace");
+        let fake_bin = dir.join("rclone");
+        fs::write(&fake_bin, b"original qualified bytes").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let digest = sha256_file(&fake_bin).unwrap();
+        let platform = host_platform_key().unwrap();
+        let toml_text = format!(
+            "[rclone]\nversion = \"1.76.0\"\n[rclone.{platform}]\nurl = \"https://example.invalid/rclone.zip\"\narchive_sha256 = \"{digest}\"\nbinary_sha256 = \"{digest}\"\n"
+        );
+        let manifest = QualificationManifest::from_toml_str(&toml_text).unwrap();
+
+        let runner = FakeProcessRunner::new();
+        runner.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stdout,
+                text: "rclone v1.76.0".to_string(),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        let identity = qualify_binary_with_runner(&fake_bin, &manifest, &runner).unwrap();
+        assert!(verify_binary_integrity(&identity, &manifest).is_ok());
+
+        // Replace binary on disk AFTER qualification.
+        fs::write(&fake_bin, b"replaced malicious bytes").unwrap();
+        let err = verify_binary_integrity(&identity, &manifest).unwrap_err();
+        assert!(matches!(err, QualificationError::Sha256Mismatch { .. }));
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -465,10 +672,11 @@ mod tests {
         };
         let manifest = QualificationManifest::embedded().unwrap();
         let identity = qualify_binary(&path, &manifest).unwrap();
-        assert_eq!(identity.version, crate::PINNED_RCLONE_VERSION);
-        assert_eq!(identity.path, path);
+        assert_eq!(identity.version(), crate::PINNED_RCLONE_VERSION);
+        assert_eq!(identity.path(), path);
+        assert_eq!(identity.platform(), host_platform_key().unwrap());
         assert_eq!(
-            identity.sha256,
+            identity.sha256(),
             manifest
                 .platform_pin(host_platform_key().unwrap())
                 .unwrap()
