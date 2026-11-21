@@ -251,14 +251,15 @@ fn reused_pid_with_different_start_time_is_not_trusted_on_restart() {
         let _ = run_id_to_corrupt;
     }
 
-    // FakeProcessInspector reports the SAME PID is alive, but with a DIFFERENT start time (PID reuse!).
+    // FakeProcessInspector reports the SAME PID AND SAME executable, changing ONLY start_time
+    // so this test isolates the start-time check (managert3-review1 Medium follow-up).
     let inspector = Arc::new(FakeProcessInspector::new());
     inspector.set_process(
         recorded_pid,
         ProcessProbeResult::Live(LiveProcessInfo {
             pid: recorded_pid,
             start_time: Some(reused_start),
-            executable: Some(PathBuf::from("/usr/bin/unrelated-app")),
+            executable: Some(PathBuf::from("/fake/rclone")),
         }),
     );
 

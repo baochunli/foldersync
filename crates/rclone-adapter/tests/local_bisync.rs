@@ -618,6 +618,33 @@ fn sigint_interrupts_larger_run_and_records_subsequent_recovery_behavior() {
         "Post-SIGINT next run: exit={:?}, outcome={next_outcome:?}",
         next_out.exit_status
     );
+    // Timing-dependent: if SIGINT lands before rclone saved the prior listings, the pinned engine
+    // refuses `--recover` with "cannot find prior Path1 or Path2 listings". That is the intended
+    // hold (RecoveryRequired; reinitialization is a separate reviewed workflow), not a failure.
+    // In that case verify nothing was lost or corrupted and stop here.
+    if let Outcome::Critical {
+        requires_resync: true,
+        reason,
+    } = &next_outcome
+    {
+        assert!(
+            reason.contains("cannot find prior Path1 or Path2 listings"),
+            "unexpected critical outcome after SIGINT: {reason}"
+        );
+        assert_eq!(
+            tree_hashes(&ws.path1),
+            truth,
+            "path1 must keep every original file after an interrupted run"
+        );
+        for (rel, hash) in tree_hashes(&ws.path2) {
+            assert_eq!(
+                truth.get(&rel),
+                Some(&hash),
+                "path2 holds an unexpected or corrupted file: {rel}"
+            );
+        }
+        return;
+    }
     assert_eq!(
         next_outcome,
         Outcome::Success,

@@ -494,9 +494,7 @@ fn mapping_row(
                 );
             }
             why_row = why_row.child(link_button(link.label(), 12.0, move || match link {
-                StatusLink::StartRecovery => {
-                    ctrl_link.navigate(ScreenRoute::Recovery(id_rec.clone()))
-                }
+                StatusLink::StartRecovery => ctrl_link.open_recovery(id_rec.clone()),
                 StatusLink::ShowConflicts | StatusLink::Reconnect | StatusLink::ReviewEndpoint => {
                     ctrl_link.navigate(ScreenRoute::Attention)
                 }
@@ -549,37 +547,54 @@ fn mapping_row(
     if pres.is_draft {
         let ctrl_cont = ctrl.clone();
         let ctrl_disc = ctrl.clone();
+        let id_cont = m.id.clone();
         let id_disc = m.id.clone();
         col_actions = col_actions
-            .child(app_button(
-                "Continue setup…",
-                BtnKind::Default,
-                true,
-                false,
-                None,
-                None,
-                move || ctrl_cont.navigate(ScreenRoute::AddMapping),
-            ))
-            .child(app_button(
-                "Discard draft",
-                BtnKind::Default,
-                true,
-                false,
-                None,
-                None,
-                move || ctrl_disc.send(UiCommand::DiscardDraft(id_disc.clone())),
-            ));
+            .child(
+                app_button(
+                    "Continue setup…",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || {
+                        ctrl_cont.send(UiCommand::ResumeDraft(id_cont.clone()));
+                        ctrl_cont.navigate(ScreenRoute::AddMapping);
+                    },
+                )
+                .test_id(&format!("continue-setup-{}", m.id)),
+            )
+            .child(
+                app_button(
+                    "Discard draft",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || ctrl_disc.send(UiCommand::DiscardDraft(id_disc.clone())),
+                )
+                .test_id(&format!("discard-draft-{}", m.id)),
+            );
     } else if pres.needs_init {
         let ctrl_init = ctrl.clone();
-        col_actions = col_actions.child(app_button(
-            "Finish setup…",
-            BtnKind::Default,
-            true,
-            false,
-            None,
-            None,
-            move || ctrl_init.navigate(ScreenRoute::AddMapping),
-        ));
+        let id_init = m.id.clone();
+        col_actions = col_actions.child(
+            app_button(
+                "Finish setup…",
+                BtnKind::Default,
+                true,
+                false,
+                None,
+                None,
+                move || {
+                    ctrl_init.send(UiCommand::FinishSetup(id_init.clone()));
+                    ctrl_init.navigate(ScreenRoute::AddMapping);
+                },
+            )
+            .test_id(&format!("finish-setup-{}", m.id)),
+        );
     } else if pres.show_stop {
         let ctrl_stop = ctrl.clone();
         let id_stop = m.id.clone();

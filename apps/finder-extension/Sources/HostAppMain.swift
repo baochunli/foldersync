@@ -92,7 +92,7 @@ struct FolderSyncHostMain {
         // Optional utility mode: notify the running Finder extension that status.json changed.
         if args.contains("--notify-snapshot") {
             let notif = (info["FolderSyncDarwinSnapshotNotification"] as? String)
-                ?? "dev.foldersync.finder.snapshot-updated"
+                ?? darwinSnapshotUpdatedNotification
             CFNotificationCenterPostNotification(
                 CFNotificationCenterGetDarwinNotifyCenter(),
                 CFNotificationName(notif as CFString),
@@ -111,7 +111,7 @@ struct FolderSyncHostMain {
         }
 
         let actionNotif = (info["FolderSyncDarwinActionNotification"] as? String)
-            ?? "dev.foldersync.finder.action-requested"
+            ?? darwinActionRequestedNotification
         let actionLogPath = ProcessInfo.processInfo.environment["FOLDERSYNC_HOST_LOG"]
 
         let app = NSApplication.shared

@@ -61,6 +61,43 @@ pub enum BackupDir2 {
 }
 
 impl BackupDir2 {
+    /// Builds the plan §7 same-remote cloud recovery path
+    /// `<remote>:Recovery/<collection>/<device>/<run>`.
+    pub fn drive_recovery(
+        remote: impl Into<String>,
+        collection: &str,
+        device_id: &str,
+        run_id: &str,
+    ) -> Result<Self, RequestError> {
+        let remote = remote.into();
+        validate_remote_name(&remote)?;
+        for (label, seg) in [
+            ("collection", collection),
+            ("device", device_id),
+            ("run", run_id),
+        ] {
+            if seg.is_empty()
+                || seg == "."
+                || seg == ".."
+                || seg.contains('/')
+                || seg.contains('\\')
+                || contains_control_breaks(seg)
+            {
+                return Err(RequestError::InvalidRemotePath {
+                    path: format!("Recovery/{collection}/{device_id}/{run_id}"),
+                    reason: match label {
+                        "collection" => "invalid collection segment in Recovery path",
+                        "device" => "invalid device segment in Recovery path",
+                        _ => "invalid run segment in Recovery path",
+                    },
+                });
+            }
+        }
+        let path = format!("Recovery/{collection}/{device_id}/{run_id}");
+        validate_remote_path(&path)?;
+        Ok(BackupDir2::Remote { remote, path })
+    }
+
     fn to_os_string(&self) -> OsString {
         match self {
             BackupDir2::Remote { remote, path } => OsString::from(format!("{remote}:{path}")),
@@ -497,6 +534,14 @@ fn validate_local_path(field: &'static str, path: &Path) -> Result<(), RequestEr
         });
     }
     Ok(())
+}
+
+pub(crate) fn validate_remote_name_str(remote: &str) -> Result<(), RequestError> {
+    validate_remote_name(remote)
+}
+
+pub(crate) fn validate_remote_path_str(path: &str) -> Result<(), RequestError> {
+    validate_remote_path(path)
 }
 
 fn validate_remote_name(remote: &str) -> Result<(), RequestError> {
@@ -1529,5 +1574,47 @@ mod tests {
             matches!(err, ProcessError::BinaryIntegrityMismatch { .. }),
             "must refuse replaced binary with BinaryIntegrityMismatch before exec, got {err:?}"
         );
+    }
+
+    #[test]
+    fn drive_recovery_helper_builds_section7_path_and_rejects_bad_segments_or_cross_remote() {
+        let root = TestFixtureDir::new("drive-recovery-profile");
+        let backup2 =
+            BackupDir2::drive_recovery("household", "research", "dev-laptop", "run-20261120")
+                .unwrap();
+        assert_eq!(
+            backup2,
+            BackupDir2::Remote {
+                remote: "household".to_string(),
+                path: "Recovery/research/dev-laptop/run-20261120".to_string(),
+            }
+        );
+
+        let req = base_drive_builder(&root)
+            .backup_dir2(backup2)
+            .build()
+            .unwrap();
+        let args = args_as_strings(&req);
+        assert!(args.windows(2).any(|w| w
+            == [
+                "--backup-dir2",
+                "household:Recovery/research/dev-laptop/run-20261120"
+            ]));
+        assert!(args.contains(&"--drive-skip-gdocs".to_string()));
+        assert!(args.contains(&"--drive-skip-shortcuts".to_string()));
+
+        // Cross-remote backup_dir2 must be rejected (§7: data and recovery must share the same remote).
+        let other_remote_backup =
+            BackupDir2::drive_recovery("other_remote", "research", "dev-laptop", "run-1").unwrap();
+        let err = base_drive_builder(&root)
+            .backup_dir2(other_remote_backup)
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, RequestError::BackupDir2Mismatch { .. }));
+
+        // Invalid segments (traversal or slash) must be rejected.
+        assert!(BackupDir2::drive_recovery("household", "../escape", "dev", "run").is_err());
+        assert!(BackupDir2::drive_recovery("household", "a/b", "dev", "run").is_err());
+        assert!(BackupDir2::drive_recovery("household", "research", "", "run").is_err());
     }
 }

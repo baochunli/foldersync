@@ -9,7 +9,7 @@
     <key>CFBundleExecutable</key>
     <string>FolderSyncFinder</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.foldersync.spike.host.finder-extension</string>
+    <string>dev.foldersync.app.finder-extension</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -17,13 +17,15 @@
     <key>CFBundlePackageType</key>
     <string>XPC!</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>1.0.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>FolderSyncHostBundleIdentifier</key>
-    <string>dev.foldersync.spike.host</string>
+    <string>dev.foldersync.app</string>
+    <key>FolderSyncSharedHomeRelativeDir</key>
+    <string>Library/Application Support/FolderSync/finder</string>
     <key>FolderSyncDarwinSnapshotNotification</key>
     <string>dev.foldersync.finder.snapshot-updated</string>
     <key>FolderSyncDarwinActionNotification</key>

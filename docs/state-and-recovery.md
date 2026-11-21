@@ -96,9 +96,67 @@ the real application directory.
     identity failure, and startup reconciliation, with startup repair rewriting
     any missing `outcome.json` for committed terminal rows).
   - `finder/status.json` (or configured `--finder-dir`) — atomically written
-    (temp + `sync_all` + rename) v1 Finder status snapshot matching ADR 0002.
-    Finder publication failures are logged as non-fatal warnings and never
-    suppress stop signals or undo committed state.
+    (temp + `sync_all` + rename) v1 Finder status snapshot matching ADR 0002,
+    refusing symlinked handoff directories or symlinked parent paths. Reflects
+    global scheduling pause (`paused` / `"Scheduling paused"`) and refreshes
+    `generated_at` on a periodic heartbeat well under the 300-second TTL while
+    running. Idle worker wakeups preserve the next refresh deadline. After
+    every successful `status.json` write, `sync-manager` invokes
+    an injectable `FinderNotifier` (`NoopFinderNotifier` by default in
+    `ManagerConfig::with_state_dir` so tests never post live notifications;
+    `DarwinFinderNotifier` in the real interactive desktop app; tests inject
+    `RecordingFinderNotifier`). Finder publication failures are logged as
+    non-fatal warnings and never suppress stop signals or undo committed state.
+  - `finder/actions/*.json` — ADR 0002 v1 Finder action files (`sync_now`,
+    `pause`, `open_app`, `show_last_run`) drained by the manager/UI on a
+    background thread. Symlinks are refused (`symlink_metadata` / `O_NOFOLLOW`),
+    temporary/hidden files are ignored, unknown JSON fields and invalid IDs or
+    timestamps are rejected, and each file is atomically claimed via `rename`
+    to a hidden `.processing-*` name before dispatch (unclaimable files are
+    rejected without dispatch) and deleted only after dispatch completes.
+
+## Desktop UI wiring, recovery inspection, and controlled quit (`apps/sync-ui`)
+
+- **Real manager by default (`ManagerSource`):** `apps/sync-ui` defaults to
+  `ManagerSource` for interactive app runs, owning `SyncManager` strictly on a
+  dedicated background worker thread (`foldersync-ui-manager`). Immutable
+  `StatusSnapshot` updates flow through a coalescing latest-snapshot slot
+  (never replaying older snapshots or queuing commands behind log output) and
+  are marshaled onto the NSH main thread via `run_on_main_thread`. Headless
+  test opens without an explicit `FOLDERSYNC_STATE_DIR` and runs with
+  `FOLDERSYNC_DEMO=1` or `--demo` use the in-memory `DemoSource`.
+- **Off-mutex & background preflight:** Initialization layout/inventory checks
+  and engine qualification run off the manager state mutex on the background
+  worker thread (`StartInitialize`) with per-attempt IDs so a cancelled attempt
+  never writes or hijacks a later Start. Snapshot rebuilds use bounded
+  per-mapping latest-run queries (`LIMIT 1`), and the exclusive OS `flock`
+  stays held until after the worker thread joins and SQLite closes.
+- **Run-specific inspection & safe local recovery copies:** Each historical run
+  opens its own run-specific log (`output.ndjson`) and lists local recovery
+  copies preserved on disk (`backup_dir1` and local-fixture `backup_dir2`;
+  remote Google Drive recovery copy enumeration is not implemented in this
+  build). Copying a recovery file (`Copy to inspection folder…`) checks path
+  types with `lstat` before canonicalizing, refuses symlinked recovery roots
+  and inspection directories, writes with `create_new` into a user-chosen
+  separate folder, and refuses any destination overlapping a live synced
+  mapping root.
+- **Unreviewed conflict persistence:** `mappings.unreviewed_conflict_run_id`
+  (SQLite schema v2, backfilling existing `SuccessWithConflicts` mappings on
+  upgrade) tracks unreviewed conflicts independently of `Pause`, `Resume`, or
+  restart; acknowledging conflicts clears only the review notice while
+  preserving `RunOutcome::SuccessWithConflicts` in run history.
+- **Main-thread desktop actions & injectable `SystemActions`:** In the real
+  desktop app, Reveal in Finder, Open URL (restricted to `https://` and
+  `x-apple.systempreferences:`), and Launch at Login are sent over a channel
+  to execute strictly on the NSH main thread and report their actual outcomes
+  back to the worker; tests and demo mode inject `RecordingSystemActions`.
+- **Single controlled-stop Quit:** Tray Quit, ⌘Q, and `on_quit_request` share
+  one handler that prompts when a run is active, displays an honest `"Stopping…"`
+  state, pauses scheduling, requests graceful stop, waits up to the bounded
+  timeout, persists `Interrupted` / `RecoveryRequired` (`shutdown_timeout`) if
+  the child does not exit before timeout (blocking new jobs on restart while
+  that child remains alive), and delivers `QuitReady` without blocking on a
+  hung child thread.
 
 ## Run records, crash recovery, and orphan reconciliation
 

@@ -260,6 +260,8 @@ pub struct FakeLaunchScript {
     pub simulate_crash_before_pid_record: bool,
     pub on_prepare: Option<SpawnCallback>,
     pub on_spawn: Option<SpawnCallback>,
+    /// Optional hook invoked inside `wait()` (outside manager mutex) to simulate slow/hung children.
+    pub on_wait: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for FakeLaunchScript {
@@ -289,6 +291,7 @@ impl Default for FakeLaunchScript {
             simulate_crash_before_pid_record: false,
             on_prepare: None,
             on_spawn: None,
+            on_wait: None,
         }
     }
 }
@@ -376,6 +379,9 @@ impl LaunchedRunBackend for FakeLaunchedBackend {
             buf.push(line);
         }
 
+        if let Some(cb) = &self.script.on_wait {
+            cb();
+        }
         let (stop_requested, force_stopped) = {
             let mut st = self.stopper.stop_state.lock().unwrap();
             if self.script.wait_for_stop {

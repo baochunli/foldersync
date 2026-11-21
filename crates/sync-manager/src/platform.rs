@@ -177,13 +177,29 @@ pub fn ensure_contained_path(
     Ok(resolved_derived)
 }
 
-/// Verifies that `target` stays inside `root` and that neither `target` nor any
-/// existing path component under `root` is a symbolic link (`symlink_metadata`).
+/// Verifies that `target` stays inside `root` and that neither `root`, `target`,
+/// nor any existing path component under `root` is a symbolic link (`symlink_metadata`).
 pub fn reject_symlinks_under_root(
     field: &str,
     root: &Path,
     target: &Path,
 ) -> Result<PathBuf, ManagerError> {
+    let root_meta = fs::symlink_metadata(root).map_err(|err| ManagerError::Io {
+        cause: format!(
+            "Could not inspect root `{}` for {field}: {err}.",
+            root.display()
+        ),
+        next_step: "Verify the FolderSync directory exists and is accessible.".to_string(),
+    })?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Refused symbolic link or non-directory root `{}` for {field}.",
+                root.display()
+            ),
+            next_step: "Use an ordinary directory with no symbolic links.".to_string(),
+        });
+    }
     let canonical_root = fs::canonicalize(root).map_err(|err| ManagerError::Io {
         cause: format!("Could not resolve state root `{}`: {err}.", root.display()),
         next_step: "Verify the FolderSync state directory exists and is accessible.".to_string(),
@@ -332,33 +348,60 @@ pub fn ensure_private_dir_under(
                     )?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    #[cfg(unix)]
-                    {
-                        fs::DirBuilder::new()
-                            .mode(0o700)
-                            .create(&cur)
-                            .map_err(|err| ManagerError::Io {
+                    let create_res = {
+                        #[cfg(unix)]
+                        {
+                            fs::DirBuilder::new().mode(0o700).create(&cur)
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            fs::create_dir(&cur)
+                        }
+                    };
+                    match create_res {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let meta =
+                                fs::symlink_metadata(&cur).map_err(|merr| ManagerError::Io {
+                                    cause: format!(
+                                        "Failed to inspect `{}`: {merr}.",
+                                        cur.display()
+                                    ),
+                                    next_step: "Check permissions inside the state directory."
+                                        .to_string(),
+                                })?;
+                            if meta.file_type().is_symlink() || !meta.is_dir() {
+                                return Err(ManagerError::PreflightRejected {
+                                    cause: format!(
+                                        "Path `{}` inside state root is not an ordinary directory.",
+                                        cur.display()
+                                    ),
+                                    next_step:
+                                        "Remove the unexpected file or symlink inside the state directory."
+                                            .to_string(),
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            return Err(ManagerError::Io {
                                 cause: format!(
                                     "Failed to create private directory `{}`: {err}.",
                                     cur.display()
                                 ),
                                 next_step: "Confirm the state directory is writable.".to_string(),
-                            })?;
-                        fs::set_permissions(&cur, fs::Permissions::from_mode(0o700)).map_err(
-                            |err| ManagerError::Io {
-                                cause: format!(
-                                    "Failed to set 0700 permissions on `{}`: {err}.",
-                                    cur.display()
-                                ),
-                                next_step: "Verify ownership of the state directory.".to_string(),
-                            },
-                        )?;
+                            });
+                        }
                     }
-                    #[cfg(not(unix))]
-                    fs::create_dir(&cur).map_err(|err| ManagerError::Io {
-                        cause: format!("Failed to create directory `{}`: {err}.", cur.display()),
-                        next_step: "Confirm the state directory is writable.".to_string(),
-                    })?;
+                    #[cfg(unix)]
+                    fs::set_permissions(&cur, fs::Permissions::from_mode(0o700)).map_err(
+                        |err| ManagerError::Io {
+                            cause: format!(
+                                "Failed to set 0700 permissions on `{}`: {err}.",
+                                cur.display()
+                            ),
+                            next_step: "Verify ownership of the state directory.".to_string(),
+                        },
+                    )?;
                 }
                 Err(err) => {
                     return Err(ManagerError::Io {
@@ -719,25 +762,61 @@ pub struct StateLock {
 }
 
 impl StateLock {
-    /// Acquires a non-blocking exclusive OS lock (`flock`) inside `state_dir`.
+    /// Acquires a non-blocking exclusive OS lock (`flock`) inside `state_dir`,
+    /// refusing symlinks on `state_dir` and `manager.lock` (`O_NOFOLLOW`).
     pub fn acquire(state_dir: &Path) -> Result<Self, ManagerError> {
+        if let Ok(meta) = fs::symlink_metadata(state_dir)
+            && meta.file_type().is_symlink()
+        {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!(
+                    "Refused to follow symbolic link at state directory `{}`.",
+                    state_dir.display()
+                ),
+                next_step: "Point FolderSync at a real local state directory, not a symbolic link."
+                    .to_string(),
+            });
+        }
         ensure_private_dir(state_dir)?;
-        let lock_path = state_dir.join("manager.lock");
+        let lock_path =
+            reject_symlinks_under_root("manager_lock", state_dir, &state_dir.join("manager.lock"))?;
 
         let mut opts = OpenOptions::new();
         opts.create(true).read(true).write(true);
         #[cfg(unix)]
         {
             opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut file = opts.open(&lock_path).map_err(|err| ManagerError::Io {
-            cause: format!(
-                "Failed to open state lock file `{}`: {err}.",
-                lock_path.display()
-            ),
-            next_step: "Verify permissions on the FolderSync state directory.".to_string(),
+        let mut file = opts.open(&lock_path).map_err(|err| {
+            #[cfg(unix)]
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Refused to follow symbolic link at state lock `{}`.",
+                        lock_path.display()
+                    ),
+                    next_step: "Remove the unexpected symbolic link inside the state directory."
+                        .to_string(),
+                };
+            }
+            ManagerError::Io {
+                cause: format!(
+                    "Failed to open state lock file `{}`: {err}.",
+                    lock_path.display()
+                ),
+                next_step: "Verify permissions on the FolderSync state directory.".to_string(),
+            }
         })?;
-        set_private_file_permissions(&lock_path)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|err| ManagerError::Io {
+                cause: format!(
+                    "Failed to set private 0600 permissions on `{}`: {err}.",
+                    lock_path.display()
+                ),
+                next_step: "Verify ownership inside the state directory.".to_string(),
+            })?;
 
         #[cfg(unix)]
         {

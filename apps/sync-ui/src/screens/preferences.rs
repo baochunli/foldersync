@@ -140,6 +140,12 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
         FinderExtensionStatus::Unavailable => (IconKind::Dash, "Not installed", Tone::Neutral),
     };
 
+    let open_at_login_subtitle = if snap.is_demo_mode {
+        "FolderSync starts in the menu bar when you log in (demo toggle — does not change macOS Login Items)."
+    } else {
+        "FolderSync starts in the menu bar when you log in."
+    };
+
     let general_card = card()
         .gap(px(14.0))
         .child(
@@ -149,7 +155,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                 .child(app_switch(
                     prefs.open_at_login,
                     "Open at login",
-                    "FolderSync starts in the menu bar when you log in (demo toggle — does not change macOS Login Items).",
+                    open_at_login_subtitle,
                     move |next| {
                         c_login.send(UiCommand::SetOpenAtLogin(next));
                     },
@@ -164,12 +170,31 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                     view().into_element()
                 }),
         )
-        .child(app_switch(
-            prefs.notifications_enabled,
-            "Notifications",
-            "Notify when a mapping needs attention or completes with conflicts (works in a signed app bundle).",
-            move |next| c_notif.send(UiCommand::SetNotifications(next)),
-        ))
+        .child(if snap.is_demo_mode {
+            app_switch(
+                prefs.notifications_enabled,
+                "Notifications",
+                "Notify when a mapping needs attention or completes with conflicts (works in a signed app bundle).",
+                move |next| c_notif.send(UiCommand::SetNotifications(next)),
+            )
+            .into_element()
+        } else {
+            view()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    text("Notifications · not connected yet in this build")
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.muted),
+                )
+                .child(
+                    text("Desktop notifications are not connected to sync events in this build yet.")
+                        .text_size(px(12.0))
+                        .text_color(p.muted),
+                )
+                .into_element()
+        })
         .child(
             view()
                 .flex_row()
@@ -211,89 +236,96 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                     None,
                     None,
                     move || {
-                        c_ext.send(UiCommand::DemoAction(
-                            "Simulated Open Extension Settings (demo mode)".to_owned(),
-                        ));
+                        c_ext.send(UiCommand::OpenExtensionSettings);
                     },
                 )),
         );
 
     let limited = prefs.bandwidth_limit_mb_s.is_some();
-    let bandwidth_card = card().child(card_title("Bandwidth")).child(
-        radio_group()
-            .accessibility_label("Bandwidth")
-            .flex_col()
-            .gap(px(10.0))
-            .child(
-                radio()
-                    .checked(!limited)
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .cursor_pointer()
-                    .focus_visible(focus_ring)
-                    .on_change(move |checked: &bool| {
-                        if *checked {
-                            c_bw_none.send(UiCommand::SetBandwidthLimit(None));
-                        }
-                    })
-                    .child(radio_dot(!limited))
-                    .child(text("No limit").text_size(px(13.0)).text_color(p.fg)),
-            )
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        radio()
-                            .checked(limited)
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .cursor_pointer()
-                            .focus_visible(focus_ring)
-                            .on_change(move |checked: &bool| {
-                                if *checked {
-                                    let val = bw_input
-                                        .get_untracked()
-                                        .parse::<u32>()
-                                        .unwrap_or(20)
-                                        .max(1);
-                                    c_bw_lim.send(UiCommand::SetBandwidthLimit(Some(val)));
-                                }
-                            })
-                            .child(radio_dot(limited))
-                            .child(text("Limit to").text_size(px(13.0)).text_color(p.fg)),
-                    )
-                    .child(
-                        input()
-                            .w(px(64.0))
-                            .min_h(px(28.0))
-                            .px(px(8.0))
-                            .py(px(3.0))
-                            .rounded(px(7.0))
-                            .bg(p.bg)
-                            .border_1()
-                            .border_color(p.border)
-                            .focus(focus_ring)
-                            .focus_visible(focus_ring)
-                            .text_size(px(12.5))
-                            .text_color(p.fg)
-                            .label("Megabytes per second")
-                            .value(move || bw_input.get())
-                            .on_change(move |s: &str| {
-                                bw_input.set(s.to_owned());
-                                if let Ok(v) = s.trim().parse::<u32>()
-                                    && v > 0
-                                {
-                                    c_bw_edit.send(UiCommand::SetBandwidthLimit(Some(v)));
-                                }
-                            }),
-                    )
-                    .child(text("MB/s").text_size(px(13.0)).text_color(p.fg)),
-            ),
-    );
+    let bandwidth_card = if snap.is_demo_mode {
+        card().child(card_title("Bandwidth")).child(
+            radio_group()
+                .accessibility_label("Bandwidth")
+                .flex_col()
+                .gap(px(10.0))
+                .child(
+                    radio()
+                        .checked(!limited)
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .cursor_pointer()
+                        .focus_visible(focus_ring)
+                        .on_change(move |checked: &bool| {
+                            if *checked {
+                                c_bw_none.send(UiCommand::SetBandwidthLimit(None));
+                            }
+                        })
+                        .child(radio_dot(!limited))
+                        .child(text("No limit").text_size(px(13.0)).text_color(p.fg)),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            radio()
+                                .checked(limited)
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.0))
+                                .cursor_pointer()
+                                .focus_visible(focus_ring)
+                                .on_change(move |checked: &bool| {
+                                    if *checked {
+                                        let val = bw_input
+                                            .get_untracked()
+                                            .parse::<u32>()
+                                            .unwrap_or(20)
+                                            .max(1);
+                                        c_bw_lim.send(UiCommand::SetBandwidthLimit(Some(val)));
+                                    }
+                                })
+                                .child(radio_dot(limited))
+                                .child(text("Limit to").text_size(px(13.0)).text_color(p.fg)),
+                        )
+                        .child(
+                            input()
+                                .w(px(64.0))
+                                .min_h(px(28.0))
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(7.0))
+                                .bg(p.bg)
+                                .border_1()
+                                .border_color(p.border)
+                                .focus(focus_ring)
+                                .focus_visible(focus_ring)
+                                .text_size(px(12.5))
+                                .text_color(p.fg)
+                                .label("Megabytes per second")
+                                .value(move || bw_input.get())
+                                .on_change(move |s: &str| {
+                                    bw_input.set(s.to_owned());
+                                    if let Ok(v) = s.trim().parse::<u32>()
+                                        && v > 0
+                                    {
+                                        c_bw_edit.send(UiCommand::SetBandwidthLimit(Some(v)));
+                                    }
+                                }),
+                        )
+                        .child(text("MB/s").text_size(px(13.0)).text_color(p.fg)),
+                ),
+        )
+    } else {
+        let _ = (c_bw_none, c_bw_lim, c_bw_edit, bw_input);
+        card().child(card_title("Bandwidth")).child(
+            text("Bandwidth limits are not connected to sync runs in this build yet.")
+                .text_size(px(12.5))
+                .text_color(p.muted),
+        )
+    };
 
     view()
         .flex_col()
@@ -334,11 +366,17 @@ fn render_diagnostics(
         .child(diag_kv("System", &prefs.system_summary));
 
     let c_exp = ctrl.clone();
+    let is_demo = snap.is_demo_mode;
+    let export_desc = if is_demo {
+        "Prepares versions, configuration without secrets, selected run logs and error details with no file contents or sign-in data. Demo mode simulates export without writing a file."
+    } else {
+        "Writes versions, configuration without secrets, recent run summaries and error details with no file contents or sign-in data."
+    };
     let mut export_card = card()
         .flex_1()
         .child(card_title("Export diagnostics"))
         .child(
-            text("Prepares versions, configuration without secrets, selected run logs and error details with no file contents or sign-in data. Demo mode simulates export without writing a file.")
+            text(export_desc)
                 .text_size(px(12.5))
                 .text_color(p.fg),
         )
@@ -354,17 +392,25 @@ fn render_diagnostics(
                     let c = c_exp.clone();
                     let answer = pick_save_path(
                         SaveDialog::new()
-                            .title("Export FolderSync diagnostics (simulated)")
+                            .title(if is_demo {
+                                "Export FolderSync diagnostics (simulated)"
+                            } else {
+                                "Export FolderSync diagnostics"
+                            })
                             .file_name("foldersync-diagnostics.txt"),
                     );
                     spawn(async move {
                         if let Ok(Some(path)) = answer.await {
-                            let msg = format!(
-                                "Simulated diagnostics export to {} (demo mode — no file written).",
-                                path.display()
-                            );
-                            export_notice.set(Some(msg.clone()));
-                            c.send(UiCommand::DemoAction(msg));
+                            let path_str = path.to_string_lossy().into_owned();
+                            let msg = if is_demo {
+                                format!(
+                                    "Simulated diagnostics export to {path_str} (demo mode — no file written)."
+                                )
+                            } else {
+                                format!("Exporting diagnostics to {path_str}…")
+                            };
+                            export_notice.set(Some(msg));
+                            c.send(UiCommand::ExportDiagnostics(path_str));
                         }
                     });
                 },

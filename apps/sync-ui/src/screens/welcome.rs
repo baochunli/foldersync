@@ -13,6 +13,7 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
 
     if !has_account {
         let ctrl_connect = ctrl.clone();
+        let is_demo = snap.is_demo_mode;
         view()
             .flex_col()
             .items_center()
@@ -69,7 +70,13 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
                     false,
                     None,
                     None,
-                    move || ctrl_connect.send(UiCommand::ConnectDemoAccount),
+                    move || {
+                        if is_demo {
+                            ctrl_connect.send(UiCommand::ConnectDemoAccount);
+                        } else {
+                            ctrl_connect.navigate(crate::contract::ScreenRoute::Accounts);
+                        }
+                    },
                 )
                 .test_id("welcome-connect-btn"),
             )

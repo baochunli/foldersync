@@ -7,9 +7,8 @@ final class FolderSyncFinderExtension: FIFinderSync {
     private let logger = Logger(subsystem: "dev.foldersync.app.finder-extension", category: "extension")
     private let stateLock = NSLock()
 
+    private let handoffLocation: FinderHandoffLocation
     private let sharedDirectoryURL: URL
-    private let snapshotFileURL: URL
-    private let actionsDirectoryURL: URL
     private let hostBundleIdentifier: String
     private let snapshotUpdatedNotification: String
     private let actionRequestedNotification: String
@@ -23,15 +22,11 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     override init() {
         let info = Bundle.main.infoDictionary ?? [:]
-        let configuredSharedDir = (info["FolderSyncSharedDir"] as? String) ?? ""
-        if configuredSharedDir.isEmpty {
-            self.sharedDirectoryURL = SnapshotEvaluator.defaultSpikeSharedDirectoryURL()
-        } else {
-            self.sharedDirectoryURL = URL(fileURLWithPath: configuredSharedDir, isDirectory: true)
-        }
-
-        self.snapshotFileURL = self.sharedDirectoryURL.appendingPathComponent("status.json")
-        self.actionsDirectoryURL = self.sharedDirectoryURL.appendingPathComponent("actions", isDirectory: true)
+        self.handoffLocation = SnapshotEvaluator.resolveHandoffLocation(
+            configuredAbsolutePath: info["FolderSyncSharedDir"] as? String,
+            configuredHomeRelativePath: info["FolderSyncSharedHomeRelativeDir"] as? String
+        )
+        self.sharedDirectoryURL = self.handoffLocation.resolvedURL
 
         if let configuredHost = info["FolderSyncHostBundleIdentifier"] as? String, !configuredHost.isEmpty {
             self.hostBundleIdentifier = configuredHost
@@ -41,10 +36,10 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
         self.snapshotUpdatedNotification =
             (info["FolderSyncDarwinSnapshotNotification"] as? String)
-            ?? "dev.foldersync.finder.snapshot-updated"
+            ?? darwinSnapshotUpdatedNotification
         self.actionRequestedNotification =
             (info["FolderSyncDarwinActionNotification"] as? String)
-            ?? "dev.foldersync.finder.action-requested"
+            ?? darwinActionRequestedNotification
 
         super.init()
 
@@ -68,7 +63,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     private static func derivedHostBundleIdentifier() -> String {
         guard let extId = Bundle.main.bundleIdentifier else {
-            return "dev.foldersync.spike.host"
+            return productionHostBundleIdentifier
         }
         let parts = extId.split(separator: ".")
         if parts.count > 1 {
@@ -122,18 +117,11 @@ final class FolderSyncFinderExtension: FIFinderSync {
     }
 
     private func readSnapshotFromDisk() -> SnapshotReadResult {
-        let data: Data
-        do {
-            data = try Data(contentsOf: snapshotFileURL)
-        } catch {
-            logger.notice("Snapshot unreadable at \(self.snapshotFileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            return .failed(reason: "Status unavailable")
+        let result = SnapshotEvaluator.readSnapshotData(location: handoffLocation)
+        if case .failed(let reason) = result {
+            logger.notice("Snapshot read failed at \(self.sharedDirectoryURL.path, privacy: .public)/status.json: \(reason, privacy: .public)")
         }
-        guard let decoded = SnapshotEvaluator.decode(data: data) else {
-            logger.warning("Snapshot JSON invalid or unsupported version at \(self.snapshotFileURL.path, privacy: .public)")
-            return .failed(reason: "Status unavailable (invalid snapshot)")
-        }
-        return .valid(decoded)
+        return result
     }
 
     private func evaluateCurrentState() -> SnapshotEvaluation {
@@ -340,7 +328,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
         }
 
         do {
-            let written = try SnapshotEvaluator.writeActionRequest(request, toDirectory: actionsDirectoryURL)
+            let written = try SnapshotEvaluator.writeActionRequest(request, toLocation: handoffLocation)
             let center = CFNotificationCenterGetDarwinNotifyCenter()
             CFNotificationCenterPostNotification(
                 center,

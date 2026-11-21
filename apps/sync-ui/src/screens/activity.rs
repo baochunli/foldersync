@@ -3,7 +3,8 @@
 //! and expandable raw log (`collapsible`, closed by default) (`ui-spec.md` §5.5).
 
 use nsh_base::collapsible;
-use nsh_core::prelude::*;
+use nsh_core::{file_dialog::OpenDialog, prelude::*};
+use sync_core::{MappingId, RunId};
 
 use crate::contract::{
     ActiveRunSnapshot, DemoActivityPhase, IconKind, RunPhase, ScreenRoute, Tone, UiCommand,
@@ -82,19 +83,32 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                 ))
         };
 
-        // Queue and Held summary cards
-        let queued_names: Vec<String> = snap
-            .mappings
-            .iter()
-            .filter(|m| !m.is_variant_showcase && m.state.execution == sync_core::Execution::Queued)
-            .map(|m| m.display_name.clone())
-            .collect();
+        // Queue and Held summary cards — reflect actual `queue_order` (#6).
+        let mut queued_names: Vec<String> = Vec::new();
+        for qid in &snap.queue_order {
+            if let Some(m) = snap.mapping(qid)
+                && !m.is_variant_showcase
+                && m.state.execution == sync_core::Execution::Queued
+            {
+                queued_names.push(m.display_name.clone());
+            }
+        }
+        for m in &snap.mappings {
+            if !m.is_variant_showcase
+                && m.state.execution == sync_core::Execution::Queued
+                && !snap.queue_order.contains(&m.id)
+            {
+                queued_names.push(m.display_name.clone());
+            }
+        }
         let queue_body = if !queued_names.is_empty() {
-            format!("Queued: {}", queued_names.join(", "))
+            format!("Queued (in order): {}", queued_names.join(" → "))
         } else if snap.scheduling_paused {
             "Nothing waiting. Scheduling is paused — Sync now still works.".to_owned()
-        } else {
+        } else if snap.is_demo_mode {
             "Nothing waiting. Next scheduled check: Documents at about 14:48.".to_owned()
+        } else {
+            "Nothing waiting right now.".to_owned()
         };
 
         // Count only mappings actually held from running separately from review-only conflicts (§12).
@@ -118,10 +132,11 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
             .filter(|m| {
                 !m.is_variant_showcase
                     && m.state.readiness() == sync_core::Readiness::Ready
-                    && matches!(
-                        m.modifier,
-                        crate::contract::StatusModifier::UnreviewedConflicts { .. }
-                    )
+                    && (m.unreviewed_conflicts.is_some()
+                        || matches!(
+                            m.modifier,
+                            crate::contract::StatusModifier::UnreviewedConflicts { .. }
+                        ))
             })
             .count();
         let held_copy = match (held_count, conflict_count) {
@@ -204,8 +219,16 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                         .text_color(p.fg),
                 );
             if let Some((label, dest)) = ev.link.clone() {
-                row = row.child(link_button(label, 12.0, move || {
-                    c_link.navigate(dest.clone());
+                row = row.child(link_button(label, 12.0, move || match dest.clone() {
+                    ScreenRoute::RunInspection { mapping_id, run_id } => {
+                        c_link.open_run_inspection(mapping_id, run_id);
+                    }
+                    ScreenRoute::Recovery(mapping_id) => {
+                        c_link.open_recovery(mapping_id);
+                    }
+                    other => {
+                        c_link.navigate(other);
+                    }
                 }));
             }
             row
@@ -307,16 +330,244 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                 ),
         );
 
+        let mut root = view()
+            .flex_col()
+            .w_full()
+            .gap(px(14.0))
+            .child(page_title("Activity"));
+        if snap.is_demo_mode {
+            root = root.child(phase_bar);
+        }
+        root.child(current_card)
+            .child(queue_held)
+            .child(recent_card)
+            .child(raw_log_card)
+            .into_element()
+    })
+}
+
+/// Run-specific log and recovery copies inspection screen (§12 steps 1–4, uit3-review1 #9).
+///
+/// Never restores recovery copies directly over a live synced folder; copies a selected
+/// file to a separate inspection folder chosen by the user.
+pub fn run_inspection_view(
+    ctrl: AppController,
+    mapping_id: MappingId,
+    run_id: RunId,
+) -> impl IntoElement {
+    let copied_log = signal(false);
+
+    dynamic(move || {
+        let snap = ctrl.snapshot.get();
+        let p = Palette::current();
+        let inspected = snap
+            .inspected_run
+            .as_ref()
+            .filter(|r| r.run_id == run_id && r.mapping_id == mapping_id);
+
+        let c_back_detail = ctrl.clone();
+        let c_back_act = ctrl.clone();
+        let mid_back = mapping_id.clone();
+
+        let nav_bar = view()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .child(link_button("‹ Mapping", 12.5, move || {
+                c_back_detail.navigate(ScreenRoute::MappingDetail(mid_back.clone()));
+            }))
+            .child(text("·").text_size(px(12.0)).text_color(p.muted))
+            .child(link_button("Activity", 12.5, move || {
+                c_back_act.navigate(ScreenRoute::Activity);
+            }));
+
+        let Some(insp) = inspected else {
+            return view()
+                .flex_col()
+                .w_full()
+                .gap(px(14.0))
+                .child(nav_bar)
+                .child(page_title("Loading run record…"))
+                .child(
+                    card().child(
+                        text(format!("Reading log and recovery copies for run {run_id}."))
+                            .text_size(px(13.0))
+                            .text_color(p.muted),
+                    ),
+                )
+                .into_element();
+        };
+
+        let log_text = if insp.log_lines.is_empty() {
+            "No log lines were recorded for this run.".to_owned()
+        } else {
+            insp.log_lines.join("\n")
+        };
+        let log_copy = log_text.clone();
+        let is_copied = copied_log.get();
+
+        let log_path_opt = insp.log_exists.then(|| insp.log_path.clone()).flatten();
+        let c_reveal = ctrl.clone();
+        let reveal_btn = match log_path_opt {
+            Some(lp) => app_button(
+                "Reveal full log in Finder",
+                BtnKind::Default,
+                true,
+                false,
+                None,
+                None,
+                move || c_reveal.send(UiCommand::RevealPath(lp.clone())),
+            ),
+            None => app_button(
+                "Reveal full log in Finder",
+                BtnKind::Default,
+                true,
+                true,
+                None,
+                Some("No log file on disk for this run"),
+                || {},
+            ),
+        };
+
+        let log_card = card()
+            .child(card_title(format!(
+                "Run log · {} ({})",
+                insp.mapping_name, insp.run_id
+            )))
+            .child(
+                text(format!("{} · {}", insp.started_label, insp.result_label))
+                    .text_size(px(12.5))
+                    .text_color(p.muted),
+            )
+            .child(
+                view()
+                    .test_id("run-inspection-log-body")
+                    .selectable(true)
+                    .bg(p.sunk)
+                    .border_1()
+                    .border_color(p.hair)
+                    .rounded(px(8.0))
+                    .p(px(11.0))
+                    .child(mono_text(log_text, 11.0, p.fg)),
+            )
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(app_button(
+                        if is_copied { "Copied" } else { "Copy log" },
+                        BtnKind::Default,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            set_clipboard(log_copy.clone());
+                            copied_log.set(true);
+                        },
+                    ))
+                    .child(reveal_btn),
+            );
+
+        let mut copies_card = card()
+            .test_id("run-inspection-recovery-copies")
+            .child(card_title("Recovery copies from this run"))
+            .child(
+                text("Choose a file to copy to a separate inspection folder so you can check it before replacing anything yourself. FolderSync never restores recovery copies directly into a synced folder.")
+                    .text_size(px(12.0))
+                    .text_color(p.muted),
+            );
+
+        if insp.recovery_copies.is_empty() {
+            copies_card = copies_card.child(
+                text("No recovery copies were kept by this run.")
+                    .text_size(px(12.5))
+                    .text_color(p.muted),
+            );
+        } else {
+            for (idx, copy_item) in insp.recovery_copies.iter().enumerate() {
+                let c_copy = ctrl.clone();
+                let rid = insp.run_id.clone();
+                let rel = copy_item.relative_path.clone();
+                let is_remote = copy_item.is_remote;
+                let btn_tid = format!("copy-recovery-item-{idx}");
+                copies_card = copies_card.child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .py(px(7.0))
+                        .border_t_1()
+                        .border_color(p.hair)
+                        .child(
+                            view()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .flex_1()
+                                .child(mono_text(copy_item.relative_path.clone(), 11.5, p.fg))
+                                .child(
+                                    text(format!(
+                                        "{} · {}",
+                                        copy_item.side_label, copy_item.size_label
+                                    ))
+                                    .text_size(px(11.5))
+                                    .text_color(p.muted),
+                                ),
+                        )
+                        .child(
+                            app_button(
+                                "Copy to inspection folder…",
+                                BtnKind::Default,
+                                true,
+                                false,
+                                None,
+                                None,
+                                move || {
+                                    let c = c_copy.clone();
+                                    let rid_c = rid.clone();
+                                    let rel_c = rel.clone();
+                                    let answer = pick_paths(
+                                        OpenDialog::folders()
+                                            .title(
+                                                "Choose inspection folder (outside synced folders)",
+                                            )
+                                            .button_label("Copy here"),
+                                    );
+                                    spawn(async move {
+                                        if let Ok(Some(paths)) = answer.await
+                                            && let Some(first) = paths.first()
+                                        {
+                                            c.send(UiCommand::CopyRecoveryCopyToInspection {
+                                                run_id: rid_c,
+                                                is_remote,
+                                                relative_path: rel_c,
+                                                dest_dir: first.to_string_lossy().into_owned(),
+                                            });
+                                        }
+                                    });
+                                },
+                            )
+                            .test_id(&btn_tid),
+                        ),
+                );
+            }
+        }
+
+        if let Some(notice) = &insp.copy_notice {
+            copies_card =
+                copies_card.child(text(notice.clone()).text_size(px(12.0)).text_color(p.ok));
+        }
+
         view()
             .flex_col()
             .w_full()
             .gap(px(14.0))
-            .child(page_title("Activity"))
-            .child(phase_bar)
-            .child(current_card)
-            .child(queue_held)
-            .child(recent_card)
-            .child(raw_log_card)
+            .child(nav_bar)
+            .child(page_title(format!("Run details · {}", insp.mapping_name)))
+            .child(log_card)
+            .child(copies_card)
             .into_element()
     })
 }

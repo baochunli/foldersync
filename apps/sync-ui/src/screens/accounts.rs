@@ -1,7 +1,7 @@
 //! Accounts screen (`ui-spec.md` §5.7): connected identity, access status,
 //! reconnect, check access, and guarded remove account.
 
-use nsh_core::prelude::*;
+use nsh_core::{file_dialog::OpenDialog, prelude::*};
 
 use crate::contract::{AccountSnapshot, AccountStatus, IconKind, Tone, UiCommand};
 use crate::screens::AppController;
@@ -11,10 +11,13 @@ use crate::theme::{
 
 /// Renders the Accounts screen.
 pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
+    let show_real_connect_help = signal(false);
+
     dynamic(move || {
         let snap = ctrl.snapshot.get();
         let p = Palette::current();
         let c_connect = ctrl.clone();
+        let is_demo = snap.is_demo_mode;
 
         let mut root = view().flex_col().w_full().gap(px(14.0)).child(
             view()
@@ -22,21 +25,112 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
                 .items_end()
                 .justify_between()
                 .child(page_title("Accounts"))
-                .child(app_button(
-                    "Connect account…",
-                    BtnKind::Primary,
-                    false,
-                    false,
-                    Some(IconKind::Plus),
-                    None,
-                    move || c_connect.send(UiCommand::ConnectDemoAccount),
-                )),
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(if !is_demo {
+                            let c_local = ctrl.clone();
+                            app_button(
+                                "Add local folder account…",
+                                BtnKind::Default,
+                                false,
+                                false,
+                                Some(IconKind::Folder),
+                                None,
+                                move || {
+                                    let c = c_local.clone();
+                                    let answer = pick_paths(
+                                        OpenDialog::folders()
+                                            .title("Choose parent folder for local test account")
+                                            .button_label("Use folder"),
+                                    );
+                                    spawn(async move {
+                                        if let Ok(Some(paths)) = answer.await
+                                            && let Some(first) = paths.first()
+                                        {
+                                            let dir_str = first.to_string_lossy().into_owned();
+                                            let name = first
+                                                .file_name()
+                                                .map(|s| s.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| "local-fixture".to_owned());
+                                            let slug: String = name
+                                                .to_ascii_lowercase()
+                                                .chars()
+                                                .map(|ch| {
+                                                    if ch.is_ascii_alphanumeric() {
+                                                        ch
+                                                    } else {
+                                                        '-'
+                                                    }
+                                                })
+                                                .collect();
+                                            c.send(UiCommand::AddLocalFixtureAccount {
+                                                id: if slug.is_empty() {
+                                                    "local-account".to_owned()
+                                                } else {
+                                                    slug
+                                                },
+                                                display_name: format!("{name} (local folder)"),
+                                                parent_dir: dir_str,
+                                            });
+                                        }
+                                    });
+                                },
+                            )
+                            .test_id("accounts-add-local-fixture-btn")
+                            .into_element()
+                        } else {
+                            view().into_element()
+                        })
+                        .child(
+                            app_button(
+                                "Connect account…",
+                                BtnKind::Primary,
+                                false,
+                                false,
+                                Some(IconKind::Plus),
+                                None,
+                                move || {
+                                    if is_demo {
+                                        c_connect.send(UiCommand::ConnectDemoAccount);
+                                    } else {
+                                        show_real_connect_help.set(true);
+                                    }
+                                },
+                            )
+                            .test_id("accounts-connect-btn"),
+                        ),
+                ),
         );
+
+        if !is_demo && show_real_connect_help.get() {
+            root = root.child(
+                card()
+                    .border_color(p.run_bd)
+                    .child(card_title("Connect a Google Drive account"))
+                    .child(
+                        text("Browser Google Drive sign-in is provided by the Drive account onboarding flow. For local-to-local folder testing right now, use “Add local folder account…” above.")
+                            .text_size(px(12.5))
+                            .text_color(p.fg),
+                    )
+                    .child(view().flex_row().pt(px(4.0)).child(app_button(
+                        "Dismiss",
+                        BtnKind::Default,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || show_real_connect_help.set(false),
+                    ))),
+            );
+        }
 
         if snap.accounts.is_empty() {
             root = root.child(
                 card().child(
-                    text("No Google Drive accounts connected yet.")
+                    text("No accounts connected yet.")
                         .text_size(px(13.0))
                         .text_color(p.muted),
                 ),
@@ -53,52 +147,59 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
             let c_complete = ctrl.clone();
             let id_open = reconnecting_id.clone();
             let id_complete = reconnecting_id.clone();
+            let mut btn_row = view()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .pt(px(4.0))
+                .child(app_button(
+                    "Open the sign-in page again",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || {
+                        c_open.send(UiCommand::OpenCloudUrl(format!(
+                            "https://accounts.google.com/?account={id_open}"
+                        )));
+                    },
+                ));
+            if is_demo {
+                btn_row = btn_row.child(
+                    app_button(
+                        "Simulate sign-in complete (demo)",
+                        BtnKind::Primary,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            c_complete.send(UiCommand::CheckAccountAccess(id_complete.clone()));
+                        },
+                    )
+                    .test_id("accounts-simulate-signin-btn"),
+                );
+            }
+            btn_row = btn_row.child(
+                app_button(
+                    "Cancel",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || c_cancel.send(UiCommand::CancelReconnect),
+                )
+                .test_id("accounts-cancel-reconnect-btn"),
+            );
+
             root = root.child(
                 card()
                     .border_color(p.run_bd)
                     .child(card_title("Finish signing in in your browser"))
                     .child(progress_bar(None, 6.0, "Waiting for browser sign-in"))
-                    .child(
-                        view()
-                            .flex_row()
-                            .flex_wrap()
-                            .gap(px(8.0))
-                            .pt(px(4.0))
-                            .child(app_button(
-                                "Open the sign-in page again",
-                                BtnKind::Default,
-                                true,
-                                false,
-                                None,
-                                None,
-                                move || {
-                                    c_open.send(UiCommand::DemoAction(format!(
-                                        "Simulated browser sign-in page for {id_open} (demo mode)"
-                                    )));
-                                },
-                            ))
-                            .child(app_button(
-                                "Simulate sign-in complete (demo)",
-                                BtnKind::Primary,
-                                true,
-                                false,
-                                None,
-                                None,
-                                move || {
-                                    c_complete
-                                        .send(UiCommand::CheckAccountAccess(id_complete.clone()));
-                                },
-                            ))
-                            .child(app_button(
-                                "Cancel",
-                                BtnKind::Default,
-                                true,
-                                false,
-                                None,
-                                None,
-                                move || c_cancel.send(UiCommand::CancelReconnect),
-                            )),
-                    ),
+                    .child(btn_row),
             );
         }
 

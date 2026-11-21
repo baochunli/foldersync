@@ -249,13 +249,14 @@ test("Activity Stop targets the displayed mapping, ⌘R targets only selected Ma
   expect(archiveText).toContain("1Zx…m9T");
   expect(archiveText).toContain("changed since setup");
 
-  // Detail for Teaching routes "Start recovery…" to the honest snapshot-derived Recovery checklist (#9, #13)
+  // Detail for Teaching routes "Start recovery…" to the inspected Recovery checklist (#9, #13)
   await app.press("id:nav-overview");
   await app.press("id:open-detail-teaching");
   await app.press("text:Start recovery…");
   const recText = app.texts().join("\n");
   expect(recText).toContain("Recover “Teaching”");
-  expect(recText).toContain("Not checked yet");
+  expect(recText).toContain("No earlier sync process is running.");
+  expect(recText).toContain("Local and cloud folders match setup.");
   expect(recText).toContain("Last run was interrupted at 09:14");
   expect(recText).not.toContain("log ends during uploads");
 });
@@ -290,4 +291,50 @@ test("Both populated block recovers when choosing a valid replacement folder and
   expect(app.texts()).toContain("First sync: download from the cloud");
   expect(app.shows("id:wizard-start-first-sync-btn")).toBe(true);
   expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
+});
+
+test("Deferred UI fixes: resumable draft, new folder, queue order, conflict preservation, run inspection, and accounts (#3,#4,#6,#7,#9,#10)", async () => {
+  const app = await open(".", DESKTOP);
+
+  // #7: Pausing Family must preserve its unreviewed conflicts; Mark as reviewed clears badge while keeping history
+  await app.press("id:pause-family");
+  expect(app.texts()).toContain("5");
+  await app.press("id:nav-attention");
+  expect(app.texts().join("\n")).toContain("Family · completed with conflicts");
+
+  // #9: Attention "Show recovery copies" opens run-specific log & recovery copies view
+  await app.press("id:attn-show-recovery-copies-teaching");
+  const inspText = app.texts().join("\n");
+  expect(inspText).toContain("Run details · Teaching");
+  expect(inspText).toContain("Recovery copies from this run");
+  expect(inspText).toContain("Lectures/week-04-slides.pdf");
+  expect(inspText).toContain("Copy to inspection folder…");
+
+  // #6: Queue order shows queued mappings in order and Sync now moves queued mapping to front
+  await app.press("id:nav-overview");
+  await app.press("id:sync-ready-btn");
+  await app.press("id:nav-activity");
+  expect(app.texts().join("\n")).toContain("Queued (in order):");
+
+  // #10: Cancel reconnect on Connected account restores Connected; Connect account adds a new account
+  await app.press("id:nav-accounts");
+  await app.press("id:accounts-connect-btn");
+  await app.press("id:accounts-simulate-signin-btn");
+  expect(app.texts().join("\n")).toContain("work-2");
+
+  // #3 & #4: With 2 connected accounts, Step 1 (Account) is shown; advance to Folder, create a new empty folder, and complete upload first sync
+  await app.press("id:nav-overview");
+  await app.press("id:add-mapping-btn");
+  expect(app.texts()).toContain("Which Google account holds the folder?");
+  await app.press("id:wizard-continue-btn");
+  await app.press("id:wizard-new-folder-btn");
+  expect(app.texts().join("\n")).toContain("New-Folder");
+  await app.press("id:wizard-step-6");
+  expect(app.texts().join("\n")).toContain("First sync: upload to the cloud");
+  expect(app.texts().join("\n")).toContain("creates a new access marker file");
+  await app.press("id:wizard-no-other-sync-checkbox");
+  await app.press("id:wizard-start-first-sync-btn");
+  expect(app.texts().join("\n")).toContain("Uploading to the cloud");
+  await app.press("id:wizard-demo-complete-first-sync-btn");
+  expect(app.texts().join("\n")).toContain("Automatic sync is now on");
 });
