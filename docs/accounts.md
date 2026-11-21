@@ -5,24 +5,37 @@ runs manual qualification against a **disposable** Google Drive shared parent
 folder using `sync-cli`.
 
 > **Qualification status:** Automated tests in this repository verify encrypted
-> config creation (`0600`, `RCLONE_ENCRYPT_V0:`), `config encryption check`,
-> single-remote import (`local` backend), `lsjson` JSON parsing and duplicate
-> rejection (fixtures), Drive argv construction, per-account mutation locking,
-> and the in-memory `SecretStore` fake. **Real Google Drive OAuth sign-in, real
-> Drive folder IDs, real macOS Keychain storage, two-account shared-parent
-> permissions/quota, and token refresh remain owner-qualification items and are
-> not verified by automated CI.**
+> config creation in a `0600` temp file before atomic publication (`0600`,
+> `RCLONE_ENCRYPT_V0:`), `config encryption check`, single-remote import
+> (`local` backend live; Drive import root override and `shared_with_me`
+> stripping with fixtures), `lsjson` JSON parsing and duplicate rejection
+> (fixtures), Drive argv construction, per-account mutation locking, per-state
+> Keychain key isolation, and the in-memory `SecretStore` fake. **Real Google
+> Drive OAuth sign-in, real Drive folder IDs, real macOS Keychain storage,
+> two-account shared-parent permissions/quota, and token refresh remain
+> owner-qualification items and are not verified by automated CI.**
 
 ## How account configs and secrets are stored
 
 - **App-owned encrypted config:** Each account gets its own rclone config at
   `<state-dir>/accounts/<account-id>/rclone.conf` (`0600` permissions inside a
-  `0700` directory). FolderSync never reads or modifies `~/.config/rclone`.
-- **Encryption passphrase:** A random 256-bit passphrase is generated per
-  account and stored in macOS Keychain as a generic password under service
-  `dev.foldersync` and account `<account-id>`.
+  `0700` directory). Setup writes the single-section INI to an exclusive `0600`
+  temp file inside that directory, encrypts and verifies it in place via pinned
+  rclone, and only then publishes `rclone.conf` (scrubbing/removing temp and
+  rclone backup files on failure and startup). FolderSync never modifies any
+  user-global rclone config and refuses to read rclone's default locations
+  (`<rclone-exe-dir>/rclone.conf`, `$XDG_CONFIG_HOME/rclone/rclone.conf`,
+  `~/.config/rclone/rclone.conf`, or `~/.rclone.conf`) unless the user
+  explicitly passes both `--from <path>` and `--allow-global-config` to
+  `account import`.
+- **Per-state scoped encryption passphrase:** A random 256-bit passphrase is
+  generated per account and registered (create-only) in macOS Keychain as a
+  generic password under service `dev.foldersync` and account
+  `<install-id>/<account-id>`, where `<install-id>` is the random per-state ID
+  stored in `state.sqlite`. Disposable qualification state directories therefore
+  never overwrite or delete another state directory's Keychain credentials.
 - **Credential helper:** Pinned rclone retrieves the passphrase exclusively via
-  `--password-command "<path-to-sync-cli> credential-helper --account <id>"`
+  `--password-command "<path-to-sync-cli> credential-helper --account <install-id>/<account-id>"`
   with `--ask-password=false` and stdin closed. Neither the config passphrase
   nor the OAuth `client_secret` is ever placed in command-line arguments or
   ordinary logs.
@@ -30,11 +43,15 @@ folder using `sync-cli`.
   `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail` so a locked Keychain
   fails immediately with `authentication_required` (exit code `3`) instead of
   blocking on a hidden prompt.
-- **Serialized config mutations:** All config mutations for an account
-  (creation, import, encryption, OAuth reconnect) hold an exclusive per-account
-  lock at `<state-dir>/accounts/<account-id>/config.lock`.
+- **Serialized config mutations:** One exclusive per-account lock at
+  `<state-dir>/accounts/<account-id>/config.lock` serializes add/import
+  existence checks, credential registration, config publication, OAuth
+  reconnect, and refresh-capable `lsjson` / `check` invocations.
 - **Direct shared-parent root:** Drive remotes set `root_folder_id` directly to
-  the actual shared parent folder ID and never enable `shared_with_me`.
+  the actual shared parent folder ID and never retain `shared_with_me`.
+- **Reserved fixture ID:** The account ID `local-fixture` is reserved for
+  local-to-local CLI fixture mappings; `account add-drive` and `account import`
+  refuse it.
 
 ## Step 1: Create your own Google OAuth client
 
@@ -55,13 +72,14 @@ your own personal OAuth client before connecting a real Drive account:
    - Application type: **Desktop app**.
    - Record the **Client ID** (`...apps.googleusercontent.com`) and **Client
      secret**.
-5. Save the Client secret to a private temporary file (`0600`) so it stays out
-   of shell history and process argument lists:
-
-```sh
-umask 077
-printf '%s' 'YOUR_CLIENT_SECRET' > /tmp/foldersync-oauth-secret.txt
-```
+5. Supply the Client secret without putting it as a literal in a shell command
+   or at a predictable `/tmp` path — choose one of:
+   - **Interactive stdin prompt (`--client-secret-stdin`):** run `account add-drive`
+     with `--client-secret-stdin`, paste the secret when prompted, press Enter,
+     and send EOF (`Ctrl-D`).
+   - **Private `0600` file (`--client-secret-file`):** create a private file via
+     `umask 077 && SECRET_FILE="$(mktemp)" && cat > "$SECRET_FILE"`, paste the
+     secret, press `Ctrl-D`, and delete `"$SECRET_FILE"` right after setup.
 
 FolderSync defaults to the `drive` scope because `drive.file` does not cover
 preexisting arbitrary Drive files.
@@ -97,7 +115,9 @@ QUAL_STATE="$(mktemp -d /tmp/foldersync-qual-state.XXXXXX)"
 SYNC_CLI="./target/debug/sync-cli"
 
 # 1. Create the encrypted Drive config and run browser OAuth authorization.
-#    sync-cli prints the loopback authorization URL to open in your browser.
+#    Paste your OAuth Client Secret on stdin and press Ctrl-D (never pass it
+#    as a literal in a shell command). sync-cli prints the loopback URL to open
+#    in your browser and verifies a token was saved before marking the account ready.
 "$SYNC_CLI" account add-drive \
   --state-dir "$QUAL_STATE" \
   --id household-a \
@@ -105,10 +125,12 @@ SYNC_CLI="./target/debug/sync-cli"
   --remote household \
   --root-folder-id "1AbCdEfGhIjKlMnOpQrStUvWxYz" \
   --client-id "1234567890-example.apps.googleusercontent.com" \
-  --client-secret-file /tmp/foldersync-oauth-secret.txt
+  --client-secret-stdin
 
-# Remove the temporary secret file once encrypted into accounts/household-a/rclone.conf.
-rm -f /tmp/foldersync-oauth-secret.txt
+# If authorization was canceled or exited without saving a token, resume with:
+"$SYNC_CLI" account reconnect \
+  --state-dir "$QUAL_STATE" \
+  --account household-a
 
 # 2. List configured accounts (never prints secrets).
 "$SYNC_CLI" account list --state-dir "$QUAL_STATE"
@@ -138,12 +160,18 @@ without modifying the source file:
   --state-dir "$QUAL_STATE" \
   --from /path/to/exported-rclone.conf \
   --remote household \
-  --id imported-1
+  --id imported-1 \
+  --root-folder-id "1AbCdEfGhIjKlMnOpQrStUvWxYz"
 ```
 
-By default, `account import` refuses to read `~/.config/rclone/rclone.conf`,
-`$XDG_CONFIG_HOME/rclone/rclone.conf`, or `~/.rclone.conf` unless
-`--allow-global-config` is passed explicitly.
+For Google Drive remotes, `account import` sets `root_folder_id` in the copied
+section to the requested shared-parent ID (or rejects the import if none is
+available), removes `shared_with_me`, and verifies the effective root with
+`lsjson --dirs-only` before recording the account.
+
+By default, `account import` refuses to read `<rclone-exe-dir>/rclone.conf`,
+`$XDG_CONFIG_HOME/rclone/rclone.conf`, `~/.config/rclone/rclone.conf`, or
+`~/.rclone.conf` unless `--allow-global-config` is passed explicitly.
 
 ## Step 4: Owner qualification checks (real Google Drive)
 
@@ -154,7 +182,8 @@ Account A and Account B:
    `cargo test -p sync-manager --lib keychain_generic_password_roundtrip_manual_only -- --ignored`.
 2. **Duplicate-name guard:** Temporarily create two sibling folders named
    `Data/Research` in Drive and confirm `remote resolve Data/Research` refuses
-   with an ambiguous-duplicate error listing both IDs.
+   with an error of the form:
+   ``Error: Ambiguous duplicate cloud folder `Research` at `Data/Research` (2 matching folders; IDs: <id-1>, <id-2>).``
 3. **Storage & permissions:** Upload disposable files from Account A and Account
    B, confirm which account's quota is charged, and verify that overwriting or
    deleting a file owned by the other account successfully moves the recovery
@@ -164,4 +193,5 @@ Account A and Account B:
 5. **Token refresh & reauthorization:** Wait for access-token expiry (and check
    after several days in Testing mode) to confirm rclone persists refreshed
    tokens into the encrypted `accounts/<id>/rclone.conf` under `config.lock`,
-   and that a revoked token cleanly enters `authentication_required`.
+   and that a revoked token cleanly enters `authentication_required` and
+   recovers via `account reconnect`.

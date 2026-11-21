@@ -45,22 +45,28 @@ sync:
   accepts only an absolute path to a dedicated helper executable (shell
   interpreters such as `sh`, `bash`, `zsh`, `cmd`, and `powershell` are
   rejected) plus non-secret lookup arguments (e.g.
-  `sync-cli credential-helper --account <id>`), encoded as an RFC4180 CSV
-  `SpaceSepList`. The helper retrieves the account passphrase from the OS
-  credential store (`SecretStore`, macOS Keychain generic password under service
-  `dev.foldersync`), prints the passphrase solely to stdout on success, never
-  prompts on stdin, and exits with code `3` (`authentication_required`) when the
-  store is locked or unavailable. `rclone-adapter` additionally redacts
+  `sync-cli credential-helper --account <install-id>/<account-id>`), encoded as
+  an RFC4180 CSV `SpaceSepList`. The helper retrieves the account passphrase
+  from the OS credential store (`SecretStore`, macOS Keychain generic password
+  under service `dev.foldersync` keyed by `<install-id>/<account-id>`), prints
+  the passphrase solely to stdout on success, never prompts on stdin, and exits
+  with code `3` (`authentication_required`) when the store is locked or
+  unavailable. `rclone-adapter` additionally redacts
   `--password-command stderr:` payloads before capture storage or live observer
   delivery.
 - **App-owned encrypted configs and per-account locking:** Each account uses
-  `<state-dir>/accounts/<id>/rclone.conf` (`0600`) encrypted immediately via
-  pinned `rclone config encryption set` and verified via
-  `rclone config encryption check` (header `RCLONE_ENCRYPT_V0:`). All config
-  mutations for an account (creation, single-remote import, encryption, OAuth
-  `config reconnect`) are serialized through `<state-dir>/accounts/<id>/config.lock`
-  (in-process mutex + Unix `flock(LOCK_EX)`). OAuth `client_secret` and config
-  passphrases are never passed in argv or logs. See [`docs/accounts.md`](accounts.md).
+  `<state-dir>/accounts/<id>/rclone.conf` (`0600`). Setup builds the config in
+  an exclusive `0600` temp file inside `<state-dir>/accounts/<id>/`, encrypts
+  and verifies it in place via pinned `rclone config encryption set` and
+  `rclone config encryption check` (`RCLONE_ENCRYPT_V0:`), publishes
+  `rclone.conf` only after verification, and scrubs/removes temp and rclone
+  backup files on failure and startup. One per-account lock
+  (`<state-dir>/accounts/<id>/config.lock`, in-process mutex + Unix
+  `flock(LOCK_EX)`) spans add/import existence checks, create-only credential
+  registration, config publication, OAuth `config reconnect` (which verifies a
+  token is saved before marking `ready`), and refresh-capable `lsjson` / `check`
+  runs. OAuth `client_secret`, tokens, and config passphrases are never passed
+  in argv or logs. See [`docs/accounts.md`](accounts.md).
 - **Bounded capture and observer delivery:** Stdout/stderr lines are bounded by
   line length, line count, and total bytes. Live observer delivery uses a
   bounded, nonblocking `SyncSender::try_send` with drop accounting. Recognized
@@ -146,16 +152,23 @@ policy or explicit content-audit command.
 - Relative, shell-interpreter, non-UTF-8, or control-character-bearing
   `PasswordCommand` arguments.
 
-- `--backup-dir2` for Google Drive uses `BackupDir2::drive_recovery` to build
-  the same-remote cloud recovery path
-  `<remote>:Recovery/<collection>/<device>/<run>` and rejects cross-remote or
-  overlapping destinations.
-- Drive remotes root directly at the shared parent folder ID (`root_folder_id`
-  in the encrypted remote config) without enabling `shared_with_me`.
-- Pre-run cloud folder identity checks use `rclone lsjson --dirs-only` (with
-  `--drive-skip-gdocs --drive-skip-shortcuts` for Drive remotes) to resolve each
-  path component's folder ID, reject ambiguous duplicate sibling names, and
-  confirm the expected folder and ancestor IDs have not changed.
+### Drive recovery path and folder-identity APIs (pending `connect-t4` manager wiring)
+
+The following Drive helpers are implemented and tested as adapter/account-service
+APIs; `SyncManager`'s normal `LaunchPlan` does not invoke them automatically yet
+and will be wired by the `connect-t4` lane:
+
+- `BackupDir2::drive_recovery` constructs the opt-in same-remote cloud recovery
+  path `<remote>:Recovery/<collection>/<device>/<run>` and rejects cross-remote
+  or overlapping destinations.
+- Drive account creation and Drive import bind `root_folder_id` directly to the
+  shared parent folder ID in the encrypted remote config and strip
+  `shared_with_me`.
+- `AccountService::verify_collection_identity` and `rclone_adapter::lsjson`
+  provide the `rclone lsjson --dirs-only` (with `--drive-skip-gdocs
+  --drive-skip-shortcuts` for Drive remotes) pre-run folder-identity guard that
+  resolves each path component's folder ID, rejects ambiguous duplicate sibling
+  names, and confirms expected folder and ancestor IDs have not changed.
 
 ## Exit-code and diagnostic classification (`1.76.0`)
 
@@ -206,8 +219,8 @@ verification, and a second clean sync cycle
 | Access check (`--check-access --check-filename RCLONE_TEST`) | Passed | Removing Path2's `RCLONE_TEST` aborted with `AccessCheckFailed` and left all synced files untouched. |
 | Graceful `SIGINT` during larger batch (400 × 32 KiB) + next run | Passed | First `SIGINT` triggered graceful shutdown (`exit 130`, `Signal received: interrupt`, `Graceful shutdown completed successfully`), leaving `.lst-new` files in `workdir`; classified as `Interrupted { graceful: true, needs_recovery: true }`. The subsequent normal `--resilient --recover` run completed with `exit 0` (`Outcome::Success`), converged all 400 files to exact truth-set hashes, and stayed clean on the following cycle. |
 | Same-size, same-mtime in-place edit (`--compare size,modtime`) | Known limitation verified | Overwriting a 9-byte file with different 9-byte contents while restoring its exact mtime exited `0` (`Outcome::Success`) without propagating the edit to Path2, confirming §10's documented limitation. |
-| Encrypted app-owned config (`config encryption set` + `check` + `dump`) | Passed | Created `0600` encrypted `rclone.conf` (`RCLONE_ENCRYPT_V0:`) via `--password-command` without secrets in argv, logs, or plaintext disk; verified `AccountConfigLock` serializes concurrent mutations. |
-| Single-remote import (`local` backend) + `lsjson --dirs-only` | Passed | Imported one named `local` remote into an encrypted config while leaving the multi-section source byte-identical, refusing the global default config path without explicit opt-in, and listing subdirectories via `lsjson --dirs-only`. Drive folder-ID and duplicate-name logic verified with recorded JSON fixtures. |
+| Encrypted app-owned config (`config encryption set` + `check` + `dump`) | Passed | Built single-section config in an exclusive `0600` temp file, encrypted and verified it in place via `--password-command` (`RCLONE_ENCRYPT_V0:`) before publishing `0600` `rclone.conf`, scrubbed/removed temp and engine backup files on failure and startup, kept secrets out of argv/logs, and verified `AccountConfigLock` serializes concurrent mutations. |
+| Single-remote import (`local` + Drive fixtures) + `lsjson --dirs-only` | Passed | Imported one named `local` remote into an encrypted config while leaving the multi-section source byte-identical, refused default config locations (including rclone's executable directory) without explicit opt-in, verified Drive import overrides `root_folder_id`, strips `shared_with_me`, and checks the effective root before recording, and verified Drive folder-ID and duplicate-name logic with recorded JSON fixtures. |
 
 ### Surprises and engine quirks observed in `1.76.0`
 
