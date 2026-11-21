@@ -17,10 +17,11 @@ use sync_core::{
 use crate::contract::{
     AccountSnapshot, AccountStatus, ActiveRunSnapshot, ActivityEvent, AttentionItem, AttentionKind,
     AttentionPriority, CloudFolderCandidate, DemoActivityPhase, DemoPreset, FinderExtensionStatus,
-    IconKind, InspectedRunSnapshot, LocationCheck, MappingSnapshot, PreferencesSnapshot,
-    RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem, ReviewScenario, RunPhase,
-    RunRecordSnapshot, ScreenRoute, StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot,
-    UnreviewedConflicts, VolumeSnapshot, WizardDraft, WizardStep,
+    FolderSize, IconKind, InspectedRunSnapshot, LocationCheck, MappingSnapshot,
+    PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem,
+    ReviewScenario, RunPhase, RunRecordSnapshot, ScheduledCheck, ScreenRoute, StatusModifier,
+    SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardDraft,
+    WizardStep,
 };
 use crate::system_actions::{RecordingSystemActions, SystemActions};
 
@@ -708,6 +709,7 @@ impl DemoSource {
                 if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == mapping_id) {
                     m.schedule_minutes = minutes;
                     m.next_check_label = "Time not available".to_owned();
+                    m.next_check = None;
                 }
             }
             UiCommand::ConnectDrive { .. } | UiCommand::ImportDrive { .. } => {}
@@ -854,10 +856,14 @@ impl DemoSource {
             UiCommand::WizardSetStep(step) => {
                 recompute_wizard_checks(&mut snap);
                 if snap.wizard.can_visit_step(step) {
+                    if step != WizardStep::Folder {
+                        cancel_demo_size(&mut snap);
+                    }
                     snap.wizard.step = step;
                 }
             }
             UiCommand::WizardSelectAccount(acct) => {
+                cancel_demo_size(&mut snap);
                 snap.wizard.selected_account = acct;
                 snap.wizard.no_other_sync_confirmed = false;
                 snap.wizard.cloud_recovery_path = format!(
@@ -869,33 +875,66 @@ impl DemoSource {
                 recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSelectFolder(folder) => {
+                cancel_demo_size(&mut snap);
                 apply_wizard_folder_selection(&mut snap, &folder);
+                if let Some(item) = snap
+                    .cloud_catalog
+                    .iter_mut()
+                    .find(|item| item.name == folder)
+                    && item.size.bytes().is_none()
+                {
+                    item.size = FolderSize::Calculating;
+                    snap.folder_size_pending = true;
+                }
+            }
+            UiCommand::WizardCancelFolderSize | UiCommand::WizardLeave => {
+                cancel_demo_size(&mut snap)
+            }
+            UiCommand::WizardRefreshFolders => {}
+            UiCommand::DemoFailFolderSize => {
+                let selected = snap.wizard.selected_folder.clone();
+                if let Some(item) = snap
+                    .cloud_catalog
+                    .iter_mut()
+                    .find(|item| item.name == selected && item.size == FolderSize::Calculating)
+                {
+                    item.size = FolderSize::Failed {
+                        cause: "Some files did not report a size.".to_owned(),
+                    };
+                    snap.folder_size_pending = false;
+                }
             }
             UiCommand::WizardCreateNewFolder(name) => {
-                // #4: Create a brand-new empty folder in Data (never hijacking Shared-Media).
-                let clean = sanitize_folder_name(&name);
-                let final_name = if clean.is_empty() {
-                    next_new_folder_name(&snap.cloud_catalog)
-                } else {
-                    clean
-                };
-                if !snap.cloud_catalog.iter().any(|c| c.name == final_name) {
+                let name = name.trim();
+                if snap
+                    .cloud_catalog
+                    .iter()
+                    .any(|item| item.name.eq_ignore_ascii_case(name))
+                {
+                    snap.action_error = Some(format!(
+                        "The name `{name}` is already used in Data. Choose a different folder name."
+                    ));
+                } else if !name.is_empty() {
                     snap.cloud_catalog.push(CloudFolderCandidate {
-                        name: final_name.clone(),
-                        size_gb: Some(0.0),
-                        size_label: "Empty (new folder)".to_owned(),
+                        name: name.to_owned(),
+                        collection: None,
+                        size: FolderSize::Known {
+                            bytes: 0,
+                            files: Some(0),
+                            measured_at: None,
+                        },
                         on_this_mac: None,
                         used_by_other_computer: false,
                     });
+                    apply_wizard_folder_selection(&mut snap, name);
+                    snap.wizard.review_scenario = ReviewScenario::LocalToCloud;
+                    snap.wizard.marker_reused = false;
+                    snap.wizard.cloud_file_count = Some(0);
+                    snap.wizard.cloud_total_bytes = Some(0);
+                    snap.wizard.local_file_count = Some(240);
+                    snap.wizard.local_total_bytes = Some(1_200_000_000);
+                    recompute_wizard_checks(&mut snap);
                 }
-                apply_wizard_folder_selection(&mut snap, &final_name);
-                snap.wizard.review_scenario = ReviewScenario::LocalToCloud;
-                snap.wizard.marker_reused = false;
-                snap.wizard.cloud_file_count = Some(0);
-                snap.wizard.cloud_total_bytes = Some(0);
-                snap.wizard.local_file_count = Some(240);
-                snap.wizard.local_total_bytes = Some(1_200_000_000);
-                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSetRemotePath(path) => {
                 snap.wizard.remote_folder_path = Some(path);
@@ -1121,6 +1160,7 @@ impl DemoSource {
                 }
             }
             UiCommand::WizardReset => {
+                cancel_demo_size(&mut snap);
                 let skip_acct = snap
                     .accounts
                     .iter()
@@ -1329,27 +1369,13 @@ fn promote_next_queued(snap: &mut UiSnapshot) {
     }
 }
 
-fn sanitize_folder_name(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
-        .collect::<String>()
-        .trim()
-        .to_owned()
-}
-
-fn next_new_folder_name(catalog: &[CloudFolderCandidate]) -> String {
-    let base = "New-Folder";
-    if !catalog.iter().any(|c| c.name == base) {
-        return base.to_owned();
-    }
-    for n in 2..=99 {
-        let candidate = format!("{base}-{n}");
-        if !catalog.iter().any(|c| c.name == candidate) {
-            return candidate;
+fn cancel_demo_size(snap: &mut UiSnapshot) {
+    snap.folder_size_pending = false;
+    for folder in &mut snap.cloud_catalog {
+        if folder.size == FolderSize::Calculating {
+            folder.size = FolderSize::Unmeasured;
         }
     }
-    "New-Folder-100".to_owned()
 }
 
 fn demo_subfolders_for_folder(folder: &str, size_gb: Option<f64>) -> Vec<SubfolderNode> {
@@ -1444,15 +1470,17 @@ fn apply_wizard_folder_selection(snap: &mut UiSnapshot, folder: &str) {
         snap.device_id
     );
     snap.wizard.no_other_sync_confirmed = false;
-    snap.wizard.subfolders =
-        demo_subfolders_for_folder(folder, candidate.as_ref().and_then(|c| c.size_gb));
+    snap.wizard.subfolders = demo_subfolders_for_folder(
+        folder,
+        candidate
+            .as_ref()
+            .and_then(|c| c.size.bytes())
+            .map(|bytes| bytes as f64 / 1_000_000_000.0),
+    );
     snap.wizard.marker_reused = candidate.as_ref().is_some_and(|c| c.used_by_other_computer);
-    snap.wizard.cloud_total_bytes = candidate
-        .as_ref()
-        .and_then(|c| c.size_gb)
-        .map(|gb| (gb * 1_000_000_000.0) as u64);
-    snap.wizard.cloud_file_count = match candidate.as_ref().and_then(|c| c.size_gb) {
-        Some(0.0) => Some(0),
+    snap.wizard.cloud_total_bytes = candidate.as_ref().and_then(|c| c.size.bytes());
+    snap.wizard.cloud_file_count = match snap.wizard.cloud_total_bytes {
+        Some(0) => Some(0),
         Some(_) if folder == "Projects" => Some(2_410),
         Some(_) => Some(420),
         None => None,
@@ -1477,8 +1505,13 @@ fn load_mapping_into_wizard(snap: &mut UiSnapshot, m: &MappingSnapshot, step: Wi
     snap.wizard.local_path = m.local_path.clone();
     snap.wizard.local_recovery_path = m.local_recovery_path.clone();
     snap.wizard.cloud_recovery_path = m.cloud_recovery_path.clone();
-    snap.wizard.subfolders =
-        demo_subfolders_for_folder(&folder, candidate.as_ref().and_then(|c| c.size_gb));
+    snap.wizard.subfolders = demo_subfolders_for_folder(
+        &folder,
+        candidate
+            .as_ref()
+            .and_then(|c| c.size.bytes())
+            .map(|bytes| bytes as f64 / 1_000_000_000.0),
+    );
     snap.wizard.custom_patterns = m.custom_exclusions.clone();
     snap.wizard.marker_reused = candidate.as_ref().is_some_and(|c| c.used_by_other_computer);
     snap.wizard.no_other_sync_confirmed = false;
@@ -1756,7 +1789,7 @@ fn rederive_wizard_scenario(snap: &mut UiSnapshot) {
         .cloud_catalog
         .iter()
         .find(|c| c.name == snap.wizard.selected_folder)
-        .is_none_or(|c| c.size_gb.is_none_or(|gb| gb > 0.0));
+        .is_none_or(|c| c.size.bytes().is_none_or(|bytes| bytes > 0));
 
     if snap.wizard.review_scenario == ReviewScenario::BothPopulated {
         if still_blocked_pair || (local_has_files && cloud_has_files) {
@@ -2065,6 +2098,7 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         selected_account: AccountId::new("household"),
         selected_folder: "Projects".to_owned(),
         remote_folder_path: None,
+        drive_collection: None,
         location_checks: Vec::new(),
         local_path,
         volume_name: "WorkSSD".to_owned(),
@@ -2126,6 +2160,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             connected: true,
             total_gb: 994,
             free_gb: 212,
+            free_bytes: Some(212_000_000_000),
             free_label: "212 GB".to_owned(),
             total_label: "994 GB".to_owned(),
             used_percent: 79,
@@ -2140,6 +2175,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             connected: true,
             total_gb: 2000,
             free_gb: 1400,
+            free_bytes: Some(1_400_000_000_000),
             free_label: "1.4 TB".to_owned(),
             total_label: "2 TB".to_owned(),
             used_percent: 30,
@@ -2154,6 +2190,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             connected: false,
             total_gb: 4000,
             free_gb: 0,
+            free_bytes: None,
             free_label: "Unknown".to_owned(),
             total_label: "4 TB".to_owned(),
             used_percent: 0,
@@ -2168,6 +2205,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             connected: true,
             total_gb: 8000,
             free_gb: 260,
+            free_bytes: Some(260_000_000_000),
             free_label: "260 GB".to_owned(),
             total_label: "8 TB".to_owned(),
             used_percent: 97,
@@ -2180,64 +2218,96 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
     let cloud_catalog = vec![
         CloudFolderCandidate {
             name: "Archive".to_owned(),
-            size_gb: Some(4600.0),
-            size_label: "4.6 TB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 4_600_000_000_000,
+                files: None,
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: Some("On ArchiveSSD".to_owned()),
             used_by_other_computer: false,
         },
         CloudFolderCandidate {
             name: "Documents".to_owned(),
-            size_gb: Some(38.0),
-            size_label: "38 GB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 38_000_000_000,
+                files: None,
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: Some("On Internal SSD".to_owned()),
             used_by_other_computer: false,
         },
         CloudFolderCandidate {
             name: "Family".to_owned(),
-            size_gb: Some(86.0),
-            size_label: "86 GB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 86_000_000_000,
+                files: None,
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: Some("On Internal SSD".to_owned()),
             used_by_other_computer: false,
         },
         CloudFolderCandidate {
             name: "Photos-Archive".to_owned(),
-            size_gb: Some(3100.0),
-            size_label: "3.1 TB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 3_100_000_000_000,
+                files: None,
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: Some("On ArchiveSSD".to_owned()),
             used_by_other_computer: false,
         },
         CloudFolderCandidate {
             name: "Photos-Family".to_owned(),
-            size_gb: Some(1200.0),
-            size_label: "1.2 TB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 1_200_000_000_000,
+                files: None,
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: Some("On PhotoSSD".to_owned()),
             used_by_other_computer: false,
         },
         CloudFolderCandidate {
             name: "Projects".to_owned(),
-            size_gb: Some(18.6),
-            size_label: "18.6 GB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 18_600_000_000,
+                files: Some(2_410),
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: None,
             used_by_other_computer: true,
         },
         CloudFolderCandidate {
             name: "Research".to_owned(),
-            size_gb: Some(412.0),
-            size_label: "412 GB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 412_000_000_000,
+                files: None,
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: Some("On WorkSSD".to_owned()),
             used_by_other_computer: false,
         },
         CloudFolderCandidate {
             name: "Shared-Media".to_owned(),
-            size_gb: None,
-            size_label: "Measuring…".to_owned(),
+            collection: None,
+            size: FolderSize::Unmeasured,
             on_this_mac: None,
             used_by_other_computer: false,
         },
         CloudFolderCandidate {
             name: "Teaching".to_owned(),
-            size_gb: Some(22.0),
-            size_label: "22 GB".to_owned(),
+            collection: None,
+            size: FolderSize::Known {
+                bytes: 22_000_000_000,
+                files: None,
+                measured_at: Some("14:20".to_owned()),
+            },
             on_this_mac: Some("On Internal SSD".to_owned()),
             used_by_other_computer: false,
         },
@@ -2276,7 +2346,9 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             inspected_run: None,
             recovery_checklist: None,
             cloud_catalog,
-            cloud_catalog_measured_at: "14:20".to_owned(),
+            skipped_cloud_folders: Vec::new(),
+            cloud_catalog_error: None,
+            folder_size_pending: false,
             wizard: default_wizard_draft(false),
             preferences,
             reconnecting_account: None,
@@ -2317,7 +2389,9 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             inspected_run: None,
             recovery_checklist: None,
             cloud_catalog,
-            cloud_catalog_measured_at: "14:20".to_owned(),
+            skipped_cloud_folders: Vec::new(),
+            cloud_catalog_error: None,
+            folder_size_pending: false,
             wizard: default_wizard_draft(true),
             preferences,
             reconnecting_account: None,
@@ -2476,7 +2550,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             "Today 14:38",
             StatusModifier::None,
             5,
-            "About 14:48, after the queue",
+            "In about 7 minutes",
             5,
             5,
             "38 GB",
@@ -2719,6 +2793,15 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
     ];
 
     if preset == DemoPreset::AllStates {
+        let mut wrong_disk = mappings
+            .iter()
+            .find(|m| m.id.as_str() == "photos-family")
+            .unwrap()
+            .clone();
+        wrong_disk.id = MappingId::new("photos-wrong-disk");
+        wrong_disk.volume_issue = Some("A different disk named PhotoSSD is connected".to_owned());
+        wrong_disk.is_variant_showcase = true;
+        mappings.push(wrong_disk);
         // Every remaining state from the §6 Readiness × Execution × Intent table at once.
         mappings.extend([
             make_mapping(
@@ -3028,7 +3111,18 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
         inspected_run: None,
         recovery_checklist: None,
         cloud_catalog,
-        cloud_catalog_measured_at: "14:20".to_owned(),
+        skipped_cloud_folders: vec![
+            sync_manager::SkippedCollection {
+                name: "Old Projects".to_owned(),
+                reason: sync_manager::CollectionSkipReason::Duplicate,
+            },
+            sync_manager::SkippedCollection {
+                name: "Draft:Notes".to_owned(),
+                reason: sync_manager::CollectionSkipReason::UnsupportedName,
+            },
+        ],
+        cloud_catalog_error: None,
+        folder_size_pending: false,
         wizard: default_wizard_draft(false),
         preferences,
         reconnecting_account: None,
@@ -3092,6 +3186,10 @@ fn make_mapping(
         available_actions: available,
         schedule_minutes,
         next_check_label: next_check_label.to_owned(),
+        next_check: (id == "documents").then(|| ScheduledCheck {
+            at: chrono::Utc::now() + chrono::TimeDelta::minutes(7),
+            retry: false,
+        }),
         scheduling_enabled: state.readiness() == Readiness::Ready,
         volume_issue: None,
         included_subfolders,
@@ -3238,32 +3336,7 @@ pub fn rebuild_attention(snap: &mut UiSnapshot) {
                     },
                 });
             }
-            Readiness::VolumeUnavailable => {
-                items.push(AttentionItem {
-                    id: format!("attn-vol-{}", m.id),
-                    priority: AttentionPriority::VolumeMissing,
-                    mapping_id: Some(m.id.clone()),
-                    mapping_name: Some(m.display_name.clone()),
-                    pill_label: "Waiting".to_owned(),
-                    pill_tone: Tone::Attn,
-                    icon: IconKind::DriveMissing,
-                    is_error_accent: false,
-                    title: format!("Waiting for {}", m.volume_name),
-                    cause: format!(
-                        "{} is stored on {}, which isn't connected.",
-                        m.display_name, m.volume_name
-                    ),
-                    what_did: format!(
-                        "Nothing runs for {}. Nothing is deleted in the cloud because the drive is missing.",
-                        m.display_name
-                    ),
-                    next_step: format!(
-                        "Connect {}. FolderSync checks it and continues on its own.",
-                        m.volume_name
-                    ),
-                    kind: AttentionKind::VolumeMissing { can_check_again: false },
-                });
-            }
+            Readiness::VolumeUnavailable => items.push(m.volume_attention()),
             Readiness::Ready => {
                 if let Some(unrev) = &m.unreviewed_conflicts {
                     let count = unrev.paths.len().max(1);

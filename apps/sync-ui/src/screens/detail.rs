@@ -604,10 +604,20 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     } else {
         "Automatic sync on"
     };
-    let next_check = if scheduling == "Automatic sync on" {
-        m.next_check_label.as_str()
+    let next_check = if scheduling != "Automatic sync on" {
+        text(scheduling).text_color(p.fg).into_element()
+    } else if let Some(check) = m.next_check {
+        let clock = ctrl.schedule_clock;
+        dynamic(move || {
+            text(check.label(clock.get(), false))
+                .text_color(p.fg)
+                .into_element()
+        })
+        .into_element()
     } else {
-        scheduling
+        text(m.next_check_label.clone())
+            .text_color(p.fg)
+            .into_element()
     };
     let schedule_card = card()
         .flex_1()
@@ -620,10 +630,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .text_color(p.fg)
                 .into_element(),
         ))
-        .child(kv_row(
-            "Next check",
-            text(next_check.to_owned()).text_color(p.fg).into_element(),
-        ))
+        .child(kv_row("Next check", next_check))
         .child(kv_row("Last run", text(m.last_completed_label.clone()).text_color(p.fg).into_element()))
         )
         .child(

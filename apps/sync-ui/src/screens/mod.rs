@@ -40,6 +40,7 @@ pub struct AppController {
     /// 1 Hz elapsed-second counter read only by active-run elapsed labels so
     /// unrelated views, inputs, and buttons never rebuild on timer ticks.
     pub elapsed_offset: Signal<u64>,
+    pub schedule_clock: Signal<chrono::DateTime<chrono::Utc>>,
     /// True while controlled shutdown is waiting for an active run to finish stopping.
     pub quitting: Signal<bool>,
     pub source: AppDataSource,
@@ -53,6 +54,7 @@ impl AppController {
             snapshot: signal(initial),
             route: signal(ScreenRoute::Overview),
             elapsed_offset: signal(0),
+            schedule_clock: signal(chrono::Utc::now()),
             quitting: signal(false),
             source: AppDataSource::Manager(manager),
         }
@@ -65,6 +67,7 @@ impl AppController {
             snapshot: signal(initial),
             route: signal(ScreenRoute::Overview),
             elapsed_offset: signal(0),
+            schedule_clock: signal(chrono::Utc::now()),
             quitting: signal(false),
             source: AppDataSource::Demo(demo),
         }
@@ -111,6 +114,10 @@ impl AppController {
 
     /// Navigates to a route in the content area.
     pub fn navigate(&self, route: ScreenRoute) {
+        if route != ScreenRoute::AddMapping && self.route.get_untracked() == ScreenRoute::AddMapping
+        {
+            self.send(UiCommand::WizardLeave);
+        }
         self.route.set(route);
     }
 

@@ -9,8 +9,8 @@ use nsh_core::{file_dialog::OpenDialog, prelude::*};
 use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, VolumeKind};
 
 use crate::contract::{
-    AccountStatus, IconKind, ReviewScenario, ScreenRoute, Tone, UiCommand, UiSnapshot, WizardDraft,
-    WizardStep, format_duration,
+    AccountStatus, FolderSize, IconKind, ReviewScenario, ScreenRoute, Tone, UiCommand, UiSnapshot,
+    WizardDraft, WizardStep, format_bytes, format_duration,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -23,6 +23,8 @@ use crate::theme::{
 /// Renders the Add-mapping wizard inside the main content area (sidebar stays visible).
 pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
     let pattern_input = signal(String::new());
+    let new_folder_open = signal(false);
+    let new_folder_name = signal(String::new());
     dynamic(move || {
         let snap = ctrl.snapshot.get();
         let draft = &snap.wizard;
@@ -51,7 +53,7 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
                         draft.selected_account
                     )
                 } else if snap.accounts.iter().any(|a| a.id == draft.selected_account && a.is_drive) {
-                    "Browsing Google Drive folders is unavailable in this build.".to_owned()
+                    format!("Folders in {}:Data. Pick one; add more afterwards.", draft.selected_account)
                 } else {
                     "Choose a folder from the local test account.".to_owned()
                 }),
@@ -84,7 +86,9 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
 
         let body = match draft.step {
             WizardStep::Account => render_step_account(ctrl.clone(), &snap),
-            WizardStep::Folder => render_step_folder(ctrl.clone(), &snap),
+            WizardStep::Folder => {
+                render_step_folder(ctrl.clone(), &snap, new_folder_open, new_folder_name)
+            }
             WizardStep::Location => render_step_location(ctrl.clone(), draft, snap.is_demo_mode),
             WizardStep::Subfolders => render_step_subfolders(ctrl.clone(), draft, pattern_input),
             WizardStep::Recovery => render_step_recovery(ctrl.clone(), draft),
@@ -96,7 +100,7 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
             .accounts
             .iter()
             .any(|a| a.id == draft.selected_account && a.status == AccountStatus::Connected);
-        let folder_ready = snap.is_demo_mode || draft.remote_folder_path.is_some();
+        let folder_ready = snap.is_demo_mode || draft.has_cloud_folder();
         let footer = render_wizard_footer(
             ctrl.clone(),
             draft,
@@ -197,6 +201,7 @@ fn render_filter_change(
         let can_apply = review.can_apply();
         let c_consent = ctrl.clone();
         if can_apply {
+            let checked = draft.no_other_sync_confirmed;
             checks = checks.child(
                 checkbox()
                     .checked(draft.no_other_sync_confirmed)
@@ -208,7 +213,21 @@ fn render_filter_change(
                     .on_change(move |checked: &bool| {
                         c_consent.send(UiCommand::WizardSetNoOtherSyncConfirmed(*checked))
                     })
-                    .child(radio_circle(draft.no_other_sync_confirmed, false))
+                    .indicator_style(move |s| {
+                        s.w(px(16.0))
+                            .h(px(16.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(if checked { p.primary } else { p.border })
+                            .bg(if checked { p.primary } else { p.bg })
+                            .items_center()
+                            .justify_center()
+                    })
+                    .indicator(if checked {
+                        icon(IconKind::Check, 11.0, p.primary_fg).into_element()
+                    } else {
+                        view().into_element()
+                    })
                     .child(
                         text("I’ve reviewed the changes and want to start a new first sync.")
                             .text_color(p.fg),
@@ -420,32 +439,20 @@ fn render_step_account(ctrl: AppController, snap: &UiSnapshot) -> View {
         })
 }
 
-fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
+fn render_step_folder(
+    ctrl: AppController,
+    snap: &UiSnapshot,
+    new_folder_open: Signal<bool>,
+    new_folder_name: Signal<String>,
+) -> View {
     let p = Palette::current();
     let selected_folder = &snap.wizard.selected_folder;
-    if !snap.is_demo_mode
-        && snap
-            .accounts
-            .iter()
-            .any(|a| a.id == snap.wizard.selected_account && a.is_drive)
-    {
-        return card()
-            .child(
-                app_button(
-                    "New folder in Data…",
-                    BtnKind::Default,
-                    true,
-                    true,
-                    Some(IconKind::Plus),
-                    Some("Folder creation in Data is unavailable in this build"),
-                    || {},
-                )
-                .test_id("wizard-new-folder-btn"),
-            )
-            .child(
-                text("Folder creation in Data is unavailable in this build.").text_color(p.muted),
-            );
-    }
+    let can_create = snap.is_demo_mode
+        || snap.accounts.iter().any(|a| {
+            a.id == snap.wizard.selected_account
+                && a.is_drive
+                && a.status == AccountStatus::Connected
+        });
 
     let mut body = table_body().flex_col().w_full();
     for item in &snap.cloud_catalog {
@@ -492,15 +499,20 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
             )
             .child(
                 table_cell().w(px(86.0)).items_end().child(
-                    text(item.size_label.clone())
-                        .text_size(px(S_COMPACT))
-                        .font_weight(if is_selected { W_TITLE } else { W_BODY })
-                        .text_color(if item.size_gb.is_none() {
-                            p.muted
-                        } else {
-                            p.fg
-                        })
-                        .tabular_nums(),
+                    text(match &item.size {
+                        FolderSize::Unmeasured => "Not measured".to_owned(),
+                        FolderSize::Calculating => "Calculating…".to_owned(),
+                        FolderSize::Known { bytes, .. } => format_bytes(*bytes),
+                        FolderSize::Failed { .. } => "Unavailable".to_owned(),
+                    })
+                    .text_size(px(S_COMPACT))
+                    .font_weight(if is_selected { W_TITLE } else { W_BODY })
+                    .text_color(if item.size.bytes().is_none() {
+                        p.muted
+                    } else {
+                        p.fg
+                    })
+                    .tabular_nums(),
                 ),
             )
             .child(
@@ -516,9 +528,10 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
             );
 
         if !already_mapped {
-            inner = inner.cursor_pointer().on_press(move || {
-                c.send(UiCommand::WizardSelectFolder(name.clone()));
-            });
+            inner = inner
+                .test_id(&format!("wizard-folder-{name}"))
+                .cursor_pointer()
+                .on_press(move || c.send(UiCommand::WizardSelectFolder(name.clone())));
         }
         let row = table_row()
             .w_full()
@@ -528,42 +541,128 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
         body = body.child(row);
     }
 
-    let c_new = ctrl.clone();
-    let is_demo = snap.is_demo_mode;
-    let folder_footer = view()
-        .flex_row()
-        .items_center()
-        .flex_wrap()
-        .gap(px(8.0))
-        .px(px(8.0))
-        .pt(px(6.0))
-        .child(
-            app_button(
-                "New folder in Data…",
+    for skipped in &snap.skipped_cloud_folders {
+        let reason = match skipped.reason {
+            sync_manager::CollectionSkipReason::Duplicate => "Duplicate name",
+            sync_manager::CollectionSkipReason::UnsupportedName => "Unsupported name",
+        };
+        body = body.child(
+            table_row()
+                .w_full()
+                .border_t_1()
+                .border_color(p.hair)
+                .child(
+                    table_cell()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .child(text(format!("{} · {reason}", skipped.name)).text_color(p.muted)),
+                ),
+        );
+    }
+
+    let mut folder_footer = view().flex_col().gap(px(8.0)).px(px(8.0)).pt(px(6.0));
+    if let Some(error) = &snap.cloud_catalog_error {
+        let c = ctrl.clone();
+        folder_footer = folder_footer
+            .child(text(error.clone()).text_color(p.err))
+            .child(view().flex_row().child(app_button(
+                "Try again",
                 BtnKind::Default,
                 true,
-                !is_demo,
-                Some(IconKind::Plus),
-                (!is_demo).then_some(
-                    "Creating new folders inside Data is not available in this build yet",
-                ),
-                move || {
-                    if is_demo {
-                        c_new.send(UiCommand::WizardCreateNewFolder(String::new()));
-                    }
-                },
-            )
-            .test_id("wizard-new-folder-btn"),
-        )
-        .child(
-            text(if is_demo {
-                "Only folders directly inside Data are offered, so collections never overlap."
+                false,
+                None,
+                None,
+                move || c.send(UiCommand::WizardRefreshFolders),
+            )));
+    } else if snap.cloud_catalog.is_empty() && snap.skipped_cloud_folders.is_empty() {
+        folder_footer = folder_footer.child(
+            text(if snap.folder_size_pending {
+                "Finishing the previous size check…"
             } else {
-                "Folder creation in Data is unavailable in this build."
+                "No folders found in Data."
             })
-            .text_size(px(S_CAPTION))
             .text_color(p.muted),
         );
+    }
+
+    if can_create {
+        let c = ctrl.clone();
+        let size_pending = snap.folder_size_pending;
+        folder_footer = folder_footer.child(
+            view()
+                .flex_row()
+                .items_center()
+                .flex_wrap()
+                .gap(px(8.0))
+                .child(app_button(
+                    "New folder in Data…",
+                    BtnKind::Default,
+                    true,
+                    snap.folder_size_pending,
+                    Some(IconKind::Plus),
+                    snap.folder_size_pending.then_some("Finish or cancel the size check first"),
+                    move || new_folder_open.set(true),
+                ).test_id("wizard-new-folder-btn"))
+                .child(
+                    text("Only folders directly inside Data are offered, so collections never overlap.")
+                        .text_size(px(S_CAPTION))
+                        .text_color(p.muted),
+                ),
+        );
+        if new_folder_open.get() {
+            folder_footer = folder_footer.child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        input()
+                            .test_id("wizard-new-folder-name")
+                            .placeholder("Folder name")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(p.border)
+                            .bg(p.bg)
+                            .text_color(p.fg)
+                            .focus(focus_ring)
+                            .value(move || new_folder_name.get())
+                            .on_change(move |value: &str| new_folder_name.set(value.to_owned())),
+                    )
+                    .child(app_button(
+                        "Cancel",
+                        BtnKind::Default,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || new_folder_open.set(false),
+                    ))
+                    .child(dynamic(move || {
+                        let c = c.clone();
+                        app_button(
+                            "Create folder",
+                            BtnKind::Primary,
+                            true,
+                            new_folder_name.get().trim().is_empty() || size_pending,
+                            None,
+                            None,
+                            move || {
+                                c.send(UiCommand::WizardCreateNewFolder(
+                                    new_folder_name.get_untracked(),
+                                ));
+                                new_folder_open.set(false);
+                            },
+                        )
+                        .test_id("wizard-create-folder-btn")
+                        .into_element()
+                    })),
+            );
+        }
+    }
 
     let folder_table_card = card()
         .flex_1()
@@ -598,30 +697,83 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
         )
         .child(folder_footer);
 
-    // Side card: "Where <Folder> fits" — handle unknown size ("Measuring…") honestly (#4).
-    let selected_candidate = snap
+    let selected_size = snap
         .cloud_catalog
         .iter()
-        .find(|f| f.name == *selected_folder);
-    let selected_size_gb = selected_candidate.and_then(|f| f.size_gb);
-    let selected_size_label = selected_candidate
-        .map(|f| f.size_label.clone())
-        .unwrap_or_else(|| "Size unknown".to_owned());
-
-    let size_header = if selected_size_gb.is_some() {
-        format!(
-            "About {selected_size_label}, measured at {}",
-            snap.cloud_catalog_measured_at
-        )
-    } else {
-        "Size is still being measured — free space is checked once measured.".to_owned()
+        .find(|item| item.name == *selected_folder)
+        .map(|item| &item.size);
+    let size_header = match selected_size {
+        Some(FolderSize::Known { bytes, files, .. }) => {
+            let size = format_bytes(*bytes);
+            files.map_or(size.clone(), |count| {
+                format!(
+                    "{size} · {count} {}",
+                    if count == 1 { "file" } else { "files" }
+                )
+            })
+        }
+        Some(FolderSize::Calculating) => "Calculating the selected folder’s size…".to_owned(),
+        Some(FolderSize::Failed { cause }) => cause.clone(),
+        Some(FolderSize::Unmeasured) => "Select the folder again to calculate its size.".to_owned(),
+        None => "Choose a folder to compare its size with available space.".to_owned(),
     };
 
+    let fit_title = if selected_folder.is_empty() {
+        "Space on this Mac".to_owned()
+    } else {
+        format!("Where {selected_folder} fits")
+    };
     let mut fit_card = card()
         .w(px(276.0))
         .flex_none()
-        .child(card_title(format!("Where {selected_folder} fits")))
+        .child(card_title(fit_title))
         .child(text(size_header).text_size(px(S_SMALL)).text_color(p.muted));
+    if let Some(FolderSize::Known {
+        measured_at: Some(at),
+        ..
+    }) = selected_size
+    {
+        fit_card = fit_card.child(
+            text(format!("Measured at {at}"))
+                .text_size(px(S_CAPTION))
+                .text_color(p.muted),
+        );
+    }
+    if selected_size == Some(&FolderSize::Calculating) {
+        let c = ctrl.clone();
+        let mut actions = view().flex_row().flex_wrap().gap(px(8.0)).child(
+            app_button(
+                "Cancel calculation",
+                BtnKind::Default,
+                true,
+                false,
+                None,
+                None,
+                move || c.send(UiCommand::WizardCancelFolderSize),
+            )
+            .test_id("wizard-cancel-size-btn"),
+        );
+        if snap.is_demo_mode {
+            let c = ctrl.clone();
+            actions = actions.child(
+                app_button(
+                    "Show size failure (demo)",
+                    BtnKind::Ghost,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || c.send(UiCommand::DemoFailFolderSize),
+                )
+                .test_id("wizard-demo-fail-size-btn"),
+            );
+        }
+        fit_card = fit_card.child(actions);
+    }
+    if snap.volumes.is_empty() {
+        fit_card = fit_card
+            .child(text("Choose a destination to check its free space.").text_color(p.muted));
+    }
 
     for vol in &snap.volumes {
         let icon_kind = if !vol.connected {
@@ -633,8 +785,11 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
         };
         let (fit_text, fit_color) = if !vol.connected {
             ("Not connected".to_owned(), p.muted)
-        } else if let Some(size_gb) = selected_size_gb {
-            if (vol.free_gb as f64) < size_gb {
+        } else if let Some((size, free)) = selected_size
+            .and_then(FolderSize::bytes)
+            .zip(vol.free_bytes)
+        {
+            if free < size {
                 (format!("{} free · doesn't fit", vol.free_label), p.err)
             } else if vol.low_space {
                 (format!("{} free · fits, low", vol.free_label), p.attn)
@@ -642,7 +797,7 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
                 (format!("{} free · fits", vol.free_label), p.ok)
             }
         } else {
-            (format!("{} free · size measuring", vol.free_label), p.muted)
+            (format!("{} free", vol.free_label), p.muted)
         };
         fit_card = fit_card.child(
             view()
@@ -726,19 +881,27 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
         );
     }
 
-    let free_after = (draft.volume_free_gb as f64 - draft.included_gb()).max(0.0);
-    let free_after_label = if free_after >= 1000.0 {
-        format!("{:.2} TB", free_after / 1000.0)
-    } else {
-        format!("{free_after:.0} GB")
-    };
-    let free_now_label = if draft.volume_free_gb >= 1000 {
-        format!("{:.1} TB", draft.volume_free_gb as f64 / 1000.0)
-    } else {
-        format!("{} GB", draft.volume_free_gb)
-    };
-    let space_line =
-        format!("{free_now_label} free now · about {free_after_label} free after the first sync");
+    let space_line = draft.volume_free_bytes.map_or_else(
+        || "Free space unknown".to_owned(),
+        |free| {
+            let free_now = format_bytes(free);
+            match (draft.review_scenario, draft.cloud_total_bytes) {
+                (ReviewScenario::CloudToLocal, Some(bytes)) if bytes > free => {
+                    format!(
+                        "{free_now} free · download needs about {}",
+                        format_bytes(bytes)
+                    )
+                }
+                (ReviewScenario::CloudToLocal, Some(bytes)) => {
+                    format!(
+                        "{free_now} free now · about {} free after the first sync",
+                        format_bytes(free - bytes)
+                    )
+                }
+                _ => format!("{free_now} free"),
+            }
+        },
+    );
     let used_pct = draft
         .volume_total_gb
         .saturating_sub(draft.volume_free_gb)

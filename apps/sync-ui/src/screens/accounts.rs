@@ -520,7 +520,7 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot, busy: bool) -> View
         ));
     }
 
-    if acct.is_drive && acct.status != AccountStatus::SignInRequired {
+    if acct.is_drive {
         actions = actions.child(app_button(
             "Check access",
             BtnKind::Default,

@@ -85,6 +85,7 @@ fn test_mgr_config(
         finder_status_dir: Some(finder_dir),
         launcher: Some(launcher),
         account_service: None,
+        manager_accounts: None,
         finder_notifier: Some(notifier),
         finder_heartbeat_interval: None,
         shutdown_timeout: Duration::from_secs(5),
@@ -931,7 +932,7 @@ fn manager_source_confirms_new_subfolders_before_reinitializing() {
 
 #[test]
 fn manager_source_reports_pending_verified_and_held_drive_access() {
-    use nsh_app_sync_ui::contract::AccountStatus;
+    use nsh_app_sync_ui::contract::{AccountStatus, FolderSize};
     use rclone_adapter::{FakeProcessRunner, FakeRunScript};
     use sync_core::{AccountId, DeviceId};
     use sync_manager::{
@@ -947,7 +948,7 @@ fn manager_source_reports_pending_verified_and_held_drive_access() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let (state_dir, finder_dir, ..) = setup_dirs(tmp.path());
+    let (state_dir, finder_dir, ..) = setup_dirs(&tmp.path().canonicalize().unwrap());
     let account_dir = state_dir.join("accounts/drive-test");
     fs::create_dir_all(&account_dir).unwrap();
     let config_path = account_dir.join("rclone.conf");
@@ -1006,11 +1007,15 @@ fn manager_source_reports_pending_verified_and_held_drive_access() {
         "[test-drive]\ntype = drive\ntoken = XXX",
     ));
     runner.push_run(script(StreamKind::Stdout, "[]"));
-    let mut service_config = AccountServiceConfig::with_state_dir(&state_dir);
-    service_config.rclone_binary_override = Some(binary);
-    service_config.secret_store = secrets.clone();
-    service_config.process_runner = runner;
-    let service = AccountService::for_locked_manager(service_config).unwrap();
+    let account_config = || {
+        let mut config = AccountServiceConfig::with_state_dir(&state_dir);
+        config.rclone_binary_override = Some(binary.clone());
+        config.secret_store = secrets.clone();
+        config.process_runner = runner.clone();
+        config
+    };
+    let manager_accounts = account_config();
+    let service = AccountService::for_locked_manager(account_config()).unwrap();
 
     let mut config = test_mgr_config(
         state_dir,
@@ -1019,6 +1024,7 @@ fn manager_source_reports_pending_verified_and_held_drive_access() {
         Arc::new(RecordingFinderNotifier::new()),
     );
     config.account_service = Some(Arc::new(service));
+    config.manager_accounts = Some(manager_accounts);
     let sys = Arc::new(RecordingSystemActions::new());
     let mgr = ManagerSource::spawn(config, sys.clone());
     let pending = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.accounts.is_empty());
@@ -1038,11 +1044,119 @@ fn manager_source_reports_pending_verified_and_held_drive_access() {
         vec![RecordedSystemAction::OpenDriveAuthorization]
     );
 
-    secrets.delete_secret(&key).unwrap();
-    mgr.dispatch(UiCommand::CheckAccountAccess(id));
+    let data = r#"[{"Name":"Data","Path":"Data","IsDir":true,"ID":"data-id"}]"#;
+    let research = r#"[{"Name":"Research","Path":"Research","IsDir":true,"ID":"research-id"}]"#;
+    let with_skipped = r#"[
+        {"Name":"Research","Path":"Research","IsDir":true,"ID":"research-id"},
+        {"Name":"Old","Path":"Old","IsDir":true,"ID":"old-one"},
+        {"Name":"Old","Path":"Old","IsDir":true,"ID":"old-two"}
+    ]"#;
+    let listing = |children| {
+        runner.push_run(script(StreamKind::Stdout, data));
+        runner.push_run(script(StreamKind::Stdout, children));
+    };
+    listing(with_skipped);
+    mgr.dispatch(UiCommand::WizardReset);
+    let catalog = wait_for_snapshot(&mgr, Duration::from_secs(20), |s| {
+        !s.cloud_catalog.is_empty() || s.cloud_catalog_error.is_some()
+    });
+    assert_eq!(catalog.cloud_catalog_error, None);
+    assert_eq!(catalog.cloud_catalog.len(), 1);
+    assert_eq!(catalog.cloud_catalog[0].size, FolderSize::Unmeasured);
+    assert_eq!(catalog.skipped_cloud_folders[0].name, "Old");
+    assert_eq!(
+        catalog.skipped_cloud_folders[0].reason,
+        sync_manager::CollectionSkipReason::Duplicate
+    );
+
+    listing(research);
+    runner.push_run(FakeRunScript {
+        wait_for_stop: true,
+        ..Default::default()
+    });
+    let expected_spawn_count = runner.spawned_specs().len() + 3;
+    mgr.dispatch(UiCommand::WizardSelectFolder("Research".to_owned()));
+    let measuring = wait_for_snapshot(&mgr, Duration::from_secs(20), |s| s.folder_size_pending);
+    assert_eq!(measuring.cloud_catalog[0].size, FolderSize::Calculating);
+    assert_eq!(
+        measuring
+            .wizard
+            .drive_collection
+            .as_ref()
+            .unwrap()
+            .ancestor_ids,
+        ["test-parent", "data-id"]
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while runner.spawned_specs().len() < expected_spawn_count {
+        assert!(Instant::now() < deadline, "fake size process did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    mgr.dispatch(UiCommand::WizardCancelFolderSize);
+    let canceled = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| !s.folder_size_pending);
+    assert_eq!(canceled.cloud_catalog[0].size, FolderSize::Unmeasured);
+
+    listing(research);
+    runner.push_run(script(
+        StreamKind::Stdout,
+        r#"{"count":2,"bytes":25,"sizeless":0}"#,
+    ));
+    listing(research);
+    mgr.dispatch(UiCommand::WizardSelectFolder("Research".to_owned()));
+    let measured = wait_for_snapshot(&mgr, Duration::from_secs(30), |s| {
+        matches!(
+            s.cloud_catalog[0].size,
+            FolderSize::Known { .. } | FolderSize::Failed { .. }
+        )
+    });
+    assert!(
+        matches!(
+            measured.cloud_catalog[0].size,
+            FolderSize::Known {
+                bytes: 25,
+                files: Some(2),
+                ..
+            }
+        ),
+        "{:?}",
+        measured.cloud_catalog[0].size
+    );
+
+    listing(research);
+    mgr.dispatch(UiCommand::WizardCreateNewFolder("Research".to_owned()));
+    let duplicate = wait_for_snapshot(&mgr, Duration::from_secs(20), |s| s.action_error.is_some());
+    assert!(
+        duplicate
+            .action_error
+            .unwrap()
+            .contains("already used in Data")
+    );
+
+    secrets.set_locked(true);
+    mgr.dispatch(UiCommand::CheckAccountAccess(id.clone()));
     let held = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
         s.accounts[0].status == AccountStatus::SignInRequired
     });
-    assert!(held.action_error.is_some());
+    assert!(held.action_error.unwrap().contains("choose Check access"));
+    secrets.set_locked(false);
+
+    let mut browser_wait = script(
+        StreamKind::Stderr,
+        "NOTICE: Please go to the following link: http://127.0.0.1:53682/auth?state=fixture",
+    );
+    browser_wait.wait_for_stop = true;
+    runner.push_run(browser_wait);
+    mgr.dispatch(UiCommand::ReconnectAccount(id));
+    wait_for_snapshot(&mgr, Duration::from_secs(20), |s| {
+        s.can_reopen_authorization
+    });
+    mgr.request_controlled_shutdown();
+    let quit = drain_control_until(&mgr, Duration::from_secs(4), |event| {
+        matches!(event, UiControlEvent::QuitReady(_))
+    });
+    assert!(matches!(
+        quit,
+        Some(UiControlEvent::QuitReady(ControlledShutdownOutcome::Clean))
+    ));
     mgr.shutdown();
 }
