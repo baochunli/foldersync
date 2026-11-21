@@ -5,7 +5,9 @@ with local directories. Each folder can have a different local destination,
 including an external disk.
 
 **Status** — prototype, not for real data. The desktop app opens a placeholder
-window. The CLI prints its version and help.
+window. `sync-cli` provides local-to-local fixture commands (`status`,
+`add-mapping`, `init`, `run-once`, `pause`, `resume`, requiring an explicit
+`--state-dir <dir>`) backed by `sync-manager`.
 
 ## Development
 
