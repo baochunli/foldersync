@@ -39,6 +39,8 @@ impl Schedule {
     }
 
     pub fn due(&self, now: DateTime<Utc>, interval_secs: u64) -> bool {
+        // A network hint cannot distinguish a resolved outage from throttling,
+        // which also uses retryable backoff.
         if let Some(retry_at) = self.retry_at {
             return now >= retry_at;
         }

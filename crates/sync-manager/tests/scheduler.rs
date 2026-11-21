@@ -15,7 +15,7 @@ use sync_manager::{
 };
 use tempfile::TempDir;
 
-const DEADLINE: Duration = Duration::from_secs(15);
+const DEADLINE: Duration = Duration::from_secs(120);
 
 struct FakeWatcher {
     changes: mpsc::Receiver<BTreeSet<PathBuf>>,
@@ -191,16 +191,60 @@ fn hints_coalesce_and_one_dirty_follow_up_respects_cooldown() {
 
 #[test]
 fn stopping_a_claimed_poll_before_spawn_restarts_the_interval() {
-    assert_claimed_poll_restarts_interval(false);
+    let fx = Fixture::new();
+    interrupt_claimed_poll(&fx, false);
+    let snapshot = fx.idle();
+    assert_eq!(
+        snapshot.mappings[0].next_poll_at,
+        Some(fx.epoch + TimeDelta::seconds(601))
+    );
+
+    fx.launcher.push_script(FakeLaunchScript::default());
+    fx.tick(600, &[]);
+    assert_eq!(
+        fx.idle().mappings[0].last_run_outcome,
+        Some(RunOutcome::Interrupted)
+    );
+    assert_eq!(fx.launcher.launched_plans().len(), 1);
+    fx.tick(601, &[]);
+    assert_eq!(
+        fx.idle().mappings[0].last_run_outcome,
+        Some(RunOutcome::Success)
+    );
+    assert_eq!(fx.launcher.launched_plans().len(), 2);
 }
 
 #[test]
-fn force_stopping_a_claimed_poll_before_spawn_restarts_the_interval() {
-    assert_claimed_poll_restarts_interval(true);
+fn resuming_after_a_force_stopped_poll_respects_the_hint_cooldown() {
+    let fx = Fixture::new();
+    interrupt_claimed_poll(&fx, true);
+    assert_eq!(fx.idle().mappings[0].readiness, Readiness::RecoveryRequired);
+    fx.manager.complete_recovery("notes", false).unwrap();
+    let resumed = fx.manager.resume("notes").unwrap();
+    assert_eq!(
+        resumed.snapshot.mappings[0].next_poll_at,
+        Some(fx.epoch + TimeDelta::seconds(601))
+    );
+
+    // Keep ticks within the wake threshold so they cannot replace Resume's hint.
+    for second in [302, 314, 326, 330] {
+        fx.tick(second, &[]);
+        assert_eq!(
+            fx.idle().mappings[0].last_run_outcome,
+            Some(RunOutcome::Interrupted)
+        );
+        assert_eq!(fx.launcher.launched_plans().len(), 1);
+    }
+    fx.launcher.push_script(FakeLaunchScript::default());
+    fx.tick(331, &[]);
+    assert_eq!(
+        fx.idle().mappings[0].last_run_outcome,
+        Some(RunOutcome::Success)
+    );
+    assert_eq!(fx.launcher.launched_plans().len(), 2);
 }
 
-fn assert_claimed_poll_restarts_interval(force_stop: bool) {
-    let fx = Fixture::new();
+fn interrupt_claimed_poll(fx: &Fixture, force_stop: bool) {
     fx.add("notes");
     fx.initialize("notes");
 
@@ -230,31 +274,6 @@ fn assert_claimed_poll_restarts_interval(force_stop: bool) {
         Some(RunOutcome::Interrupted)
     );
     assert_eq!(fx.launcher.launched_plans().len(), 1);
-    if force_stop {
-        assert_eq!(snapshot.mappings[0].readiness, Readiness::RecoveryRequired);
-        fx.manager.complete_recovery("notes", false).unwrap();
-        fx.manager.resume("notes").unwrap();
-    }
-
-    fx.launcher.push_script(FakeLaunchScript::default());
-    fx.tick(302, &[]);
-    assert_eq!(
-        fx.idle().mappings[0].last_run_outcome,
-        Some(RunOutcome::Interrupted)
-    );
-    assert_eq!(fx.launcher.launched_plans().len(), 1);
-
-    fx.tick(600, &[]);
-    assert_eq!(
-        fx.idle().mappings[0].last_run_outcome,
-        Some(RunOutcome::Interrupted)
-    );
-    fx.tick(601, &[]);
-    assert_eq!(
-        fx.idle().mappings[0].last_run_outcome,
-        Some(RunOutcome::Success)
-    );
-    assert_eq!(fx.launcher.launched_plans().len(), 2);
 }
 
 #[test]

@@ -6863,6 +6863,9 @@ fn abort_endpoint_check_failed_locked(
             ("authentication_failure", RunOutcome::AuthenticationFailure)
         }
         Some(_) => ("endpoint_mismatch", RunOutcome::EndpointMismatch),
+        None if matches!(err, ManagerError::AccountBusy { .. }) => {
+            ("retryable", RunOutcome::RetryableFailure)
+        }
         None => ("preflight_failed", RunOutcome::RetryableFailure),
     };
     run.status = "failed".to_string();
@@ -6912,7 +6915,11 @@ fn abort_endpoint_check_failed_locked(
     guard.active_run = None;
     guard.volumes.insert(run.mapping_id.clone(), volume);
     if let Some(schedule) = guard.schedules.get_mut(&run.mapping_id) {
-        schedule.finish(inner.clock.now_utc(), false, run.id.as_str());
+        schedule.finish(
+            inner.clock.now_utc(),
+            outcome_kind == "retryable",
+            run.id.as_str(),
+        );
     }
     let _ = publish_updated_snapshot(inner, guard);
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
