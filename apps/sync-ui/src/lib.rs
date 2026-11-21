@@ -1,21 +1,520 @@
-//! The FolderSync prototype's Rust root component.
+//! FolderSync NSH desktop interface (Group 3: approved mockups driven by an in-memory demo source).
+//!
+//! No real `sync-manager`, `rclone` binary, Keychain, or filesystem mutation occurs in this crate.
 
-use nsh_base::theme;
-use nsh_core::prelude::*;
+pub mod contract;
+pub mod demo;
+pub mod screens;
+pub mod theme;
+
+use std::rc::Rc;
+use std::time::Duration;
+
+use nsh_core::{
+    desktop::{MenuRole, QuitRequestOptions},
+    element::desktop::{
+        MenuItem, main_window, on_quit_request, set_application_menu, set_quit_request_options,
+        set_tray, tray,
+    },
+    prelude::*,
+};
+
+use crate::contract::{
+    ScreenRoute, UiCommand, selected_stop_target, selected_sync_now_target,
+    should_show_window_at_launch,
+};
+use crate::demo::DemoSource;
+use crate::screens::{
+    AppController, accounts::accounts_view, activity::activity_view, attention::attention_view,
+    attention::recovery_view, detail::detail_view, overview::overview_view,
+    preferences::preferences_view, sidebar::sidebar_view, wizard::wizard_view,
+};
+use crate::theme::{Palette, TRAY_ATTENTION_ICON, TRAY_ICON};
+
+/// Bundled crate assets (`PaperMono-Regular.ttf`, tray template SVGs, Welcome illustration).
+pub const CRATE_ASSETS: &[nsh_core::element::AssetFile] = assets!();
 
 #[native_module("sync-ui/native")]
 fn native(registry: &mut Registry) {
-    registry.register::<App>();
+    registry.assets(CRATE_ASSETS).register::<App>();
 }
 
-/// The application's root component.
+/// Marshals a UI state update onto the main thread using NSH's documented
+/// `run_on_main_thread` mechanism so worker/background threads never mutate UI signals directly.
+pub fn marshal_to_main_thread(work: impl FnOnce() + Send + 'static) {
+    drop(run_on_main_thread(work));
+}
+
+/// The FolderSync desktop application root component.
 #[component]
 pub fn App() -> impl IntoElement {
+    let demo = Rc::new(DemoSource::default());
+    let ctrl = AppController::new(demo);
+
+    // Keep-alive-on-close: closing the window hides it while the tray stays active (§3, §14).
+    let win = main_window();
+    win.on_close_press(move |_| {
+        main_window().hide();
+    });
+
+    // Spec §3: `nsh.json` starts the window hidden (`defaultVisible: false`).
+    // Show it when no account or mapping exists yet, or on a manual launch (not a login launch).
+    let launched_at_login = std::env::args().any(|a| a == "--login-launch")
+        || std::env::var_os("FOLDERSYNC_LOGIN_LAUNCH").is_some();
+    if ctrl
+        .snapshot
+        .with_untracked(|s| should_show_window_at_launch(s, launched_at_login))
+    {
+        main_window().show();
+        main_window().focus();
+    }
+
+    // Controlled shutdown handler shared by tray Quit, ⌘Q, and system quit (§5.9).
+    set_quit_request_options(
+        QuitRequestOptions::default()
+            .system(true)
+            .main_window_close(false),
+    );
+    {
+        let c_quit = ctrl.clone();
+        on_quit_request(move || {
+            c_quit.request_controlled_quit();
+        });
+    }
+
+    // Native macOS menu-bar (tray) icon & menu (§5.9).
+    // No `on_click` handler so primary click opens the menu directly.
+    {
+        let c_tray = ctrl.clone();
+        effect(move || {
+            let snap = c_tray.snapshot.get();
+            let attn_count = snap.attention_badge_count();
+            let ready_count = snap.ready_mapping_count();
+            let sched_paused = snap.scheduling_paused;
+            let status_line = snap.tray_status_line();
+            let tip = snap.tray_tooltip();
+
+            let c_sync = c_tray.clone();
+            let c_pause = c_tray.clone();
+            let c_quit = c_tray.clone();
+
+            let tray_icon = if attn_count > 0 {
+                TRAY_ATTENTION_ICON
+            } else {
+                TRAY_ICON
+            };
+
+            set_tray(
+                tray().icon(tray_icon).tooltip(tip).menu([
+                    MenuItem::new(status_line).disabled(true),
+                    MenuItem::separator(),
+                    MenuItem::new("Show window").on_select(|| {
+                        main_window().show();
+                        main_window().focus();
+                    }),
+                    MenuItem::new("Sync ready mappings")
+                        .disabled(ready_count == 0)
+                        .on_select(move || {
+                            c_sync.send(UiCommand::SyncReadyMappings);
+                        }),
+                    MenuItem::new("Pause scheduling")
+                        .checked(sched_paused)
+                        .on_select(move || {
+                            c_pause.send(UiCommand::SetSchedulingPaused(!sched_paused));
+                        }),
+                    MenuItem::separator(),
+                    MenuItem::new("Quit FolderSync")
+                        .shortcut("mod+q")
+                        .on_select(move || {
+                            c_quit.request_controlled_quit();
+                        }),
+                ]),
+            );
+        });
+    }
+
+    // Application menu providing keyboard shortcuts while the window is active (§8):
+    // ⌘N Add mapping…, ⌘R Sync now (selected mapping only), ⌘. Stop (displayed run), ⌘, Preferences.
+    {
+        let c_menu = ctrl.clone();
+        effect(move || {
+            let route = c_menu.route.get();
+            let snap = c_menu.snapshot.get();
+            let sync_target = selected_sync_now_target(&route, &snap);
+            let stop_target = selected_stop_target(&route, &snap);
+
+            let c_add = c_menu.clone();
+            let c_sync = c_menu.clone();
+            let c_stop = c_menu.clone();
+            let c_prefs = c_menu.clone();
+            let c_quit = c_menu.clone();
+
+            let sync_disabled = sync_target.is_none();
+            let stop_disabled = stop_target.is_none();
+
+            set_application_menu(vec![
+                MenuItem::submenu(
+                    "FolderSync",
+                    [
+                        MenuItem::role(MenuRole::About),
+                        MenuItem::separator(),
+                        MenuItem::new("Preferences…")
+                            .shortcut("mod+,")
+                            .on_select(move || {
+                                c_prefs.navigate(ScreenRoute::Preferences);
+                            }),
+                        MenuItem::separator(),
+                        MenuItem::role(MenuRole::Hide),
+                        MenuItem::role(MenuRole::HideOthers),
+                        MenuItem::role(MenuRole::ShowAll),
+                        MenuItem::separator(),
+                        MenuItem::new("Quit FolderSync")
+                            .shortcut("mod+q")
+                            .on_select(move || {
+                                c_quit.request_controlled_quit();
+                            }),
+                    ],
+                ),
+                MenuItem::submenu(
+                    "Mappings",
+                    [
+                        MenuItem::new("Add mapping…")
+                            .shortcut("mod+n")
+                            .on_select(move || {
+                                c_add.open_wizard();
+                            }),
+                        MenuItem::new("Sync now")
+                            .shortcut("mod+r")
+                            .disabled(sync_disabled)
+                            .on_select(move || {
+                                if let Some(id) = sync_target.clone() {
+                                    c_sync.send(UiCommand::SyncNow(id));
+                                }
+                            }),
+                        MenuItem::new("Stop")
+                            .shortcut("mod+.")
+                            .disabled(stop_disabled)
+                            .on_select(move || {
+                                if let Some(id) = stop_target.clone() {
+                                    c_stop.send(UiCommand::StopRun(id));
+                                }
+                            }),
+                    ],
+                ),
+                MenuItem::submenu(
+                    "Edit",
+                    [
+                        MenuItem::role(MenuRole::Undo),
+                        MenuItem::role(MenuRole::Redo),
+                        MenuItem::separator(),
+                        MenuItem::role(MenuRole::Cut),
+                        MenuItem::role(MenuRole::Copy),
+                        MenuItem::role(MenuRole::Paste),
+                        MenuItem::role(MenuRole::SelectAll),
+                    ],
+                ),
+                MenuItem::submenu(
+                    "Window",
+                    [
+                        MenuItem::new("Show window")
+                            .shortcut("mod+0")
+                            .on_select(|| {
+                                main_window().show();
+                                main_window().focus();
+                            }),
+                        MenuItem::separator(),
+                        MenuItem::role(MenuRole::Minimize),
+                        MenuItem::role(MenuRole::Zoom),
+                        MenuItem::role(MenuRole::Close),
+                    ],
+                ),
+            ]);
+        });
+    }
+
+    // Throttled 1 Hz progress refresh (~1 update/sec per §5.5 & §16).
+    // Updates only the fine-grained `elapsed_offset` signal so views, inputs, and
+    // focus never rebuild on timer ticks.
+    {
+        let c_tick = ctrl.clone();
+        let tick_task = set_interval(Duration::from_secs(1), move || {
+            if c_tick.snapshot.with_untracked(|s| s.active_run.is_some()) {
+                c_tick.elapsed_offset.update(|v| *v = v.saturating_add(1));
+            }
+        });
+        cleanup(move || tick_task.cancel());
+    }
+
+    let c_content = ctrl.clone();
+    let c_sidebar = ctrl.clone();
+
     view()
         .flex_1()
-        .bg(move || theme().background)
-        .text_color(move || theme().foreground)
-        .items_center()
-        .justify_center()
-        .child(text("FolderSync — prototype").text_size(px(28.0)))
+        .w_full()
+        .h_full()
+        .flex_row()
+        .bg(move || Palette::current().bg)
+        .text_color(move || Palette::current().fg)
+        .child(sidebar_view(c_sidebar))
+        .child(
+            view()
+                .flex_1()
+                .h_full()
+                .flex_col()
+                .bg(move || Palette::current().bg)
+                // Top window drag bar above scrollable content
+                .child(view().window_drag(true).w_full().h(move || {
+                    let inset = nsh_core::element::desktop::title_bar().top.0;
+                    px(inset.max(12.0))
+                }))
+                .child(
+                    scroll().flex_1().w_full().child(
+                        view()
+                            .w_full()
+                            .px(px(20.0))
+                            .pt(px(8.0))
+                            .pb(px(32.0))
+                            .child(dynamic(move || match c_content.route.get() {
+                                ScreenRoute::Overview => {
+                                    overview_view(c_content.clone()).into_element()
+                                }
+                                ScreenRoute::MappingDetail(id) => {
+                                    detail_view(c_content.clone(), id).into_element()
+                                }
+                                ScreenRoute::AddMapping => {
+                                    wizard_view(c_content.clone()).into_element()
+                                }
+                                ScreenRoute::Activity => {
+                                    activity_view(c_content.clone()).into_element()
+                                }
+                                ScreenRoute::Attention => {
+                                    attention_view(c_content.clone()).into_element()
+                                }
+                                ScreenRoute::Recovery(id) => {
+                                    recovery_view(c_content.clone(), id).into_element()
+                                }
+                                ScreenRoute::Accounts => {
+                                    accounts_view(c_content.clone()).into_element()
+                                }
+                                ScreenRoute::Preferences => {
+                                    preferences_view(c_content.clone()).into_element()
+                                }
+                            })),
+                    ),
+                ),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use nsh_base::Theme;
+    use sync_core::{Execution, Intent, MappingId, Readiness};
+
+    use crate::contract::{DemoPreset, ReviewScenario, UiCommand};
+    use crate::demo::DemoSource;
+    use crate::theme::{PAPER_MONO_FONT, mono_font_family};
+
+    #[test]
+    fn paper_mono_font_asset_and_theme_parse_cleanly() {
+        assert_eq!(PAPER_MONO_FONT.family, "Paper Mono");
+        assert_eq!(mono_font_family(), "Paper Mono");
+        assert!(
+            crate::CRATE_ASSETS
+                .iter()
+                .any(|a| a.uri.ends_with("fonts/PaperMono-Regular.ttf")),
+            "PaperMono-Regular.ttf must be registered in crate assets"
+        );
+
+        let raw_theme = include_str!("../theme.json");
+        let (parsed, ignored) = Theme::from_json_lenient(raw_theme).expect("theme.json must parse");
+        assert!(
+            ignored.is_empty(),
+            "theme.json must have no ignored entries: {ignored:?}"
+        );
+        assert_eq!(parsed.font_mono.as_deref(), Some("Paper Mono"));
+        assert_eq!(
+            parsed.font_sans, None,
+            "sans-serif must remain macOS system font (no bundled sans)"
+        );
+
+        // Verify mono_text() (used by mono_path()) explicitly applies Paper Mono to rendered path elements.
+        use nsh_core::prelude::{AdaptiveColor, Styled};
+        let mut path_el = crate::theme::mono_text(
+            "household:Data/Documents",
+            11.0,
+            AdaptiveColor::rgb(0x62636b, 0xa9aab2),
+        );
+        let style_dbg = format!("{:?}", path_el.style());
+        assert!(
+            style_dbg.contains("Paper Mono"),
+            "mono_text/mono_path must apply Paper Mono font family, got: {style_dbg}"
+        );
+    }
+
+    #[test]
+    fn demo_all_states_covers_every_spec_state_and_attention_count() {
+        let demo = DemoSource::new(DemoPreset::AllStates);
+        let snap = demo.snapshot();
+
+        // Exact §2 household attention count is 5 (blocking + conflicts; advisory low-space separate).
+        assert_eq!(snap.attention_badge_count(), 5);
+
+        // Verify every Readiness × Execution × Intent combination in §6 is present at once.
+        let statuses: Vec<_> = snap
+            .mappings
+            .iter()
+            .map(|m| m.presented_status(snap.active_run.as_ref()))
+            .collect();
+
+        let has_line = |needle: &str| statuses.iter().any(|s| s.status_line.contains(needle));
+        assert!(has_line("Setup not finished"));
+        assert!(has_line("First sync needed"));
+        assert!(has_line("Last completed at 14:38"));
+        assert!(has_line("Completed with conflicts at 14:32"));
+        assert!(has_line("Couldn't reach Google Drive · retrying at 14:50"));
+        assert!(has_line("Not run yet"));
+        assert!(has_line("Runs after Research"));
+        assert!(has_line("Scanning Research · 3m 12s"));
+        assert!(has_line("pauses after this run"));
+        assert!(has_line("Stopping · 0:24"));
+        assert!(has_line("Paused by you on 16 Nov"));
+        assert!(has_line("Waiting for PhotoSSD"));
+        assert!(has_line("Sign-in for lab has expired"));
+        assert!(has_line("Cloud folder changed"));
+        assert!(has_line("Last run was interrupted at 09:14"));
+    }
+
+    #[test]
+    fn wizard_review_blocks_both_populated() {
+        let demo = DemoSource::new(DemoPreset::AllStates);
+        let snap = demo.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+        assert!(snap.wizard.can_start_first_sync());
+
+        let blocked = demo.dispatch(UiCommand::WizardSetReviewScenario(
+            ReviewScenario::BothPopulated,
+        ));
+        assert!(!blocked.wizard.can_start_first_sync());
+    }
+
+    #[test]
+    fn demo_commands_mutate_only_in_memory_state() {
+        let demo = DemoSource::new(DemoPreset::HouseholdOnly);
+        let s1 = demo.dispatch(UiCommand::PauseMapping(MappingId::new("documents")));
+        let docs = s1.mapping(&MappingId::new("documents")).unwrap();
+        assert_eq!(docs.state.intent, Intent::Paused);
+        assert_eq!(docs.state.readiness(), Readiness::Ready);
+        assert_eq!(docs.state.execution, Execution::Idle);
+
+        let s2 = demo.dispatch(UiCommand::MarkConflictsReviewed(MappingId::new("family")));
+        assert_eq!(s2.attention_badge_count(), 4);
+
+        let s3 = demo.dispatch(UiCommand::SetSchedulingPaused(true));
+        assert!(s3.scheduling_paused);
+        assert_eq!(s3.tray_status_line(), "Scheduling paused");
+    }
+
+    #[test]
+    fn wizard_gating_blocks_invalid_steps_and_resets_consent_on_plan_change() {
+        use crate::contract::WizardStep;
+        let demo = DemoSource::new(DemoPreset::AllStates);
+
+        // Fail location check (volume root) -> cannot jump past Location to Review and cannot Start.
+        let s = demo.dispatch(UiCommand::WizardSetLocalPath("/Volumes/WorkSSD".to_owned()));
+        assert!(!s.wizard.location_valid());
+        assert!(!s.wizard.can_visit_step(WizardStep::Subfolders));
+        assert!(!s.wizard.can_visit_step(WizardStep::Review));
+        let jumped = demo.dispatch(UiCommand::WizardSetStep(WizardStep::Review));
+        assert_ne!(jumped.wizard.step, WizardStep::Review);
+
+        // Fail location check via nested overlap inside an existing mapping.
+        let overlap = demo.dispatch(UiCommand::WizardSetLocalPath(
+            "~/FolderSync/Documents/Nested".to_owned(),
+        ));
+        assert!(!overlap.wizard.location_valid());
+
+        // Restore valid path, confirm consent, then verify changing recovery path resets consent.
+        let valid = demo.dispatch(UiCommand::WizardSetLocalPath(
+            "/Volumes/WorkSSD/Projects".to_owned(),
+        ));
+        assert!(valid.wizard.location_valid());
+        assert!(valid.wizard.recovery_valid());
+        let consented = demo.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+        assert!(consented.wizard.can_start_first_sync());
+
+        // Recovery path overlapping the local folder fails recovery checks and resets consent.
+        let bad_rec = demo.dispatch(UiCommand::WizardSetLocalRecoveryPath(
+            "/Volumes/WorkSSD/Projects/Recovery".to_owned(),
+        ));
+        assert!(!bad_rec.wizard.recovery_valid());
+        assert!(!bad_rec.wizard.no_other_sync_confirmed);
+        assert!(!bad_rec.wizard.can_start_first_sync());
+        assert!(!bad_rec.wizard.can_visit_step(WizardStep::Review));
+    }
+
+    #[test]
+    fn shortcuts_and_run_controls_target_displayed_mapping_only() {
+        use crate::contract::{
+            DemoActivityPhase, ScreenRoute, selected_stop_target, selected_sync_now_target,
+        };
+        let demo = DemoSource::new(DemoPreset::AllStates);
+        let snap = demo.snapshot();
+
+        // ⌘R must be disabled outside MappingDetail (Overview, Accounts, Activity, etc.).
+        assert_eq!(
+            selected_sync_now_target(&ScreenRoute::Overview, &snap),
+            None
+        );
+        assert_eq!(
+            selected_sync_now_target(&ScreenRoute::Accounts, &snap),
+            None
+        );
+        assert_eq!(
+            selected_sync_now_target(&ScreenRoute::Activity, &snap),
+            None
+        );
+
+        // ⌘R targets the displayed MappingDetail only when Sync now is enabled.
+        assert_eq!(
+            selected_sync_now_target(
+                &ScreenRoute::MappingDetail(MappingId::new("documents")),
+                &snap
+            ),
+            Some(MappingId::new("documents"))
+        );
+        assert_eq!(
+            selected_sync_now_target(
+                &ScreenRoute::MappingDetail(MappingId::new("photos-archive")),
+                &snap
+            ),
+            None
+        );
+
+        // Switching Activity progress preview preserves the displayed mapping's ID (`research`).
+        let preview = demo.dispatch(UiCommand::DemoSetActivityPhase(
+            DemoActivityPhase::TransferringKnown,
+        ));
+        let active = preview.active_run.as_ref().unwrap();
+        assert_eq!(active.mapping_id, MappingId::new("research"));
+        assert_eq!(active.mapping_name, "Research");
+        assert_eq!(
+            selected_stop_target(&ScreenRoute::Activity, &preview),
+            Some(MappingId::new("research"))
+        );
+        assert_eq!(selected_stop_target(&ScreenRoute::Accounts, &preview), None);
+    }
+
+    #[test]
+    fn launch_visibility_respects_default_hidden_on_login_launch() {
+        use crate::contract::should_show_window_at_launch;
+
+        let configured = DemoSource::new(DemoPreset::HouseholdOnly).snapshot();
+        assert!(!should_show_window_at_launch(&configured, true));
+        assert!(should_show_window_at_launch(&configured, false));
+
+        let no_acct = DemoSource::new(DemoPreset::WelcomeNoAccount).snapshot();
+        assert!(should_show_window_at_launch(&no_acct, true));
+
+        let no_map = DemoSource::new(DemoPreset::WelcomeNoMappings).snapshot();
+        assert!(should_show_window_at_launch(&no_map, true));
+    }
 }
