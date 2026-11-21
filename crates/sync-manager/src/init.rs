@@ -22,6 +22,278 @@ pub enum SideClassification {
     HasData,
 }
 
+/// Summary of one immediate subfolder discovered during detailed endpoint inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubfolderInventory {
+    pub name: String,
+    pub relative_path: String,
+    pub total_bytes: u64,
+    pub file_count: usize,
+    pub has_children: bool,
+}
+
+/// Real filesystem disk space info for a local path (via `statvfs` on Unix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSpaceInfo {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// Reads real total/available bytes on the filesystem containing `path`.
+pub fn disk_space_for_path(path: &Path) -> Option<DiskSpaceInfo> {
+    // Walk up to the longest existing ancestor if `path` doesn't exist yet.
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+        if rc != 0 {
+            return None;
+        }
+        let block_size = if stat.f_frsize > 0 {
+            stat.f_frsize as u64
+        } else {
+            stat.f_bsize as u64
+        };
+        let total_bytes = (stat.f_blocks as u64).saturating_mul(block_size);
+        let free_bytes = (stat.f_bavail as u64).saturating_mul(block_size);
+        Some(DiskSpaceInfo {
+            total_bytes,
+            free_bytes,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = probe;
+        None
+    }
+}
+
+/// Detailed preflight inventory for UI wizard review and selective sync (§9, §18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedEndpointInventory {
+    pub root: PathBuf,
+    pub classification: SideClassification,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub has_valid_marker: bool,
+    pub marker_conflict: Option<String>,
+    pub subfolders: Vec<SubfolderInventory>,
+    pub symlinks: Vec<String>,
+    pub special_files: Vec<String>,
+    pub name_findings: Vec<String>,
+}
+
+/// Inspects a local directory tree without following symlinks and returns a
+/// rich non-mutating inventory (byte counts, immediate subfolders, symlinks,
+/// naming findings, and access-marker status) for the wizard selective-sync UI.
+pub fn inspect_local_endpoint_detailed(
+    root: &Path,
+    collection: &CloudCollection,
+    exclusions: &BTreeSet<String>,
+) -> Result<DetailedEndpointInventory, ManagerError> {
+    let meta = fs::symlink_metadata(root).map_err(|err| ManagerError::Io {
+        cause: format!(
+            "Folder `{}` does not exist or cannot be inspected: {err}.",
+            root.display()
+        ),
+        next_step:
+            "Confirm the folder exists and is accessible (FolderSync never auto-creates missing roots)."
+                .to_string(),
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Folder `{}` must be an ordinary directory, not a file or symbolic link.",
+                root.display()
+            ),
+            next_step: "Choose an ordinary directory for this mapping.".to_string(),
+        });
+    }
+
+    let mut relative_paths = Vec::new();
+    let mut symlinks = Vec::new();
+    let mut special_files = Vec::new();
+    let mut has_valid_marker = false;
+    let mut marker_conflict = None;
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    let mut top_subfolders: std::collections::BTreeMap<String, SubfolderInventory> =
+        std::collections::BTreeMap::new();
+
+    walk_detailed(
+        root,
+        "",
+        None,
+        collection,
+        exclusions,
+        &mut relative_paths,
+        &mut symlinks,
+        &mut special_files,
+        &mut has_valid_marker,
+        &mut marker_conflict,
+        &mut file_count,
+        &mut total_bytes,
+        &mut top_subfolders,
+    )?;
+
+    let name_findings: Vec<String> = validate_names(&relative_paths)
+        .into_iter()
+        .map(|f| f.cause)
+        .collect();
+    let classification = if relative_paths.is_empty() {
+        SideClassification::Empty
+    } else {
+        SideClassification::HasData
+    };
+
+    Ok(DetailedEndpointInventory {
+        root: root.to_path_buf(),
+        classification,
+        file_count,
+        total_bytes,
+        has_valid_marker,
+        marker_conflict,
+        subfolders: top_subfolders.into_values().collect(),
+        symlinks,
+        special_files,
+        name_findings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_detailed(
+    current: &Path,
+    rel_prefix: &str,
+    top_subdir: Option<&str>,
+    collection: &CloudCollection,
+    exclusions: &BTreeSet<String>,
+    relative_paths: &mut Vec<String>,
+    symlinks: &mut Vec<String>,
+    special_files: &mut Vec<String>,
+    has_valid_marker: &mut bool,
+    marker_conflict: &mut Option<String>,
+    file_count: &mut usize,
+    total_bytes: &mut u64,
+    top_subfolders: &mut std::collections::BTreeMap<String, SubfolderInventory>,
+) -> Result<(), ManagerError> {
+    let entries = fs::read_dir(current).map_err(|err| ManagerError::Io {
+        cause: format!("Failed to read directory `{}`: {err}.", current.display()),
+        next_step: "Check filesystem permissions on the folder and retry.".to_string(),
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to read directory entry in `{}`: {err}.",
+                current.display()
+            ),
+            next_step: "Check filesystem permissions and retry.".to_string(),
+        })?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(|err| ManagerError::Io {
+            cause: format!("Failed to inspect `{}`: {err}.", path.display()),
+            next_step: "Check filesystem permissions and retry.".to_string(),
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if rel_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+        let ft = meta.file_type();
+
+        if rel_prefix.is_empty() && name.eq_ignore_ascii_case(ACCESS_MARKER_FILENAME) {
+            if name != ACCESS_MARKER_FILENAME {
+                *marker_conflict = Some(format!(
+                    "Existing `{name}` collides case-insensitively with FolderSync's `{ACCESS_MARKER_FILENAME}` access marker."
+                ));
+            } else {
+                match validate_marker_file(&path, &meta, collection) {
+                    Ok(()) => *has_valid_marker = true,
+                    Err(err) => *marker_conflict = Some(err.cause()),
+                }
+            }
+            continue;
+        }
+
+        if ft.is_symlink() {
+            if !is_excluded(&rel, exclusions) {
+                symlinks.push(rel);
+            }
+            continue;
+        }
+
+        if !ft.is_file() && !ft.is_dir() {
+            special_files.push(rel);
+            continue;
+        }
+
+        if ft.is_dir() && rel_prefix.is_empty() {
+            top_subfolders
+                .entry(name.clone())
+                .or_insert_with(|| SubfolderInventory {
+                    name: name.clone(),
+                    relative_path: rel.clone(),
+                    total_bytes: 0,
+                    file_count: 0,
+                    has_children: false,
+                });
+        }
+
+        let excluded = is_excluded(&rel, exclusions);
+        if !excluded {
+            relative_paths.push(rel.clone());
+            if ft.is_file() {
+                *file_count += 1;
+                *total_bytes = total_bytes.saturating_add(meta.len());
+            }
+        }
+
+        if let Some(top) = top_subdir
+            && let Some(sub) = top_subfolders.get_mut(top)
+        {
+            if ft.is_dir() {
+                sub.has_children = true;
+            } else if ft.is_file() {
+                sub.file_count += 1;
+                sub.total_bytes = sub.total_bytes.saturating_add(meta.len());
+            }
+        }
+
+        if ft.is_dir() {
+            let next_top = if rel_prefix.is_empty() {
+                Some(name.as_str())
+            } else {
+                top_subdir
+            };
+            walk_detailed(
+                &path,
+                &rel,
+                next_top,
+                collection,
+                exclusions,
+                relative_paths,
+                symlinks,
+                special_files,
+                has_valid_marker,
+                marker_conflict,
+                file_count,
+                total_bytes,
+                top_subfolders,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Preflight summary of a local or local-fixture endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointInventory {
@@ -451,9 +723,15 @@ pub fn decide_init_direction(
     if let Some(expected) = expected_direction
         && expected != detected
     {
+        let label = |dir: InitPreference| match dir {
+            InitPreference::Path1 => "upload to the cloud",
+            InitPreference::Path2 => "download from the cloud",
+        };
         return Err(ManagerError::PreflightRejected {
             cause: format!(
-                "Requested initial direction `{expected:?}` conflicts with observed folder contents (detected `{detected:?}`)."
+                "Requested first-sync direction ({}) conflicts with the observed folder contents ({}).",
+                label(expected),
+                label(detected),
             ),
             next_step:
                 "Review which side contains your files and choose the matching initial direction."

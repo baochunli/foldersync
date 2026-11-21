@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// Current highest SQLite schema migration version supported by this build.
-pub const LATEST_SCHEMA_VERSION: i64 = 1;
+pub const LATEST_SCHEMA_VERSION: i64 = 2;
 
 struct Migration {
     version: i64,
@@ -26,10 +26,11 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_section6_schema",
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_section6_schema",
+        sql: r#"
 CREATE TABLE devices (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -148,7 +149,13 @@ CREATE TABLE recovery_cases (
 
 CREATE INDEX idx_recovery_cases_mapping_status ON recovery_cases(mapping_id, status);
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "unreviewed_conflict_acknowledgment",
+        sql: "ALTER TABLE mappings ADD COLUMN unreviewed_conflict_run_id TEXT;",
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRecord {
@@ -191,6 +198,9 @@ pub struct MappingRecord {
     pub last_run_outcome: Option<RunOutcome>,
     pub last_run_completed_at: Option<String>,
     pub last_run_summary_text: Option<String>,
+    /// Run ID whose conflict copies have not yet been marked reviewed by the user.
+    #[serde(default)]
+    pub unreviewed_conflict_run_id: Option<RunId>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -577,6 +587,41 @@ impl SqliteStateStore {
             .map_err(|e| storage_err("Failed to query account", e))
     }
 
+    pub fn list_accounts(&self) -> Result<Vec<AccountRecord>, ManagerError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, display_name, kind, remote_name, remote_root_folder_id,
+                        config_path, auth_status, created_at, updated_at
+                 FROM accounts ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| storage_err("Failed to prepare list_accounts", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AccountRecord {
+                    id: AccountId::new(row.get::<_, String>(0)?),
+                    display_name: row.get(1)?,
+                    kind: row.get(2)?,
+                    remote_name: row.get(3)?,
+                    remote_root_folder_id: row.get(4)?,
+                    config_path: PathBuf::from(row.get::<_, String>(5)?),
+                    auth_status: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| storage_err("Failed to read accounts", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| storage_err("Failed to collect accounts", e))
+    }
+
+    pub fn delete_account(&self, id: &AccountId) -> Result<(), ManagerError> {
+        self.conn
+            .execute("DELETE FROM accounts WHERE id = ?1", params![id.as_str()])
+            .map_err(|e| storage_err("Failed to delete account record", e))?;
+        Ok(())
+    }
+
     pub fn insert_mapping(&self, m: &MappingRecord) -> Result<(), ManagerError> {
         let ancestors_json = serde_json::to_string(&m.collection.ancestor_ids)
             .map_err(|e| storage_err("Failed to serialize ancestor_ids", e))?;
@@ -602,10 +647,11 @@ impl SqliteStateStore {
                     state_json, intent, readiness, execution,
                     active_generation_id, exclusions_json, max_delete_percent,
                     last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
+                    unreviewed_conflict_run_id,
                     created_at, updated_at
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
                 )",
                 params![
                     m.id.as_str(),
@@ -635,11 +681,86 @@ impl SqliteStateStore {
                     last_outcome_json,
                     m.last_run_completed_at,
                     m.last_run_summary_text,
+                    m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                     m.created_at,
                     m.updated_at,
                 ],
             )
             .map_err(|e| storage_err("Failed to insert mapping record", e))?;
+        Ok(())
+    }
+
+    pub fn update_mapping_draft(&self, m: &MappingRecord) -> Result<(), ManagerError> {
+        let ancestors_json = serde_json::to_string(&m.collection.ancestor_ids)
+            .map_err(|e| storage_err("Failed to serialize ancestor_ids", e))?;
+        let state_json = serde_json::to_string(&m.state)
+            .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
+        let exclusions_json = serde_json::to_string(&m.exclusions)
+            .map_err(|e| storage_err("Failed to serialize exclusions", e))?;
+        self.conn
+            .execute(
+                "UPDATE mappings SET
+                    account_id = ?2,
+                    collection_display_path = ?3,
+                    collection_folder_id = ?4,
+                    collection_ancestor_ids_json = ?5,
+                    local_volume_kind = ?6,
+                    local_volume_stable_id = ?7,
+                    local_mount_path = ?8,
+                    local_relative_dir = ?9,
+                    remote_endpoint_kind = ?10,
+                    remote_endpoint_value = ?11,
+                    local_recovery_root = ?12,
+                    cloud_recovery_path = ?13,
+                    schedule_interval_secs = ?14,
+                    state_json = ?15,
+                    intent = ?16,
+                    readiness = ?17,
+                    execution = ?18,
+                    exclusions_json = ?19,
+                    max_delete_percent = ?20,
+                    updated_at = ?21
+                 WHERE id = ?1",
+                params![
+                    m.id.as_str(),
+                    m.account_id.as_str(),
+                    m.collection.display_path,
+                    m.collection.folder_id,
+                    ancestors_json,
+                    volume_kind_str(m.local_binding.volume.kind),
+                    m.local_binding.volume.stable_id,
+                    m.local_binding.mount_path.to_string_lossy().as_ref(),
+                    m.local_binding.relative_dir.to_string_lossy().as_ref(),
+                    m.remote_endpoint_kind,
+                    m.remote_endpoint_value,
+                    m.local_recovery_root.to_string_lossy().as_ref(),
+                    m.cloud_recovery_path,
+                    m.schedule_interval_secs as i64,
+                    state_json,
+                    intent_str(m.state.intent),
+                    readiness_str(m.state.readiness()),
+                    execution_str(m.state.execution),
+                    exclusions_json,
+                    i64::from(m.max_delete_percent),
+                    m.updated_at,
+                ],
+            )
+            .map_err(|e| storage_err("Failed to update draft mapping record", e))?;
+        Ok(())
+    }
+
+    pub fn update_mapping_schedule_interval(
+        &self,
+        mapping_id: &MappingId,
+        interval_secs: u64,
+        updated_at: &str,
+    ) -> Result<(), ManagerError> {
+        self.conn
+            .execute(
+                "UPDATE mappings SET schedule_interval_secs = ?2, updated_at = ?3 WHERE id = ?1",
+                params![mapping_id.as_str(), interval_secs as i64, updated_at],
+            )
+            .map_err(|e| storage_err("Failed to update schedule interval", e))?;
         Ok(())
     }
 
@@ -665,7 +786,8 @@ impl SqliteStateStore {
                     last_run_outcome = ?9,
                     last_run_completed_at = ?10,
                     last_run_summary_text = ?11,
-                    updated_at = ?12
+                    unreviewed_conflict_run_id = ?12,
+                    updated_at = ?13
                  WHERE id = ?1",
                 params![
                     m.id.as_str(),
@@ -679,10 +801,43 @@ impl SqliteStateStore {
                     last_outcome_json,
                     m.last_run_completed_at,
                     m.last_run_summary_text,
+                    m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                     m.updated_at,
                 ],
             )
             .map_err(|e| storage_err("Failed to update mapping state", e))?;
+        Ok(())
+    }
+
+    /// Removes a mapping and its database metadata in a single SQLite transaction.
+    /// Never touches local synced folders, cloud collections, or recovery copies (§7).
+    pub fn delete_mapping_cascade(&mut self, mapping_id: &MappingId) -> Result<(), ManagerError> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| storage_err("Failed to start remove-mapping transaction", e))?;
+        tx.execute(
+            "DELETE FROM recovery_cases WHERE mapping_id = ?1",
+            params![mapping_id.as_str()],
+        )
+        .map_err(|e| storage_err("Failed to delete recovery cases for mapping", e))?;
+        tx.execute(
+            "DELETE FROM runs WHERE mapping_id = ?1",
+            params![mapping_id.as_str()],
+        )
+        .map_err(|e| storage_err("Failed to delete runs for mapping", e))?;
+        tx.execute(
+            "DELETE FROM mapping_generations WHERE mapping_id = ?1",
+            params![mapping_id.as_str()],
+        )
+        .map_err(|e| storage_err("Failed to delete generations for mapping", e))?;
+        tx.execute(
+            "DELETE FROM mappings WHERE id = ?1",
+            params![mapping_id.as_str()],
+        )
+        .map_err(|e| storage_err("Failed to delete mapping record", e))?;
+        tx.commit()
+            .map_err(|e| storage_err("Failed to commit remove-mapping transaction", e))?;
         Ok(())
     }
 
@@ -731,8 +886,9 @@ impl SqliteStateStore {
             last_run_outcome,
             last_run_completed_at: row.get(25)?,
             last_run_summary_text: row.get(26)?,
-            created_at: row.get(27)?,
-            updated_at: row.get(28)?,
+            unreviewed_conflict_run_id: row.get::<_, Option<String>>(27)?.map(RunId::new),
+            created_at: row.get(28)?,
+            updated_at: row.get(29)?,
         })
     }
 
@@ -751,6 +907,7 @@ impl SqliteStateStore {
                         state_json, intent, readiness, execution,
                         active_generation_id, exclusions_json, max_delete_percent,
                         last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
+                        unreviewed_conflict_run_id,
                         created_at, updated_at
                  FROM mappings WHERE id = ?1",
                 params![mapping_id.as_str()],
@@ -773,6 +930,7 @@ impl SqliteStateStore {
                         state_json, intent, readiness, execution,
                         active_generation_id, exclusions_json, max_delete_percent,
                         last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
+                        unreviewed_conflict_run_id,
                         created_at, updated_at
                  FROM mappings ORDER BY created_at ASC, id ASC",
             )
@@ -1106,6 +1264,55 @@ impl SqliteStateStore {
             .map_err(|e| storage_err("Failed to collect runs for mapping", e))
     }
 
+    /// Returns only the newest `limit` runs for `mapping_id` (bounded query).
+    pub fn list_recent_runs_for_mapping(
+        &self,
+        mapping_id: &MappingId,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, ManagerError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, mapping_id, generation_id, mode, status, started_at, finished_at,
+                        workdir_path, backup_dir1, backup_dir2, run_dir, log_path,
+                        child_pid, child_start_time_kind, child_start_time_value, child_executable,
+                        engine_version, engine_sha256, engine_platform,
+                        exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                 FROM runs WHERE mapping_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2",
+            )
+            .map_err(|e| storage_err("Failed to query recent runs for mapping", e))?;
+        let rows = stmt
+            .query_map(
+                params![mapping_id.as_str(), limit.max(1) as i64],
+                Self::map_run_row,
+            )
+            .map_err(|e| storage_err("Failed to read recent runs for mapping", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| storage_err("Failed to collect recent runs for mapping", e))
+    }
+
+    /// Returns only the single newest run for `mapping_id` (O(1) index probe via `LIMIT 1`).
+    pub fn get_latest_run_for_mapping(
+        &self,
+        mapping_id: &MappingId,
+    ) -> Result<Option<RunRecord>, ManagerError> {
+        self.conn
+            .query_row(
+                "SELECT id, mapping_id, generation_id, mode, status, started_at, finished_at,
+                        workdir_path, backup_dir1, backup_dir2, run_dir, log_path,
+                        child_pid, child_start_time_kind, child_start_time_value, child_executable,
+                        engine_version, engine_sha256, engine_platform,
+                        exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                 FROM runs WHERE mapping_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                params![mapping_id.as_str()],
+                Self::map_run_row,
+            )
+            .optional()
+            .map_err(|e| storage_err("Failed to query latest run for mapping", e))
+    }
+
     pub fn insert_recovery_case(&self, case: &RecoveryCaseRecord) -> Result<(), ManagerError> {
         self.conn
             .execute(
@@ -1271,7 +1478,8 @@ impl SqliteStateStore {
                     last_run_outcome = ?9,
                     last_run_completed_at = ?10,
                     last_run_summary_text = ?11,
-                    updated_at = ?12
+                    unreviewed_conflict_run_id = ?12,
+                    updated_at = ?13
                  WHERE id = ?1",
                 params![
                     m.id.as_str(),
@@ -1285,6 +1493,7 @@ impl SqliteStateStore {
                     last_outcome_json,
                     m.last_run_completed_at,
                     m.last_run_summary_text,
+                    m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                     m.updated_at,
                 ],
             )
@@ -1361,7 +1570,8 @@ impl SqliteStateStore {
                 last_run_outcome = ?9,
                 last_run_completed_at = ?10,
                 last_run_summary_text = ?11,
-                updated_at = ?12
+                unreviewed_conflict_run_id = ?12,
+                updated_at = ?13
              WHERE id = ?1",
             params![
                 m.id.as_str(),
@@ -1375,6 +1585,7 @@ impl SqliteStateStore {
                 last_outcome_json,
                 m.last_run_completed_at,
                 m.last_run_summary_text,
+                m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                 m.updated_at,
             ],
         )
@@ -1416,6 +1627,72 @@ impl SqliteStateStore {
 
         tx.commit()
             .map_err(|e| storage_err("Failed to commit mapping/recovery transaction", e))?;
+        Ok(())
+    }
+
+    /// Atomically marks all open recovery cases for `m.id` resolved and updates
+    /// the mapping's runtime state in a single SQLite transaction.
+    pub fn resolve_recovery_and_update_mapping(
+        &mut self,
+        m: &MappingRecord,
+        resolved_at: &str,
+        resolution_note: &str,
+    ) -> Result<(), ManagerError> {
+        let state_json = serde_json::to_string(&m.state)
+            .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
+        let last_outcome_json = m
+            .last_run_outcome
+            .map(|o| serde_json::to_string(&o))
+            .transpose()
+            .map_err(|e| storage_err("Failed to serialize last_run_outcome", e))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| storage_err("Failed to start resolve-recovery transaction", e))?;
+
+        tx.execute(
+            "UPDATE recovery_cases
+             SET status = 'resolved', resolved_at = ?2, resolution_note = ?3
+             WHERE mapping_id = ?1 AND status = 'open'",
+            params![m.id.as_str(), resolved_at, resolution_note],
+        )
+        .map_err(|e| storage_err("Failed to resolve open recovery cases", e))?;
+
+        tx.execute(
+            "UPDATE mappings SET
+                scheduling_enabled = ?2,
+                state_json = ?3,
+                intent = ?4,
+                readiness = ?5,
+                execution = ?6,
+                active_generation_id = ?7,
+                last_run_id = ?8,
+                last_run_outcome = ?9,
+                last_run_completed_at = ?10,
+                last_run_summary_text = ?11,
+                unreviewed_conflict_run_id = ?12,
+                updated_at = ?13
+             WHERE id = ?1",
+            params![
+                m.id.as_str(),
+                i64::from(m.scheduling_enabled),
+                state_json,
+                intent_str(m.state.intent),
+                readiness_str(m.state.readiness()),
+                execution_str(m.state.execution),
+                m.active_generation_id.as_ref().map(|g| g.as_str()),
+                m.last_run_id.as_ref().map(|r| r.as_str()),
+                last_outcome_json,
+                m.last_run_completed_at,
+                m.last_run_summary_text,
+                m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
+                m.updated_at,
+            ],
+        )
+        .map_err(|e| storage_err("Failed to update mapping state after recovery", e))?;
+
+        tx.commit()
+            .map_err(|e| storage_err("Failed to commit resolve-recovery transaction", e))?;
         Ok(())
     }
 
@@ -1505,6 +1782,7 @@ mod tests {
             last_run_outcome: None,
             last_run_completed_at: None,
             last_run_summary_text: None,
+            unreviewed_conflict_run_id: None,
             created_at: "2026-11-20T00:00:00Z".to_string(),
             updated_at: "2026-11-20T00:00:00Z".to_string(),
         };

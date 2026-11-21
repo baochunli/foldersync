@@ -1,10 +1,15 @@
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{TimeZone, Utc};
 use sync_manager::{
-    AddMappingCommand, FINDER_SNAPSHOT_VERSION, FakeBisyncLauncher, FakeLaunchScript,
-    FinderMappingState, FinderStatusSnapshot, FixedClock, InitializeCommand, ManagerConfig,
-    SyncManager,
+    AddMappingCommand, DARWIN_SNAPSHOT_UPDATED_NOTIFICATION, FINDER_SNAPSHOT_VERSION,
+    FakeBisyncLauncher, FakeLaunchScript, FinderMappingState, FinderStatusSnapshot, FixedClock,
+    InitializeCommand, ManagerConfig, RecordingFinderNotifier, SyncManager,
 };
 use tempfile::TempDir;
 
@@ -28,8 +33,10 @@ fn finder_status_json_is_valid_v1_atomic_and_updated_on_state_changes() {
     let launcher = Arc::new(FakeBisyncLauncher::new());
     launcher.push_script(FakeLaunchScript::default());
 
+    let notifier = Arc::new(RecordingFinderNotifier::new());
     let mut cfg = ManagerConfig::with_state_dir(&state_dir);
     cfg.finder_status_dir = Some(finder_dir.clone());
+    cfg.finder_notifier = Arc::clone(&notifier) as Arc<dyn sync_manager::FinderNotifier>;
     cfg.clock = clock;
     cfg.launcher = launcher;
 
@@ -38,6 +45,12 @@ fn finder_status_json_is_valid_v1_atomic_and_updated_on_state_changes() {
     assert!(
         status_path.is_file(),
         "status.json must be written on startup"
+    );
+    let initial_inode = fs::metadata(&status_path).unwrap().ino();
+    assert_eq!(
+        notifier.posted_notifications(),
+        vec![DARWIN_SNAPSHOT_UPDATED_NOTIFICATION.to_string()],
+        "Darwin snapshot notification must be posted after initial status.json write"
     );
 
     // Check atomic write left no temp files and used private permissions.
@@ -97,10 +110,20 @@ fn finder_status_json_is_valid_v1_atomic_and_updated_on_state_changes() {
     assert_eq!(after_init.mappings[0].state, FinderMappingState::Synced);
 
     // Pause -> Finder state transitions to "paused".
+    let prev_notifs = notifier.posted_notifications().len();
     mgr.pause("research").unwrap();
     let after_pause: FinderStatusSnapshot =
         serde_json::from_str(&fs::read_to_string(&status_path).unwrap()).unwrap();
     assert_eq!(after_pause.mappings[0].state, FinderMappingState::Paused);
+    let pause_inode = fs::metadata(&status_path).unwrap().ino();
+    assert_ne!(
+        initial_inode, pause_inode,
+        "atomic rename replacement must swap in a new inode (not truncate in place)"
+    );
+    assert!(
+        notifier.posted_notifications().len() > prev_notifs,
+        "Darwin notification must be posted after every status.json update"
+    );
 
     // Verify exact serialized JSON keys match ADR 0002.
     let raw_json: serde_json::Value =

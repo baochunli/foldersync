@@ -1,15 +1,17 @@
-//! Immutable status snapshots and bounded manager event stream (§16).
+//! Immutable status snapshots, coalescing snapshot subscriptions, and bounded
+//! manager event stream (§16).
 
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 use sync_core::{
     AccountId, AvailableAction, Execution, GenerationId, Intent, MappingId, Readiness, RunId,
-    RunOutcome,
+    RunOutcome, VolumeKind,
 };
 
 /// Default capacity of the bounded in-memory event ring buffer.
@@ -32,23 +34,47 @@ pub struct MappingStatusSnapshot {
     pub display_name: String,
     pub account_id: AccountId,
     pub collection_display_path: String,
+    #[serde(default)]
+    pub collection_folder_id: String,
     pub local_root: PathBuf,
     pub volume_name: String,
+    #[serde(default = "default_volume_kind")]
+    pub volume_kind: VolumeKind,
+    #[serde(default)]
+    pub volume_stable_id: String,
     pub readiness: Readiness,
     pub execution: Execution,
     pub intent: Intent,
     pub scheduling_enabled: bool,
+    #[serde(default = "default_schedule_interval_secs")]
+    pub schedule_interval_secs: u64,
     pub active_generation_id: Option<GenerationId>,
     pub active_generation_fingerprint: Option<String>,
     pub last_run_id: Option<RunId>,
     pub last_run_outcome: Option<RunOutcome>,
     pub last_run_completed_at: Option<String>,
     pub last_run_summary: Option<String>,
+    /// Run ID whose conflict copies have not yet been marked reviewed by the user.
+    #[serde(default)]
+    pub unreviewed_conflict_run_id: Option<RunId>,
+    /// Observed conflict copy paths from the unreviewed conflict run (if any).
+    #[serde(default)]
+    pub unreviewed_conflict_paths: Vec<String>,
+    #[serde(default)]
+    pub exclusions: Vec<String>,
     pub counters: MappingCounters,
     pub available_actions: Vec<AvailableAction>,
     pub status_text: String,
     pub local_recovery_root: PathBuf,
     pub cloud_recovery_path: String,
+}
+
+fn default_volume_kind() -> VolumeKind {
+    VolumeKind::Internal
+}
+
+fn default_schedule_interval_secs() -> u64 {
+    300
 }
 
 /// Immutable manager-wide snapshot published to UI/CLI subscribers (§16).
@@ -57,6 +83,12 @@ pub struct StatusSnapshot {
     pub sequence: u64,
     pub generated_at: String,
     pub active_job_mapping_id: Option<MappingId>,
+    /// Ordered list of queued mapping IDs (front of queue first).
+    #[serde(default)]
+    pub queue_order: Vec<MappingId>,
+    /// Global automatic-scheduling pause hold (D1: manual Sync now still works).
+    #[serde(default)]
+    pub scheduling_paused: bool,
     pub mappings: Vec<MappingStatusSnapshot>,
 }
 
@@ -96,6 +128,141 @@ pub enum ManagerEvent {
         cause: String,
         timestamp: String,
     },
+    PreflightFailed {
+        mapping_id: MappingId,
+        cause: String,
+        next_step: String,
+        timestamp: String,
+    },
+    ShutdownTimedOut {
+        mapping_id: MappingId,
+        run_id: RunId,
+        timestamp: String,
+    },
+}
+
+/// Coalescing snapshot subscription that NEVER drops the newest snapshot.
+///
+/// When a subscriber falls behind and its bounded buffer is full, the oldest
+/// superseded snapshot is evicted so the latest [`StatusSnapshot`] is always
+/// delivered promptly.
+#[derive(Debug)]
+pub struct SnapshotReceiver {
+    shared: Arc<SnapshotSubShared>,
+}
+
+#[derive(Debug)]
+struct SnapshotSubShared {
+    state: Mutex<SnapshotSubState>,
+    cv: Condvar,
+}
+
+#[derive(Debug)]
+struct SnapshotSubState {
+    pending: VecDeque<Arc<StatusSnapshot>>,
+    latest: Option<Arc<StatusSnapshot>>,
+    capacity: usize,
+    sender_closed: bool,
+    receiver_dropped: bool,
+}
+
+impl SnapshotReceiver {
+    fn new(capacity: usize) -> (Arc<SnapshotSubShared>, Self) {
+        let shared = Arc::new(SnapshotSubShared {
+            state: Mutex::new(SnapshotSubState {
+                pending: VecDeque::with_capacity(capacity.max(1)),
+                latest: None,
+                capacity: capacity.max(1),
+                sender_closed: false,
+                receiver_dropped: false,
+            }),
+            cv: Condvar::new(),
+        });
+        (
+            Arc::clone(&shared),
+            Self {
+                shared: Arc::clone(&shared),
+            },
+        )
+    }
+
+    /// Blocks until the next snapshot arrives or the manager closes.
+    pub fn recv(&self) -> Result<Arc<StatusSnapshot>, mpsc::RecvError> {
+        let mut guard = self.shared.state.lock().unwrap();
+        loop {
+            if let Some(snap) = guard.pending.pop_front() {
+                return Ok(snap);
+            }
+            if guard.sender_closed {
+                return Err(mpsc::RecvError);
+            }
+            guard = self.shared.cv.wait(guard).unwrap();
+        }
+    }
+
+    /// Waits up to `timeout` for the next snapshot.
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Arc<StatusSnapshot>, mpsc::RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.shared.state.lock().unwrap();
+        loop {
+            if let Some(snap) = guard.pending.pop_front() {
+                return Ok(snap);
+            }
+            if guard.sender_closed {
+                return Err(mpsc::RecvTimeoutError::Disconnected);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            let (next_guard, wait_res) = self.shared.cv.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if let Some(snap) = guard.pending.pop_front() {
+                return Ok(snap);
+            }
+            if guard.sender_closed {
+                return Err(mpsc::RecvTimeoutError::Disconnected);
+            }
+            if wait_res.timed_out() {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+        }
+    }
+
+    /// Returns the next buffered snapshot immediately without blocking.
+    pub fn try_recv(&self) -> Result<Arc<StatusSnapshot>, mpsc::TryRecvError> {
+        let mut guard = self.shared.state.lock().unwrap();
+        if let Some(snap) = guard.pending.pop_front() {
+            Ok(snap)
+        } else if guard.sender_closed {
+            Err(mpsc::TryRecvError::Disconnected)
+        } else {
+            Err(mpsc::TryRecvError::Empty)
+        }
+    }
+
+    /// Drains any older buffered snapshots and returns the newest available snapshot, if any.
+    pub fn drain_latest(&self) -> Option<Arc<StatusSnapshot>> {
+        let mut guard = self.shared.state.lock().unwrap();
+        let last = guard.pending.back().cloned();
+        guard.pending.clear();
+        last
+    }
+
+    /// Returns the most recently published snapshot ever seen by this subscription.
+    pub fn latest(&self) -> Option<Arc<StatusSnapshot>> {
+        self.shared.state.lock().unwrap().latest.clone()
+    }
+}
+
+impl Drop for SnapshotReceiver {
+    fn drop(&mut self) {
+        let mut guard = self.shared.state.lock().unwrap();
+        guard.receiver_dropped = true;
+    }
 }
 
 #[derive(Debug)]
@@ -108,7 +275,7 @@ pub(crate) struct EventBus {
 struct EventBusInner {
     recent: VecDeque<ManagerEvent>,
     event_subscribers: Vec<mpsc::SyncSender<ManagerEvent>>,
-    snapshot_subscribers: Vec<mpsc::SyncSender<Arc<StatusSnapshot>>>,
+    snapshot_subscribers: Vec<Arc<SnapshotSubShared>>,
 }
 
 impl EventBus {
@@ -137,13 +304,23 @@ impl EventBus {
         });
     }
 
+    /// Publishes `snapshot` to all subscribers, coalescing by dropping the
+    /// oldest buffered snapshot when a subscriber's queue is full so the latest
+    /// snapshot is NEVER dropped.
     pub(crate) fn publish_snapshot(&self, snapshot: Arc<StatusSnapshot>) {
         let mut guard = self.inner.lock().unwrap();
-        guard.snapshot_subscribers.retain(|tx| {
-            !matches!(
-                tx.try_send(Arc::clone(&snapshot)),
-                Err(mpsc::TrySendError::Disconnected(_))
-            )
+        guard.snapshot_subscribers.retain(|sub| {
+            let mut st = sub.state.lock().unwrap();
+            if st.receiver_dropped {
+                return false;
+            }
+            while st.pending.len() >= st.capacity {
+                st.pending.pop_front();
+            }
+            st.pending.push_back(Arc::clone(&snapshot));
+            st.latest = Some(Arc::clone(&snapshot));
+            sub.cv.notify_one();
+            true
         });
     }
 
@@ -157,9 +334,22 @@ impl EventBus {
         rx
     }
 
-    pub(crate) fn subscribe_snapshots(&self, bound: usize) -> mpsc::Receiver<Arc<StatusSnapshot>> {
-        let (tx, rx) = mpsc::sync_channel(bound.max(1));
-        self.inner.lock().unwrap().snapshot_subscribers.push(tx);
+    pub(crate) fn subscribe_snapshots(&self, bound: usize) -> SnapshotReceiver {
+        let (shared, rx) = SnapshotReceiver::new(bound.max(1));
+        self.inner.lock().unwrap().snapshot_subscribers.push(shared);
         rx
+    }
+}
+
+impl Drop for EventBus {
+    fn drop(&mut self) {
+        if let Ok(guard) = self.inner.lock() {
+            for sub in &guard.snapshot_subscribers {
+                if let Ok(mut st) = sub.state.lock() {
+                    st.sender_closed = true;
+                    sub.cv.notify_all();
+                }
+            }
+        }
     }
 }
