@@ -34,13 +34,14 @@ fn all_intent() -> [Intent; 2] {
     [Intent::Enabled, Intent::Paused]
 }
 
-fn all_outcomes() -> [RunOutcome; 10] {
+fn all_outcomes() -> [RunOutcome; 11] {
     [
         RunOutcome::Success,
         RunOutcome::SuccessWithConflicts,
         RunOutcome::RetryableFailure,
         RunOutcome::AuthenticationFailure,
-        RunOutcome::EndpointOrVolumeMismatch,
+        RunOutcome::VolumeMismatch,
+        RunOutcome::EndpointMismatch,
         RunOutcome::InvalidConfiguration,
         RunOutcome::CriticalFailure,
         RunOutcome::UnknownFailure,
@@ -372,7 +373,7 @@ fn initialization_completed_is_preserved_while_another_gate_is_active() {
 fn volume_only_mismatch_allows_known_volume_reconnect_without_endpoint_approval() {
     let running = MappingState::new(Readiness::Ready, Execution::Running, Intent::Enabled);
 
-    // Exact review probe: VolumeLost -> RunFinished(EndpointOrVolumeMismatch) -> VolumeAvailable => Ready.
+    // VolumeLost -> RunFinished(VolumeMismatch) -> VolumeAvailable => Ready.
     let lost = apply_event(running, ObservedEvent::VolumeLost);
     assert_eq!(lost.state.readiness(), Readiness::VolumeUnavailable);
     assert_eq!(lost.state.execution, Execution::Stopping);
@@ -380,7 +381,7 @@ fn volume_only_mismatch_allows_known_volume_reconnect_without_endpoint_approval(
 
     let finished = apply_event(
         lost.state,
-        ObservedEvent::RunFinished(RunOutcome::EndpointOrVolumeMismatch),
+        ObservedEvent::RunFinished(RunOutcome::VolumeMismatch),
     );
     assert_eq!(finished.state.readiness(), Readiness::VolumeUnavailable);
     assert_eq!(finished.state.execution, Execution::Idle);
@@ -391,13 +392,54 @@ fn volume_only_mismatch_allows_known_volume_reconnect_without_endpoint_approval(
     assert!(!available_actions(&back.state).contains(&AvailableAction::ReviewEndpointChange));
     assert!(available_actions(&back.state).contains(&AvailableAction::RunNow));
 
-    // Genuine endpoint mismatch while the volume is still present still latches EndpointChanged.
+    // Even without a prior VolumeLost event, VolumeMismatch sets only the volume gate.
+    let direct_vol = apply_event(
+        running,
+        ObservedEvent::RunFinished(RunOutcome::VolumeMismatch),
+    );
+    assert_eq!(direct_vol.state.readiness(), Readiness::VolumeUnavailable);
+    let direct_back = apply_event(direct_vol.state, ObservedEvent::VolumeAvailable);
+    assert_eq!(direct_back.state.readiness(), Readiness::Ready);
+    assert_eq!(direct_back.effect, TransitionEffect::EligibleForScheduling);
+
+    // Genuine endpoint mismatch while the volume is present latches EndpointChanged.
     let genuine = apply_event(
         running,
-        ObservedEvent::RunFinished(RunOutcome::EndpointOrVolumeMismatch),
+        ObservedEvent::RunFinished(RunOutcome::EndpointMismatch),
     );
     assert_eq!(genuine.state.readiness(), Readiness::EndpointChanged);
     assert!(available_actions(&genuine.state).contains(&AvailableAction::ReviewEndpointChange));
+}
+
+#[test]
+fn endpoint_mismatch_with_concurrent_volume_loss_stays_blocked_until_validated() {
+    let running = MappingState::new(Readiness::Ready, Execution::Running, Intent::Enabled);
+
+    // Ready+Running -> VolumeLost -> RunFinished(EndpointMismatch) -> VolumeAvailable
+    // must remain blocked on EndpointChanged and refuse scheduling until EndpointValidated.
+    let lost = apply_event(running, ObservedEvent::VolumeLost).state;
+    assert_eq!(lost.readiness(), Readiness::VolumeUnavailable);
+
+    let finished = apply_event(
+        lost,
+        ObservedEvent::RunFinished(RunOutcome::EndpointMismatch),
+    )
+    .state;
+    assert_eq!(finished.readiness(), Readiness::EndpointChanged);
+    assert_eq!(finished.execution, Execution::Idle);
+
+    let back = apply_event(finished, ObservedEvent::VolumeAvailable);
+    assert_eq!(back.state.readiness(), Readiness::EndpointChanged);
+    assert_eq!(back.effect, TransitionEffect::None);
+    assert!(available_actions(&back.state).contains(&AvailableAction::ReviewEndpointChange));
+
+    let tick = apply_event(back.state, ObservedEvent::ScheduleTriggered);
+    assert_eq!(tick.state.execution, Execution::Idle);
+    assert_eq!(tick.effect, TransitionEffect::None);
+
+    let validated = apply_event(back.state, ObservedEvent::EndpointValidated);
+    assert_eq!(validated.state.readiness(), Readiness::Ready);
+    assert_eq!(validated.effect, TransitionEffect::EligibleForScheduling);
 }
 
 #[test]
@@ -466,8 +508,9 @@ fn status_text_labels_past_failures_as_history_once_hold_is_cleared() {
         (RunOutcome::Interrupted, "Recovery required"),
         (RunOutcome::CriticalFailure, "Recovery required"),
         (RunOutcome::AuthenticationFailure, "Authentication required"),
+        (RunOutcome::VolumeMismatch, "Waiting for PhotoSSD"),
         (
-            RunOutcome::EndpointOrVolumeMismatch,
+            RunOutcome::EndpointMismatch,
             "Endpoint changed — review required",
         ),
     ] {

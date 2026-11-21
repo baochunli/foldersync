@@ -240,8 +240,10 @@ pub enum RunOutcome {
     RetryableFailure,
     /// Credentials expired, revoked, or locked during the run.
     AuthenticationFailure,
-    /// Local volume or cloud endpoint identity no longer matched.
-    EndpointOrVolumeMismatch,
+    /// Bound local volume was unavailable or did not match the expected volume identity.
+    VolumeMismatch,
+    /// Cloud endpoint identity or path changed unexpectedly and requires review.
+    EndpointMismatch,
     /// Invalid command or configuration detected.
     InvalidConfiguration,
     /// Critical engine error requiring recovery.
@@ -659,14 +661,12 @@ pub fn apply_event(state: MappingState, event: ObservedEvent) -> TransitionResul
                     gates.auth_required = true;
                     Execution::Idle
                 }
-                RunOutcome::EndpointOrVolumeMismatch => {
-                    // When the bound volume is already known to be absent, this
-                    // mismatch is attributable to the lost volume rather than a
-                    // separate endpoint identity change, so reconnecting the
-                    // known volume can return to Ready without extra approval.
-                    if !gates.volume_unavailable {
-                        gates.endpoint_changed = true;
-                    }
+                RunOutcome::VolumeMismatch => {
+                    gates.volume_unavailable = true;
+                    Execution::Idle
+                }
+                RunOutcome::EndpointMismatch => {
+                    gates.endpoint_changed = true;
                     Execution::Idle
                 }
                 RunOutcome::InvalidConfiguration
