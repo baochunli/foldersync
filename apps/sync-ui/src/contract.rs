@@ -20,6 +20,11 @@ pub enum ScreenRoute {
     AddMapping,
     /// Live activity, queue, recent events, and expandable raw log.
     Activity,
+    /// Run-specific log and recovery copies inspection (§12, uit3-review1 #9).
+    RunInspection {
+        mapping_id: MappingId,
+        run_id: RunId,
+    },
     /// Ordered attention cards for held mappings and unreviewed outcomes.
     Attention,
     /// Guided recovery checklist for one mapping in `RecoveryRequired`.
@@ -35,7 +40,7 @@ impl ScreenRoute {
     pub fn sidebar_id(&self) -> &'static str {
         match self {
             Self::Overview | Self::MappingDetail(_) | Self::AddMapping => "overview",
-            Self::Activity => "activity",
+            Self::Activity | Self::RunInspection { .. } => "activity",
             Self::Attention | Self::Recovery(_) => "attention",
             Self::Accounts => "accounts",
             Self::Preferences => "preferences",
@@ -202,6 +207,60 @@ pub struct RunRecordSnapshot {
     pub changes_label: String,
 }
 
+/// Unreviewed conflict notice stored independently of transient status modifiers
+/// so Pause/Resume/SyncReady never erase it, and Mark as reviewed clears ONLY
+/// this notice while preserving `RunOutcome::SuccessWithConflicts` (Q5, #7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreviewedConflicts {
+    pub run_id: RunId,
+    pub paths: Vec<String>,
+}
+
+/// One recovery copy preserved by a run (§12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCopyItem {
+    pub side_label: String,
+    pub is_remote: bool,
+    pub relative_path: String,
+    pub size_label: String,
+}
+
+/// Run-specific log and recovery copies view (§12, uit3-review1 #9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedRunSnapshot {
+    pub run_id: RunId,
+    pub mapping_id: MappingId,
+    pub mapping_name: String,
+    pub started_label: String,
+    pub result_label: String,
+    pub log_lines: Vec<String>,
+    pub log_path: Option<String>,
+    /// True only when the run's `output.ndjson` actually exists on disk (HIGH #9).
+    pub log_exists: bool,
+    pub recovery_copies: Vec<RecoveryCopyItem>,
+    pub copy_notice: Option<String>,
+}
+
+/// Live recovery checklist evidence loaded from `InspectRecovery` (§5.6, #9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryChecklistData {
+    pub mapping_id: MappingId,
+    pub inspected: bool,
+    pub is_paused: bool,
+    pub orphan_alive: Option<bool>,
+    pub has_ambiguous_case: bool,
+    pub has_lock_file: bool,
+    pub workdir_files: Vec<String>,
+    pub cause: String,
+    pub next_step: String,
+    pub latest_run_id: Option<RunId>,
+    pub recovery_copies: Vec<RecoveryCopyItem>,
+    /// True only after endpoint roots and access markers were verified during inspection (HIGH #9).
+    pub identities_verified: bool,
+    /// Human-readable result of the identity check.
+    pub identity_check_detail: String,
+}
+
 /// Immutable snapshot of one mapping for UI rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappingSnapshot {
@@ -218,6 +277,8 @@ pub struct MappingSnapshot {
     pub last_run: Option<LastRunSummary>,
     pub last_completed_label: String,
     pub modifier: StatusModifier,
+    /// Persistent unreviewed conflict notice (independent of Pause/Queued modifiers).
+    pub unreviewed_conflicts: Option<UnreviewedConflicts>,
     pub available_actions: Vec<AvailableAction>,
     pub schedule_minutes: u32,
     pub next_check_label: String,
@@ -286,12 +347,18 @@ impl MappingSnapshot {
         let readiness = state.readiness();
         let execution = state.execution;
         let intent = state.intent;
-        let core_text = status_text(
+        let mut core_text = status_text(
             state,
             &self.display_name,
             &self.volume_name,
             self.last_run.as_ref(),
         );
+        // Never promise automatic retry when automatic scheduling is off (HIGH #4).
+        if self.next_check_label == "Manual runs only"
+            && core_text == "Last run failed — will retry"
+        {
+            core_text = "Last run failed — retry manually".to_owned();
+        }
         let actions = available_actions(state);
 
         let paused_suffix = if intent == Intent::Paused
@@ -610,6 +677,34 @@ impl MappingSnapshot {
 
         // 6. Last outcome (Ready / Idle / Enabled)
         let sync_now_enabled = actions.contains(&AvailableAction::RunNow);
+        if let Some(unrev) = &self.unreviewed_conflicts {
+            let count = unrev.paths.len().max(1);
+            let at = self
+                .last_run
+                .map(|r| format!(" at {}", r.completed_at))
+                .unwrap_or_default();
+            let copies = if count == 1 {
+                "1 conflict copy kept".to_owned()
+            } else {
+                format!("{count} conflict copies kept")
+            };
+            return PresentedStatus {
+                pill_label: Some("Conflicts".to_owned()),
+                pill_tone: Tone::Attn,
+                icon: IconKind::Bang,
+                status_line: format!("Completed with conflicts{at}"),
+                why_line: Some(copies),
+                secondary_link: Some(StatusLink::ShowConflicts),
+                sync_now_enabled,
+                show_stop: false,
+                show_force_stop: false,
+                show_pause: true,
+                show_resume: false,
+                is_draft: false,
+                needs_init: false,
+                sync_now_tooltip: None,
+            };
+        }
         match &self.modifier {
             StatusModifier::UnreviewedConflicts { count, .. } => {
                 let at = self
@@ -700,7 +795,8 @@ impl MappingSnapshot {
                 | Readiness::RecoveryRequired
                 | Readiness::EndpointChanged
                 | Readiness::VolumeUnavailable
-        ) || matches!(self.modifier, StatusModifier::UnreviewedConflicts { .. })
+        ) || self.unreviewed_conflicts.is_some()
+            || matches!(self.modifier, StatusModifier::UnreviewedConflicts { .. })
     }
 }
 
@@ -886,8 +982,12 @@ pub enum ReviewScenario {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WizardDraft {
     pub step: WizardStep,
+    /// Mapping ID when resuming an existing draft or finishing first sync (#3).
+    pub editing_mapping_id: Option<MappingId>,
     pub selected_account: AccountId,
     pub selected_folder: String,
+    /// Local-to-local fixture remote folder path (used by real ManagerSource).
+    pub remote_folder_path: Option<String>,
     pub local_path: String,
     pub volume_name: String,
     pub volume_kind: VolumeKind,
@@ -902,32 +1002,71 @@ pub struct WizardDraft {
     pub cloud_recovery_path: String,
     pub recovery_checks: Vec<LocationCheck>,
     pub review_scenario: ReviewScenario,
+    /// Real inventory counts & byte totals for Review & FirstSync (#4).
+    pub cloud_file_count: Option<usize>,
+    pub cloud_total_bytes: Option<u64>,
+    pub local_file_count: Option<usize>,
+    pub local_total_bytes: Option<u64>,
+    /// True only when a recognized collection marker already exists on the remote side (§9 step 5).
+    pub marker_reused: bool,
+    /// Unsupported items observed during inventory (§18).
+    pub found_symlinks: Vec<String>,
+    pub found_name_issues: Vec<String>,
     /// When `BothPopulated` is triggered in the demo, remembers the `(folder, normalized_local_path)`
     /// pair that was blocked so Start stays blocked for that pair while a different valid destination
     /// re-derives the scenario from demo data.
     pub blocked_populated_pair: Option<(String, String)>,
     pub no_other_sync_confirmed: bool,
+    /// Fingerprint of the reviewed paths, exclusions, inventory, and direction when confirmed (HIGH #1).
+    pub reviewed_fingerprint: Option<String>,
+    pub first_sync_mapping_id: Option<MappingId>,
+    /// True only after the manager actually reports preflight passed / run started (HIGH #4).
+    pub first_sync_preflight_done: bool,
+    /// True only after the manager actually reports markers in place / run started (HIGH #4).
+    pub first_sync_markers_ready: bool,
+    /// True while waiting for Stop on the active first sync run to finish (HIGH #4).
+    pub first_sync_stopping: bool,
     pub first_sync_percent: u8,
     pub first_sync_elapsed_secs: u64,
+    pub first_sync_completed: bool,
+    pub first_sync_error: Option<String>,
 }
 
 impl WizardDraft {
-    /// Sum of included subfolder sizes (GB) at depth 1.
+    /// Sum of included subfolder sizes (GB) at depth 1, or cloud/local byte total if flat.
     pub fn included_gb(&self) -> f64 {
-        self.subfolders
+        let sub_sum: f64 = self
+            .subfolders
             .iter()
             .filter(|n| n.depth == 1 && n.included)
             .map(|n| n.size_gb)
-            .sum()
+            .sum();
+        if self.subfolders.iter().any(|n| n.depth == 1) {
+            sub_sum
+        } else if let Some(bytes) = self.cloud_total_bytes.or(self.local_total_bytes) {
+            (bytes as f64) / 1_000_000_000.0
+        } else {
+            self.subfolders
+                .iter()
+                .find(|n| n.depth == 0 && n.included)
+                .map(|n| n.size_gb)
+                .unwrap_or(0.0)
+        }
+    }
+
+    /// Total size of the folder (GB), returning `None` when unknown ("Measuring…").
+    pub fn total_gb_opt(&self) -> Option<f64> {
+        if let Some(root) = self.subfolders.iter().find(|n| n.depth == 0) {
+            return Some(root.size_gb);
+        }
+        self.cloud_total_bytes
+            .or(self.local_total_bytes)
+            .map(|b| (b as f64) / 1_000_000_000.0)
     }
 
     /// Total size of the folder (GB).
     pub fn total_gb(&self) -> f64 {
-        self.subfolders
-            .iter()
-            .find(|n| n.depth == 0)
-            .map(|n| n.size_gb)
-            .unwrap_or(18.6)
+        self.total_gb_opt().unwrap_or(0.0)
     }
 
     /// Excluded subfolder names.
@@ -1011,6 +1150,7 @@ pub enum DemoPreset {
 /// Immutable snapshot delivered from the manager (or demo source) to the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiSnapshot {
+    pub is_demo_mode: bool,
     pub device_id: String,
     pub scheduling_paused: bool,
     pub demo_preset: DemoPreset,
@@ -1018,15 +1158,21 @@ pub struct UiSnapshot {
     pub volumes: Vec<VolumeSnapshot>,
     pub mappings: Vec<MappingSnapshot>,
     pub active_run: Option<ActiveRunSnapshot>,
+    /// Actual ordered queue of waiting mapping IDs (front first, #6).
+    pub queue_order: Vec<MappingId>,
     pub attention_items: Vec<AttentionItem>,
     pub recent_events: Vec<ActivityEvent>,
     pub raw_log: Vec<String>,
+    pub inspected_run: Option<InspectedRunSnapshot>,
+    pub recovery_checklist: Option<RecoveryChecklistData>,
     pub cloud_catalog: Vec<CloudFolderCandidate>,
     pub cloud_catalog_measured_at: String,
     pub wizard: WizardDraft,
     pub preferences: PreferencesSnapshot,
     pub reconnecting_account: Option<AccountId>,
     pub status_notice: Option<String>,
+    /// Actionable manager error displayed prominently in the UI with a Dismiss control.
+    pub action_error: Option<String>,
 }
 
 impl UiSnapshot {
@@ -1044,8 +1190,7 @@ impl UiSnapshot {
         self.mappings
             .iter()
             .filter(|m| {
-                !m.is_variant_showcase
-                    && m.state.readiness() == Readiness::Ready
+                m.state.readiness() == Readiness::Ready
                     && m.state.execution == Execution::Idle
                     && m.state.intent == Intent::Enabled
             })
@@ -1124,17 +1269,35 @@ pub enum UiCommand {
     SetSchedulingPaused(bool),
     MarkConflictsReviewed(MappingId),
     CheckAgain(MappingId),
+    InspectRecovery(MappingId),
+    InspectRun {
+        mapping_id: MappingId,
+        run_id: RunId,
+    },
+    CopyRecoveryCopyToInspection {
+        run_id: RunId,
+        is_remote: bool,
+        relative_path: String,
+        dest_dir: String,
+    },
     CompleteRecovery {
         mapping_id: MappingId,
         resume_and_run: bool,
     },
     RemoveMapping(MappingId),
     DiscardDraft(MappingId),
+    ResumeDraft(MappingId),
+    FinishSetup(MappingId),
     SetScheduleInterval {
         mapping_id: MappingId,
         minutes: u32,
     },
     ConnectDemoAccount,
+    AddLocalFixtureAccount {
+        id: String,
+        display_name: String,
+        parent_dir: String,
+    },
     ReconnectAccount(AccountId),
     CancelReconnect,
     CheckAccountAccess(AccountId),
@@ -1145,6 +1308,8 @@ pub enum UiCommand {
     WizardSetStep(WizardStep),
     WizardSelectAccount(AccountId),
     WizardSelectFolder(String),
+    WizardCreateNewFolder(String),
+    WizardSetRemotePath(String),
     WizardSetLocalPath(String),
     WizardToggleSubfolder(String),
     WizardToggleDefaultExclusions,
@@ -1152,8 +1317,18 @@ pub enum UiCommand {
     WizardSetLocalRecoveryPath(String),
     WizardSetReviewScenario(ReviewScenario),
     WizardSetNoOtherSyncConfirmed(bool),
+    WizardSaveDraft,
     WizardStartFirstSync,
+    WizardStopFirstSync,
+    WizardCompleteDemoFirstSync,
     WizardReset,
+    /// Injectable system actions (routed to RealMacOsSystemActions or RecordingSystemActions).
+    RevealPath(String),
+    OpenCloudUrl(String),
+    OpenExtensionSettings,
+    ExportDiagnostics(String),
+    DismissError,
+    PollFinderActions,
     /// Switch active demo progress variant on the Activity screen.
     DemoSetActivityPhase(DemoActivityPhase),
     /// Switch entire demo preset (AllStates / HouseholdOnly / Welcome states).
@@ -1164,7 +1339,7 @@ pub enum UiCommand {
     DemoTickElapsed,
     /// Record a simulated system action (Reveal, Open URL, Export) in Activity without touching the OS.
     DemoAction(String),
-    /// Controlled quit handler (no-op against demo data; marks active run stopping).
+    /// Controlled quit handler (marks active run stopping and shuts down manager).
     RequestControlledQuit,
 }
 

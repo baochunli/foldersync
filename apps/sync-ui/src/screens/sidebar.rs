@@ -186,8 +186,14 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                     ctrl_act.navigate(nav_for(id));
                 })
         })
-        // Compact demo preset switcher (Group 3 in-memory state preview)
-        .child(demo_switcher_box(ctrl_demo))
+        // Compact demo preset switcher (shown ONLY in explicit demo mode)
+        .child(dynamic(move || {
+            if ctrl_demo.snapshot.get().is_demo_mode {
+                demo_switcher_box(ctrl_demo.clone()).into_element()
+            } else {
+                view().into_element()
+            }
+        }))
         // Sidebar footer: scheduling status & running mapping
         .child(dynamic(move || {
             let snap = ctrl_foot.snapshot.get();

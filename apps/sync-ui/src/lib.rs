@@ -1,13 +1,18 @@
-//! FolderSync NSH desktop interface (Group 3: approved mockups driven by an in-memory demo source).
+//! FolderSync NSH desktop application.
 //!
-//! No real `sync-manager`, `rclone` binary, Keychain, or filesystem mutation occurs in this crate.
+//! By default the app runs against the real [`manager_source::ManagerSource`]
+//! owning `sync-manager` on a background worker thread. Set `FOLDERSYNC_DEMO=1`
+//! (or pass `--demo`) to run with the in-memory [`demo::DemoSource`] instead.
 
 pub mod contract;
 pub mod demo;
+pub mod manager_source;
 pub mod screens;
+pub mod system_actions;
 pub mod theme;
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nsh_core::{
@@ -20,16 +25,19 @@ use nsh_core::{
 };
 
 use crate::contract::{
-    ScreenRoute, UiCommand, selected_stop_target, selected_sync_now_target,
+    IconKind, ScreenRoute, Tone, UiCommand, selected_stop_target, selected_sync_now_target,
     should_show_window_at_launch,
 };
 use crate::demo::DemoSource;
+use crate::manager_source::{ManagerSource, ManagerSourceConfig, UiControlEvent};
 use crate::screens::{
-    AppController, accounts::accounts_view, activity::activity_view, attention::attention_view,
-    attention::recovery_view, detail::detail_view, overview::overview_view,
-    preferences::preferences_view, sidebar::sidebar_view, wizard::wizard_view,
+    AppController, accounts::accounts_view, activity::activity_view, activity::run_inspection_view,
+    attention::attention_view, attention::recovery_view, detail::detail_view,
+    overview::overview_view, preferences::preferences_view, sidebar::sidebar_view,
+    wizard::wizard_view,
 };
-use crate::theme::{Palette, TRAY_ATTENTION_ICON, TRAY_ICON};
+use crate::system_actions::execute_system_action_on_main_thread;
+use crate::theme::{BtnKind, Palette, TRAY_ATTENTION_ICON, TRAY_ICON, app_button, status_pill};
 
 /// Bundled crate assets (`PaperMono-Regular.ttf`, tray template SVGs, Welcome illustration).
 pub const CRATE_ASSETS: &[nsh_core::element::AssetFile] = assets!();
@@ -37,6 +45,33 @@ pub const CRATE_ASSETS: &[nsh_core::element::AssetFile] = assets!();
 #[native_module("sync-ui/native")]
 fn native(registry: &mut Registry) {
     registry.assets(CRATE_ASSETS).register::<App>();
+}
+
+/// Returns `true` when in-memory demo mode is explicitly requested via
+/// `FOLDERSYNC_DEMO=1` or `--demo`, OR when running in a headless test binary
+/// without an explicit isolated `FOLDERSYNC_STATE_DIR` (HIGH #15).
+pub fn is_demo_mode_requested() -> bool {
+    if std::env::var("FOLDERSYNC_DEMO").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        || std::env::args().any(|a| a == "--demo")
+    {
+        return true;
+    }
+    // Never default a bare headless test open to the real user's ~/Library/Application Support/FolderSync.
+    let explicit_state_dir =
+        std::env::var_os("FOLDERSYNC_STATE_DIR").is_some_and(|v| !v.is_empty());
+    if !explicit_state_dir {
+        if cfg!(test) {
+            return true;
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(name) = exe.file_name().and_then(|n| n.to_str())
+            && name.starts_with("nsh-app-")
+            && !name.ends_with("-macos-host")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Marshals a UI state update onto the main thread using NSH's documented
@@ -48,8 +83,17 @@ pub fn marshal_to_main_thread(work: impl FnOnce() + Send + 'static) {
 /// The FolderSync desktop application root component.
 #[component]
 pub fn App() -> impl IntoElement {
-    let demo = Rc::new(DemoSource::default());
-    let ctrl = AppController::new(demo);
+    let demo_mode = is_demo_mode_requested();
+    let launched_at_login = std::env::args().any(|a| a == "--login-launch")
+        || std::env::var_os("FOLDERSYNC_LOGIN_LAUNCH").is_some();
+
+    let (ctrl, manager_for_updates) = if demo_mode {
+        let demo = Rc::new(DemoSource::default());
+        (AppController::new_demo(demo), None)
+    } else {
+        let mgr = Rc::new(ManagerSource::spawn_for_app(ManagerSourceConfig::default()));
+        (AppController::new_manager(Rc::clone(&mgr)), Some(mgr))
+    };
 
     // Keep-alive-on-close: closing the window hides it while the tray stays active (§3, §14).
     let win = main_window();
@@ -59,14 +103,78 @@ pub fn App() -> impl IntoElement {
 
     // Spec §3: `nsh.json` starts the window hidden (`defaultVisible: false`).
     // Show it when no account or mapping exists yet, or on a manual launch (not a login launch).
-    let launched_at_login = std::env::args().any(|a| a == "--login-launch")
-        || std::env::var_os("FOLDERSYNC_LOGIN_LAUNCH").is_some();
     if ctrl
         .snapshot
         .with_untracked(|s| should_show_window_at_launch(s, launched_at_login))
     {
         main_window().show();
         main_window().focus();
+    }
+
+    // Consume coalesced latest snapshots & control events off the NSH thread via
+    // `blocking` and marshal every update onto the main thread via `run_on_main_thread` (HIGH #8, #14).
+    if let Some(mgr) = manager_for_updates {
+        let slot = mgr.ui_slot();
+        let mgr_for_sys = Rc::clone(&mgr);
+        let c_updates = ctrl.clone();
+        let mut checked_initial_launch_visibility = false;
+        let task = spawn(async move {
+            loop {
+                let slot_clone = Arc::clone(&slot);
+                let recv_res = blocking(move || slot_clone.wait_for_batch()).await;
+                let Ok(Some((latest_snap, events))) = recv_res else {
+                    break;
+                };
+                // Marshal onto the main thread before mutating signals or invoking NSH desktop APIs.
+                let Ok((latest_snap, events)) =
+                    run_on_main_thread(move || (latest_snap, events)).await
+                else {
+                    break;
+                };
+                if let Some(snap) = latest_snap {
+                    if !checked_initial_launch_visibility {
+                        checked_initial_launch_visibility = true;
+                        if should_show_window_at_launch(&snap, launched_at_login) {
+                            main_window().show();
+                            main_window().focus();
+                        }
+                    }
+                    c_updates.apply_snapshot(*snap);
+                }
+                let mut quit_now = false;
+                for ev in events {
+                    match ev {
+                        UiControlEvent::Navigate(route) => {
+                            c_updates.navigate(route);
+                        }
+                        UiControlEvent::ShowWindowAndNavigate(route) => {
+                            c_updates.navigate(route);
+                            main_window().show();
+                            main_window().focus();
+                        }
+                        UiControlEvent::SystemAction {
+                            request_id,
+                            request,
+                        } => {
+                            let mgr_reply = Rc::clone(&mgr_for_sys);
+                            spawn(async move {
+                                let outcome = execute_system_action_on_main_thread(request).await;
+                                mgr_reply.complete_system_action(request_id, outcome);
+                            });
+                        }
+                        UiControlEvent::QuitReady(_outcome) => {
+                            nsh_core::element::desktop::quit();
+                            quit_now = true;
+                            break;
+                        }
+                    }
+                }
+                if quit_now {
+                    break;
+                }
+            }
+        });
+        cleanup(move || task.cancel());
     }
 
     // Controlled shutdown handler shared by tray Quit, ⌘Q, and system quit (§5.9).
@@ -88,10 +196,15 @@ pub fn App() -> impl IntoElement {
         let c_tray = ctrl.clone();
         effect(move || {
             let snap = c_tray.snapshot.get();
+            let quitting = c_tray.quitting.get();
             let attn_count = snap.attention_badge_count();
             let ready_count = snap.ready_mapping_count();
             let sched_paused = snap.scheduling_paused;
-            let status_line = snap.tray_status_line();
+            let status_line = if quitting {
+                "Stopping…".to_owned()
+            } else {
+                snap.tray_status_line()
+            };
             let tip = snap.tray_tooltip();
 
             let c_sync = c_tray.clone();
@@ -113,21 +226,27 @@ pub fn App() -> impl IntoElement {
                         main_window().focus();
                     }),
                     MenuItem::new("Sync ready mappings")
-                        .disabled(ready_count == 0)
+                        .disabled(ready_count == 0 || quitting)
                         .on_select(move || {
                             c_sync.send(UiCommand::SyncReadyMappings);
                         }),
                     MenuItem::new("Pause scheduling")
                         .checked(sched_paused)
+                        .disabled(quitting)
                         .on_select(move || {
                             c_pause.send(UiCommand::SetSchedulingPaused(!sched_paused));
                         }),
                     MenuItem::separator(),
-                    MenuItem::new("Quit FolderSync")
-                        .shortcut("mod+q")
-                        .on_select(move || {
-                            c_quit.request_controlled_quit();
-                        }),
+                    MenuItem::new(if quitting {
+                        "Stopping…"
+                    } else {
+                        "Quit FolderSync"
+                    })
+                    .shortcut("mod+q")
+                    .disabled(quitting)
+                    .on_select(move || {
+                        c_quit.request_controlled_quit();
+                    }),
                 ]),
             );
         });
@@ -246,6 +365,7 @@ pub fn App() -> impl IntoElement {
     }
 
     let c_content = ctrl.clone();
+    let c_banners = ctrl.clone();
     let c_sidebar = ctrl.clone();
 
     view()
@@ -267,6 +387,83 @@ pub fn App() -> impl IntoElement {
                     let inset = nsh_core::element::desktop::title_bar().top.0;
                     px(inset.max(12.0))
                 }))
+                // Top banners: controlled shutdown status + actionable manager errors
+                .child(dynamic(move || {
+                    let p = Palette::current();
+                    let quitting = c_banners.quitting.get();
+                    let snap = c_banners.snapshot.get();
+                    let mut col = view().w_full().flex_col().gap(px(8.0));
+                    let mut any = false;
+
+                    if quitting {
+                        any = true;
+                        col = col.child(
+                            view()
+                                .test_id("quitting-banner")
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.0))
+                                .mx(px(20.0))
+                                .mb(px(4.0))
+                                .px(px(14.0))
+                                .py(px(10.0))
+                                .rounded(px(10.0))
+                                .bg(p.neu_bg)
+                                .border_1()
+                                .border_color(p.neu_bd)
+                                .child(status_pill(IconKind::Stop, "Stopping…", Tone::Neutral))
+                                .child(
+                                    text("Waiting for active sync work to stop cleanly before quitting.")
+                                        .flex_1()
+                                        .text_size(px(12.5))
+                                        .text_color(p.fg),
+                                ),
+                        );
+                    }
+
+                    if let Some(err) = &snap.action_error {
+                        any = true;
+                        let c_dismiss = c_banners.clone();
+                        col = col.child(
+                            view()
+                                .test_id("action-error-banner")
+                                .role(AccessibilityRole::Alert)
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.0))
+                                .mx(px(20.0))
+                                .mb(px(4.0))
+                                .px(px(14.0))
+                                .py(px(10.0))
+                                .rounded(px(10.0))
+                                .bg(p.err_bg)
+                                .border_1()
+                                .border_color(p.err_bd)
+                                .child(status_pill(IconKind::Octagon, "Couldn't complete", Tone::Err))
+                                .child(
+                                    text(err.clone())
+                                        .flex_1()
+                                        .text_size(px(12.5))
+                                        .text_color(p.fg),
+                                )
+                                .child(app_button(
+                                    "Dismiss",
+                                    BtnKind::Default,
+                                    true,
+                                    false,
+                                    None,
+                                    None,
+                                    move || c_dismiss.send(UiCommand::DismissError),
+                                )),
+                        );
+                    }
+
+                    if any {
+                        col.into_element()
+                    } else {
+                        view().into_element()
+                    }
+                }))
                 .child(
                     scroll().flex_1().w_full().child(
                         view()
@@ -286,6 +483,10 @@ pub fn App() -> impl IntoElement {
                                 }
                                 ScreenRoute::Activity => {
                                     activity_view(c_content.clone()).into_element()
+                                }
+                                ScreenRoute::RunInspection { mapping_id, run_id } => {
+                                    run_inspection_view(c_content.clone(), mapping_id, run_id)
+                                        .into_element()
                                 }
                                 ScreenRoute::Attention => {
                                     attention_view(c_content.clone()).into_element()
@@ -308,7 +509,7 @@ pub fn App() -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use nsh_base::Theme;
-    use sync_core::{Execution, Intent, MappingId, Readiness};
+    use sync_core::{Execution, Intent, MappingId, Readiness, RunOutcome};
 
     use crate::contract::{DemoPreset, ReviewScenario, UiCommand};
     use crate::demo::DemoSource;
@@ -397,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn demo_commands_mutate_only_in_memory_state() {
+    fn demo_commands_mutate_only_in_memory_state_and_preserve_conflict_history() {
         let demo = DemoSource::new(DemoPreset::HouseholdOnly);
         let s1 = demo.dispatch(UiCommand::PauseMapping(MappingId::new("documents")));
         let docs = s1.mapping(&MappingId::new("documents")).unwrap();
@@ -405,8 +606,25 @@ mod tests {
         assert_eq!(docs.state.readiness(), Readiness::Ready);
         assert_eq!(docs.state.execution, Execution::Idle);
 
+        // Pausing Family must NOT erase its unreviewed conflicts (#7).
+        let s_pf = demo.dispatch(UiCommand::PauseMapping(MappingId::new("family")));
+        assert_eq!(s_pf.attention_badge_count(), 5);
+        assert!(
+            s_pf.mapping(&MappingId::new("family"))
+                .unwrap()
+                .unreviewed_conflicts
+                .is_some()
+        );
+
+        // Marking conflicts reviewed drops attention count to 4 while preserving RunOutcome::SuccessWithConflicts (#7).
         let s2 = demo.dispatch(UiCommand::MarkConflictsReviewed(MappingId::new("family")));
         assert_eq!(s2.attention_badge_count(), 4);
+        let fam = s2.mapping(&MappingId::new("family")).unwrap();
+        assert!(fam.unreviewed_conflicts.is_none());
+        assert_eq!(
+            fam.last_run.unwrap().outcome,
+            RunOutcome::SuccessWithConflicts
+        );
 
         let s3 = demo.dispatch(UiCommand::SetSchedulingPaused(true));
         assert!(s3.scheduling_paused);

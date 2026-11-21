@@ -1,6 +1,6 @@
 //! Coordinates durable state, exclusive locking, run records, crash/orphan
 //! recovery, initialization, manual runs, status snapshots, and Finder status
-//! publication for FolderSync.
+//! publication/action handling for FolderSync.
 
 pub mod accounts;
 pub mod clock;
@@ -22,17 +22,27 @@ pub use accounts::{
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::ManagerError;
 pub use finder::{
-    FINDER_SNAPSHOT_VERSION, FinderMappingSnapshot, FinderMappingState, FinderStatusSnapshot,
-    FinderStatusWriter,
+    ClaimedFinderAction, DARWIN_ACTION_REQUESTED_NOTIFICATION,
+    DARWIN_SNAPSHOT_UPDATED_NOTIFICATION, DarwinFinderNotifier, FINDER_SNAPSHOT_VERSION,
+    FinderActionFileOutcome, FinderActionKind, FinderActionRequest, FinderMappingSnapshot,
+    FinderMappingState, FinderNotifier, FinderStatusSnapshot, FinderStatusWriter,
+    NoopFinderNotifier, RecordingFinderNotifier, ValidatedFinderAction, claim_finder_action_files,
+    derive_finder_state_with_pause, drain_finder_action_files, parse_and_validate_finder_action,
 };
-pub use init::{EndpointInventory, SideClassification};
+pub use init::{
+    DetailedEndpointInventory, DetectedVolume, DiskSpaceInfo, EndpointInventory,
+    SideClassification, SubfolderInventory, detect_volume_identity, disk_space_for_path,
+    inspect_local_endpoint_detailed,
+};
 pub use launcher::{
     BisyncLauncher, FakeBisyncLauncher, FakeLaunchScript, LaunchPlan, LaunchedRun,
     RealBisyncLauncher,
 };
 pub use manager::{
-    AddMappingCommand, CommandAcceptance, CommandOutcome, InitializeCommand, ManagerCommand,
-    ManagerConfig, RecoveryCaseView, RecoveryReport, RemoteEndpoint, SyncManager,
+    AddMappingCommand, CommandAcceptance, CommandOutcome, ControlledShutdownOutcome,
+    FinderActionDispatch, InitializeCommand, ManagerCommand, ManagerConfig, PreflightPreview,
+    RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide, RecoveryReport, RemoteEndpoint,
+    SyncManager,
 };
 pub use platform::{
     FakeProcessInspector, LiveProcessInfo, OsProcessInspector, ProcessInspector,
@@ -44,7 +54,9 @@ pub use secrets::{
     InMemorySecretStore, KEYCHAIN_SERVICE, SecretStore, SecretStoreError, SecretString,
     SystemSecretStore, run_credential_helper, scoped_credential_key, validate_credential_key,
 };
-pub use snapshot::{ManagerEvent, MappingCounters, MappingStatusSnapshot, StatusSnapshot};
+pub use snapshot::{
+    ManagerEvent, MappingCounters, MappingStatusSnapshot, SnapshotReceiver, StatusSnapshot,
+};
 pub use store::{
     AccountRecord, DeviceRecord, GenerationRecord, MappingRecord, RecoveryCaseRecord, RunRecord,
     SqliteStateStore,
