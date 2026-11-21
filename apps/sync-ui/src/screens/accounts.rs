@@ -406,6 +406,12 @@ fn authorization_card(ctrl: AppController, snap: &UiSnapshot) -> View {
             view()
         };
     };
+    if snap.authorization_canceling {
+        return card()
+            .border_color(p.run_bd)
+            .child(card_title("Canceling Google Drive sign-in…"))
+            .child(progress_bar(None, 6.0, "Canceling Google Drive sign-in"));
+    }
     let is_demo = snap.is_demo_mode;
     let ready = is_demo || snap.can_reopen_authorization;
     let demo_id = id.clone();
@@ -426,32 +432,31 @@ fn authorization_card(ctrl: AppController, snap: &UiSnapshot) -> View {
         ));
     if is_demo {
         let c_complete = ctrl.clone();
-        buttons = buttons
-            .child(
-                app_button(
-                    "Simulate sign-in complete (demo)",
-                    BtnKind::Primary,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || c_complete.send(UiCommand::CheckAccountAccess(demo_id.clone())),
-                )
-                .test_id("accounts-simulate-signin-btn"),
+        buttons = buttons.child(
+            app_button(
+                "Simulate sign-in complete (demo)",
+                BtnKind::Primary,
+                true,
+                false,
+                None,
+                None,
+                move || c_complete.send(UiCommand::CheckAccountAccess(demo_id.clone())),
             )
-            .child(
-                app_button(
-                    "Cancel",
-                    BtnKind::Default,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || ctrl.send(UiCommand::CancelReconnect),
-                )
-                .test_id("accounts-cancel-reconnect-btn"),
-            );
+            .test_id("accounts-simulate-signin-btn"),
+        );
     }
+    let buttons = buttons.child(
+        app_button(
+            "Cancel",
+            BtnKind::Default,
+            true,
+            false,
+            None,
+            None,
+            move || ctrl.send(UiCommand::CancelReconnect),
+        )
+        .test_id("accounts-cancel-reconnect-btn"),
+    );
     card()
         .border_color(p.run_bd)
         .child(card_title(if ready {
@@ -520,7 +525,7 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot, busy: bool) -> View
         ));
     }
 
-    if acct.is_drive && acct.status != AccountStatus::SignInRequired {
+    if acct.is_drive {
         actions = actions.child(app_button(
             "Check access",
             BtnKind::Default,

@@ -404,6 +404,15 @@ impl fmt::Debug for AccountConfigLock {
 impl AccountConfigLock {
     /// Acquires the blocking exclusive lock on `lock_path` (`accounts/<id>/config.lock`).
     pub fn acquire(lock_path: &Path) -> Result<Self, ConfigError> {
+        Self::acquire_inner(lock_path, false).map(|lock| lock.expect("blocking account lock"))
+    }
+
+    /// Attempts the same lock without waiting on a different account operation.
+    pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>, ConfigError> {
+        Self::acquire_inner(lock_path, true)
+    }
+
+    fn acquire_inner(lock_path: &Path, nonblocking: bool) -> Result<Option<Self>, ConfigError> {
         if !lock_path.is_absolute() {
             return Err(ConfigError::InvalidInput {
                 field: "lock_path",
@@ -439,7 +448,15 @@ impl AccountConfigLock {
         // `_in_process_guard` after releasing `flock` and BEFORE `_in_process_mutex`.
         let guard: std::sync::MutexGuard<'static, ()> = unsafe {
             let ptr: *const Mutex<()> = Arc::as_ptr(&per_path_mutex);
-            (*ptr).lock().unwrap_or_else(|e| e.into_inner())
+            if nonblocking {
+                match (*ptr).try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                }
+            } else {
+                (*ptr).lock().unwrap_or_else(|e| e.into_inner())
+            }
         };
 
         let mut opts = OpenOptions::new();
@@ -465,21 +482,26 @@ impl AccountConfigLock {
 
         #[cfg(unix)]
         {
-            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+            let ret = unsafe { libc::flock(file.as_raw_fd(), flags) };
             if ret != 0 {
+                let source = std::io::Error::last_os_error();
+                if nonblocking && source.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
                 return Err(ConfigError::Io {
                     path: lock_path.to_path_buf(),
-                    source: std::io::Error::last_os_error(),
+                    source,
                 });
             }
         }
 
-        Ok(Self {
+        Ok(Some(Self {
             file,
             lock_path: lock_path.to_path_buf(),
             _in_process_mutex: per_path_mutex,
             _in_process_guard: Some(guard),
-        })
+        }))
     }
 
     pub fn lock_path(&self) -> &Path {

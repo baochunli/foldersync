@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use sync_core::{
-    AccountId, AvailableAction, Execution, Intent, LastRunSummary, MappingId, MappingState,
-    Readiness, RunId, VolumeIdentity, VolumeKind, available_actions, status_text,
+    AccountId, AvailableAction, CloudCollection, Execution, Intent, LastRunSummary, MappingId,
+    MappingState, Readiness, RunId, VolumeIdentity, VolumeKind, available_actions, status_text,
 };
 
 /// Top-level route shown in the main window content area.
@@ -188,6 +188,7 @@ pub struct VolumeSnapshot {
     pub connected: bool,
     pub total_gb: u64,
     pub free_gb: u64,
+    pub free_bytes: Option<u64>,
     pub free_label: String,
     pub total_label: String,
     /// Used percentage (0..=100) for the capacity meter bar.
@@ -263,6 +264,39 @@ pub struct RecoveryChecklistData {
     pub identity_check_detail: String,
 }
 
+/// An estimate published by the scheduler. Local changes may prompt an earlier check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledCheck {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub retry: bool,
+}
+
+impl ScheduledCheck {
+    pub fn label(self, now: chrono::DateTime<chrono::Utc>, include_subject: bool) -> String {
+        let seconds = (self.at - now).num_seconds();
+        let when = if seconds <= 0 {
+            "due now".to_owned()
+        } else if seconds < 60 {
+            "in under a minute".to_owned()
+        } else {
+            let minutes = (seconds + 30) / 60;
+            format!(
+                "in about {minutes} minute{}",
+                if minutes == 1 { "" } else { "s" }
+            )
+        };
+        if self.retry {
+            format!("Retry {when}")
+        } else if include_subject {
+            format!("Next check {when}")
+        } else {
+            let mut label = when;
+            label[..1].make_ascii_uppercase();
+            label
+        }
+    }
+}
+
 /// Immutable snapshot of one mapping for UI rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappingSnapshot {
@@ -286,6 +320,7 @@ pub struct MappingSnapshot {
     pub volume_issue: Option<String>,
     pub schedule_minutes: u32,
     pub next_check_label: String,
+    pub next_check: Option<ScheduledCheck>,
     pub included_subfolders: usize,
     pub total_subfolders: usize,
     pub included_size_label: String,
@@ -344,6 +379,70 @@ impl StatusLink {
 }
 
 impl MappingSnapshot {
+    fn volume_hold(&self) -> (String, VolumeHold) {
+        match self.volume_issue.as_deref() {
+            Some(issue) if issue.starts_with("A different disk named ") => {
+                (issue.to_owned(), VolumeHold::WrongDisk)
+            }
+            Some(issue) if issue.starts_with("Can’t access ") => (
+                format!("Can’t access {}", self.volume_name),
+                VolumeHold::Inaccessible,
+            ),
+            _ => (
+                format!("Waiting for {}", self.volume_name),
+                VolumeHold::Missing,
+            ),
+        }
+    }
+
+    pub fn volume_attention(&self) -> AttentionItem {
+        let (title, hold) = self.volume_hold();
+        let (cause, what_did, next_step) = match hold {
+            VolumeHold::WrongDisk => (
+                "The connected disk doesn’t match this mapping.".to_owned(),
+                "Held the mapping to avoid syncing with a different disk.".to_owned(),
+                "Connect the disk selected during setup.".to_owned(),
+            ),
+            VolumeHold::Inaccessible => (
+                format!(
+                    "{}.",
+                    self.volume_issue
+                        .as_deref()
+                        .unwrap_or(&title)
+                        .trim_end()
+                        .trim_end_matches('.')
+                ),
+                "Held the mapping because the local folder couldn’t be checked.".to_owned(),
+                "Check disk permissions, then choose Check again.".to_owned(),
+            ),
+            VolumeHold::Missing => (
+                format!("{} isn’t connected right now.", self.volume_name),
+                "Held the mapping while the disk is disconnected.".to_owned(),
+                format!(
+                    "Connect {}. FolderSync rechecks it automatically.",
+                    self.volume_name
+                ),
+            ),
+        };
+        AttentionItem {
+            id: format!("attn-vol-{}", self.id),
+            priority: AttentionPriority::VolumeMissing,
+            mapping_id: Some(self.id.clone()),
+            mapping_name: Some(self.display_name.clone()),
+            pill_label: "Waiting".to_owned(),
+            pill_tone: Tone::Attn,
+            icon: IconKind::DriveMissing,
+            is_error_accent: false,
+            title,
+            cause,
+            what_did,
+            next_step,
+            kind: AttentionKind::VolumeMissing {
+                can_check_again: hold == VolumeHold::Inaccessible,
+            },
+        }
+    }
+
     /// Computes the exact status wording, icon shape, pill, and button enablement
     /// per `ui-spec.md` §6 and `sync_core::status_text` / `available_actions`.
     pub fn presented_status(
@@ -497,8 +596,19 @@ impl MappingSnapshot {
                 };
             }
             Readiness::VolumeUnavailable => {
-                let status_line = format!("Waiting for {}", self.volume_name);
-                let why = if intent == Intent::Paused {
+                let (status_line, hold) = self.volume_hold();
+                let why = if hold != VolumeHold::Missing {
+                    let next = if hold == VolumeHold::WrongDisk {
+                        "Connect the disk selected during setup."
+                    } else {
+                        "Check the disk’s permissions."
+                    };
+                    if intent == Intent::Paused {
+                        format!("Paused by you · {next}")
+                    } else {
+                        next.to_owned()
+                    }
+                } else if intent == Intent::Paused {
                     format!(
                         "Paused by you · stays paused when {} returns.",
                         self.volume_name
@@ -520,7 +630,7 @@ impl MappingSnapshot {
                     show_resume: intent == Intent::Paused,
                     is_draft: false,
                     needs_init: false,
-                    sync_now_tooltip: Some("Connect the drive to sync"),
+                    sync_now_tooltip: Some("Resolve the disk issue to sync"),
                 };
             }
             Readiness::AuthenticationRequired => {
@@ -810,6 +920,13 @@ impl MappingSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeHold {
+    Missing,
+    WrongDisk,
+    Inaccessible,
+}
+
 /// Ordered category for Attention cards (§5.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AttentionPriority {
@@ -952,10 +1069,52 @@ impl WizardStep {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloudFolderCandidate {
     pub name: String,
-    pub size_gb: Option<f64>,
-    pub size_label: String,
+    pub collection: Option<CloudCollection>,
+    pub size: FolderSize,
     pub on_this_mac: Option<String>,
     pub used_by_other_computer: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderSize {
+    Unmeasured,
+    Calculating,
+    Known {
+        bytes: u64,
+        files: Option<u64>,
+        measured_at: Option<String>,
+    },
+    Failed {
+        cause: String,
+    },
+}
+
+impl FolderSize {
+    pub fn bytes(&self) -> Option<u64> {
+        match self {
+            Self::Known { bytes, .. } => Some(*bytes),
+            _ => None,
+        }
+    }
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1_000.0;
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    const TB: f64 = 1_000_000_000_000.0;
+    let b = bytes as f64;
+    if b >= TB {
+        format!("{:.2} TB", b / TB)
+    } else if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// One node in the Wizard Step 4 subfolder selection tree.
@@ -1018,6 +1177,7 @@ pub struct WizardDraft {
     pub selected_folder: String,
     /// Local-to-local fixture remote folder path (used by real ManagerSource).
     pub remote_folder_path: Option<String>,
+    pub drive_collection: Option<CloudCollection>,
     pub local_path: String,
     pub volume_name: String,
     pub volume_kind: VolumeKind,
@@ -1063,6 +1223,10 @@ pub struct WizardDraft {
 }
 
 impl WizardDraft {
+    pub fn has_cloud_folder(&self) -> bool {
+        self.remote_folder_path.is_some() || self.drive_collection.is_some()
+    }
+
     /// Estimated selection size, including files directly inside the root folder.
     pub fn included_gb(&self) -> f64 {
         let omitted = self
@@ -1210,11 +1374,14 @@ pub struct UiSnapshot {
     pub inspected_run: Option<InspectedRunSnapshot>,
     pub recovery_checklist: Option<RecoveryChecklistData>,
     pub cloud_catalog: Vec<CloudFolderCandidate>,
-    pub cloud_catalog_measured_at: String,
+    pub skipped_cloud_folders: Vec<sync_manager::SkippedCollection>,
+    pub cloud_catalog_error: Option<String>,
+    pub folder_size_pending: bool,
     pub wizard: WizardDraft,
     pub preferences: PreferencesSnapshot,
     pub reconnecting_account: Option<AccountId>,
     pub account_operation_pending: bool,
+    pub authorization_canceling: bool,
     pub can_reopen_authorization: bool,
     pub status_notice: Option<String>,
     /// Actionable manager error displayed prominently in the UI with a Dismiss control.
@@ -1373,6 +1540,8 @@ pub enum UiCommand {
     WizardSelectAccount(AccountId),
     WizardSelectFolder(String),
     WizardCreateNewFolder(String),
+    WizardRefreshFolders,
+    WizardCancelFolderSize,
     WizardSetRemotePath(String),
     WizardSetLocalPath(String),
     WizardToggleSubfolder(String),
@@ -1386,6 +1555,8 @@ pub enum UiCommand {
     WizardStopFirstSync,
     WizardCompleteDemoFirstSync,
     WizardReset,
+    WizardLeave,
+    DemoFailFolderSize,
     /// Injectable system actions (routed to RealMacOsSystemActions or RecordingSystemActions).
     RevealPath(String),
     OpenCloudUrl(String),

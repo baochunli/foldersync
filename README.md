@@ -28,7 +28,9 @@ The full path remains available in the accessibility label and mapping detail.
 Automatic scheduling starts after FolderSync verifies a mapping’s first sync.
 Choose its polling interval in Mapping Detail. Pause scheduling in the sidebar
 or menu bar. **Sync now** requests an on-demand run while scheduling is paused.
-Activity shows the pending run order. Exact next-run times are unavailable.
+Activity shows the pending run order. Overview and Mapping Detail show the
+estimated next check or retry when one is scheduled. Local changes can prompt
+an earlier check.
 
 Overview and Mapping Detail show reported disk capacity and filesystem.
 Use **Change subfolders…** to review a replacement selection and its first-sync
@@ -37,9 +39,16 @@ excluded local files in place.
 
 Accounts supports browser sign-in, import from an explicitly chosen exported
 configuration, reconnect, and checking access to the shared parent folder.
-Both native launchers include the credential helper. Drive folder browsing,
-creation, and first sync remain unavailable in the wizard. Local test
-accounts support the full wizard workflow.
+Choose **Cancel** in Accounts to stop an in-progress sign-in. Quit also cancels
+sign-in as part of controlled shutdown. Both native launchers include the
+credential helper.
+
+The wizard lists folders directly inside the selected Drive account's shared
+`Data` folder. It explains duplicate and unsupported folder names and lets you
+create a new folder with an unused name. Select a folder to calculate its size
+and file count before choosing subfolder exclusions. FolderSync compares that
+estimate with free space on known volumes and checks the chosen destination
+again during setup. Review the first sync before starting it.
 
 ## Development
 

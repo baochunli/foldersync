@@ -356,6 +356,74 @@ impl ExitStatusInfo {
     }
 }
 
+/// Shared cancellation and optional deadline for a sequence of engine calls.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessControl {
+    canceled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl ProcessControl {
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            deadline: Some(Instant::now() + timeout),
+            ..Self::default()
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.canceled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn check(&self) -> Result<(), ProcessError> {
+        if self.canceled.load(Ordering::SeqCst) {
+            return Err(ProcessError::Canceled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(ProcessError::TimedOut);
+        }
+        Ok(())
+    }
+
+    /// Reap the child after requesting a graceful stop and escalating by PID.
+    fn wait(&self, handle: RunHandle) -> Result<RunOutput, ProcessError> {
+        let stop = handle.stop_handle();
+        let (done, finished) = mpsc::channel();
+        thread::scope(|scope| {
+            let watcher = scope.spawn(move || {
+                loop {
+                    if let Err(error) = self.check() {
+                        stop.request_stop()?;
+                        if matches!(
+                            finished.recv_timeout(Duration::from_millis(250)),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            stop.force_stop(Duration::ZERO)?;
+                        }
+                        return Err(error);
+                    }
+                    if !matches!(
+                        finished.recv_timeout(Duration::from_millis(25)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        return Ok(());
+                    }
+                }
+            });
+            let result = handle.wait();
+            let _ = done.send(());
+            watcher
+                .join()
+                .expect("process cancellation watcher panicked")?;
+            self.check()?;
+            result
+        })
+    }
+}
+
 /// Final result returned by [`RunHandle::wait`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunOutput {
@@ -368,6 +436,10 @@ pub struct RunOutput {
 /// Errors raised while spawning, signaling, or awaiting a child process.
 #[derive(Debug, Error)]
 pub enum ProcessError {
+    #[error("operation canceled")]
+    Canceled,
+    #[error("operation timed out")]
+    TimedOut,
     #[error("failed to spawn process `{program}`: {source}")]
     Spawn {
         program: PathBuf,
@@ -907,6 +979,45 @@ impl RunHandle {
     }
 }
 
+/// Applies one control to every child launched through a borrowed runner.
+pub struct ControlledProcessRunner<'a> {
+    pub runner: &'a dyn ProcessRunner,
+    pub control: &'a ProcessControl,
+}
+
+impl ProcessRunner for ControlledProcessRunner<'_> {
+    fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
+        self.control.check()?;
+        let child = self.runner.spawn(spec, options)?;
+        Ok(RunHandle {
+            identity: child.identity().clone(),
+            backend: Box::new(ControlledRun {
+                child,
+                control: self.control.clone(),
+            }),
+        })
+    }
+}
+
+struct ControlledRun {
+    child: RunHandle,
+    control: ProcessControl,
+}
+
+impl RunHandleBackend for ControlledRun {
+    fn stop_handle(&self) -> StopHandle {
+        self.child.stop_handle()
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.child.stop_requested()
+    }
+
+    fn wait(self: Box<Self>) -> Result<RunOutput, ProcessError> {
+        self.control.wait(self.child)
+    }
+}
+
 /// Scripted behavior for a single [`FakeProcessRunner`] spawn.
 #[derive(Debug, Clone)]
 pub struct FakeRunScript {
@@ -1417,6 +1528,38 @@ mod tests {
         assert!(!out.output.stdout_text().contains("GOT_STDIN"));
         assert_eq!(out.output.lines.len(), 2);
         assert!(out.output.dropped_lines >= 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_runner_reaps_a_child_that_ignores_graceful_cancellation() {
+        let control = ProcessControl::default();
+        let runner = ControlledProcessRunner {
+            runner: &RealProcessRunner,
+            control: &control,
+        };
+        let (tx, rx) = mpsc::sync_channel(64);
+        let child = runner
+            .spawn(
+                &helper_spec("stubborn_sigint"),
+                SpawnOptions {
+                    line_observer: Some(tx),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let pid = child.identity().pid;
+        while rx.recv_timeout(Duration::from_secs(5)).unwrap().text != "STUBBORN_READY" {}
+        let started = Instant::now();
+        control.cancel();
+        assert!(matches!(child.wait(), Err(ProcessError::Canceled)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // An unreaped child (including a zombie) would still answer kill(pid, 0).
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[cfg(unix)]

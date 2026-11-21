@@ -90,6 +90,7 @@ test("Attention count badge is 5 and marking conflicts reviewed updates it to 4"
   expect(joined).toContain("5 items · items that block syncing first");
   expect(joined).toContain("Cause:");
   expect(joined).toContain("What FolderSync did:");
+  expect(joined).toContain("Held the mapping while the disk is disconnected.");
   expect(joined).toContain("Next:");
   expect(joined).toContain("Family · completed with conflicts");
 
@@ -364,6 +365,8 @@ test("Deferred UI fixes: resumable draft, new folder, queue order, conflict pres
   expect(app.texts()).toContain("Which Google account holds the folder?");
   await app.press("id:wizard-continue-btn");
   await app.press("id:wizard-new-folder-btn");
+  await app.type("id:wizard-new-folder-name", "New-Folder");
+  await app.press("id:wizard-create-folder-btn");
   expect(app.texts().join("\n")).toContain("New-Folder");
   await app.press("id:wizard-step-6");
   expect(app.texts().join("\n")).toContain("First sync: upload to the cloud");
@@ -385,4 +388,55 @@ test("Accounts show sign-in, browser wait, and connected states", async () => {
   expect(app.texts().join("\n")).toContain("Finish signing in in your browser");
   await app.press("id:accounts-simulate-signin-btn");
   expect(app.texts().join("\n")).toContain("work-2");
+});
+
+test("Folder choices show on-demand size, cancellation, and measurement failure", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  expect(app.texts()).toContain("Projects");
+  expect(app.texts()).toContain("Old Projects · Duplicate name");
+  expect(app.texts()).toContain("Draft:Notes · Unsupported name");
+  expect(app.texts().join("\n")).toContain("18.6 GB · 2410 files");
+  await app.press("id:wizard-folder-Shared-Media");
+  expect(app.texts()).toContain("Calculating…");
+  await app.press("id:wizard-cancel-size-btn");
+  expect(app.texts()).not.toContain("Calculating…");
+  await app.press("id:wizard-folder-Shared-Media");
+  await app.press("id:wizard-demo-fail-size-btn");
+  expect(app.texts()).toContain("Some files did not report a size.");
+});
+
+test("New folder refuses a duplicate name in Data", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await app.press("id:wizard-new-folder-btn");
+  await app.type("id:wizard-new-folder-name", "Discard this name");
+  await app.press("id:wizard-cancel-new-folder-btn");
+  await app.press("id:wizard-new-folder-btn");
+  expect(app.enabled("id:wizard-create-folder-btn")).toBe(false);
+  await app.type("id:wizard-new-folder-name", "Projects");
+  await app.press("id:wizard-create-folder-btn");
+  expect(app.texts().join("\n")).toContain("The name `Projects` is already used in Data.");
+  await app.press("id:wizard-new-folder-btn");
+  expect(app.enabled("id:wizard-create-folder-btn")).toBe(false);
+});
+
+test("Cancel sign-in clears the browser waiting card", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:nav-accounts");
+  await app.press("id:accounts-connect-btn");
+  await app.press("id:accounts-cancel-reconnect-btn");
+  expect(app.texts()).not.toContain("Finish signing in in your browser");
+  expect(app.texts()).not.toContain("work-2");
+});
+
+test("Overview and Detail show the next check and distinguish the wrong disk", async () => {
+  const app = await open(".", DESKTOP);
+  expect(app.texts()).toContain("Next check in about 7 minutes");
+  expect(app.texts()).toContain("A different disk named PhotoSSD is connected");
+  await app.press("id:open-detail-documents");
+  expect(app.texts()).toContain("In about 7 minutes");
+  await app.press("id:nav-overview");
+  await app.press("id:open-detail-photos-wrong-disk");
+  expect(app.texts()).toContain("A different disk named PhotoSSD is connected");
 });

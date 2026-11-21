@@ -36,6 +36,7 @@ pub use state::{
 pub use validation::{
     DeviceCloudCollection, LocalLayoutEntry, MAX_COMPONENT_BYTES, NameFinding, NameFindingKind,
     PathResolutionError, PathResolver, RESERVED_FILENAME_CHARS, StdPathResolver, ValidationError,
-    ValidationErrorKind, validate_cloud_collection_pair, validate_cloud_collections,
-    validate_local_binding, validate_local_layout, validate_local_roots_disjoint, validate_names,
+    ValidationErrorKind, validate_cloud_collection_identity_pair, validate_cloud_collection_pair,
+    validate_cloud_collections, validate_local_binding, validate_local_layout,
+    validate_local_roots_disjoint, validate_names,
 };

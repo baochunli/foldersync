@@ -8,17 +8,18 @@
 //! `SyncManager` / UI wiring layer (`connect-t4`) can call cleanly.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use rclone_adapter::{
-    AccountConfigLock, AuthUrlCallback, ConfigError, DriveAuthError, DriveAuthRequest,
-    DriveRemoteConfigSpec, DuplicateDirFinding, EngineIdentity, ImportRemoteSpec, LsJsonEntry,
-    LsJsonError, LsJsonRequest, PasswordCommand, ProcessRunner, RealProcessRunner,
-    ResolvedRemotePath, check_config_recovery_state, cleanup_account_setup_temp_files,
-    create_drive_remote_config_locked, find_duplicate_dir_names,
+    AccountConfigLock, AuthUrlCallback, ConfigError, ControlledProcessRunner, DriveAuthError,
+    DriveAuthRequest, DriveRemoteConfigSpec, DuplicateDirFinding, EngineIdentity, ImportRemoteSpec,
+    LsJsonEntry, LsJsonError, LsJsonRequest, PasswordCommand, ProcessControl, ProcessRunner,
+    RealProcessRunner, ResolvedRemotePath, check_config_recovery_state,
+    cleanup_account_setup_temp_files, create_drive_remote_config_locked, find_duplicate_dir_names,
     import_single_remote_into_encrypted_config_locked, is_global_default_rclone_config,
     list_dirs_with_runner, pinned_binary_path, qualify_binary, qualify_pinned_binary,
     resolve_folder_path_with_runner, run_drive_auth_locked, verify_encrypted_config,
@@ -410,6 +411,186 @@ pub struct AccountCheckReport {
     pub duplicate_directories: Vec<DuplicateDirFinding>,
 }
 
+/// A selectable immediate child of the shared Data folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionCandidate {
+    pub collection: CloudCollection,
+    pub name: String,
+    pub modified_at: String,
+}
+
+/// Selectable folders and the sibling names skipped during browsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionListing {
+    pub candidates: Vec<CollectionCandidate>,
+    pub skipped: Vec<SkippedCollection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedCollection {
+    pub name: String,
+    pub reason: CollectionSkipReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CollectionSkipReason {
+    #[serde(rename = "unsupported name")]
+    UnsupportedName,
+    #[serde(rename = "duplicate")]
+    Duplicate,
+}
+
+/// Account operation started by the manager's cancellable authorization API.
+pub enum DriveAuthorization {
+    Connect(AddDriveAccountRequest),
+    Reconnect(AccountId),
+}
+
+pub(crate) struct LockedDrive<'a> {
+    _lock: AccountConfigLock,
+    pub account: AccountRecord,
+    pub request: LsJsonRequest,
+    pub runner: ControlledProcessRunner<'a>,
+}
+
+pub(crate) const DRIVE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl LockedDrive<'_> {
+    pub fn verify_collection(
+        &self,
+        collection: &CloudCollection,
+    ) -> Result<CloudCollection, AccountError> {
+        validate_drive_folder_id(&collection.folder_id)?;
+        if !collection.display_path.starts_with("Data/") {
+            return Err(AccountError::InvalidInput {
+                cause: "Drive collections must be inside the shared Data folder.".into(),
+                next_step: "Choose a collection under Data.".into(),
+            });
+        }
+        if let Some(finding) = sync_core::validate_names(&[&collection.display_path])
+            .into_iter()
+            .next()
+        {
+            return Err(AccountError::InvalidInput {
+                cause: finding.cause,
+                next_step: finding.next_step,
+            });
+        }
+        let root = Some(self.account.remote_root_folder_id.as_str());
+        let verified = verify_expected_folder_identity_with_runner(
+            &self.request,
+            &collection.display_path,
+            &collection.folder_id,
+            root,
+            (!collection.ancestor_ids.is_empty()).then_some(collection.ancestor_ids.as_slice()),
+            &self.runner,
+        )?;
+        Ok(CloudCollection {
+            display_path: verified.display_path.clone(),
+            folder_id: collection.folder_id.clone(),
+            ancestor_ids: verified.ancestor_ids(root),
+        })
+    }
+
+    fn data_id(&self) -> Result<String, AccountError> {
+        let data = resolve_folder_path_with_runner(&self.request, "Data", true, &self.runner)?;
+        Ok(data
+            .leaf_folder_id()
+            .expect("Data folder ID required")
+            .to_owned())
+    }
+
+    fn candidates(&self, data_id: &str) -> Result<CollectionListing, AccountError> {
+        let entries = list_dirs_with_runner(&self.request, "Data", &self.runner)?;
+        let duplicates: BTreeSet<_> = find_duplicate_dir_names(&entries)
+            .into_iter()
+            .map(|duplicate| duplicate.name)
+            .collect();
+        let mut listing = CollectionListing {
+            candidates: Vec::new(),
+            skipped: duplicates
+                .iter()
+                .map(|name| SkippedCollection {
+                    name: name.clone(),
+                    reason: CollectionSkipReason::Duplicate,
+                })
+                .collect(),
+        };
+        for entry in entries.into_iter().filter(|entry| entry.is_dir) {
+            if duplicates.contains(&entry.name) {
+                continue;
+            }
+            if validate_collection_name(&entry.name).is_err() {
+                listing.skipped.push(SkippedCollection {
+                    name: entry.name,
+                    reason: CollectionSkipReason::UnsupportedName,
+                });
+                continue;
+            }
+            listing.candidates.push(self.candidate(data_id, entry)?);
+        }
+        Ok(listing)
+    }
+
+    fn candidate(
+        &self,
+        data_id: &str,
+        entry: LsJsonEntry,
+    ) -> Result<CollectionCandidate, AccountError> {
+        if entry.path != entry.name {
+            return Err(AccountError::InvalidInput {
+                cause: "The Data listing returned a folder outside its immediate children.".into(),
+                next_step: "Refresh the folder list and review the shared Data folder.".into(),
+            });
+        }
+        let folder_id = entry.id.unwrap_or_default();
+        validate_drive_folder_id(&folder_id)?;
+        Ok(CollectionCandidate {
+            collection: CloudCollection {
+                display_path: format!("Data/{}", entry.name),
+                folder_id,
+                ancestor_ids: vec![
+                    self.account.remote_root_folder_id.clone(),
+                    data_id.to_owned(),
+                ],
+            },
+            name: entry.name,
+            modified_at: entry.mod_time,
+        })
+    }
+}
+
+pub(crate) fn validate_drive_folder_id(id: &str) -> Result<(), AccountError> {
+    if id.is_empty()
+        || id.len() > 255
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(AccountError::InvalidInput {
+            cause: "The Drive folder returned an invalid ID.".into(),
+            next_step: "Refresh the Drive folder list and select the folder again.".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_collection_name(name: &str) -> Result<(), AccountError> {
+    if name.trim().is_empty() || name.contains('/') {
+        return Err(AccountError::InvalidInput {
+            cause: "Enter one folder name inside Data.".into(),
+            next_step: "Use a single nonempty folder name.".into(),
+        });
+    }
+    if let Some(finding) = sync_core::validate_names(&[name]).into_iter().next() {
+        return Err(AccountError::InvalidInput {
+            cause: finding.cause,
+            next_step: finding.next_step,
+        });
+    }
+    Ok(())
+}
+
 /// Account management service for encrypted rclone configs, per-state scoped
 /// credentials, Drive OAuth flows, explicit single-remote import, and
 /// folder-identity resolution.
@@ -432,8 +613,14 @@ impl AccountService {
     /// directories, and records startup warnings for any missing-config
     /// recovery-needed backups or stale installation-scoped credentials.
     pub fn new(config: AccountServiceConfig) -> Result<Self, AccountError> {
+        let mut svc = Self::from_config(config)?;
+        svc.startup_warnings = svc.cleanup_stale_account_artifacts();
+        Ok(svc)
+    }
+
+    pub(crate) fn from_config(config: AccountServiceConfig) -> Result<Self, AccountError> {
         let state_dir = resolve_state_dir(Some(&config.state_dir))?;
-        let mut svc = Self {
+        Ok(Self {
             state_dir,
             secret_store: config.secret_store,
             process_runner: config.process_runner,
@@ -444,9 +631,7 @@ impl AccountService {
             password_command_factory: config.password_command_factory,
             acquire_state_lock: config.acquire_state_lock,
             startup_warnings: Vec::new(),
-        };
-        svc.startup_warnings = svc.cleanup_stale_account_artifacts();
-        Ok(svc)
+        })
     }
 
     /// Convenience constructor for callers (such as `SyncManager`) that already
@@ -652,6 +837,17 @@ impl AccountService {
         Ok(AccountConfigLock::acquire(&lock_path)?)
     }
 
+    pub(crate) fn try_account_lock(
+        &self,
+        id: &AccountId,
+    ) -> Result<AccountConfigLock, AccountError> {
+        let path = self.account_lock_path(id)?;
+        AccountConfigLock::try_acquire(&path)?.ok_or_else(|| AccountError::InvalidInput {
+            cause: "Another operation is using this account.".to_owned(),
+            next_step: "Try again when the account operation finishes.".to_owned(),
+        })
+    }
+
     /// Builds the validated non-secret `--password-command`
     /// (`sync-cli credential-helper --account <install-id>/<account-id>`).
     pub fn password_command_for(&self, id: &AccountId) -> Result<PasswordCommand, AccountError> {
@@ -727,10 +923,10 @@ impl AccountService {
         config_path: PathBuf,
         remote_name: String,
         pw_cmd: PasswordCommand,
-        _acct_lock: &AccountConfigLock,
+        runner: &dyn ProcessRunner,
     ) -> Result<(), AccountError> {
         let ls_req = LsJsonRequest::new(engine, config_path, remote_name, true, Some(pw_cmd))?;
-        list_dirs_with_runner(&ls_req, "", self.process_runner.as_ref())?;
+        list_dirs_with_runner(&ls_req, "", runner)?;
         Ok(())
     }
 
@@ -750,6 +946,20 @@ impl AccountService {
         req: AddDriveAccountRequest,
         on_auth_url: Option<AuthUrlCallback>,
     ) -> Result<DriveAccountResult, AccountError> {
+        self.add_drive_account_using(req, on_auth_url, None)
+    }
+
+    pub(crate) fn add_drive_account_using(
+        &self,
+        req: AddDriveAccountRequest,
+        on_auth_url: Option<AuthUrlCallback>,
+        control: Option<&ProcessControl>,
+    ) -> Result<DriveAccountResult, AccountError> {
+        let runner = self.process_runner.as_ref();
+        let controlled = control.map(|control| ControlledProcessRunner { runner, control });
+        let runner = controlled
+            .as_ref()
+            .map_or(runner, |r| r as &dyn ProcessRunner);
         validate_safe_path_id("account_id", req.id.as_str())?;
         Self::reject_reserved_account_id(&req.id)?;
 
@@ -778,8 +988,13 @@ impl AccountService {
         let _state_lock = self.maybe_lock_state()?;
         // Hold ONE per-account lock across existence checks, credential registration,
         // config encryption/publication, DB persistence, OAuth, and root verification.
-        let acct_lock = self.acquire_account_lock(&req.id)?;
         let account_dir = self.account_dir(&req.id)?;
+        ensure_private_dir_under("account_dir", &self.state_dir, &account_dir)?;
+        let acct_lock = if control.is_some() {
+            self.try_account_lock(&req.id)?
+        } else {
+            self.acquire_account_lock(&req.id)?
+        };
         let config_path = self.account_config_path(&req.id)?;
         let lock_path = self.account_lock_path(&req.id)?;
 
@@ -808,13 +1023,9 @@ impl AccountService {
                 lock_path,
                 existing.remote_name.clone(),
                 pw_cmd.clone(),
-            )?;
-            let outcome = match run_drive_auth_locked(
-                &auth_req,
-                &acct_lock,
-                self.process_runner.as_ref(),
-                on_auth_url,
-            ) {
+            )?
+            .caller_opens_browser(control.is_some());
+            let outcome = match run_drive_auth_locked(&auth_req, &acct_lock, runner, on_auth_url) {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     existing.auth_status = "authentication_required".to_string();
@@ -828,7 +1039,7 @@ impl AccountService {
                 config_path,
                 existing.remote_name.clone(),
                 pw_cmd,
-                &acct_lock,
+                runner,
             ) {
                 existing.auth_status = "authentication_required".to_string();
                 existing.updated_at = self.now_rfc3339();
@@ -874,7 +1085,7 @@ impl AccountService {
 
         if let Err(err) = create_drive_remote_config_locked(
             &engine,
-            self.process_runner.as_ref(),
+            runner,
             &config_path,
             &acct_lock,
             &pw_cmd,
@@ -919,20 +1130,16 @@ impl AccountService {
                 lock_path,
                 remote_name.clone(),
                 pw_cmd.clone(),
-            )?;
-            match run_drive_auth_locked(
-                &auth_req,
-                &acct_lock,
-                self.process_runner.as_ref(),
-                on_auth_url,
-            ) {
+            )?
+            .caller_opens_browser(control.is_some());
+            match run_drive_auth_locked(&auth_req, &acct_lock, runner, on_auth_url) {
                 Ok(outcome) => {
                     if let Err(err) = self.verify_drive_root_listing_locked(
                         engine,
                         config_path,
                         remote_name,
                         pw_cmd,
-                        &acct_lock,
+                        runner,
                     ) {
                         record.auth_status = "authentication_required".to_string();
                         record.updated_at = self.now_rfc3339();
@@ -968,9 +1175,27 @@ impl AccountService {
         id: &AccountId,
         on_auth_url: Option<AuthUrlCallback>,
     ) -> Result<DriveAccountResult, AccountError> {
+        self.reconnect_drive_account_using(id, on_auth_url, None)
+    }
+
+    pub(crate) fn reconnect_drive_account_using(
+        &self,
+        id: &AccountId,
+        on_auth_url: Option<AuthUrlCallback>,
+        control: Option<&ProcessControl>,
+    ) -> Result<DriveAccountResult, AccountError> {
+        let runner = self.process_runner.as_ref();
+        let controlled = control.map(|control| ControlledProcessRunner { runner, control });
+        let runner = controlled
+            .as_ref()
+            .map_or(runner, |r| r as &dyn ProcessRunner);
         validate_safe_path_id("account_id", id.as_str())?;
         let _state_lock = self.maybe_lock_state()?;
-        let acct_lock = self.acquire_account_lock(id)?;
+        let acct_lock = if control.is_some() {
+            self.try_account_lock(id)?
+        } else {
+            self.acquire_account_lock(id)?
+        };
         let store = self.open_store()?;
         let mut account = self.load_account_for_op(&store, id)?;
 
@@ -1009,20 +1234,16 @@ impl AccountService {
             lock_path,
             account.remote_name.clone(),
             pw_cmd.clone(),
-        )?;
-        match run_drive_auth_locked(
-            &auth_req,
-            &acct_lock,
-            self.process_runner.as_ref(),
-            on_auth_url,
-        ) {
+        )?
+        .caller_opens_browser(control.is_some());
+        match run_drive_auth_locked(&auth_req, &acct_lock, runner, on_auth_url) {
             Ok(outcome) => {
                 if let Err(err) = self.verify_drive_root_listing_locked(
                     engine,
                     config_path,
                     account.remote_name.clone(),
                     pw_cmd,
-                    &acct_lock,
+                    runner,
                 ) {
                     account.auth_status = "authentication_required".to_string();
                     account.updated_at = self.now_rfc3339();
@@ -1168,7 +1389,7 @@ impl AccountService {
                 target_config_path.clone(),
                 imported.target_remote_name.clone(),
                 pw_cmd,
-                &acct_lock,
+                self.process_runner.as_ref(),
             )
         {
             let _ = fs::remove_file(&target_config_path);
@@ -1415,6 +1636,156 @@ impl AccountService {
             is_drive,
             self.process_runner.as_ref(),
         )?)
+    }
+
+    pub(crate) fn locked_drive<'a>(
+        &'a self,
+        id: &AccountId,
+        control: &'a ProcessControl,
+    ) -> Result<LockedDrive<'a>, AccountError> {
+        let store = self.open_store()?;
+        self.load_account_for_op(&store, id)?;
+        let lock = self.try_account_lock(id)?;
+        let account = self.load_account_for_op(&store, id)?;
+        if account.kind != "drive" || account.remote_root_folder_id.is_empty() {
+            return Err(AccountError::InvalidInput {
+                cause: "Choose a Drive account with a shared parent folder.".into(),
+                next_step: "Review the shared parent configured in Accounts.".into(),
+            });
+        }
+        if account.auth_status != "ready" {
+            return Err(AccountError::AuthenticationRequired {
+                cause: "Sign in to this Drive account before using its folders.".into(),
+                next_step: "Reconnect the Drive account in Accounts.".into(),
+            });
+        }
+        let config_path = self.account_config_path(id)?;
+        if config_path != account.config_path {
+            return Err(AccountError::InvalidInput {
+                cause: "The saved Drive configuration is outside the account's expected path."
+                    .into(),
+                next_step: "Review the account configuration before using Drive folders.".into(),
+            });
+        }
+        check_config_recovery_state(&config_path)?;
+        let cred_key = self.credential_key_for(&store, id)?;
+        self.secret_store.get_secret(&cred_key)?;
+        let request = LsJsonRequest::new(
+            self.qualify_engine()?,
+            config_path,
+            account.remote_name.clone(),
+            true,
+            Some(self.password_command_for_key(&cred_key)?),
+        )?;
+        Ok(LockedDrive {
+            _lock: lock,
+            account,
+            request,
+            runner: ControlledProcessRunner {
+                runner: self.process_runner.as_ref(),
+                control,
+            },
+        })
+    }
+
+    pub fn list_collection_candidates(
+        &self,
+        id: &AccountId,
+    ) -> Result<CollectionListing, AccountError> {
+        let _state_lock = self.maybe_lock_state()?;
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = self.locked_drive(id, &control)?;
+        drive.candidates(&drive.data_id()?)
+    }
+
+    pub fn create_collection_folder(
+        &self,
+        id: &AccountId,
+        name: &str,
+    ) -> Result<CollectionCandidate, AccountError> {
+        validate_collection_name(name)?;
+        let _state_lock = self.maybe_lock_state()?;
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = self.locked_drive(id, &control)?;
+        let data_id = drive.data_id()?;
+        let siblings = drive.request.list_entries("Data", false, &drive.runner)?;
+        if siblings.iter().any(|entry| {
+            sync_core::validate_names(&[entry.name.as_str(), name])
+                .iter()
+                .any(|finding| {
+                    matches!(
+                        finding.kind,
+                        sync_core::NameFindingKind::ExactDuplicateName { .. }
+                            | sync_core::NameFindingKind::CaseOnlyCollision { .. }
+                            | sync_core::NameFindingKind::UnicodeNormalizationCollision { .. }
+                    )
+                })
+        }) {
+            return Err(AccountError::InvalidInput {
+                cause: format!("The name `{name}` is already used in Data."),
+                next_step: "Choose a different folder name.".into(),
+            });
+        }
+        drive
+            .request
+            .mkdir(&format!("Data/{name}"), &drive.runner)?;
+        let actual_data_id = drive.data_id()?;
+        if actual_data_id != data_id {
+            return Err(AccountError::FolderIdMismatch {
+                path: "Data".into(),
+                expected_id: data_id,
+                actual_id: actual_data_id,
+            });
+        }
+        let entries = list_dirs_with_runner(&drive.request, "Data", &drive.runner)?;
+        let mut matches = entries
+            .into_iter()
+            .filter(|entry| entry.is_dir && entry.name == name)
+            .peekable();
+        let path = format!("Data/{name}");
+        let entry = matches.next().ok_or_else(|| AccountError::FolderNotFound {
+            path: path.clone(),
+            component: name.to_owned(),
+        })?;
+        if matches.peek().is_some() {
+            let matching_ids = std::iter::once(entry.id)
+                .chain(matches.map(|entry| entry.id))
+                .collect();
+            return Err(AccountError::AmbiguousDuplicate {
+                path,
+                component: name.to_owned(),
+                matching_ids,
+            });
+        }
+        drive.candidate(&data_id, entry)
+    }
+
+    pub(crate) fn measure_collection(
+        &self,
+        id: &AccountId,
+        folder_id: &str,
+        control: &ProcessControl,
+    ) -> Result<rclone_adapter::RemoteSize, AccountError> {
+        let drive = self.locked_drive(id, control)?;
+        let data_id = drive.data_id()?;
+        let mut candidates = drive
+            .candidates(&data_id)?
+            .candidates
+            .into_iter()
+            .filter(|candidate| candidate.collection.folder_id == folder_id);
+        let selection = candidates
+            .next()
+            .filter(|_| candidates.next().is_none())
+            .ok_or_else(|| AccountError::InvalidInput {
+                cause: "The selected folder could not be identified in Data.".into(),
+                next_step: "Refresh the Drive folder list and select the folder again.".into(),
+            })?;
+        let size = drive
+            .request
+            .size(&selection.collection.display_path, &drive.runner)?;
+        // Size is path-addressed, so discard a result if the identity changed during the scan.
+        drive.verify_collection(&selection.collection)?;
+        Ok(size)
     }
 
     /// Pre-run cloud folder identity check (§7): acquires the per-account config

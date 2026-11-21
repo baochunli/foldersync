@@ -3,7 +3,7 @@
 
 use nsh_base::{table, table_body, table_cell, table_row};
 use nsh_core::prelude::*;
-use sync_core::{Execution, VolumeKind};
+use sync_core::{Execution, Intent, Readiness, VolumeKind};
 
 use crate::contract::{
     IconKind, MappingSnapshot, ScreenRoute, StatusLink, Tone, UiCommand, UiSnapshot, VolumeSnapshot,
@@ -393,7 +393,7 @@ fn state_variants_card(ctrl: AppController, snap: &UiSnapshot, rows: &[&MappingS
                                 .text_color(p.fg),
                         )
                         .child(
-                            text("Draft, Needs initialization, Not run yet, Queued, Running + paused, Stopping, and Retry pending")
+                            text("Wrong disk, Draft, Needs initialization, Not run yet, Queued, Running + paused, Stopping, and Retry pending")
                                 .text_size(px(S_CAPTION))
                                 .text_color(p.muted),
                         ),
@@ -522,7 +522,24 @@ fn mapping_row(
             }));
             col_status = col_status.child(why_row);
         }
-        (None, None) => {}
+        (None, None) => {
+            if !snap.scheduling_paused
+                && m.scheduling_enabled
+                && m.state.readiness() == Readiness::Ready
+                && m.state.execution == Execution::Idle
+                && m.state.intent == Intent::Enabled
+                && let Some(check) = m.next_check
+            {
+                let clock = ctrl.schedule_clock;
+                col_status = col_status.child(dynamic(move || {
+                    text(check.label(clock.get(), true))
+                        .w_full()
+                        .text_size(px(S_SMALL))
+                        .text_color(p.muted)
+                        .into_element()
+                }));
+            }
+        }
     }
 
     if m.state.execution == Execution::Running {
