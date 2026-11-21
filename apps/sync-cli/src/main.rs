@@ -1,8 +1,14 @@
-use std::{env, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
-use sync_core::{MappingId, Readiness, RunOutcome};
+use sync_core::{MappingId, Readiness, RunId, RunOutcome};
 use sync_manager::{
-    AddMappingCommand, InitializeCommand, ManagerConfig, ManagerError, SyncManager,
+    AddMappingCommand, InitializeCommand, ManagerConfig, ManagerError, MappingStatusSnapshot,
+    SyncManager,
 };
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -80,6 +86,7 @@ fn run_cmd(res: Result<(), CliError>) -> ExitCode {
     }
 }
 
+#[derive(Debug)]
 enum CliError {
     Usage(String),
     Manager(ManagerError),
@@ -250,7 +257,10 @@ fn cmd_add_mapping(args: &[String]) -> Result<(), CliError> {
         .ok_or_else(|| CliError::Usage("Missing required --remote-dir <path>.".to_string()))?;
     let recovery_dir = recovery_dir
         .ok_or_else(|| CliError::Usage("Missing required --recovery-dir <path>.".to_string()))?;
-    let remote_recovery_dir = remote_recovery_dir.unwrap_or_else(|| recovery_dir.join("remote"));
+    let remote_recovery_dir = match remote_recovery_dir {
+        Some(dir) => dir,
+        None => default_remote_recovery_dir(&recovery_dir)?,
+    };
     let collection_path = collection.unwrap_or_else(|| format!("Data/{id}"));
 
     let mgr = open_manager(state_dir, finder_dir)?;
@@ -309,6 +319,23 @@ fn parse_mapping_and_flags(
     Ok((id, state_dir, finder_dir))
 }
 
+fn default_remote_recovery_dir(local_recovery_dir: &Path) -> Result<PathBuf, CliError> {
+    let file_name = local_recovery_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "Cannot derive sibling remote recovery directory from `{}`; pass --remote-recovery-dir explicitly.",
+                local_recovery_dir.display()
+            ))
+        })?;
+    let sibling_name = format!("{file_name}-remote");
+    match local_recovery_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => Ok(parent.join(sibling_name)),
+        _ => Ok(PathBuf::from(sibling_name)),
+    }
+}
+
 fn run_succeeded(readiness: Readiness, outcome: Option<RunOutcome>) -> bool {
     readiness == Readiness::Ready
         && matches!(
@@ -317,57 +344,112 @@ fn run_succeeded(readiness: Readiness, outcome: Option<RunOutcome>) -> bool {
         )
 }
 
+fn verify_new_run_succeeded(
+    mgr: &SyncManager,
+    mapping_id: &MappingId,
+    prev_run_id: Option<&RunId>,
+    mapping: &MappingStatusSnapshot,
+) -> Result<(), String> {
+    let Some(new_run_id) = mapping.last_run_id.as_ref() else {
+        return Err(format!(
+            "No new run was recorded for `{}` (readiness={:?}): {}",
+            mapping.id, mapping.readiness, mapping.status_text
+        ));
+    };
+    if prev_run_id == Some(new_run_id) {
+        return Err(format!(
+            "No new run completed for `{}` (still pointing at previous run `{}`; readiness={:?}): {}",
+            mapping.id, new_run_id, mapping.readiness, mapping.status_text
+        ));
+    }
+    let runs = mgr
+        .list_runs(mapping_id)
+        .map_err(|err| format!("Failed to read run record `{new_run_id}`: {}", err.cause()))?;
+    let run = runs
+        .iter()
+        .find(|r| &r.id == new_run_id)
+        .ok_or_else(|| format!("Recorded run `{new_run_id}` was not found in SQLite."))?;
+    let ok_outcome = matches!(
+        run.outcome_kind.as_deref(),
+        Some("success" | "success_with_conflicts")
+    );
+    if mapping.readiness == Readiness::Ready
+        && run.status == "completed"
+        && ok_outcome
+        && run_succeeded(mapping.readiness, mapping.last_run_outcome)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Run `{}` for `{}` did not succeed (status={}, outcome={:?}, readiness={:?}): {}",
+            run.id,
+            mapping.id,
+            run.status,
+            run.outcome_kind,
+            mapping.readiness,
+            run.outcome_detail
+                .as_deref()
+                .unwrap_or(mapping.status_text.as_str())
+        ))
+    }
+}
+
 fn cmd_init(args: &[String]) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
+    let mapping_id = MappingId::new(id.clone());
     let mgr = open_manager(state_dir, finder_dir)?;
+    let prev_run_id = mgr.last_run_id(&mapping_id);
     mgr.initialize(InitializeCommand {
-        mapping_id: MappingId::new(id.clone()),
+        mapping_id: mapping_id.clone(),
         expected_direction: None,
     })?;
     let snap = mgr.wait_until_idle(DEFAULT_WAIT_TIMEOUT)?;
     let mapping = snap
         .mappings
         .iter()
-        .find(|m| m.id.as_str() == id)
+        .find(|m| m.id == mapping_id)
         .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after init.")))?
         .clone();
+    let verification = verify_new_run_succeeded(&mgr, &mapping_id, prev_run_id.as_ref(), &mapping);
     mgr.shutdown()?;
 
-    if run_succeeded(mapping.readiness, mapping.last_run_outcome) {
-        println!("Initialized `{}`: {}", mapping.id, mapping.status_text);
-        Ok(())
-    } else {
-        Err(CliError::Failed(format!(
-            "Initialization for `{}` did not succeed (readiness={:?}, outcome={:?}): {}",
-            mapping.id, mapping.readiness, mapping.last_run_outcome, mapping.status_text
-        )))
+    match verification {
+        Ok(()) => {
+            println!("Initialized `{}`: {}", mapping.id, mapping.status_text);
+            Ok(())
+        }
+        Err(msg) => Err(CliError::Failed(format!(
+            "Initialization for `{}` failed: {msg}",
+            mapping.id
+        ))),
     }
 }
 
 fn cmd_run_once(args: &[String]) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
+    let mapping_id = MappingId::new(id.clone());
     let mgr = open_manager(state_dir, finder_dir)?;
-    mgr.run_now(id.clone())?;
+    let prev_run_id = mgr.last_run_id(&mapping_id);
+    mgr.run_now(mapping_id.clone())?;
     let snap = mgr.wait_until_idle(DEFAULT_WAIT_TIMEOUT)?;
     let mapping = snap
         .mappings
         .iter()
-        .find(|m| m.id.as_str() == id)
+        .find(|m| m.id == mapping_id)
         .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after run.")))?
         .clone();
+    let verification = verify_new_run_succeeded(&mgr, &mapping_id, prev_run_id.as_ref(), &mapping);
     mgr.shutdown()?;
 
-    if run_succeeded(mapping.readiness, mapping.last_run_outcome) {
-        println!(
-            "Run completed for `{}`: {}",
-            mapping.id, mapping.status_text
-        );
-        Ok(())
-    } else {
-        Err(CliError::Failed(format!(
-            "Run for `{}` failed (readiness={:?}, outcome={:?}): {}",
-            mapping.id, mapping.readiness, mapping.last_run_outcome, mapping.status_text
-        )))
+    match verification {
+        Ok(()) => {
+            println!(
+                "Run completed for `{}`: {}",
+                mapping.id, mapping.status_text
+            );
+            Ok(())
+        }
+        Err(msg) => Err(CliError::Failed(msg)),
     }
 }
 
@@ -396,6 +478,15 @@ fn cmd_resume(args: &[String]) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_remote_recovery_dir_is_disjoint_sibling() {
+        let local = Path::new("/tmp/work/local_recovery");
+        let remote = default_remote_recovery_dir(local).unwrap();
+        assert_eq!(remote, PathBuf::from("/tmp/work/local_recovery-remote"));
+        assert!(!remote.starts_with(local));
+        assert!(!local.starts_with(&remote));
+    }
 
     #[test]
     fn run_succeeded_rejects_retryable_and_other_failure_outcomes() {

@@ -4,13 +4,17 @@ use rclone_adapter::pinned_binary_path;
 use sync_manager::StateLock;
 use tempfile::TempDir;
 
+fn cli_cmd(home: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sync-cli"));
+    cmd.env("HOME", home).env_remove("FOLDERSYNC_STATE_DIR");
+    cmd
+}
+
 #[test]
 fn prints_version() {
+    let tmp = TempDir::new().unwrap();
     for args in [&[][..], &["version"][..], &["--version"][..]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_sync-cli"))
-            .args(args)
-            .output()
-            .unwrap();
+        let output = cli_cmd(tmp.path()).args(args).output().unwrap();
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
@@ -21,10 +25,8 @@ fn prints_version() {
 
 #[test]
 fn prints_help() {
-    let output = Command::new(env!("CARGO_BIN_EXE_sync-cli"))
-        .arg("--help")
-        .output()
-        .unwrap();
+    let tmp = TempDir::new().unwrap();
+    let output = cli_cmd(tmp.path()).arg("--help").output().unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("Usage: sync-cli"));
@@ -39,10 +41,8 @@ fn prints_help() {
 
 #[test]
 fn rejects_unknown_arguments() {
-    let output = Command::new(env!("CARGO_BIN_EXE_sync-cli"))
-        .arg("unknown")
-        .output()
-        .unwrap();
+    let tmp = TempDir::new().unwrap();
+    let output = cli_cmd(tmp.path()).arg("unknown").output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr).unwrap().contains("--help"));
 }
@@ -60,10 +60,8 @@ fn cli_add_mapping_status_pause_resume_and_lock_refusal() {
     fs::create_dir_all(&local_recovery).unwrap();
     fs::create_dir_all(&remote_recovery).unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_sync-cli");
-
     // 1. add-mapping
-    let out = Command::new(bin)
+    let out = cli_cmd(tmp.path())
         .args([
             "add-mapping",
             "--state-dir",
@@ -88,7 +86,7 @@ fn cli_add_mapping_status_pause_resume_and_lock_refusal() {
     );
 
     // 2. status --json
-    let out = Command::new(bin)
+    let out = cli_cmd(tmp.path())
         .args([
             "status",
             "--state-dir",
@@ -107,13 +105,13 @@ fn cli_add_mapping_status_pause_resume_and_lock_refusal() {
     assert_eq!(snap["mappings"][0]["intent"], "Enabled");
 
     // 3. pause
-    let out = Command::new(bin)
+    let out = cli_cmd(tmp.path())
         .args(["pause", "docs", "--state-dir", state_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success());
 
-    let out = Command::new(bin)
+    let out = cli_cmd(tmp.path())
         .args([
             "status",
             "--state-dir",
@@ -126,13 +124,13 @@ fn cli_add_mapping_status_pause_resume_and_lock_refusal() {
     assert_eq!(snap["mappings"][0]["intent"], "Paused");
 
     // 4. resume
-    let out = Command::new(bin)
+    let out = cli_cmd(tmp.path())
         .args(["resume", "docs", "--state-dir", state_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success());
 
-    let out = Command::new(bin)
+    let out = cli_cmd(tmp.path())
         .args([
             "status",
             "--state-dir",
@@ -146,7 +144,7 @@ fn cli_add_mapping_status_pause_resume_and_lock_refusal() {
 
     // 5. Refuse to run while another instance holds the exclusive lock!
     let _lock = StateLock::acquire(&state_dir).unwrap();
-    let out = Command::new(bin)
+    let out = cli_cmd(tmp.path())
         .args(["status", "--state-dir", state_dir.to_str().unwrap()])
         .output()
         .unwrap();
@@ -182,9 +180,8 @@ fn cli_init_and_run_once_end_to_end_with_pinned_rclone() {
     fs::create_dir_all(&remote_recovery).unwrap();
 
     fs::write(local_dir.join("hello.txt"), b"cli-v1").unwrap();
-    let bin = env!("CARGO_BIN_EXE_sync-cli");
 
-    let add = Command::new(bin)
+    let add = cli_cmd(tmp.path())
         .args([
             "add-mapping",
             "--state-dir",
@@ -208,7 +205,7 @@ fn cli_init_and_run_once_end_to_end_with_pinned_rclone() {
         String::from_utf8_lossy(&add.stderr)
     );
 
-    let init = Command::new(bin)
+    let init = cli_cmd(tmp.path())
         .args(["init", "docs", "--state-dir", state_dir.to_str().unwrap()])
         .output()
         .unwrap();
@@ -222,7 +219,7 @@ fn cli_init_and_run_once_end_to_end_with_pinned_rclone() {
     thread::sleep(Duration::from_millis(1100));
     fs::write(local_dir.join("hello.txt"), b"cli-v2-edited").unwrap();
 
-    let run = Command::new(bin)
+    let run = cli_cmd(tmp.path())
         .args([
             "run-once",
             "docs",
@@ -245,15 +242,9 @@ fn cli_init_and_run_once_end_to_end_with_pinned_rclone() {
 #[test]
 fn cli_requires_non_empty_state_dir_and_never_uses_default() {
     let tmp = TempDir::new().unwrap();
-    let bin = env!("CARGO_BIN_EXE_sync-cli");
 
     // Missing --state-dir must fail with usage error (exit 2) even for `status`.
-    let out = Command::new(bin)
-        .args(["status"])
-        .env("HOME", tmp.path())
-        .env_remove("FOLDERSYNC_STATE_DIR")
-        .output()
-        .unwrap();
+    let out = cli_cmd(tmp.path()).args(["status"]).output().unwrap();
     assert!(
         !out.status.success(),
         "status without --state-dir must be rejected"
@@ -265,10 +256,8 @@ fn cli_requires_non_empty_state_dir_and_never_uses_default() {
     );
 
     // Empty --state-dir "" must also fail.
-    let out_empty = Command::new(bin)
+    let out_empty = cli_cmd(tmp.path())
         .args(["status", "--state-dir", ""])
-        .env("HOME", tmp.path())
-        .env_remove("FOLDERSYNC_STATE_DIR")
         .output()
         .unwrap();
     assert!(
@@ -294,8 +283,7 @@ fn cli_init_failure_exits_nonzero_without_printing_initialized() {
     fs::write(local_dir.join("a.txt"), b"local").unwrap();
     fs::write(remote_dir.join("b.txt"), b"remote").unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_sync-cli");
-    let add = Command::new(bin)
+    let add = cli_cmd(tmp.path())
         .args([
             "add-mapping",
             "--state-dir",
@@ -315,7 +303,7 @@ fn cli_init_failure_exits_nonzero_without_printing_initialized() {
         .unwrap();
     assert!(add.status.success());
 
-    let init = Command::new(bin)
+    let init = cli_cmd(tmp.path())
         .args(["init", "docs", "--state-dir", state_dir.to_str().unwrap()])
         .output()
         .unwrap();
@@ -324,5 +312,119 @@ fn cli_init_failure_exits_nonzero_without_printing_initialized() {
     assert!(
         !stdout.contains("Initialized"),
         "failed init must not print 'Initialized', got stdout: {stdout:?}"
+    );
+}
+
+#[test]
+fn cli_add_mapping_without_remote_recovery_dir_uses_sibling_and_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    let local_dir = tmp.path().join("local_docs");
+    let remote_dir = tmp.path().join("remote_docs");
+    let local_recovery = tmp.path().join("local_recovery");
+    fs::create_dir_all(&local_dir).unwrap();
+    fs::create_dir_all(&remote_dir).unwrap();
+    fs::create_dir_all(&local_recovery).unwrap();
+
+    let add = cli_cmd(tmp.path())
+        .args([
+            "add-mapping",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--id",
+            "docs",
+            "--local-dir",
+            local_dir.to_str().unwrap(),
+            "--remote-dir",
+            remote_dir.to_str().unwrap(),
+            "--recovery-dir",
+            local_recovery.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "add-mapping without --remote-recovery-dir must succeed with sibling default: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+}
+
+#[test]
+fn cli_run_once_fails_when_terminal_db_commit_fails_and_never_reuses_old_success() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    let local_dir = tmp.path().join("local_docs");
+    let remote_dir = tmp.path().join("remote_docs");
+    let local_recovery = tmp.path().join("local_recovery");
+    let remote_recovery = tmp.path().join("remote_recovery");
+    fs::create_dir_all(&local_dir).unwrap();
+    fs::create_dir_all(&remote_dir).unwrap();
+    fs::create_dir_all(&local_recovery).unwrap();
+    fs::create_dir_all(&remote_recovery).unwrap();
+
+    // Initialize cleanly using FakeBisyncLauncher so the mapping is Ready with a prior Success run.
+    {
+        let launcher = std::sync::Arc::new(sync_manager::FakeBisyncLauncher::new());
+        launcher.push_script(sync_manager::FakeLaunchScript::default());
+        let mut cfg = sync_manager::ManagerConfig::with_state_dir(&state_dir);
+        cfg.launcher = launcher;
+        let mgr = sync_manager::SyncManager::open(cfg).unwrap();
+        mgr.register_local_fixture_account("local-fixture", "Local Fixture")
+            .unwrap();
+        mgr.add_mapping(
+            sync_manager::AddMappingCommand::local_fixture(
+                "docs",
+                "local-fixture",
+                "Data/docs",
+                &local_dir,
+                &remote_dir,
+                &local_recovery,
+                &remote_recovery,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        mgr.initialize(sync_manager::InitializeCommand {
+            mapping_id: sync_core::MappingId::new("docs"),
+            expected_direction: None,
+        })
+        .unwrap();
+        mgr.wait_until_idle(Duration::from_secs(5)).unwrap();
+        mgr.shutdown().unwrap();
+    }
+
+    // Inject a failing terminal UPDATE trigger via sqlite3 (when available) AND
+    // point FOLDERSYNC_RCLONE to a non-existent binary so `sync-cli run-once`
+    // MUST exit non-zero and never mistake the prior Success run for a new success!
+    let trigger_sql = "CREATE TRIGGER fail_cli_terminal BEFORE UPDATE ON runs \
+         WHEN NEW.status IN ('completed', 'failed', 'interrupted') \
+         BEGIN SELECT RAISE(ABORT, 'injected cli terminal DB failure'); END;";
+    if let Ok(status) = Command::new("sqlite3")
+        .arg(state_dir.join("state.sqlite"))
+        .arg(trigger_sql)
+        .status()
+    {
+        assert!(status.success(), "sqlite3 trigger setup failed");
+    }
+
+    let out = cli_cmd(tmp.path())
+        .env("FOLDERSYNC_RCLONE", tmp.path().join("missing-rclone"))
+        .args([
+            "run-once",
+            "docs",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "run-once must fail when terminal DB commit fails (stdout={}, stderr={})",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Run completed"),
+        "failed run-once must not print 'Run completed'"
     );
 }
