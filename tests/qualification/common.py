@@ -10,7 +10,6 @@ import platform
 import random
 import re
 import subprocess
-import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,9 +19,76 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "packaging" / "qualification-manifest.toml"
 
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+PW_CMD_STDERR_PREFIX = "--password-command stderr:"
+RCLONE_TIMESTAMP_RE = re.compile(r"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+")
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_CSI_RE.sub("", text)
+
+
+def redact_credential_stderr(text: str) -> str:
+    """Redacts rclone `--password-command stderr:` payloads at the capture boundary.
+
+    Mirrors `crates/rclone-adapter/src/process.rs`:
+    - Matches JSON log objects whose decoded `msg` starts with `--password-command stderr:`.
+    - Matches plaintext lines starting with `--password-command stderr:` or
+      `... ERROR : --password-command stderr:` and drops any unprefixed continuation lines
+      that immediately follow a multiline helper stderr dump.
+    - Preserves benign transfer/conflict lines whose filenames happen to contain the phrase.
+    """
+    if not text:
+        return text
+
+    out_lines: list[str] = []
+    dropping_continuation = False
+
+    for raw_line in text.splitlines():
+        trimmed = raw_line.strip()
+
+        if dropping_continuation:
+            if not trimmed or trimmed.startswith("{") or RCLONE_TIMESTAMP_RE.match(raw_line):
+                dropping_continuation = False
+            else:
+                continue
+
+        if trimmed.startswith("{"):
+            try:
+                obj = json.loads(trimmed)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict) and isinstance(obj.get("msg"), str):
+                plain_msg = strip_ansi(obj["msg"]).lstrip()
+                if plain_msg.startswith(PW_CMD_STDERR_PREFIX):
+                    obj["msg"] = f"{PW_CMD_STDERR_PREFIX} [REDACTED]"
+                    out_lines.append(json.dumps(obj, separators=(",", ":")))
+                    continue
+
+        plain_line = strip_ansi(raw_line)
+        plain_stripped = plain_line.lstrip()
+        if plain_stripped.startswith(PW_CMD_STDERR_PREFIX):
+            out_lines.append(f"{PW_CMD_STDERR_PREFIX} [REDACTED]")
+            dropping_continuation = True
+            continue
+
+        err_marker = " ERROR : "
+        idx = plain_line.find(err_marker)
+        if idx != -1:
+            after_err = plain_line[idx + len(err_marker) :].lstrip()
+            if after_err.startswith(PW_CMD_STDERR_PREFIX):
+                prefix = plain_line[: idx + len(err_marker)]
+                out_lines.append(f"{prefix}{PW_CMD_STDERR_PREFIX} [REDACTED]")
+                dropping_continuation = True
+                continue
+
+        out_lines.append(raw_line)
+
+    return "\n".join(out_lines)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -126,7 +192,7 @@ def is_forbidden_real_state_dir(path: Path) -> bool:
         candidate = path.expanduser().resolve()
     except OSError:
         candidate = path.expanduser().absolute()
-    return candidate == forbidden or forbidden in candidate.parents or candidate in forbidden.parents and candidate == forbidden
+    return candidate == forbidden or forbidden in candidate.parents
 
 
 def is_forbidden_rclone_config(path: Path) -> bool:
@@ -236,10 +302,29 @@ class ScenarioEvidence:
     injected_failure: str
     passed: bool
     conclusion: str
+    status: str = ""
     commands: list[dict[str, Any]] = field(default_factory=list)
     outcomes: dict[str, Any] = field(default_factory=dict)
     hash_accounting: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+    def effective_status(self) -> str:
+        if self.status:
+            return self.status
+        return "PASS" if self.passed else "FAIL"
+
+
+def compute_overall_status(scenarios: list[ScenarioEvidence]) -> str:
+    if not scenarios:
+        return "INCOMPLETE"
+    statuses = [s.effective_status() for s in scenarios]
+    if any(st == "FAIL" for st in statuses):
+        return "FAIL"
+    if any(st in ("NOT RUN", "NOT VERIFIED") for st in statuses):
+        return "INCOMPLETE"
+    if all(st == "PASS" and s.passed for st, s in zip(statuses, scenarios)):
+        return "PASS"
+    return "FAIL"
 
 
 def write_evidence_files(
@@ -256,16 +341,26 @@ def write_evidence_files(
     json_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.parent.mkdir(parents=True, exist_ok=True)
 
-    all_passed = all(s.passed for s in scenarios)
+    overall_status = compute_overall_status(scenarios)
+    all_passed = overall_status == "PASS"
+
+    serialized_scenarios = []
+    for s in scenarios:
+        row = asdict(s)
+        row["status"] = s.effective_status()
+        row["passed"] = row["status"] == "PASS" and bool(s.passed)
+        serialized_scenarios.append(row)
+
     payload = {
         "suite": suite_name,
         "seed": seed,
         "started_at": started_at,
         "finished_at": finished_at,
         "versions": versions,
+        "status": overall_status,
         "passed": all_passed,
         "overall_conclusion": overall_conclusion,
-        "scenarios": [asdict(s) for s in scenarios],
+        "scenarios": serialized_scenarios,
     }
     json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -275,7 +370,7 @@ def write_evidence_files(
         f"- **Started (UTC):** `{started_at}`",
         f"- **Finished (UTC):** `{finished_at}`",
         f"- **Deterministic seed:** `{seed}`",
-        f"- **Overall result:** `{'PASS' if all_passed else 'FAIL'}`",
+        f"- **Overall result:** `{overall_status}`",
         f"- **Conclusion:** {overall_conclusion}",
         "",
         "## Versions & Environment",
@@ -294,10 +389,11 @@ def write_evidence_files(
         "| --- | --- | --- | --- |",
     ])
     for s in scenarios:
-        res = "PASS" if s.passed else "FAIL"
+        res = s.effective_status()
         lines.append(f"| `{s.name}` | `{res}` | {s.injected_failure} | {s.conclusion} |")
 
     for s in scenarios:
+        res = s.effective_status()
         lines.extend([
             "",
             f"### `{s.name}`",
@@ -305,7 +401,7 @@ def write_evidence_files(
             f"- **Description:** {s.description}",
             f"- **Timestamps (UTC):** `{s.started_at}` → `{s.finished_at}`",
             f"- **Injected failure:** {s.injected_failure}",
-            f"- **Result:** `{'PASS' if s.passed else 'FAIL'}`",
+            f"- **Result:** `{res}`",
             f"- **Conclusion:** {s.conclusion}",
         ])
         if s.outcomes:
@@ -315,12 +411,25 @@ def write_evidence_files(
             for note in s.notes:
                 lines.append(f"  - {note}")
         if s.hash_accounting:
+            total = len(s.hash_accounting)
+            verified_cnt = sum(1 for h in s.hash_accounting if h["verified"])
+            if total > 30:
+                lines.append(
+                    f"- **Truth-set hash accounting:** `{verified_cnt}/{total}` verified (showing representative sample + any unverified entries; full list recorded in `{json_path.name}`)"
+                )
+                shown = (
+                    s.hash_accounting[:8]
+                    + [h for h in s.hash_accounting[8:-4] if not h["verified"]]
+                    + s.hash_accounting[-4:]
+                )
+            else:
+                shown = s.hash_accounting
             lines.extend([
                 "",
                 "| Truth Version | SHA-256 (prefix) | Accounted Locations | Verified |",
                 "| --- | --- | --- | --- |",
             ])
-            for h in s.hash_accounting:
+            for h in shown:
                 locs = ", ".join(f"`{loc}`" for loc in h["locations"]) if h["locations"] else "_none_"
                 lines.append(
                     f"| `{h['label']}` (`{h['rel_path']}`) | `{h['sha256'][:16]}…` | {locs} | `{'yes' if h['verified'] else 'no'}` |"

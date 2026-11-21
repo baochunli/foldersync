@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -76,23 +77,25 @@ class QualificationHarnessTests(unittest.TestCase):
         self.assertNotEqual(p1.returncode, 0)
         self.assertIn("real FolderSync state directory", p1.stderr)
 
-        p2 = subprocess.run(
-            [
-                sys.executable,
-                str(script),
-                "--remote",
-                "qualdrive",
-                "--state-dir",
-                "/tmp/qual-safe-state",
-                "--rclone-config",
-                str(global_cfg),
-                "--dry-run",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        self.assertNotEqual(p2.returncode, 0)
-        self.assertIn(".config/rclone", p2.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            safe_state = Path(tmp).resolve() / "qual-safe-state"
+            p2 = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--remote",
+                    "qualdrive",
+                    "--state-dir",
+                    str(safe_state),
+                    "--rclone-config",
+                    str(global_cfg),
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(p2.returncode, 0)
+            self.assertIn(".config/rclone", p2.stderr)
 
     def test_drive_harness_dry_run_validates_cleanly_without_touching_drive(self) -> None:
         script = Path(__file__).resolve().parent / "run_drive_qualification.py"
@@ -116,7 +119,9 @@ class QualificationHarnessTests(unittest.TestCase):
             plan = json.loads(p.stdout)
             self.assertEqual(plan["mode"], "dry-run")
             self.assertEqual(plan["remote"], "qualdrive")
-            self.assertIn("drive_three_client_same_file_conflict", plan["scenarios"])
+            self.assertEqual(plan["overall_expected_status"], "INCOMPLETE")
+            self.assertIn("drive_preflight_account_and_folder_ids", plan["preflight_scenarios"])
+            self.assertIn("drive_three_client_same_file_edit_conflict", plan["not_run_scenarios"])
 
     def test_evidence_writer_emits_json_and_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,6 +190,160 @@ class QualificationHarnessTests(unittest.TestCase):
         )
         self.assertNotEqual(p_space.returncode, 0)
         self.assertIn("whitespace", p_space.stderr)
+
+        # build-app.sh and finder-extension/build.sh must refuse --out outside target/,
+        # parent traversal out of target/, symlinked parents inside target/, and --shared-dir.
+        ext_script = common.REPO_ROOT / "apps" / "finder-extension" / "build.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp) / "outside-out"
+            for script in (build_script, ext_script):
+                for bad_out in (str(outside), str(common.REPO_ROOT / "target" / ".." / "escaped")):
+                    p = subprocess.run(["bash", str(script), "--out", bad_out], capture_output=True, text=True)
+                    self.assertNotEqual(p.returncode, 0, f"{script.name} must reject --out {bad_out}")
+                    self.assertFalse(outside.exists(), f"{script.name} must not create {outside}")
+
+                p_shared = subprocess.run(
+                    ["bash", str(script), "--shared-dir", str(outside)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(p_shared.returncode, 0, f"{script.name} must reject arbitrary --shared-dir")
+                self.assertFalse(outside.exists())
+
+            # Symlinked directory inside target/ pointing outside must be rejected BEFORE any write/rm.
+            target_dir = common.REPO_ROOT / "target"
+            target_dir.mkdir(exist_ok=True)
+            sym = target_dir / f"test-symlink-escape-{os.getpid()}"
+            if sym.is_symlink() or sym.exists():
+                sym.unlink()
+            outside.mkdir()
+            sentinel = outside / "FolderSync.app"
+            sentinel.mkdir()
+            (sentinel / "keep.txt").write_text("precious", encoding="utf-8")
+            sym.symlink_to(outside)
+            try:
+                p_sym = subprocess.run(
+                    ["bash", str(build_script), "--out", str(sym)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(p_sym.returncode, 0, "build-app.sh must refuse symlinked --out inside target/")
+                self.assertTrue((sentinel / "keep.txt").is_file(), "must never touch or delete through symlinked --out")
+
+                p_sym_ext = subprocess.run(
+                    ["bash", str(ext_script), "--out", str(sym)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(p_sym_ext.returncode, 0, "finder build.sh must refuse symlinked --out inside target/")
+            finally:
+                if sym.is_symlink():
+                    sym.unlink()
+
+    def test_redacts_credential_helper_stderr_and_blocks_pass_on_not_run(self) -> None:
+        raw_json = '{"level":"error","msg":"--password-command stderr: TOP_SECRET_PASSPHRASE","source":"config/crypt.go:199"}'
+        raw_plain = "2026/11/20 19:00:00 ERROR : --password-command stderr: ANOTHER_SECRET_123\nsecond secret line"
+        benign = "2026/11/20 19:00:00 INFO : Copied notes/--password-command stderr: draft.txt"
+
+        red_json = common.redact_credential_stderr(raw_json)
+        self.assertNotIn("TOP_SECRET_PASSPHRASE", red_json)
+        self.assertIn("[REDACTED]", red_json)
+
+        red_plain = common.redact_credential_stderr(raw_plain)
+        self.assertNotIn("ANOTHER_SECRET_123", red_plain)
+        self.assertNotIn("second secret line", red_plain)
+        self.assertIn("[REDACTED]", red_plain)
+
+        self.assertEqual(common.redact_credential_stderr(benign), benign)
+
+        # Overall evidence status must NEVER be PASS when any scenario is NOT RUN or NOT VERIFIED.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            s_ok = common.ScenarioEvidence(
+                name="preflight",
+                description="ok",
+                started_at="2026-11-20T00:00:00Z",
+                finished_at="2026-11-20T00:00:01Z",
+                injected_failure="none",
+                passed=True,
+                status="PASS",
+                conclusion="ok",
+            )
+            s_nr = common.ScenarioEvidence(
+                name="drive_conflict",
+                description="pending",
+                started_at="2026-11-20T00:00:01Z",
+                finished_at="2026-11-20T00:00:01Z",
+                injected_failure="none",
+                passed=False,
+                status="NOT RUN",
+                conclusion="blocked on drive-t4",
+            )
+            common.write_evidence_files(
+                json_path=out / "ev.json",
+                md_path=out / "ev.md",
+                suite_name="drive-test",
+                seed=1,
+                started_at="2026-11-20T00:00:00Z",
+                finished_at="2026-11-20T00:00:01Z",
+                versions={},
+                scenarios=[s_ok, s_nr],
+                overall_conclusion="incomplete",
+            )
+            parsed = json.loads((out / "ev.json").read_text(encoding="utf-8"))
+            self.assertFalse(parsed["passed"])
+            self.assertEqual(parsed["status"], "INCOMPLETE")
+            self.assertIn("`NOT RUN`", (out / "ev.md").read_text(encoding="utf-8"))
+
+    def test_drive_harness_refuses_non_empty_or_symlinked_state_dir(self) -> None:
+        script = Path(__file__).resolve().parent / "run_drive_qualification.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = root / "disposable.conf"
+            cfg.write_text("", encoding="utf-8")
+
+            non_empty = root / "existing-state"
+            non_empty.mkdir()
+            (non_empty / "preexisting.txt").write_text("x", encoding="utf-8")
+            p_ne = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--remote",
+                    "qualdrive",
+                    "--state-dir",
+                    str(non_empty),
+                    "--rclone-config",
+                    str(cfg),
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(p_ne.returncode, 0)
+            self.assertIn("empty", p_ne.stderr.lower())
+
+            target_dir = root / "real-dir"
+            target_dir.mkdir()
+            sym_state = root / "sym-state"
+            sym_state.symlink_to(target_dir)
+            p_sym = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--remote",
+                    "qualdrive",
+                    "--state-dir",
+                    str(sym_state),
+                    "--rclone-config",
+                    str(cfg),
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(p_sym.returncode, 0)
+            self.assertIn("symlink", p_sym.stderr.lower())
 
 
 if __name__ == "__main__":

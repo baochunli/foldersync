@@ -6,10 +6,17 @@ SAFETY GUARDRAILS:
   `--rclone-config <disposable-config>` are explicitly supplied.
 - Refuses the real macOS application state directory
   (`~/Library/Application Support/FolderSync`) and refuses `~/.config/rclone`.
+- Requires a fresh, empty, non-symlinked `--state-dir` and creates every
+  fixture subdirectory/file exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW` /
+  `dir_fd`).
+- Redacts `--password-command stderr:` payloads at the capture boundary before
+  storing command output, raising exceptions, or writing evidence.
 - Uses ONLY the pinned rclone binary verified against
   `packaging/qualification-manifest.toml` (never rclone on PATH).
-- Never runs automatically in CI or agent lanes; owner executes explicitly
-  against a disposable shared Drive parent folder.
+- Until `sync-cli` supports Google Drive mappings (blocked on `drive-t4` /
+  `connect-t4`), executes preflight checks ONLY (account connectivity + folder-ID
+  resolution) and records all unexercised Drive scenarios as `NOT RUN`; overall
+  evidence status is `INCOMPLETE` (never `PASS`) and exit status is non-zero.
 """
 
 from __future__ import annotations
@@ -18,10 +25,9 @@ import argparse
 import json
 import os
 import re
-import signal
+import stat
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -29,18 +35,97 @@ from typing import Any
 from common import (
     REPO_ROOT,
     ScenarioEvidence,
-    TruthSet,
+    compute_overall_status,
     get_tool_versions,
     is_forbidden_rclone_config,
     is_forbidden_real_state_dir,
+    redact_credential_stderr,
     resolve_verified_pinned_rclone,
     utc_now,
     write_evidence_files,
 )
 
 
-MTIME_STEP_SECS = 1.5
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+PENDING_SYNC_CLI_SCENARIOS: list[tuple[str, str]] = [
+    (
+        "drive_three_client_distinct_edits",
+        "Three independent sync-cli clients on Drive converge distinct edits across multiple cycles with truth-set SHA-256 verification.",
+    ),
+    (
+        "drive_three_client_same_file_edit_conflict",
+        "Three independent sync-cli clients on Drive preserve concurrent same-file edits as conflict copies and verify recovery copies by SHA-256.",
+    ),
+    (
+        "drive_three_client_edit_vs_delete",
+        "Edit vs delete across three sync-cli clients on Drive preserves the edit and retains pre-delete recovery copies.",
+    ),
+    (
+        "drive_three_client_offline_return",
+        "Offline third sync-cli client returns with stale edits without resurrecting deletions or losing data.",
+    ),
+    (
+        "drive_deletion_guard_abort",
+        "Deletion guard (--max-delete 10) aborts bulk deletion on Drive with zero remote deletes and latches RecoveryRequired.",
+    ),
+    (
+        "drive_interruption_and_recover",
+        "Mid-transfer SIGINT interruption and subsequent --resilient --recover cycle on Drive converge 100% of truth-set hashes.",
+    ),
+]
+
+
+def validate_fresh_non_symlink_state_dir(raw_state_dir: str) -> Path:
+    """Requires a fresh, empty, non-symlinked --state-dir (never real app state dir)."""
+    expanded = os.path.expanduser(raw_state_dir)
+    if not expanded or "\x00" in expanded:
+        raise ValueError("Invalid --state-dir path.")
+
+    path = Path(expanded)
+    if is_forbidden_real_state_dir(path):
+        raise ValueError(
+            f"Refused --state-dir `{path}`: never run qualification against the real FolderSync state directory."
+        )
+
+    abs_str = os.path.abspath(expanded)
+    if os.path.lexists(abs_str):
+        st = os.lstat(abs_str)
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError(f"Refused symlinked --state-dir `{path}`.")
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError(f"Refused non-directory --state-dir `{path}`.")
+        if os.listdir(abs_str):
+            raise ValueError(
+                f"Refused non-empty --state-dir `{path}`: pass a fresh, empty directory for qualification."
+            )
+    else:
+        # Walk up to existing parent and refuse any symlinked immediate parent inside user dirs.
+        parent = os.path.dirname(abs_str)
+        if not parent or not os.path.isdir(parent):
+            raise ValueError(f"Parent directory does not exist for --state-dir `{path}`.")
+        if os.path.islink(parent):
+            raise ValueError(f"Refused symlinked parent for --state-dir `{path}`.")
+
+    return Path(abs_str)
+
+
+def open_exclusive_state_dir_fd(state_dir: Path) -> int:
+    """Creates (if absent) and opens a verified fresh, empty, non-symlinked state dir fd."""
+    if not os.path.lexists(state_dir):
+        os.mkdir(state_dir, 0o700)
+    st = os.lstat(state_dir)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise ValueError(f"Refused symlinked or non-directory --state-dir `{state_dir}`.")
+    os.chmod(state_dir, 0o700)
+    fd = os.open(str(state_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.listdir(fd):
+            raise ValueError(f"Refused non-empty --state-dir `{state_dir}`.")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
 
 
 def validate_args(args: argparse.Namespace) -> tuple[str, Path, Path]:
@@ -54,11 +139,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, Path, Path]:
             f"Invalid --remote name `{args.remote}`: use a simple remote name matching [A-Za-z0-9][A-Za-z0-9_-]*."
         )
 
-    state_dir = Path(args.state_dir).expanduser()
-    if is_forbidden_real_state_dir(state_dir):
-        raise ValueError(
-            f"Refused --state-dir `{state_dir}`: never run qualification against the real FolderSync state directory."
-        )
+    state_dir = validate_fresh_non_symlink_state_dir(args.state_dir)
 
     if not args.rclone_config:
         raise ValueError(
@@ -77,18 +158,16 @@ def validate_args(args: argparse.Namespace) -> tuple[str, Path, Path]:
         if not REMOTE_NAME_RE.match(rb):
             raise ValueError(f"Invalid --remote-b name `{args.remote_b}`.")
 
-    return remote, state_dir.resolve(), rclone_cfg.resolve()
+    return remote, state_dir, rclone_cfg.resolve()
 
 
 def isolated_rclone_env(fake_home: Path) -> dict[str, str]:
-    env: dict[str, str] = {
+    return {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(fake_home),
         "TMPDIR": str(fake_home / "tmp"),
         "LANG": "en_US.UTF-8",
     }
-    (fake_home / "tmp").mkdir(parents=True, exist_ok=True)
-    return env
 
 
 def run_rclone(
@@ -117,92 +196,60 @@ def run_rclone(
         text=True,
         timeout=timeout,
     )
+    redacted_stdout = redact_credential_stderr(proc.stdout)
+    redacted_stderr = redact_credential_stderr(proc.stderr)
     rec = {
         "args": rclone_args,
         "returncode": proc.returncode,
-        "stdout": proc.stdout.strip()[:400],
-        "stderr": proc.stderr.strip()[:400],
+        "stdout": redacted_stdout.strip()[:400],
+        "stderr": redacted_stderr.strip()[:400],
     }
     if check and proc.returncode != 0:
         raise RuntimeError(
             f"rclone command failed ({rclone_args[0]}): rc={proc.returncode}\n"
-            f"stderr={proc.stderr[:600]}"
+            f"stderr={redacted_stderr[:600]}"
         )
     return rec
 
 
-def bisync_args(
-    local_dir: Path,
-    remote_path: str,
-    workdir: Path,
-    filters_file: Path,
-    backup_dir1: Path,
-    backup_dir2: str,
-    mode: str = "normal",
-    max_delete_percent: int = 10,
-) -> list[str]:
-    """Matches docs/engine-profile.md qualified Drive bisync profile."""
-    args = [
-        "bisync",
-        str(local_dir),
-        remote_path,
-        "--workdir",
-        str(workdir),
-        "--filters-file",
-        str(filters_file),
-        "--check-access",
-        "--check-filename",
-        "RCLONE_TEST",
-        "--max-delete",
-        str(max_delete_percent),
-        "--compare",
-        "size,modtime",
-        "--conflict-resolve",
-        "none",
-        "--conflict-loser",
-        "num",
-        "--check-sync",
-        "true",
-        "--backup-dir1",
-        str(backup_dir1),
-        "--backup-dir2",
-        backup_dir2,
-        "--use-json-log",
-        "--log-level",
-        "INFO",
-        "--stats",
-        "2s",
-        "--drive-skip-gdocs",
-        "--drive-skip-shortcuts",
-    ]
-    if mode == "init-path1":
-        args.extend(["--resync-mode", "path1"])
-    elif mode == "init-path2":
-        args.extend(["--resync-mode", "path2"])
-    else:
-        args.extend(["--resilient", "--recover"])
-    return args
+def sync_cli_supports_drive_mappings(sync_cli: Path) -> bool:
+    """Checks whether the built sync-cli exposes Drive mapping support."""
+    if not sync_cli.is_file():
+        return False
+    try:
+        out = subprocess.check_output(
+            [str(sync_cli), "--help"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return "--drive-remote" in out or "add-drive-mapping" in out
 
 
-def build_dry_run_plan(remote: str, remote_b: str | None, state_dir: Path, prefix: str, out_dir: Path) -> dict[str, Any]:
+def build_dry_run_plan(
+    remote: str,
+    remote_b: str | None,
+    state_dir: Path,
+    prefix: str,
+    out_dir: Path,
+) -> dict[str, Any]:
+    not_run = [name for name, _ in PENDING_SYNC_CLI_SCENARIOS]
+    if remote_b:
+        not_run.append("drive_two_account_ownership_and_recovery_move")
     return {
         "mode": "dry-run",
+        "execution_scope": "preflight-only until sync-cli supports Google Drive mappings (drive-t4/connect-t4)",
+        "overall_expected_status": "INCOMPLETE",
         "remote": remote,
         "remote_b": remote_b,
         "disposable_collection": f"{remote}:{prefix}/Data/qual",
         "disposable_recovery": f"{remote}:{prefix}/Recovery/qual",
         "state_dir": str(state_dir),
         "evidence_dir": str(out_dir),
-        "scenarios": [
-            "drive_preflight_lsjson_ids",
-            "drive_three_client_distinct_edits",
-            "drive_three_client_same_file_conflict",
-            "drive_three_client_edit_vs_delete",
-            "drive_three_client_offline_return",
-            "drive_deletion_guard_abort",
-            "drive_graceful_sigint_and_recover",
-            *(["drive_two_account_ownership_and_recovery_move"] if remote_b else []),
-        ],
+        "preflight_scenarios": ["drive_preflight_account_and_folder_ids"],
+        "not_run_scenarios": not_run,
     }
 
 
@@ -212,13 +259,13 @@ def main() -> int:
     )
     parser.add_argument("--remote", default="", help="Required owner-configured disposable Drive remote name (e.g. qualdrive)")
     parser.add_argument("--remote-b", default="", help="Optional second-account Drive remote name pointing at the same shared parent")
-    parser.add_argument("--state-dir", default="", help="Required isolated qualification state directory (never real app state dir)")
+    parser.add_argument("--state-dir", default="", help="Required fresh, empty, non-symlinked qualification state directory")
     parser.add_argument("--rclone-config", default="", help="Required explicit disposable rclone config path (never ~/.config/rclone)")
     parser.add_argument("--password-command", default="", help="Optional validated credential-helper command for encrypted config")
-    parser.add_argument("--prefix", default=None, help="Disposable subfolder prefix under the remote root (default: qual-<timestamp>)")
+    parser.add_argument("--prefix", default=None, help="Disposable subfolder prefix under the remote root (default: FolderSyncQual-<timestamp>)")
     parser.add_argument("--out-dir", default=str(REPO_ROOT / "target" / "qualification"), help="Evidence output directory")
     parser.add_argument("--seed", type=int, default=20261120, help="Deterministic content seed")
-    parser.add_argument("--sync-cli", default=None, help="Optional path to sync-cli executable for version recording")
+    parser.add_argument("--sync-cli", default=None, help="Optional path to sync-cli executable")
     parser.add_argument("--dry-run", action="store_true", help="Validate guardrails and print plan without contacting Google Drive")
     args = parser.parse_args()
 
@@ -247,38 +294,37 @@ def main() -> int:
     versions = get_tool_versions(sync_cli, rclone_bin, rclone_ver, rclone_sha)
     pw_cmd = args.password_command or None
 
-    state_dir.mkdir(parents=True, exist_ok=True)
-    fake_home = state_dir / "isolated-home"
-    fake_home.mkdir(parents=True, exist_ok=True)
-    truth = TruthSet(state_dir / "truth", seed=args.seed)
+    # Open validated fresh empty non-symlinked state directory and create private dirs exclusively.
+    try:
+        state_fd = open_exclusive_state_dir_fd(state_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
+    try:
+        os.mkdir("isolated-home", 0o700, dir_fd=state_fd)
+        home_fd = os.open("isolated-home", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+        try:
+            os.mkdir("tmp", 0o700, dir_fd=home_fd)
+        finally:
+            os.close(home_fd)
+    finally:
+        os.close(state_fd)
+
+    fake_home = state_dir / "isolated-home"
     remote_data = f"{remote}:{prefix}/Data/qual"
     remote_rec = f"{remote}:{prefix}/Recovery/qual"
-    filters_file = state_dir / "filters.txt"
-    filters_file.write_text("- .DS_Store\n- .Spotlight-V100/**\n- .Trashes/**\n", encoding="utf-8")
-
-    clients = {}
-    for cname in ("client-a", "client-b", "client-c"):
-        croot = state_dir / "clients" / cname
-        local_dir = croot / "local"
-        workdir = croot / "bisync"
-        backup1 = croot / "recovery-local"
-        for d in (local_dir, workdir, backup1):
-            d.mkdir(parents=True, exist_ok=True)
-        clients[cname] = {"local": local_dir, "workdir": workdir, "backup1": backup1}
-
     scenarios: list[ScenarioEvidence] = []
-    run_seq = 0
 
-    def next_backup2(cname: str) -> str:
-        nonlocal run_seq
-        run_seq += 1
-        return f"{remote_rec}/{cname}/run-{run_seq:03d}"
-
-    # 1. Preflight lsjson --dirs-only root/collection ID check
+    # 1. Preflight ONLY: account connectivity + unambiguous Drive folder-ID resolution.
     s_start = utc_now()
-    cmds = []
+    cmds: list[dict[str, Any]] = []
+    notes: list[str] = []
     try:
+        about_rec = run_rclone(rclone_bin, rclone_cfg, fake_home, ["about", f"{remote}:", "--json"], pw_cmd, check=False)
+        cmds.append(about_rec)
+        account_reachable = about_rec["returncode"] == 0
+
         cmds.append(run_rclone(rclone_bin, rclone_cfg, fake_home, ["mkdir", remote_data], pw_cmd))
         cmds.append(run_rclone(rclone_bin, rclone_cfg, fake_home, ["mkdir", remote_rec], pw_cmd))
         ls_rec = run_rclone(
@@ -291,140 +337,99 @@ def main() -> int:
         cmds.append(ls_rec)
         entries = json.loads(ls_rec["stdout"] or "[]")
         qual_entries = [e for e in entries if e.get("Name") == "qual"]
-        passed = len(qual_entries) == 1 and bool(qual_entries[0].get("ID"))
-        scenarios.append(
-            ScenarioEvidence(
-                name="drive_preflight_lsjson_ids",
-                description="Verify shared-parent collection directory exists unambiguously with a real Google Drive object ID.",
-                started_at=s_start,
-                finished_at=utc_now(),
-                injected_failure="none",
-                passed=passed,
-                conclusion="supported" if passed else "failed",
-                commands=cmds,
-                outcomes={"matched_count": len(qual_entries), "folder_id": qual_entries[0].get("ID") if qual_entries else None},
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        scenarios.append(
-            ScenarioEvidence(
-                name="drive_preflight_lsjson_ids",
-                description="Verify Google Drive collection ID.",
-                started_at=s_start,
-                finished_at=utc_now(),
-                injected_failure="none",
-                passed=False,
-                conclusion=f"error: {exc}",
-                commands=cmds,
-            )
-        )
+        folder_id = qual_entries[0].get("ID") if len(qual_entries) == 1 else None
+        passed = account_reachable and len(qual_entries) == 1 and bool(folder_id)
 
-    # 2. Three-client init, distinct edits, same-file conflict, edit/delete, offline return
-    marker_content = f"FolderSync qualification marker {prefix}\n".encode("utf-8")
-    for cname in ("client-a", "client-b", "client-c"):
-        (clients[cname]["local"] / "RCLONE_TEST").write_bytes(marker_content)
-
-    # Seed RCLONE_TEST on remote via client-a init-path1
-    s_start = utc_now()
-    cmds = []
-    try:
-        truth.write_into(clients["client-a"]["local"], "doc-a.txt", "d-doc-a-v1", size_bytes=220)
-        truth.write_into(clients["client-a"]["local"], "doc-b.txt", "d-doc-b-v1", size_bytes=240)
-        truth.write_into(clients["client-a"]["local"], "shared.txt", "d-shared-v1", size_bytes=260)
-        for idx in range(1, 13):
-            truth.write_into(clients["client-a"]["local"], f"baseline/b{idx:02d}.txt", f"d-base-{idx:02d}", size_bytes=160)
-
-        cmds.append(
-            run_rclone(
+        if args.remote_b:
+            rb = args.remote_b.rstrip(":")
+            ls_b = run_rclone(
                 rclone_bin,
                 rclone_cfg,
                 fake_home,
-                bisync_args(
-                    clients["client-a"]["local"],
-                    remote_data,
-                    clients["client-a"]["workdir"],
-                    filters_file,
-                    clients["client-a"]["backup1"] / "init",
-                    next_backup2("client-a"),
-                    mode="init-path1",
-                ),
+                ["lsjson", "--dirs-only", f"{rb}:{prefix}/Data"],
                 pw_cmd,
+                check=False,
             )
-        )
-        for cname in ("client-b", "client-c"):
-            cmds.append(
-                run_rclone(
-                    rclone_bin,
-                    rclone_cfg,
-                    fake_home,
-                    bisync_args(
-                        clients[cname]["local"],
-                        remote_data,
-                        clients[cname]["workdir"],
-                        filters_file,
-                        clients[cname]["backup1"] / "init",
-                        next_backup2(cname),
-                        mode="init-path2",
-                    ),
-                    pw_cmd,
-                )
-            )
+            cmds.append(ls_b)
+            b_entries = json.loads(ls_b["stdout"] or "[]") if ls_b["returncode"] == 0 else []
+            b_qual = [e for e in b_entries if e.get("Name") == "qual"]
+            b_id = b_qual[0].get("ID") if len(b_qual) == 1 else None
+            notes.append(f"Second-account remote `{rb}` preflight folder ID match: {b_id == folder_id}")
+            passed = passed and (b_id == folder_id)
 
-        time.sleep(MTIME_STEP_SECS)
-        sha_a2 = truth.write_into(clients["client-a"]["local"], "shared.txt", "d-shared-a", size_bytes=320)
-        sha_b2 = truth.write_into(clients["client-b"]["local"], "shared.txt", "d-shared-b", size_bytes=350)
-        for cname in ("client-a", "client-b", "client-c", "client-a", "client-b"):
-            cmds.append(
-                run_rclone(
-                    rclone_bin,
-                    rclone_cfg,
-                    fake_home,
-                    bisync_args(
-                        clients[cname]["local"],
-                        remote_data,
-                        clients[cname]["workdir"],
-                        filters_file,
-                        clients[cname]["backup1"] / f"run-{run_seq}",
-                        next_backup2(cname),
-                    ),
-                    pw_cmd,
-                )
-            )
-        ha = truth.scan_tree_hashes(clients["client-a"]["local"])
-        hb = truth.scan_tree_hashes(clients["client-b"]["local"])
-        hc = truth.scan_tree_hashes(clients["client-c"]["local"])
-        converged = ha == hb == hc
-        both_preserved = sha_a2 in ha.values() and sha_b2 in ha.values()
-        passed = converged and both_preserved
         scenarios.append(
             ScenarioEvidence(
-                name="drive_three_client_same_file_conflict",
-                description="Three independent clients against real Drive remote with same-file conflict and multi-cycle verification.",
+                name="drive_preflight_account_and_folder_ids",
+                description="Verify Google Drive account connectivity and unambiguous collection folder ID resolution via rclone lsjson --dirs-only.",
                 started_at=s_start,
                 finished_at=utc_now(),
-                injected_failure="concurrent edits to shared.txt on client-a and client-b",
+                injected_failure="none (preflight only)",
                 passed=passed,
-                conclusion="supported" if passed else "failed",
+                status="PASS" if passed else "FAIL",
+                conclusion="preflight verified (account reachable, unambiguous folder ID)" if passed else "preflight failed",
                 commands=cmds,
-                outcomes={"converged": converged, "both_preserved": both_preserved},
+                outcomes={
+                    "account_reachable": account_reachable,
+                    "matched_count": len(qual_entries),
+                    "folder_id": folder_id,
+                },
+                notes=notes,
             )
         )
     except Exception as exc:  # noqa: BLE001
+        safe_err = redact_credential_stderr(str(exc))
         scenarios.append(
             ScenarioEvidence(
-                name="drive_three_client_same_file_conflict",
-                description="Three-client Drive conflict scenario.",
+                name="drive_preflight_account_and_folder_ids",
+                description="Verify Google Drive account connectivity and folder ID resolution.",
                 started_at=s_start,
                 finished_at=utc_now(),
-                injected_failure="concurrent edits to shared.txt",
+                injected_failure="none (preflight only)",
                 passed=False,
-                conclusion=f"error: {exc}",
+                status="FAIL",
+                conclusion=f"preflight error: {safe_err}",
                 commands=cmds,
+                notes=notes,
+            )
+        )
+
+    # 2. Record all sync-cli Drive scenarios honestly as NOT RUN until drive-t4/connect-t4 lands.
+    has_cli_drive = sync_cli_supports_drive_mappings(sync_cli)
+    not_run_reason = (
+        "NOT RUN: sync-cli Drive mapping commands are not wired into this harness yet; full Drive scenarios must drive sync-cli."
+        if has_cli_drive
+        else "NOT RUN: sync-cli does not yet support Google Drive mappings (blocked on drive-t4 / connect-t4); Drive qualification requires driving sync-cli."
+    )
+    now_ts = utc_now()
+    for name, desc in PENDING_SYNC_CLI_SCENARIOS:
+        scenarios.append(
+            ScenarioEvidence(
+                name=name,
+                description=desc,
+                started_at=now_ts,
+                finished_at=now_ts,
+                injected_failure="not executed (preflight-only mode)",
+                passed=False,
+                status="NOT RUN",
+                conclusion=not_run_reason,
+            )
+        )
+    if args.remote_b:
+        scenarios.append(
+            ScenarioEvidence(
+                name="drive_two_account_ownership_and_recovery_move",
+                description="Verify two-account file ownership, overwrite, deletion, and same-remote Recovery move via sync-cli.",
+                started_at=now_ts,
+                finished_at=now_ts,
+                injected_failure="not executed (preflight-only mode)",
+                passed=False,
+                status="NOT RUN",
+                conclusion=not_run_reason,
             )
         )
 
     finished_at = utc_now()
-    all_passed = all(s.passed for s in scenarios)
+    overall_status = compute_overall_status(scenarios)
     write_evidence_files(
         json_path=out_dir / "drive-evidence.json",
         md_path=out_dir / "drive-evidence.md",
@@ -435,10 +440,14 @@ def main() -> int:
         versions=versions,
         scenarios=scenarios,
         overall_conclusion=(
-            "Owner-run Google Drive qualification PASSED." if all_passed else "Owner-run Google Drive qualification FAILED."
+            f"Google Drive qualification status is {overall_status}: only account/folder-ID preflight "
+            "was executed; sync-cli Drive scenarios are recorded as NOT RUN until drive-t4/connect-t4 lands."
         ),
     )
-    return 0 if all_passed else 1
+    for s in scenarios:
+        print(f"[{s.effective_status()}] {s.name}: {s.conclusion}")
+    print(f"Overall status: {overall_status} (evidence: {out_dir / 'drive-evidence.json'})")
+    return 0 if overall_status == "PASS" else 3
 
 
 def datetime_slug() -> str:

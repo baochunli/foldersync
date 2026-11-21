@@ -25,7 +25,9 @@ from common import (
     REPO_ROOT,
     ScenarioEvidence,
     TruthSet,
+    compute_overall_status,
     get_tool_versions,
+    redact_credential_stderr,
     resolve_verified_pinned_rclone,
     sha256_file,
     utc_now,
@@ -721,27 +723,26 @@ def run_interruption_scenarios(
             f"readiness={pa_status_after_fault['readiness']}, remote unchanged={phase_a_ok}"
         )
 
-        # --- Phase B: Graceful SIGINT during active multi-file transfer ---
+        # --- Phase B: Graceful SIGINT during observed active transfer + follow-up recovery cycle ---
         pb_remote = work_dir / "int-b-remote" / "Data" / "pb"
         pb_remote.mkdir(parents=True, exist_ok=True)
+        pb_rec_remote = work_dir / "int-b-remote" / "Recovery" / "pb"
         pb_client = ClientHarness("client-int-b", work_dir / "clients" / "client-int-b", sync_cli, rclone_bin, fake_home)
         truth.write_into(pb_client.local_dir, "seed.txt", "int-b-seed", size_bytes=256)
-        cmds.append(pb_client.add_mapping("pb", pb_remote, work_dir / "int-b-remote" / "Recovery" / "pb", collection="Data/pb"))
+        cmds.append(pb_client.add_mapping("pb", pb_remote, pb_rec_remote, collection="Data/pb"))
         cmds.append(pb_client.init("pb"))
 
-        # Populate a 1200-file batch (1200 x 64 KiB = ~75 MiB) so transfer is reliably
-        # interrupted in flight on fast local APFS storage.
+        # Populate a 500-file batch (500 x 128 KiB = ~64 MiB), giving EVERY generated file
+        # its own uniquely identifiable truth-set entry and SHA-256 outside the sync trees.
+        batch_count = 500
         batch_dir = pb_client.local_dir / "batch"
         batch_dir.mkdir(parents=True, exist_ok=True)
-        sample_labels: list[str] = ["int-b-seed"]
-        filler_chunk = os.urandom(65536)
-        for i in range(1200):
+        pb_truth_labels: list[str] = ["int-b-seed"]
+        for i in range(batch_count):
             fname = f"batch/chunk-{i:04d}.bin"
-            if i < 5:
-                truth.write_into(pb_client.local_dir, fname, f"int-b-chunk-{i:04d}", size_bytes=65536, binary=True)
-                sample_labels.append(f"int-b-chunk-{i:04d}")
-            else:
-                (pb_client.local_dir / fname).write_bytes(filler_chunk)
+            label = f"int-b-chunk-{i:04d}"
+            truth.write_into(pb_client.local_dir, fname, label, size_bytes=131072, binary=True)
+            pb_truth_labels.append(label)
 
         proc_b = subprocess.Popen(
             [
@@ -759,67 +760,180 @@ def run_interruption_scenarios(
             stderr=subprocess.PIPE,
             text=True,
         )
-        # Wait until the rclone child PID appears, then send SIGINT to the rclone child
-        # immediately so sync-cli observes rclone's graceful interrupt and commits
-        # Interrupted / RecoveryRequired with zero orphan processes.
-        signaled_target = "none"
-        deadline = time.monotonic() + 20.0
+
+        # Require BOTH: (1) a live `rclone bisync` child PID AND (2) observed partial transfer
+        # progress on the destination (1 <= files_transferred < batch_count) BEFORE sending SIGINT.
+        signaled_pid: int | None = None
+        signal_confirmed = False
+        transferred_before_sigint = 0
+        pb_remote_batch = pb_remote / "batch"
+        deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline and proc_b.poll() is None:
-            child_pid = None
-            try:
-                pg = subprocess.run(
-                    ["pgrep", "-P", str(proc_b.pid)],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                )
-                pids = [int(x) for x in pg.stdout.split() if x.isdigit()]
-                if pids:
-                    child_pid = pids[0]
-            except Exception:  # noqa: BLE001
-                child_pid = None
-            if child_pid is not None:
-                # Wait until bisync starts (not the short `rclone version` probe):
-                # `rclone bisync` is the second child or runs with `bisync` in argv.
-                ps_out = subprocess.run(
-                    ["ps", "-p", str(child_pid), "-o", "args="],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                ).stdout
-                if "bisync" in ps_out:
-                    time.sleep(0.02)
-                    try:
-                        os.kill(child_pid, signal.SIGINT)
-                        signaled_target = f"rclone-bisync:{child_pid}"
-                    except ProcessLookupError:
-                        signaled_target = "child-exited-before-signal"
+            cur_transferred = 0
+            if pb_remote_batch.is_dir():
+                try:
+                    cur_transferred = sum(1 for _ in pb_remote_batch.iterdir())
+                except OSError:
+                    cur_transferred = 0
+            if 1 <= cur_transferred < batch_count:
+                try:
+                    pg = subprocess.run(
+                        ["pgrep", "-P", str(proc_b.pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                    )
+                    pids = [int(x) for x in pg.stdout.split() if x.isdigit()]
+                except Exception:  # noqa: BLE001
+                    pids = []
+                for pid in pids:
+                    ps_out = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "args="],
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                    ).stdout
+                    if "bisync" in ps_out:
+                        try:
+                            os.kill(pid, signal.SIGINT)
+                            signaled_pid = pid
+                            signal_confirmed = True
+                            transferred_before_sigint = cur_transferred
+                        except ProcessLookupError:
+                            signal_confirmed = False
+                        break
+                if signal_confirmed:
                     break
-            time.sleep(0.01)
+            time.sleep(0.005)
+
         out_b, err_b = proc_b.communicate(timeout=90)
         cmds.append(
             {
                 "client": "client-int-b",
-                "args": ["run-once", "pb", f"(SIGINT -> {signaled_target})"],
+                "args": [
+                    "run-once",
+                    "pb",
+                    f"(SIGINT confirmed={signal_confirmed} pid={signaled_pid} progress={transferred_before_sigint}/{batch_count})",
+                ],
                 "returncode": proc_b.returncode,
-                "stdout": out_b.strip()[:300],
-                "stderr": err_b.strip()[:300],
+                "stdout": redact_credential_stderr(out_b).strip()[:300],
+                "stderr": redact_credential_stderr(err_b).strip()[:300],
             }
         )
         pb_status_after = pb_client.status_json()["mappings"][0]
         pb_runs = pb_client.sqlite_runs()
         pb_bisync_dir = pb_client.state_dir / "mappings" / "pb" / "generation-1" / "bisync"
+        pb_filters_file = pb_client.state_dir / "mappings" / "pb" / "generation-1" / "filters.txt"
+        pb_rclone_conf = pb_client.state_dir / "accounts" / "local-fixture" / "rclone.conf"
         pb_workdir_preserved = pb_bisync_dir.is_dir() and any(pb_bisync_dir.iterdir())
-        pb_hit_mid_run = proc_b.returncode != 0
-        phase_b_ok = (
-            pb_workdir_preserved
-            and pb_hit_mid_run
+        pb_hit_mid_run = (
+            signal_confirmed
+            and 1 <= transferred_before_sigint < batch_count
+            and proc_b.returncode != 0
             and pb_status_after["readiness"] == "RecoveryRequired"
         )
+
+        # Verify sync-cli refuses automatic re-run while mapping is held in RecoveryRequired.
+        held_refusal = pb_client.run_once("pb", check=False)
+        cmds.append(held_refusal)
+        pb_hold_enforced = held_refusal["returncode"] != 0
+
+        # Execute the follow-up `--resilient --recover` sync cycle + a second clean normal cycle
+        # against the preserved sync-manager bisync workdir using the verified pinned rclone,
+        # confirming all 500/500 batch files + seed.txt converge with exact truth-set SHA-256.
+        followup_ok = False
+        all_pb_converged = False
+        if pb_hit_mid_run and pb_workdir_preserved:
+            rclone_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(fake_home),
+                "TMPDIR": str(fake_home),
+                "LANG": "en_US.UTF-8",
+            }
+            for cycle_idx in (1, 2):
+                b1 = pb_client.recovery_dir / "pb" / f"followup-cycle-{cycle_idx}"
+                b2 = pb_rec_remote / f"followup-cycle-{cycle_idx}"
+                b1.mkdir(parents=True, exist_ok=True)
+                b2.mkdir(parents=True, exist_ok=True)
+                rc_proc = subprocess.run(
+                    [
+                        str(rclone_bin),
+                        "bisync",
+                        str(pb_client.local_dir.resolve()),
+                        str(pb_remote.resolve()),
+                        "--config",
+                        str(pb_rclone_conf.resolve()),
+                        "--ask-password=false",
+                        "--workdir",
+                        str(pb_bisync_dir.resolve()),
+                        "--filters-file",
+                        str(pb_filters_file.resolve()),
+                        "--check-access",
+                        "--check-filename",
+                        "RCLONE_TEST",
+                        "--max-delete",
+                        "10",
+                        "--compare",
+                        "size,modtime",
+                        "--conflict-resolve",
+                        "none",
+                        "--conflict-loser",
+                        "num",
+                        "--check-sync",
+                        "true",
+                        "--resilient",
+                        "--recover",
+                        "--backup-dir1",
+                        str(b1.resolve()),
+                        "--backup-dir2",
+                        str(b2.resolve()),
+                        "--use-json-log",
+                        "--log-level",
+                        "INFO",
+                    ],
+                    env=rclone_env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                cmds.append(
+                    {
+                        "client": "client-int-b",
+                        "args": ["rclone", "bisync", f"(follow-up recovery cycle {cycle_idx})"],
+                        "returncode": rc_proc.returncode,
+                        "stdout": redact_credential_stderr(rc_proc.stdout).strip()[-300:],
+                        "stderr": redact_credential_stderr(rc_proc.stderr).strip()[-400:],
+                    }
+                )
+                if rc_proc.returncode != 0:
+                    followup_ok = False
+                    break
+                followup_ok = True
+
+            if followup_ok:
+                local_hashes = truth.scan_tree_hashes(pb_client.local_dir)
+                remote_hashes = truth.scan_tree_hashes(pb_remote)
+                expected_pb = {
+                    truth.records[lbl]["rel_path"]: truth.records[lbl]["sha256"]
+                    for lbl in pb_truth_labels
+                }
+                all_pb_converged = local_hashes == expected_pb and remote_hashes == expected_pb
+
+        phase_b_verified = (
+            pb_hit_mid_run
+            and pb_workdir_preserved
+            and pb_hold_enforced
+            and followup_ok
+            and all_pb_converged
+        )
         notes.append(
-            f"Phase B (SIGINT transfer, target={signaled_target}): rc={proc_b.returncode}, "
-            f"hit_mid_run={pb_hit_mid_run}, readiness={pb_status_after['readiness']}, "
-            f"workdir_preserved={pb_workdir_preserved}, recorded_runs={len(pb_runs)}"
+            f"Phase B (mid-transfer SIGINT + recovery cycle): signal_confirmed={signal_confirmed}, "
+            f"pid={signaled_pid}, progress_before_sigint={transferred_before_sigint}/{batch_count}, "
+            f"rc={proc_b.returncode}, readiness={pb_status_after['readiness']}, "
+            f"hold_enforced={pb_hold_enforced}, workdir_preserved={pb_workdir_preserved}, "
+            f"followup_recovery_cycles_ok={followup_ok}, all_{len(pb_truth_labels)}_truth_hashes_converged={all_pb_converged}, "
+            f"recorded_runs={len(pb_runs)}"
         )
 
         # --- Phase C: Abrupt SIGKILL crash + startup reconciliation ---
@@ -889,32 +1003,83 @@ def run_interruption_scenarios(
             f"outcome_json_written={pc_outcome_file.is_file()}, workdir_preserved={pc_bisync_preserved}"
         )
 
-        acct, acct_ok = account_truth_versions(
-            truth,
-            ["int-a-keep-v1", "int-a-keep-v2", "int-c-keep", *sample_labels],
-            {
-                "pa-local": pa_client.local_dir,
-                "pa-remote": pa_remote,
-                "pb-local": pb_client.local_dir,
-                "pb-remote": pb_remote,
-                "pc-local": pc_client.local_dir,
-                "pc-remote": pc_remote,
-            },
-        )
-        passed = phase_a_ok and phase_b_ok and phase_c_ok and acct_ok
+        # Build truth-set hash accounting for every single generated file across Phases A, B (all 501), and C.
+        pa_local_h = truth.scan_tree_hashes(pa_client.local_dir)
+        pa_remote_h = truth.scan_tree_hashes(pa_remote)
+        pb_local_h = truth.scan_tree_hashes(pb_client.local_dir)
+        pb_remote_h = truth.scan_tree_hashes(pb_remote)
+        pc_local_h = truth.scan_tree_hashes(pc_client.local_dir)
+        pc_remote_h = truth.scan_tree_hashes(pc_remote)
+
+        sha_index: dict[str, list[str]] = {}
+        for root_name, tree_map in (
+            ("pa-local", pa_local_h),
+            ("pa-remote", pa_remote_h),
+            ("pb-local", pb_local_h),
+            ("pb-remote", pb_remote_h),
+            ("pc-local", pc_local_h),
+            ("pc-remote", pc_remote_h),
+        ):
+            for rel, digest in tree_map.items():
+                sha_index.setdefault(digest, []).append(f"{root_name}:{rel}")
+
+        acct: list[dict[str, Any]] = []
+        acct_ok = True
+        for label in ["int-a-keep-v1", "int-a-keep-v2", "int-c-keep", *pb_truth_labels]:
+            rec = truth.records[label]
+            locs = sha_index.get(rec["sha256"], [])
+            if label in pb_truth_labels:
+                ok = f"pb-local:{rec['rel_path']}" in locs and f"pb-remote:{rec['rel_path']}" in locs
+            else:
+                ok = len(locs) > 0
+            if not ok:
+                acct_ok = False
+            acct.append(
+                {
+                    "label": label,
+                    "rel_path": rec["rel_path"],
+                    "sha256": rec["sha256"],
+                    "locations": locs,
+                    "verified": ok,
+                }
+            )
+
+        if not (signal_confirmed and 1 <= transferred_before_sigint < batch_count):
+            scenario_status = "NOT VERIFIED"
+            passed = False
+            conclusion = (
+                "NOT VERIFIED: did not observe partial transfer progress + confirmed SIGINT delivery to rclone bisync before completion."
+            )
+        elif phase_a_ok and phase_b_verified and phase_c_ok and acct_ok:
+            scenario_status = "PASS"
+            passed = True
+            conclusion = (
+                f"supported (observed mid-transfer SIGINT at {transferred_before_sigint}/{batch_count} files, "
+                f"latched RecoveryRequired, and converged all {len(pb_truth_labels)}/{len(pb_truth_labels)} truth-set hashes across follow-up cycles)"
+            )
+        else:
+            scenario_status = "FAIL"
+            passed = False
+            conclusion = "failed (interruption hold or follow-up truth-set verification failed)"
+
         return ScenarioEvidence(
             name="interruption_at_phases",
-            description="Inject faults across phases: pre-listing missing RCLONE_TEST, mid-transfer SIGINT, and abrupt crash + startup reconciliation; verify workdir preservation, RecoveryRequired hold, and zero data loss.",
+            description="Inject faults across phases: pre-listing missing RCLONE_TEST, observed mid-transfer SIGINT + follow-up recovery cycles over 500 truth-set files, and abrupt crash + startup reconciliation.",
             started_at=start,
             finished_at=utc_now(),
-            injected_failure="missing RCLONE_TEST before listing; SIGINT during 1200-file batch; unfinished running row on restart",
+            injected_failure=f"missing RCLONE_TEST before listing; confirmed SIGINT at {transferred_before_sigint}/{batch_count} files; unfinished running row on restart",
             passed=passed,
-            conclusion="supported (holds in RecoveryRequired with workdir preserved; zero data corruption)" if passed else "failed",
+            status=scenario_status,
+            conclusion=conclusion,
             commands=cmds,
             outcomes={
                 "phase_a_ok": phase_a_ok,
-                "phase_b_ok": phase_b_ok,
-                "phase_b_hit_mid_run": pb_hit_mid_run,
+                "phase_b_signal_confirmed": signal_confirmed,
+                "phase_b_transferred_before_sigint": transferred_before_sigint,
+                "phase_b_batch_count": batch_count,
+                "phase_b_hold_enforced": pb_hold_enforced,
+                "phase_b_followup_ok": followup_ok,
+                "phase_b_all_truth_converged": all_pb_converged,
                 "phase_c_ok": phase_c_ok,
                 "pc_reconciled_readiness": pc_status_reconciled["readiness"],
             },
@@ -977,13 +1142,14 @@ def main() -> int:
         scenarios.append(run_interruption_scenarios(work_dir, sync_cli, rclone_bin, fake_home, args.seed))
 
     finished_at = utc_now()
-    all_passed = all(s.passed for s in scenarios)
+    overall_status = compute_overall_status(scenarios)
+    all_passed = overall_status == "PASS"
     conclusion = (
         "All local-to-local qualification scenarios PASSED with verified truth-set SHA-256 preservation. "
         "Real Google Drive (two accounts, OAuth, shared-parent folder IDs, rate limits) and physical "
         "external-disk unplug tests remain owner-run scenarios (see docs/qualification.md)."
         if all_passed
-        else "One or more local qualification scenarios FAILED; see scenario details above."
+        else f"Local qualification ended with status {overall_status}; see scenario details above."
     )
 
     write_evidence_files(
@@ -999,7 +1165,8 @@ def main() -> int:
     )
 
     for s in scenarios:
-        print(f"[{'PASS' if s.passed else 'FAIL'}] {s.name}: {s.conclusion}")
+        print(f"[{s.effective_status()}] {s.name}: {s.conclusion}")
+    print(f"Overall status: {overall_status}")
     print(f"Evidence written to:\n  {json_path}\n  {md_path}")
     return 0 if all_passed else 1
 
