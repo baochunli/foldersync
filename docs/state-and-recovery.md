@@ -63,10 +63,13 @@ before creating any directory or marker. Tests and the fixture `sync-cli`
 always require an explicit non-empty `--state-dir` and never open or create
 the real application directory.
 
-- **Safe path identifiers & containment:** Mapping, account, device, and run
-  IDs are validated as single path components (`[A-Za-z0-9][A-Za-z0-9_-]*`)
-  and every derived directory or file path is verified to remain strictly
-  inside its root before any write.
+- **Safe path identifiers, containment & symlink refusal:** Mapping, account,
+  device, and run IDs are validated as single path components
+  (`[A-Za-z0-9][A-Za-z0-9_-]*`) and every derived directory or file path under
+  the state root (`accounts`, `mappings`, `filters.txt`, `bisync`, `runs`,
+  `argv.json`, `output.ndjson`, `outcome.json`) is verified to remain strictly
+  inside its root with no symbolic link component (`symlink_metadata` /
+  `O_NOFOLLOW`) before any directory creation, chmod, or file write.
 - **Private permissions:** Directories under the state directory use `0700`;
   SQLite database, lock file, account configs, frozen filters, run artifacts,
   and Finder snapshots use `0600`.
@@ -86,9 +89,12 @@ the real application directory.
   - `mappings/<id>/generation-<N>/bisync/` — opaque rclone bisync workdir.
   - `runs/<run-id>/` — `argv.json` (sanitized argv + engine identity, written
     only after child identity is committed), `output.ndjson` (valid NDJSON
-    streamed live to disk during the run, wrapping plain or truncated lines as
-    JSON objects), and `outcome.json` (written on every terminal path:
-    completion, launch failure, and startup reconciliation).
+    streamed live to disk during the run and atomically finalized from the
+    adapter's lossless retained output buffer up to its bounds, wrapping plain
+    or truncated lines as JSON objects), and `outcome.json` (written before
+    each terminal commit on completion, pre-spawn abort, launch failure, child
+    identity failure, and startup reconciliation, with startup repair rewriting
+    any missing `outcome.json` for committed terminal rows).
   - `finder/status.json` (or configured `--finder-dir`) — atomically written
     (temp + `sync_all` + rename) v1 Finder status snapshot matching ADR 0002.
     Finder publication failures are logged as non-fatal warnings and never
@@ -96,22 +102,34 @@ the real application directory.
 
 ## Run records, crash recovery, and orphan reconciliation
 
-1. **Pre-spawn persistence:** Before spawning rclone, `sync-manager` atomically
-   dequeues, rechecks eligibility (pause, stop, shutdown, global orphan block),
-   re-verifies both roots against the stored generation and checks
-   `RCLONE_TEST` access-marker contents on both sides, claims the active job
-   slot, and inserts a `runs` row (`status = "starting"`,
-   `last_verified_phase = "pre_spawn"`) containing the run ID, generation ID,
-   workdir path, and unique per-run `backup_dir1`/`backup_dir2` recovery paths.
+1. **Pre-spawn persistence & no-gap launch:** Before spawning rclone,
+   `sync-manager` atomically dequeues, rechecks eligibility (pause, stop,
+   shutdown, global orphan block, storage-blocked mappings), claims the active
+   job slot, inserts a `runs` row (`status = "starting"`,
+   `last_verified_phase = "pre_spawn"`) with workdir and per-run
+   `backup_dir1`/`backup_dir2` recovery paths, and qualifies the rclone engine
+   and `BisyncRequest`. Immediately before spawn—holding the manager state
+   mutex across the final stop/force-stop/shutdown check, final root and
+   `RCLONE_TEST` access-marker content verification, child spawn, and child
+   identity commit—it aborts without spawning if stopped or if either root or
+   marker changed.
+   - *Known limitation (plan §11 residual race):* Filename-based access-marker
+     checks (`RCLONE_TEST`) cannot detect an atomic same-path directory
+     replacement that carries a copy of the recognized marker content, nor an
+     OS-level swap racing after spawn starts; external volume UUID/identity
+     probing in Group 4+ narrows this further.
 2. **Post-spawn child identity:** Immediately after spawn, `sync-manager`
    commits `child_pid`, OS process start time (`proc_pidinfo(PROC_PIDTBSDINFO)`
    on macOS, `/proc/<pid>/stat` on Linux), executable path (`proc_pidpath` /
    `/proc/<pid>/exe`), and verified engine identity to SQLite **before**
-   writing `argv.json`.
+   writing `argv.json`. If committing child identity fails, `sync-manager`
+   immediately force-stops the child, skips `argv.json`, writes `outcome.json`,
+   and records an `Interrupted` / `RecoveryRequired` outcome.
 3. **Startup reconciliation:** On every `SyncManager::open`, unfinished `runs`
-   rows (`starting` or `running`) are reconciled against live OS processes and
-   committed atomically in one SQLite transaction (run terminal status +
-   mapping hold + recovery case) alongside `outcome.json`:
+   rows (`starting` or `running`) are reconciled against live OS processes,
+   writing `outcome.json` and committing atomically in one SQLite transaction
+   (run terminal status + mapping hold + recovery case), and rewriting any
+   missing `outcome.json` on previously committed terminal rows:
    - **Missing PID (crash between spawn and PID record):** Investigates
      surviving processes referencing the run's exact workdir and workdir `.lck`
      evidence, recording `orphan_ambiguous` (`reconciled_ambiguous`) and
@@ -120,19 +138,23 @@ the real application directory.
      orphan (`reconciled_orphan_running`, `orphan_running` case with
      `orphan_pid`), blocking the **global** worker from launching any second
      job on any mapping. FolderSync never kills processes by name.
-   - **PID alive with different start time or executable (reused PID):** The
-     reused PID is ignored and never signaled (`reconciled_pid_reused`); the
-     mapping enters `RecoveryRequired` with `orphan_pid = None`.
-   - **Inconclusive probe (e.g. permission denied):** Reported as unknown
-     (`orphan_still_alive = None`, never `false`) and continues to block the
-     global worker.
+   - **PID alive with different start time or conclusively different executable
+     (reused PID):** The reused PID is ignored and never signaled
+     (`reconciled_pid_reused`); the mapping enters `RecoveryRequired` with
+     `orphan_pid = None`.
+   - **Inconclusive probe or identity comparison (e.g. permission denied,
+     ` (deleted)` executable suffix, or canonicalization failure):** Treated as
+     possibly alive (`orphan_still_alive = None`, `orphan_ambiguous`) and
+     continues to block the global worker.
    - **PID gone:** Run is marked interrupted (`reconciled_exited`), preserving
      the workdir and opening a recovery case.
-4. **Durable holds and intent:** `Pause`, `Resume`, `ForceStop`, and run
-   outcomes (including deletion-guard aborts, recorded as
-   `deletion_guard_aborted` recovery cases) are committed to SQLite before
-   acknowledging commands or publishing snapshots. Stop signals are delivered
-   before Finder snapshot publication.
+4. **Durable holds and intent:** `Pause`, `Resume`, `StopRun`, `ForceStop`, and
+   run outcomes (including deletion-guard aborts, recorded as
+   `deletion_guard_aborted` recovery cases) commit to SQLite **before**
+   mutating in-memory control flags, acknowledging commands, or publishing
+   snapshots. Terminal DB commit failures propagate to `wait_until_idle`
+   callers and keep the mapping blocked. Stop signals are delivered before
+   Finder snapshot publication.
 5. **Single global mutating job:** `SyncManager` runs at most one mutating
    rclone job globally on its dedicated worker thread, publishing immutable
    `StatusSnapshot` updates and a bounded event stream without assuming any UI
@@ -169,9 +191,9 @@ back to the real application state directory), and `init` / `run-once` exit
 non-zero on any failure outcome (including retryable failures):
 
 - `sync-cli status --state-dir <dir> [--json]`
-- `sync-cli add-mapping --state-dir <dir> --id <id> --local-dir <dir> --remote-dir <dir> --recovery-dir <dir> [--remote-recovery-dir <dir>]`
+- `sync-cli add-mapping --state-dir <dir> --id <id> --local-dir <dir> --remote-dir <dir> --recovery-dir <dir> [--remote-recovery-dir <dir>]` (defaults `--remote-recovery-dir` to a sibling `<recovery-dir>-remote` directory)
 - `sync-cli init <mapping> --state-dir <dir>`
-- `sync-cli run-once <mapping> --state-dir <dir>`
+- `sync-cli run-once <mapping> --state-dir <dir>` (ties exit status to the newly started run ID and exits non-zero on any run failure or terminal DB commit error)
 - `sync-cli pause <mapping> --state-dir <dir>`
 - `sync-cli resume <mapping> --state-dir <dir>`
 
