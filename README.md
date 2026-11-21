@@ -1,33 +1,37 @@
 # FolderSync
 
-FolderSync is a desktop prototype for syncing selected Google Drive folders
+FolderSync is a macOS desktop app for syncing selected Google Drive folders
 with local directories. Each folder can have a different local destination,
 including an external disk.
 
-**Status** — prototype, not for real data. The desktop NSH app (`apps/sync-ui`)
-runs against the real `sync-manager` by default (on a dedicated background
-worker thread with local-to-local fixture support, run/recovery inspection,
-Finder snapshot notifications and action-file handling, and controlled quit).
-Set `FOLDERSYNC_DEMO=1` (or pass `--demo`) to preview all approved screens
-against the in-memory demo source without touching macOS, rclone, Keychain, or
-the filesystem. `sync-cli` provides local-to-local fixture commands (`status`,
-`add-mapping`, `init`, `run-once`, `pause`, `resume`, requiring an explicit
-`--state-dir <dir>`) backed by `sync-manager`.
+**Use disposable data during prototype qualification.** The desktop app uses the live
+manager by default. It supports Drive account setup, selective folder sync,
+automatic scheduling after first sync, run and recovery inspection, and Finder
+status badges on mapped folder roots. Set `FOLDERSYNC_DEMO=1` or pass `--demo`
+to open the in-memory demo. `sync-cli` supports Drive account checks and local
+sync fixtures with an explicit `--state-dir <dir>`.
+
+Local fixtures exercise sync behavior. The owner still needs to qualify real
+Google Drive OAuth and transfers, two-account sharing, physical disk unplug
+behavior, Developer ID signing and notarization, and the household pilot.
+See the [qualification checklist](docs/qualification.md).
+
+- [Household guide](docs/household-guide.md)
+- [Pilot, rollback, and maintenance](docs/pilot-and-rollback.md)
 
 ## Desktop interface (`apps/sync-ui`)
 
-The GUI uses NSH 0.6.1 with macOS system sans-serif typography and bundled
-[Paper Mono](https://github.com/paper-design/paper-mono) (`OFL-1.1`, see
-`NOTICE` and `apps/sync-ui/assets/fonts/OFL.txt`) for paths, IDs, and logs.
-By default it connects to `sync-manager` via `ManagerSource` (respecting
-`FOLDERSYNC_STATE_DIR` for isolated testing). Launch with `FOLDERSYNC_DEMO=1`
-to enable the in-memory demo source and sidebar demo switcher.
+The GUI uses NSH 0.6.1 with macOS system sans-serif typography and bundles
+Paper Mono for paths, IDs, and logs. Set `FOLDERSYNC_STATE_DIR` for isolated
+testing with the live manager. See [Paper Mono](https://github.com/paper-design/paper-mono)
+and its [OFL-1.1 license](apps/sync-ui/assets/fonts/OFL.txt).
 
 Overview paths use a single line with a middle ellipsis when space is tight.
 The full path remains available in the accessibility label and mapping detail.
 Automatic scheduling starts after FolderSync verifies a mapping’s first sync.
-Choose its polling interval in Mapping Detail. Pause scheduling in the sidebar
-or menu bar. **Sync now** requests an on-demand run while scheduling is paused.
+Choose its polling interval in the mapping’s **Schedule** section. Pause
+scheduling in the sidebar or menu bar. **Sync now** requests an on-demand run
+while scheduling is paused.
 Activity shows the pending run order. Overview and Mapping Detail show the
 estimated next check or retry when one is scheduled. Local changes can prompt
 an earlier check.
