@@ -57,7 +57,7 @@ fn reconnecting_volume_never_clears_paused() {
         Intent::Paused,
     );
     let res = apply_event(state, ObservedEvent::VolumeAvailable);
-    assert_eq!(res.state.readiness, Readiness::Ready);
+    assert_eq!(res.state.readiness(), Readiness::Ready);
     assert_eq!(res.state.intent, Intent::Paused);
     assert_eq!(res.state.execution, Execution::Idle);
     assert_eq!(res.effect, TransitionEffect::None);
@@ -69,7 +69,7 @@ fn resume_queues_run_only_when_ready() {
         let state = MappingState::new(readiness, Execution::Idle, Intent::Paused);
         let res = apply_user_action(state, UserAction::Resume);
         assert_eq!(res.state.intent, Intent::Enabled);
-        assert_eq!(res.state.readiness, readiness);
+        assert_eq!(res.state.readiness(), readiness);
 
         if readiness == Readiness::Ready {
             assert_eq!(res.state.execution, Execution::Queued);
@@ -109,13 +109,13 @@ fn stop_force_stop_and_quit_follow_plan_semantics() {
     // StopRun requests graceful stop and shows Stopping.
     let stopped = apply_user_action(running, UserAction::StopRun);
     assert_eq!(stopped.state.execution, Execution::Stopping);
-    assert_eq!(stopped.state.readiness, Readiness::Ready);
+    assert_eq!(stopped.state.readiness(), Readiness::Ready);
     assert_eq!(stopped.effect, TransitionEffect::RequestGracefulStop);
 
     // ForceStop terminates and enters Interrupted + RecoveryRequired.
     let forced = apply_user_action(stopped.state, UserAction::ForceStop);
     assert_eq!(forced.state.execution, Execution::Interrupted);
-    assert_eq!(forced.state.readiness, Readiness::RecoveryRequired);
+    assert_eq!(forced.state.readiness(), Readiness::RecoveryRequired);
     assert_eq!(forced.effect, TransitionEffect::ForceTerminateChild);
 
     // QuitRequested stops scheduling and requests graceful stop without touching intent.
@@ -143,13 +143,17 @@ fn critical_unknown_corrupt_and_interrupted_outcomes_latch_recovery_required() {
     ] {
         let running = MappingState::new(Readiness::Ready, Execution::Running, Intent::Enabled);
         let after_fail = apply_event(running, ObservedEvent::RunFinished(outcome));
-        assert_eq!(after_fail.state.readiness, Readiness::RecoveryRequired);
+        assert_eq!(after_fail.state.readiness(), Readiness::RecoveryRequired);
         if outcome == RunOutcome::Interrupted {
             assert_eq!(after_fail.state.execution, Execution::Interrupted);
         }
 
-        // Non-recovery events and user actions cannot clear RecoveryRequired.
-        let mut s = after_fail.state;
+        // Persisting and reloading preserves the recovery hold and cannot bypass scheduling.
+        let serialized = serde_json::to_string(&after_fail.state).expect("serialize state");
+        let mut s: MappingState = serde_json::from_str(&serialized).expect("deserialize state");
+        assert_eq!(s.readiness(), Readiness::RecoveryRequired);
+
+        // Non-recovery events and user actions cannot clear RecoveryRequired or schedule runs.
         for action in [
             UserAction::CloseWindow,
             UserAction::Pause,
@@ -159,8 +163,10 @@ fn critical_unknown_corrupt_and_interrupted_outcomes_latch_recovery_required() {
             UserAction::ForceStop,
             UserAction::QuitRequested,
         ] {
-            s = apply_user_action(s, action).state;
-            assert_eq!(s.readiness, Readiness::RecoveryRequired);
+            let res = apply_user_action(s, action);
+            s = res.state;
+            assert_eq!(s.readiness(), Readiness::RecoveryRequired);
+            assert_ne!(res.effect, TransitionEffect::ScheduleRun);
         }
         for event in [
             ObservedEvent::Configured,
@@ -175,8 +181,10 @@ fn critical_unknown_corrupt_and_interrupted_outcomes_latch_recovery_required() {
             ObservedEvent::EndpointValidated,
             ObservedEvent::RunFinished(RunOutcome::Success),
         ] {
-            s = apply_event(s, event).state;
-            assert_eq!(s.readiness, Readiness::RecoveryRequired);
+            let res = apply_event(s, event);
+            s = res.state;
+            assert_eq!(s.readiness(), Readiness::RecoveryRequired);
+            assert_ne!(res.effect, TransitionEffect::ScheduleRun);
         }
 
         // Only explicit RecoveryCompleted clears RecoveryRequired.
@@ -186,7 +194,7 @@ fn critical_unknown_corrupt_and_interrupted_outcomes_latch_recovery_required() {
                 next_readiness: PostRecoveryReadiness::Ready,
             },
         );
-        assert_eq!(recovered.state.readiness, Readiness::Ready);
+        assert_eq!(recovered.state.readiness(), Readiness::Ready);
         assert_eq!(recovered.state.execution, Execution::Idle);
     }
 }
@@ -299,15 +307,18 @@ fn unresolved_needs_initialization_survives_resume_volume_lost_and_volume_availa
     );
     let after_resume = apply_user_action(draft, UserAction::Resume);
     assert_eq!(after_resume.state.intent, Intent::Enabled);
-    assert_eq!(after_resume.state.readiness, Readiness::NeedsInitialization);
+    assert_eq!(
+        after_resume.state.readiness(),
+        Readiness::NeedsInitialization
+    );
     assert_eq!(after_resume.state.execution, Execution::Idle);
 
     let after_lost = apply_event(after_resume.state, ObservedEvent::VolumeLost);
-    assert_eq!(after_lost.state.readiness, Readiness::VolumeUnavailable);
+    assert_eq!(after_lost.state.readiness(), Readiness::VolumeUnavailable);
 
     let after_back = apply_event(after_lost.state, ObservedEvent::VolumeAvailable);
     assert_eq!(
-        after_back.state.readiness,
+        after_back.state.readiness(),
         Readiness::NeedsInitialization,
         "reconnecting volume must not bypass NeedsInitialization"
     );
@@ -318,12 +329,79 @@ fn unresolved_needs_initialization_survives_resume_volume_lost_and_volume_availa
     assert_eq!(after_tick.effect, TransitionEffect::None);
 
     let after_init = apply_event(after_back.state, ObservedEvent::InitializationCompleted);
-    assert_eq!(after_init.state.readiness, Readiness::Ready);
+    assert_eq!(after_init.state.readiness(), Readiness::Ready);
     assert_eq!(after_init.effect, TransitionEffect::EligibleForScheduling);
 }
 
 #[test]
-fn unresolved_auth_endpoint_and_recovery_gates_survive_unrelated_events() {
+fn initialization_completed_is_preserved_while_another_gate_is_active() {
+    let init = MappingState::new(
+        Readiness::NeedsInitialization,
+        Execution::Idle,
+        Intent::Enabled,
+    );
+
+    // Exact review probe: AuthenticationFailed -> InitializationCompleted -> AuthenticationRestored => Ready.
+    let auth_failed = apply_event(init, ObservedEvent::AuthenticationFailed).state;
+    assert_eq!(auth_failed.readiness(), Readiness::AuthenticationRequired);
+
+    let init_done = apply_event(auth_failed, ObservedEvent::InitializationCompleted);
+    assert_eq!(
+        init_done.state.readiness(),
+        Readiness::AuthenticationRequired
+    );
+    assert_eq!(init_done.effect, TransitionEffect::None);
+
+    let auth_restored = apply_event(init_done.state, ObservedEvent::AuthenticationRestored);
+    assert_eq!(auth_restored.state.readiness(), Readiness::Ready);
+    assert_eq!(
+        auth_restored.effect,
+        TransitionEffect::EligibleForScheduling
+    );
+
+    // Also verify VolumeLost -> InitializationCompleted -> VolumeAvailable => Ready.
+    let vol_lost = apply_event(init, ObservedEvent::VolumeLost).state;
+    let init_done = apply_event(vol_lost, ObservedEvent::InitializationCompleted).state;
+    assert_eq!(init_done.readiness(), Readiness::VolumeUnavailable);
+    let vol_back = apply_event(init_done, ObservedEvent::VolumeAvailable);
+    assert_eq!(vol_back.state.readiness(), Readiness::Ready);
+    assert_eq!(vol_back.effect, TransitionEffect::EligibleForScheduling);
+}
+
+#[test]
+fn volume_only_mismatch_allows_known_volume_reconnect_without_endpoint_approval() {
+    let running = MappingState::new(Readiness::Ready, Execution::Running, Intent::Enabled);
+
+    // Exact review probe: VolumeLost -> RunFinished(EndpointOrVolumeMismatch) -> VolumeAvailable => Ready.
+    let lost = apply_event(running, ObservedEvent::VolumeLost);
+    assert_eq!(lost.state.readiness(), Readiness::VolumeUnavailable);
+    assert_eq!(lost.state.execution, Execution::Stopping);
+    assert_eq!(lost.effect, TransitionEffect::RequestGracefulStop);
+
+    let finished = apply_event(
+        lost.state,
+        ObservedEvent::RunFinished(RunOutcome::EndpointOrVolumeMismatch),
+    );
+    assert_eq!(finished.state.readiness(), Readiness::VolumeUnavailable);
+    assert_eq!(finished.state.execution, Execution::Idle);
+
+    let back = apply_event(finished.state, ObservedEvent::VolumeAvailable);
+    assert_eq!(back.state.readiness(), Readiness::Ready);
+    assert_eq!(back.effect, TransitionEffect::EligibleForScheduling);
+    assert!(!available_actions(&back.state).contains(&AvailableAction::ReviewEndpointChange));
+    assert!(available_actions(&back.state).contains(&AvailableAction::RunNow));
+
+    // Genuine endpoint mismatch while the volume is still present still latches EndpointChanged.
+    let genuine = apply_event(
+        running,
+        ObservedEvent::RunFinished(RunOutcome::EndpointOrVolumeMismatch),
+    );
+    assert_eq!(genuine.state.readiness(), Readiness::EndpointChanged);
+    assert!(available_actions(&genuine.state).contains(&AvailableAction::ReviewEndpointChange));
+}
+
+#[test]
+fn unresolved_auth_endpoint_volume_and_recovery_gates_survive_unrelated_events() {
     // AuthenticationRequired survives VolumeLost -> VolumeAvailable.
     let auth_hold = MappingState::new(
         Readiness::AuthenticationRequired,
@@ -332,18 +410,18 @@ fn unresolved_auth_endpoint_and_recovery_gates_survive_unrelated_events() {
     );
     let lost = apply_event(auth_hold, ObservedEvent::VolumeLost).state;
     let back = apply_event(lost, ObservedEvent::VolumeAvailable).state;
-    assert_eq!(back.readiness, Readiness::AuthenticationRequired);
+    assert_eq!(back.readiness(), Readiness::AuthenticationRequired);
     let restored = apply_event(back, ObservedEvent::AuthenticationRestored).state;
-    assert_eq!(restored.readiness, Readiness::Ready);
+    assert_eq!(restored.readiness(), Readiness::Ready);
 
     // EndpointChanged survives AuthenticationFailed -> AuthenticationRestored.
     let endpoint_hold =
         MappingState::new(Readiness::EndpointChanged, Execution::Idle, Intent::Enabled);
     let auth_bad = apply_event(endpoint_hold, ObservedEvent::AuthenticationFailed).state;
     let auth_ok = apply_event(auth_bad, ObservedEvent::AuthenticationRestored).state;
-    assert_eq!(auth_ok.readiness, Readiness::EndpointChanged);
+    assert_eq!(auth_ok.readiness(), Readiness::EndpointChanged);
     let validated = apply_event(auth_ok, ObservedEvent::EndpointValidated).state;
-    assert_eq!(validated.readiness, Readiness::Ready);
+    assert_eq!(validated.readiness(), Readiness::Ready);
 
     // VolumeUnavailable survives AuthenticationFailed -> AuthenticationRestored.
     let vol_hold = MappingState::new(
@@ -353,9 +431,30 @@ fn unresolved_auth_endpoint_and_recovery_gates_survive_unrelated_events() {
     );
     let auth_bad = apply_event(vol_hold, ObservedEvent::AuthenticationFailed).state;
     let auth_ok = apply_event(auth_bad, ObservedEvent::AuthenticationRestored).state;
-    assert_eq!(auth_ok.readiness, Readiness::VolumeUnavailable);
+    assert_eq!(auth_ok.readiness(), Readiness::VolumeUnavailable);
     let vol_ok = apply_event(auth_ok, ObservedEvent::VolumeAvailable).state;
-    assert_eq!(vol_ok.readiness, Readiness::Ready);
+    assert_eq!(vol_ok.readiness(), Readiness::Ready);
+
+    // RecoveryRequired survives VolumeLost -> VolumeAvailable and preserves other holds.
+    let rec_hold = MappingState::new(
+        Readiness::RecoveryRequired,
+        Execution::Interrupted,
+        Intent::Enabled,
+    );
+    let auth_bad = apply_event(rec_hold, ObservedEvent::AuthenticationFailed).state;
+    let vol_lost = apply_event(auth_bad, ObservedEvent::VolumeLost).state;
+    let vol_back = apply_event(vol_lost, ObservedEvent::VolumeAvailable).state;
+    assert_eq!(vol_back.readiness(), Readiness::RecoveryRequired);
+    let rec_done = apply_event(
+        vol_back,
+        ObservedEvent::RecoveryCompleted {
+            next_readiness: PostRecoveryReadiness::Ready,
+        },
+    )
+    .state;
+    assert_eq!(rec_done.readiness(), Readiness::AuthenticationRequired);
+    let fully_ready = apply_event(rec_done, ObservedEvent::AuthenticationRestored).state;
+    assert_eq!(fully_ready.readiness(), Readiness::Ready);
 }
 
 #[test]
@@ -447,6 +546,25 @@ fn arb_non_recovery_event() -> impl Strategy<Value = ObservedEvent> {
     ]
 }
 
+fn gate_clearing_matches(gate: Readiness, event: ObservedEvent) -> bool {
+    matches!(
+        (gate, event),
+        (
+            Readiness::NeedsInitialization,
+            ObservedEvent::InitializationCompleted
+        ) | (Readiness::VolumeUnavailable, ObservedEvent::VolumeAvailable)
+            | (
+                Readiness::AuthenticationRequired,
+                ObservedEvent::AuthenticationRestored
+            )
+            | (Readiness::EndpointChanged, ObservedEvent::EndpointValidated)
+            | (
+                Readiness::RecoveryRequired,
+                ObservedEvent::RecoveryCompleted { .. }
+            )
+    )
+}
+
 proptest! {
     #[test]
     fn no_non_resume_action_clears_paused(
@@ -486,7 +604,51 @@ proptest! {
         ]),
     ) {
         let state = MappingState::new(Readiness::RecoveryRequired, execution, intent);
-        prop_assert_eq!(apply_event(state, event).state.readiness, Readiness::RecoveryRequired);
-        prop_assert_eq!(apply_user_action(state, action).state.readiness, Readiness::RecoveryRequired);
+        prop_assert_eq!(apply_event(state, event).state.readiness(), Readiness::RecoveryRequired);
+        prop_assert_eq!(apply_user_action(state, action).state.readiness(), Readiness::RecoveryRequired);
+    }
+
+    #[test]
+    fn any_event_sequence_without_a_gates_clearing_event_leaves_that_gate_set(
+        gate in prop::sample::select(vec![
+            Readiness::NeedsInitialization,
+            Readiness::VolumeUnavailable,
+            Readiness::AuthenticationRequired,
+            Readiness::EndpointChanged,
+            Readiness::RecoveryRequired,
+        ]),
+        execution in arb_execution(),
+        intent in prop::sample::select(all_intent().to_vec()),
+        events in prop::collection::vec(arb_event(), 1..20),
+    ) {
+        let mut state = MappingState::new(gate, execution, intent);
+        for event in events {
+            if gate_clearing_matches(gate, event) {
+                continue;
+            }
+            state = apply_event(state, event).state;
+            prop_assert_ne!(state.readiness(), Readiness::Ready);
+            prop_assert_ne!(
+                apply_event(state, ObservedEvent::ScheduleTriggered).effect,
+                TransitionEffect::ScheduleRun
+            );
+        }
+
+        // Clearing every OTHER gate (starting with InitializationCompleted while other holds
+        // may still be set) must reveal that the original gate is still set.
+        for other_clear in [
+            ObservedEvent::InitializationCompleted,
+            ObservedEvent::RecoveryCompleted {
+                next_readiness: PostRecoveryReadiness::Ready,
+            },
+            ObservedEvent::AuthenticationRestored,
+            ObservedEvent::EndpointValidated,
+            ObservedEvent::VolumeAvailable,
+        ] {
+            if !gate_clearing_matches(gate, other_clear) {
+                state = apply_event(state, other_clear).state;
+            }
+        }
+        prop_assert_eq!(state.readiness(), gate);
     }
 }

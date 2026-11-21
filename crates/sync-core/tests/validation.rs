@@ -460,11 +460,28 @@ fn name_validation_uses_unicode_caseless_matching() {
     let findings = validate_names(&german);
     assert!(
         findings.iter().any(|f| {
-            matches!(f.kind, NameFindingKind::CaseOnlyCollision { .. })
-                && f.paths.contains(&"docs/stra\u{00DF}e.txt".to_owned())
+            matches!(
+                f.kind,
+                NameFindingKind::CaseOnlyCollision { ref normalized_key }
+                    if normalized_key == "docs/strasse.txt"
+            ) && f.paths.contains(&"docs/stra\u{00DF}e.txt".to_owned())
                 && f.paths.contains(&"docs/STRASSE.txt".to_owned())
         }),
-        "expected ß/SS to collide under Unicode caseless matching, got: {findings:?}"
+        "expected ß/SS to collide with folded key docs/strasse.txt, got: {findings:?}"
+    );
+
+    let greek_final = ["docs/\u{039F}\u{03A3}", "docs/\u{03BF}\u{03C3}"];
+    let findings = validate_names(&greek_final);
+    assert!(
+        findings.iter().any(|f| {
+            matches!(
+                f.kind,
+                NameFindingKind::CaseOnlyCollision { ref normalized_key }
+                    if normalized_key == "docs/\u{03BF}\u{03C3}"
+            ) && f.paths.contains(&"docs/\u{039F}\u{03A3}".to_owned())
+                && f.paths.contains(&"docs/\u{03BF}\u{03C3}".to_owned())
+        }),
+        "expected ΟΣ/οσ to report case-folded key docs/οσ, got: {findings:?}"
     );
 }
 

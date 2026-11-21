@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
+use caseless::default_case_fold_str;
 use serde::{Deserialize, Serialize};
-use unicase::UniCase;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::model::{CloudCollection, DeviceId, LocalBinding, MappingId};
@@ -621,6 +621,11 @@ pub struct NameFinding {
     pub next_step: String,
 }
 
+fn canonical_case_fold(s: &str) -> String {
+    let nfd: String = s.nfd().collect();
+    default_case_fold_str(&nfd).nfc().collect()
+}
+
 /// Validates a list of `/`-separated relative paths for case-only collisions,
 /// Unicode NFC/NFD collisions, over-long components, and reserved or
 /// unsupported characters.
@@ -744,26 +749,21 @@ pub fn validate_names<S: AsRef<str>>(relative_paths: &[S]) -> Vec<NameFinding> {
         }
     }
 
-    // Group distinct NFC forms by Unicode caseless matching (NFD + Unicode full case folding).
-    let mut by_case: BTreeMap<UniCase<String>, BTreeMap<String, BTreeSet<String>>> =
-        BTreeMap::new();
+    // Group distinct NFC forms by Unicode canonical caseless matching (NFD + default case fold + NFC)
+    // and emit that exact folded key as `normalized_key`.
+    let mut by_case: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
     for (nfc_form, raw_variants) in by_nfc {
-        let caseless_key = UniCase::unicode(nfc_form.nfd().collect::<String>());
+        let case_key = canonical_case_fold(&nfc_form);
         by_case
-            .entry(caseless_key)
+            .entry(case_key)
             .or_default()
             .entry(nfc_form)
             .or_default()
             .extend(raw_variants);
     }
 
-    for (caseless_key, nfc_groups) in by_case {
+    for (case_key, nfc_groups) in by_case {
         if nfc_groups.len() >= 2 {
-            let normalized_key: String = caseless_key
-                .into_inner()
-                .nfc()
-                .collect::<String>()
-                .to_lowercase();
             let paths: Vec<String> = nfc_groups
                 .into_values()
                 .flatten()
@@ -772,11 +772,11 @@ pub fn validate_names<S: AsRef<str>>(relative_paths: &[S]) -> Vec<NameFinding> {
                 .collect();
             findings.push(NameFinding {
                 kind: NameFindingKind::CaseOnlyCollision {
-                    normalized_key: normalized_key.clone(),
+                    normalized_key: case_key.clone(),
                 },
                 paths,
                 cause: format!(
-                    "Multiple items differ only by letter case (`{normalized_key}`), which collides under caseless matching."
+                    "Multiple items differ only by letter case (`{case_key}`), which collides under caseless matching."
                 ),
                 next_step: "Review the conflicting items and rename them so each name is unique regardless of case.".to_owned(),
             });

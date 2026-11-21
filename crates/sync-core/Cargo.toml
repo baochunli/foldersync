@@ -6,9 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+caseless = "0.2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-unicase = "2"
 unicode-normalization = "0.1"
 
 [dev-dependencies]

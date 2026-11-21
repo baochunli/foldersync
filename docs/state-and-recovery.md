@@ -38,7 +38,7 @@ as three separate dimensions:
 | --- | --- |
 | `Success`, `SuccessWithConflicts`, `RetryableFailure` | `Execution::Idle`; preserves current `Readiness` and `Intent`. |
 | `AuthenticationFailure` | `Execution::Idle`; activates the `AuthenticationRequired` hold while preserving other unresolved holds. |
-| `EndpointOrVolumeMismatch` | `Execution::Idle`; activates the `EndpointChanged` hold while preserving other unresolved holds. |
+| `EndpointOrVolumeMismatch` | `Execution::Idle`; activates the `EndpointChanged` hold when the bound volume is present (if `VolumeUnavailable` is already active, does not latch `EndpointChanged` so reconnecting the known volume returns to `Ready` without extra approval). |
 | `InvalidConfiguration`, `CriticalFailure`, `UnknownFailure`, `CorruptState` | `Execution::Idle`; latches `Readiness::RecoveryRequired`. |
 | `Interrupted` | `Execution::Interrupted`; latches `Readiness::RecoveryRequired`. |
 
