@@ -37,6 +37,13 @@ fn prints_help() {
     assert!(help.contains("run-once"));
     assert!(help.contains("pause"));
     assert!(help.contains("resume"));
+    assert!(help.contains("credential-helper"));
+    assert!(help.contains("account add-drive"));
+    assert!(help.contains("account reconnect"));
+    assert!(help.contains("account import"));
+    assert!(help.contains("account list"));
+    assert!(help.contains("account check"));
+    assert!(help.contains("remote resolve"));
 }
 
 #[test]
@@ -427,4 +434,160 @@ fn cli_run_once_fails_when_terminal_db_commit_fails_and_never_reuses_old_success
         !String::from_utf8_lossy(&out.stdout).contains("Run completed"),
         "failed run-once must not print 'Run completed'"
     );
+}
+
+#[test]
+fn account_and_remote_commands_require_state_dir_and_list_empty_without_touching_keychain() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+
+    // Every account/remote subcommand must reject missing --state-dir.
+    for args in [
+        &["account", "list"][..],
+        &["account", "reconnect", "--account", "a1"][..],
+        &["account", "check", "--account", "a1"][..],
+        &[
+            "account",
+            "import",
+            "--from",
+            "/tmp/src.conf",
+            "--remote",
+            "demo",
+        ][..],
+        &[
+            "account",
+            "add-drive",
+            "--id",
+            "d1",
+            "--root-folder-id",
+            "0ARoot",
+            "--client-id",
+            "cid",
+        ][..],
+        &["remote", "resolve", "Data/Research", "--account", "a1"][..],
+    ] {
+        let out = cli_cmd(tmp.path()).args(args).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "expected failure without --state-dir for {args:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--state-dir"),
+            "stderr for {args:?} should mention --state-dir: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // `account list --state-dir <dir> --json` succeeds on a clean state dir without touching Keychain.
+    let out = cli_cmd(tmp.path())
+        .args([
+            "account",
+            "list",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "account list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed, serde_json::json!([]));
+
+    // `account import` must refuse $HOME/.config/rclone/rclone.conf without --allow-global-config
+    // (before touching Keychain or creating account files).
+    let global_cfg = tmp.path().join(".config/rclone/rclone.conf");
+    fs::create_dir_all(global_cfg.parent().unwrap()).unwrap();
+    fs::write(&global_cfg, "[demo]\ntype = local\n").unwrap();
+    let refused = cli_cmd(tmp.path())
+        .args([
+            "account",
+            "import",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--from",
+            global_cfg.to_str().unwrap(),
+            "--remote",
+            "demo",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("global rclone configuration") || stderr.contains("--allow-global-config"),
+        "expected global-config refusal message, got: {stderr}"
+    );
+    assert!(!state_dir.join("accounts/demo").exists());
+}
+
+#[test]
+fn add_mapping_refuses_to_overwrite_existing_non_fixture_local_fixture_account() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    let local_dir = tmp.path().join("local_docs");
+    let remote_dir = tmp.path().join("remote_docs");
+    let recovery_dir = tmp.path().join("local_recovery");
+    fs::create_dir_all(&local_dir).unwrap();
+    fs::create_dir_all(&remote_dir).unwrap();
+    fs::create_dir_all(&recovery_dir).unwrap();
+
+    // Seed a non-fixture `drive` account claiming the reserved `local-fixture` ID.
+    let acct_dir = state_dir.join("accounts/local-fixture");
+    fs::create_dir_all(&acct_dir).unwrap();
+    let enc_bytes = b"# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nProtected==\n";
+    fs::write(acct_dir.join("rclone.conf"), enc_bytes).unwrap();
+    let store = sync_manager::SqliteStateStore::open(&state_dir.join("state.sqlite")).unwrap();
+    store
+        .upsert_account(&sync_manager::AccountRecord {
+            id: sync_core::AccountId::new("local-fixture"),
+            display_name: "Existing Drive".to_string(),
+            kind: "drive".to_string(),
+            remote_name: "household".to_string(),
+            remote_root_folder_id: "0ARoot".to_string(),
+            config_path: acct_dir.join("rclone.conf"),
+            auth_status: "ready".to_string(),
+            created_at: "2026-11-20T00:00:00Z".to_string(),
+            updated_at: "2026-11-20T00:00:00Z".to_string(),
+        })
+        .unwrap();
+    drop(store);
+
+    let out = cli_cmd(tmp.path())
+        .args([
+            "add-mapping",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--id",
+            "docs",
+            "--local-dir",
+            local_dir.to_str().unwrap(),
+            "--remote-dir",
+            remote_dir.to_str().unwrap(),
+            "--recovery-dir",
+            recovery_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "add-mapping must refuse to overwrite a non-fixture `local-fixture` account"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("non-fixture"),
+        "stderr should explain refusal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Confirm existing account row and encrypted config are untouched.
+    let store2 = sync_manager::SqliteStateStore::open(&state_dir.join("state.sqlite")).unwrap();
+    let rec = store2
+        .get_account(&sync_core::AccountId::new("local-fixture"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.kind, "drive");
+    assert_eq!(fs::read(acct_dir.join("rclone.conf")).unwrap(), enc_bytes);
 }

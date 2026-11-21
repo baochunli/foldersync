@@ -2,6 +2,7 @@
 //! recovery, initialization, manual runs, status snapshots, and Finder status
 //! publication for FolderSync.
 
+pub mod accounts;
 pub mod clock;
 pub mod error;
 pub mod finder;
@@ -9,9 +10,15 @@ pub mod init;
 pub mod launcher;
 pub mod manager;
 pub mod platform;
+pub mod secrets;
 pub mod snapshot;
 pub mod store;
 
+pub use accounts::{
+    AccountCheckReport, AccountError, AccountService, AccountServiceConfig, AddDriveAccountRequest,
+    DriveAccountResult, ImportAccountRequest, PasswordCommandFactory,
+    RESERVED_LOCAL_FIXTURE_ACCOUNT_ID,
+};
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::ManagerError;
 pub use finder::{
@@ -30,6 +37,12 @@ pub use manager::{
 pub use platform::{
     FakeProcessInspector, LiveProcessInfo, OsProcessInspector, ProcessInspector,
     ProcessProbeResult, StateLock, resolve_state_dir,
+};
+#[cfg(target_os = "macos")]
+pub use secrets::KeychainSecretStore;
+pub use secrets::{
+    InMemorySecretStore, KEYCHAIN_SERVICE, SecretStore, SecretStoreError, SecretString,
+    SystemSecretStore, run_credential_helper, scoped_credential_key, validate_credential_key,
 };
 pub use snapshot::{ManagerEvent, MappingCounters, MappingStatusSnapshot, StatusSnapshot};
 pub use store::{

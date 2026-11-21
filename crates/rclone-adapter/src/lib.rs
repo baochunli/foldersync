@@ -1,7 +1,10 @@
 //! Owns rclone version qualification, typed argument construction, process
 //! lifetime, output parsing, and outcome classification for FolderSync.
 
+pub mod auth;
+pub mod config;
 pub mod log_parser;
+pub mod lsjson;
 pub mod outcome;
 pub mod process;
 pub mod qualification;
@@ -9,9 +12,28 @@ pub mod request;
 
 use std::{env, path::PathBuf};
 
+pub use auth::{
+    AuthUrlCallback, DriveAuthError, DriveAuthOutcome, DriveAuthRequest, extract_auth_url,
+    run_drive_auth, run_drive_auth_locked,
+};
+pub use config::{
+    AccountConfigLock, ConfigError, DriveRemoteConfigSpec, ImportRemoteSpec, ImportedRemoteInfo,
+    ParsedIniSection, RCLONE_ENCRYPT_HEADER, RemoteConfigSummary, SETUP_TEMP_PREFIX,
+    check_config_recovery_state, cleanup_account_setup_temp_files, create_drive_remote_config,
+    create_drive_remote_config_locked, encrypted_remote_has_token,
+    enforce_private_config_permissions, extract_single_remote_section, find_rclone_config_backups,
+    import_single_remote_into_encrypted_config, import_single_remote_into_encrypted_config_locked,
+    init_encrypted_config, init_encrypted_config_locked, is_encrypted_config_content,
+    is_global_default_rclone_config, list_encrypted_config_remotes, verify_encrypted_config,
+};
 pub use log_parser::{
     BisyncMarker, ConflictSide, LogEvent, LogLevel, StructuredLogEvent, TransferStats,
     parse_log_line, parse_log_stream, strip_ansi_codes,
+};
+pub use lsjson::{
+    DuplicateDirFinding, LsJsonEntry, LsJsonError, LsJsonRequest, ResolvedComponent,
+    ResolvedRemotePath, find_duplicate_dir_names, list_dirs_with_runner, parse_lsjson_entries,
+    resolve_folder_path_with_runner, verify_expected_folder_identity_with_runner,
 };
 pub use outcome::{
     EXIT_CODE_TABLE_VERSION, Outcome, RcloneExitCode, classify_exit_code, classify_outcome,
