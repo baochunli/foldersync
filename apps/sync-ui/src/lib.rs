@@ -37,7 +37,10 @@ use crate::screens::{
     wizard::wizard_view,
 };
 use crate::system_actions::execute_system_action_on_main_thread;
-use crate::theme::{BtnKind, Palette, TRAY_ATTENTION_ICON, TRAY_ICON, app_button, status_pill};
+use crate::theme::{
+    BtnKind, LH_BODY, PAGE_BOTTOM_PADDING, PAGE_DRAG_HEIGHT, PAGE_SIDE_PADDING, PAGE_TOP_PADDING,
+    Palette, S_BODY, S_COMPACT, TRAY_ATTENTION_ICON, TRAY_ICON, W_BODY, app_button, status_pill,
+};
 
 /// Bundled crate assets (`PaperMono-Regular.ttf`, tray template SVGs, Welcome illustration).
 pub const CRATE_ASSETS: &[nsh_core::element::AssetFile] = assets!();
@@ -375,6 +378,10 @@ pub fn App() -> impl IntoElement {
         .flex_row()
         .bg(move || Palette::current().bg)
         .text_color(move || Palette::current().fg)
+        .text_size(px(S_BODY))
+        .line_height(LH_BODY)
+        .font_weight(W_BODY)
+        .tabular_nums()
         .child(sidebar_view(c_sidebar))
         .child(
             view()
@@ -383,10 +390,7 @@ pub fn App() -> impl IntoElement {
                 .flex_col()
                 .bg(move || Palette::current().bg)
                 // Top window drag bar above scrollable content
-                .child(view().window_drag(true).w_full().h(move || {
-                    let inset = nsh_core::element::desktop::title_bar().top.0;
-                    px(inset.max(12.0))
-                }))
+                .child(view().window_drag(true).w_full().h(px(PAGE_DRAG_HEIGHT)))
                 // Top banners: controlled shutdown status + actionable manager errors
                 .child(dynamic(move || {
                     let p = Palette::current();
@@ -403,7 +407,7 @@ pub fn App() -> impl IntoElement {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(10.0))
-                                .mx(px(20.0))
+                                .mx(px(PAGE_SIDE_PADDING))
                                 .mb(px(4.0))
                                 .px(px(14.0))
                                 .py(px(10.0))
@@ -415,7 +419,7 @@ pub fn App() -> impl IntoElement {
                                 .child(
                                     text("Waiting for active sync work to stop cleanly before quitting.")
                                         .flex_1()
-                                        .text_size(px(12.5))
+                                        .text_size(px(S_COMPACT))
                                         .text_color(p.fg),
                                 ),
                         );
@@ -431,7 +435,7 @@ pub fn App() -> impl IntoElement {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(10.0))
-                                .mx(px(20.0))
+                                .mx(px(PAGE_SIDE_PADDING))
                                 .mb(px(4.0))
                                 .px(px(14.0))
                                 .py(px(10.0))
@@ -443,7 +447,7 @@ pub fn App() -> impl IntoElement {
                                 .child(
                                     text(err.clone())
                                         .flex_1()
-                                        .text_size(px(12.5))
+                                        .text_size(px(S_COMPACT))
                                         .text_color(p.fg),
                                 )
                                 .child(app_button(
@@ -468,9 +472,9 @@ pub fn App() -> impl IntoElement {
                     scroll().flex_1().w_full().child(
                         view()
                             .w_full()
-                            .px(px(20.0))
-                            .pt(px(8.0))
-                            .pb(px(32.0))
+                            .px(px(PAGE_SIDE_PADDING))
+                            .pt(px(PAGE_TOP_PADDING))
+                            .pb(px(PAGE_BOTTOM_PADDING))
                             .child(dynamic(move || match c_content.route.get() {
                                 ScreenRoute::Overview => {
                                     overview_view(c_content.clone()).into_element()

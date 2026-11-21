@@ -23,6 +23,11 @@ By default it connects to `sync-manager` via `ManagerSource` (respecting
 `FOLDERSYNC_STATE_DIR` for isolated testing). Launch with `FOLDERSYNC_DEMO=1`
 to enable the in-memory demo source and sidebar demo switcher.
 
+Overview paths use a single line with a middle ellipsis when space is tight.
+The full path remains available in the accessibility label and mapping detail.
+The wizard review covers the first sync. Use **Sync now** to run subsequent
+syncs manually in this build.
+
 ## Development
 
 macOS 14 or later is the first desktop target. The non-UI crates are built in

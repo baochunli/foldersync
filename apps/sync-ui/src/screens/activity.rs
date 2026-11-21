@@ -12,8 +12,10 @@ use crate::contract::{
 };
 use crate::screens::AppController;
 use crate::theme::{
-    BtnKind, Palette, app_button, card, card_title, focus_ring, link_button, mono_text, page_title,
-    progress_bar, status_pill,
+    BLOCK_GAP, BtnKind, CARD_ACTION_MARGIN, HEADER_BOTTOM_MARGIN, KV_ROW_GAP, Palette, S_BODY,
+    S_CAPTION, S_CARD_TITLE, S_COMPACT, S_SMALL, S_TINY, W_TITLE, app_button, card, card_title,
+    emphasized_line, focus_ring, kv_row, link_button, mono_text, page_title, progress_bar,
+    status_pill,
 };
 
 /// Renders the Activity screen.
@@ -27,11 +29,9 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
 
         let current_card = match &snap.active_run {
             Some(run) => render_active_run_card(ctrl.clone(), run),
-            None => card().child(card_title("Current run")).child(
-                text("No sync is running right now.")
-                    .text_size(px(13.0))
-                    .text_color(p.muted),
-            ),
+            None => card()
+                .child(card_title("Current run"))
+                .child(text("No sync is running right now.").text_color(p.muted)),
         };
 
         // Demo progress-phase preview bar so every §5.5 progress variant can be verified live
@@ -58,7 +58,7 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                 .gap(px(6.0))
                 .child(
                     text("Demo progress phase:")
-                        .text_size(px(11.5))
+                        .text_size(px(S_CAPTION))
                         .text_color(p.muted),
                 )
                 .child(make_phase_btn(
@@ -160,10 +160,11 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
             .gap(px(14.0))
             .w_full()
             .child(
-                card()
-                    .flex_1()
-                    .child(card_title("Queue"))
-                    .child(text(queue_body).text_size(px(12.5)).text_color(p.muted)),
+                card().flex_1().child(card_title("Queue")).child(
+                    text(queue_body)
+                        .text_size(px(S_COMPACT))
+                        .text_color(p.muted),
+                ),
             )
             .child(
                 card()
@@ -179,11 +180,11 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                             .child(
                                 text(held_copy)
                                     .w_full()
-                                    .text_size(px(12.5))
+                                    .text_size(px(S_COMPACT))
                                     .text_color(p.fg)
                                     .tabular_nums(),
                             )
-                            .child(link_button("Attention", 12.5, move || {
+                            .child(link_button("Attention", S_COMPACT, move || {
                                 ctrl_attn.navigate(ScreenRoute::Attention);
                             })),
                     ),
@@ -197,51 +198,56 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
             let ev = &events_data[pos.index()];
             let p = Palette::current();
             let c_link = ctrl_ev.clone();
-            let mut row = view()
+            let row = view()
                 .flex_row()
-                .items_center()
+                .items_start()
                 .gap(px(12.0))
-                .py(px(7.0))
+                .px(px(10.0))
+                .py(px(8.0))
                 .border_t_1()
                 .border_color(p.hair)
                 .child(
                     text(ev.time_label.clone())
                         .w(px(56.0))
                         .flex_none()
-                        .text_size(px(12.0))
                         .text_color(p.muted)
                         .tabular_nums(),
-                )
-                .child(
-                    text(ev.message.clone())
-                        .flex_1()
-                        .text_size(px(12.5))
-                        .text_color(p.fg),
                 );
+            let mut event = view()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex_row()
+                .flex_wrap()
+                .items_baseline()
+                .gap(px(4.0));
             if let Some((label, dest)) = ev.link.clone() {
-                row = row.child(link_button(label, 12.0, move || match dest.clone() {
-                    ScreenRoute::RunInspection { mapping_id, run_id } => {
-                        c_link.open_run_inspection(mapping_id, run_id);
-                    }
-                    ScreenRoute::Recovery(mapping_id) => {
-                        c_link.open_recovery(mapping_id);
-                    }
-                    other => {
-                        c_link.navigate(other);
-                    }
-                }));
+                event = event
+                    .child(text(format!("{} ·", ev.message)))
+                    .child(link_button(label, S_BODY, move || match dest.clone() {
+                        ScreenRoute::RunInspection { mapping_id, run_id } => {
+                            c_link.open_run_inspection(mapping_id, run_id);
+                        }
+                        ScreenRoute::Recovery(mapping_id) => {
+                            c_link.open_recovery(mapping_id);
+                        }
+                        other => {
+                            c_link.navigate(other);
+                        }
+                    }));
+            } else {
+                event = event.child(text(ev.message.clone()));
             }
-            row
+            row.child(event)
         })
         .viewport(ListViewport::Parent)
-        .estimated_item_size(px(32.0));
+        .estimated_item_size(px(36.0));
 
         let recent_card = card()
             .child(card_title("Recent events"))
             .child(events_list)
             .child(
                 text("The last 200 events are kept here. Older events stay in each run's record.")
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted),
             );
 
@@ -276,8 +282,9 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                                 .border_1()
                                 .border_color(p.hair)
                                 .rounded(px(8.0))
-                                .p(px(11.0))
-                                .child(mono_text(log_text, 11.0, p.fg)),
+                                .px(px(11.0))
+                                .py(px(9.0))
+                                .child(mono_text(log_text, S_TINY, p.fg)),
                         )
                         .child(
                             view()
@@ -323,18 +330,19 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                         })
                         .child(
                             text(format!("{} {log_title}", if open_now { "▾" } else { "▸" }))
-                                .text_size(px(14.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(S_CARD_TITLE))
+                                .font_weight(W_TITLE)
                                 .text_color(p.primary),
                         ),
                 ),
         );
 
-        let mut root = view()
-            .flex_col()
-            .w_full()
-            .gap(px(14.0))
-            .child(page_title("Activity"));
+        let mut root = view().flex_col().w_full().gap(px(BLOCK_GAP)).child(
+            view()
+                .window_drag(true)
+                .mb(px(HEADER_BOTTOM_MARGIN))
+                .child(page_title("Activity")),
+        );
         if snap.is_demo_mode {
             root = root.child(phase_bar);
         }
@@ -373,11 +381,11 @@ pub fn run_inspection_view(
             .flex_row()
             .items_center()
             .gap(px(12.0))
-            .child(link_button("‹ Mapping", 12.5, move || {
+            .child(link_button("‹ Mapping", S_COMPACT, move || {
                 c_back_detail.navigate(ScreenRoute::MappingDetail(mid_back.clone()));
             }))
-            .child(text("·").text_size(px(12.0)).text_color(p.muted))
-            .child(link_button("Activity", 12.5, move || {
+            .child(text("·").text_size(px(S_SMALL)).text_color(p.muted))
+            .child(link_button("Activity", S_COMPACT, move || {
                 c_back_act.navigate(ScreenRoute::Activity);
             }));
 
@@ -391,7 +399,6 @@ pub fn run_inspection_view(
                 .child(
                     card().child(
                         text(format!("Reading log and recovery copies for run {run_id}."))
-                            .text_size(px(13.0))
                             .text_color(p.muted),
                     ),
                 )
@@ -436,7 +443,7 @@ pub fn run_inspection_view(
             )))
             .child(
                 text(format!("{} · {}", insp.started_label, insp.result_label))
-                    .text_size(px(12.5))
+                    .text_size(px(S_COMPACT))
                     .text_color(p.muted),
             )
             .child(
@@ -447,8 +454,9 @@ pub fn run_inspection_view(
                     .border_1()
                     .border_color(p.hair)
                     .rounded(px(8.0))
-                    .p(px(11.0))
-                    .child(mono_text(log_text, 11.0, p.fg)),
+                    .px(px(11.0))
+                    .py(px(9.0))
+                    .child(mono_text(log_text, S_TINY, p.fg)),
             )
             .child(
                 view()
@@ -475,14 +483,14 @@ pub fn run_inspection_view(
             .child(card_title("Recovery copies from this run"))
             .child(
                 text("Choose a file to copy to a separate inspection folder so you can check it before replacing anything yourself. FolderSync never restores recovery copies directly into a synced folder.")
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted),
             );
 
         if insp.recovery_copies.is_empty() {
             copies_card = copies_card.child(
                 text("No recovery copies were kept by this run.")
-                    .text_size(px(12.5))
+                    .text_size(px(S_COMPACT))
                     .text_color(p.muted),
             );
         } else {
@@ -506,13 +514,13 @@ pub fn run_inspection_view(
                                 .flex_col()
                                 .gap(px(2.0))
                                 .flex_1()
-                                .child(mono_text(copy_item.relative_path.clone(), 11.5, p.fg))
+                                .child(mono_text(copy_item.relative_path.clone(), S_CAPTION, p.fg))
                                 .child(
                                     text(format!(
                                         "{} · {}",
                                         copy_item.side_label, copy_item.size_label
                                     ))
-                                    .text_size(px(11.5))
+                                    .text_size(px(S_CAPTION))
                                     .text_color(p.muted),
                                 ),
                         )
@@ -557,7 +565,7 @@ pub fn run_inspection_view(
 
         if let Some(notice) = &insp.copy_notice {
             copies_card =
-                copies_card.child(text(notice.clone()).text_size(px(12.0)).text_color(p.ok));
+                copies_card.child(text(notice.clone()).text_size(px(S_SMALL)).text_color(p.ok));
         }
 
         view()
@@ -596,19 +604,13 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         .child(card_title(run.mapping_name.clone()))
                         .child(
                             text(format!("· {}", run.volume_name))
-                                .text_size(px(13.0))
                                 .text_color(p.muted),
                         ),
                 )
-                .child(
-                    text(format!(
-                        "Scanning {} · checking the local folder and the cloud folder for changes",
-                        run.mapping_name
-                    ))
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(p.fg),
-                )
+                .child(emphasized_line(
+                    format!("Scanning {}", run.mapping_name),
+                    " · checking the local folder and the cloud folder for changes",
+                ))
                 .child(progress_bar(
                     None,
                     6.0,
@@ -617,21 +619,21 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         run.mapping_name
                     ),
                 ))
-                .child(kv_reactive("Elapsed", move || {
-                    format_duration(base_secs.saturating_add(elapsed_sig.get()))
-                }))
-                .child(kv(
-                    "Started",
-                    &format!("{} · {}", run.started_label, run.trigger_label),
-                ))
-                .child(kv("Transferred", "Nothing yet"))
+                .child(
+                    view().flex_col().gap(px(KV_ROW_GAP))
+                        .child(kv_row("Elapsed", text(move || {
+                            format_duration(base_secs.saturating_add(elapsed_sig.get()))
+                        }).tabular_nums()))
+                        .child(kv_row("Started", text(format!("{} · {}", run.started_label, run.trigger_label)).tabular_nums()))
+                        .child(kv_row("Transferred", text("Nothing yet"))),
+                )
                 .child(
                     view()
                         .flex_row()
                         .items_center()
                         .flex_wrap()
-                        .gap(px(10.0))
-                        .pt(px(4.0))
+                        .gap(px(8.0))
+                        .mt(px(CARD_ACTION_MARGIN))
                         .child(
                             app_button(
                                 "Stop",
@@ -646,7 +648,7 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         )
                         .child(
                             text("Stopping lets the current step finish. It can take about 90 seconds and doesn't undo changes already made.")
-                                .text_size(px(12.0))
+                                .text_size(px(S_SMALL))
                                 .text_color(p.muted),
                         ),
                 )
@@ -669,21 +671,12 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         .gap(px(8.0))
                         .child(status_pill(IconKind::Sync, "Running", Tone::Run))
                         .child(card_title(run.mapping_name.clone()))
-                        .child(
-                            text(format!("· {}", run.volume_name))
-                                .text_size(px(13.0))
-                                .text_color(p.muted),
-                        ),
+                        .child(text(format!("· {}", run.volume_name)).text_color(p.muted)),
                 )
-                .child(
-                    text(format!(
-                        "Transferring · {transferred_label} of {total_label}"
-                    ))
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.fg)
-                    .tabular_nums(),
-                )
+                .child(emphasized_line(
+                    "Transferring",
+                    format!(" · {transferred_label} of {total_label}"),
+                ))
                 .child(progress_bar(
                     Some(f32::from(pct)),
                     6.0,
@@ -694,12 +687,12 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         let elapsed = format_duration(base_secs.saturating_add(elapsed_sig.get()));
                         format!("{pct}% · elapsed {elapsed} · total known")
                     })
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted)
                     .tabular_nums(),
                 )
                 .child(
-                    view().flex_row().pt(px(4.0)).child(
+                    view().flex_row().mt(px(CARD_ACTION_MARGIN)).child(
                         app_button(
                             "Stop",
                             BtnKind::Default,
@@ -728,19 +721,12 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         .gap(px(8.0))
                         .child(status_pill(IconKind::Sync, "Running", Tone::Run))
                         .child(card_title(run.mapping_name.clone()))
-                        .child(
-                            text(format!("· {}", run.volume_name))
-                                .text_size(px(13.0))
-                                .text_color(p.muted),
-                        ),
+                        .child(text(format!("· {}", run.volume_name)).text_color(p.muted)),
                 )
-                .child(
-                    text(format!("Transferring · {transferred_label} so far"))
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(p.fg)
-                        .tabular_nums(),
-                )
+                .child(emphasized_line(
+                    "Transferring",
+                    format!(" · {transferred_label} so far"),
+                ))
                 .child(progress_bar(
                     None,
                     6.0,
@@ -751,12 +737,12 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         let elapsed = format_duration(base_secs.saturating_add(elapsed_sig.get()));
                         format!("Total not known yet · elapsed {elapsed}")
                     })
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted)
                     .tabular_nums(),
                 )
                 .child(
-                    view().flex_row().pt(px(4.0)).child(
+                    view().flex_row().mt(px(CARD_ACTION_MARGIN)).child(
                         app_button(
                             "Stop",
                             BtnKind::Default,
@@ -784,14 +770,13 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         .child(card_title(run.mapping_name.clone())),
                 )
                 .child(
-                    text(move || {
-                        let elapsed = format_mm_ss(base_secs.saturating_add(elapsed_sig.get()));
-                        format!("Stopping · {elapsed}")
-                    })
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.fg)
-                    .tabular_nums(),
+                    text("")
+                        .child(text("Stopping").font_weight(W_TITLE))
+                        .child(text(move || {
+                            let elapsed = format_mm_ss(base_secs.saturating_add(elapsed_sig.get()));
+                            format!(" · {elapsed}")
+                        }))
+                        .tabular_nums(),
                 )
                 .child(progress_bar(
                     None,
@@ -800,60 +785,25 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                 ))
                 .child(
                     text("Letting the current step finish. This can take about 90 seconds.")
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.muted),
                 )
-                .child(view().flex_row().pt(px(4.0)).child(app_button(
-                    "Force stop…",
-                    BtnKind::Default,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || c_force.confirm_force_stop(id_force.clone(), name_force.clone()),
-                )))
+                .child(
+                    view()
+                        .flex_row()
+                        .mt(px(CARD_ACTION_MARGIN))
+                        .child(app_button(
+                            "Force stop…",
+                            BtnKind::Default,
+                            true,
+                            false,
+                            None,
+                            None,
+                            move || {
+                                c_force.confirm_force_stop(id_force.clone(), name_force.clone())
+                            },
+                        )),
+                )
         }
     }
-}
-
-fn kv_reactive(label: &str, value: impl Fn() -> String + 'static) -> View {
-    let p = Palette::current();
-    view()
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .child(
-            text(label.to_owned())
-                .w(px(110.0))
-                .flex_none()
-                .text_size(px(12.5))
-                .text_color(p.muted),
-        )
-        .child(
-            text(value)
-                .text_size(px(12.5))
-                .text_color(p.fg)
-                .tabular_nums(),
-        )
-}
-
-fn kv(label: &str, value: &str) -> View {
-    let p = Palette::current();
-    view()
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .child(
-            text(label.to_owned())
-                .w(px(110.0))
-                .flex_none()
-                .text_size(px(12.5))
-                .text_color(p.muted),
-        )
-        .child(
-            text(value.to_owned())
-                .text_size(px(12.5))
-                .text_color(p.fg)
-                .tabular_nums(),
-        )
 }

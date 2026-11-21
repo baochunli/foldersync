@@ -6,7 +6,9 @@ use nsh_core::{file_dialog::OpenDialog, prelude::*};
 use crate::contract::{AccountSnapshot, AccountStatus, IconKind, Tone, UiCommand};
 use crate::screens::AppController;
 use crate::theme::{
-    BtnKind, Palette, app_button, card, card_title, icon, page_title, progress_bar, status_pill,
+    BLOCK_GAP, BtnKind, CARD_ACTION_MARGIN, HEADER_BOTTOM_MARGIN, HEADER_GAP, KV_ROW_GAP, Palette,
+    S_COMPACT, S_SMALL, accented_card, app_button, card, card_title, icon, kv_row, page_title,
+    progress_bar, status_pill,
 };
 
 /// Renders the Accounts screen.
@@ -19,9 +21,12 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
         let c_connect = ctrl.clone();
         let is_demo = snap.is_demo_mode;
 
-        let mut root = view().flex_col().w_full().gap(px(14.0)).child(
+        let mut root = view().flex_col().w_full().gap(px(BLOCK_GAP)).child(
             view()
+                .window_drag(true)
+                .mb(px(HEADER_BOTTOM_MARGIN))
                 .flex_row()
+                .gap(px(HEADER_GAP))
                 .items_end()
                 .justify_between()
                 .child(page_title("Accounts"))
@@ -112,7 +117,7 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
                     .child(card_title("Connect a Google Drive account"))
                     .child(
                         text("Browser Google Drive sign-in is provided by the Drive account onboarding flow. For local-to-local folder testing right now, use “Add local folder account…” above.")
-                            .text_size(px(12.5))
+                            .text_size(px(S_COMPACT))
                             .text_color(p.fg),
                     )
                     .child(view().flex_row().pt(px(4.0)).child(app_button(
@@ -128,13 +133,7 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
         }
 
         if snap.accounts.is_empty() {
-            root = root.child(
-                card().child(
-                    text("No accounts connected yet.")
-                        .text_size(px(13.0))
-                        .text_color(p.muted),
-                ),
-            );
+            root = root.child(card().child(text("No accounts connected yet.").text_color(p.muted)));
         } else {
             for acct in &snap.accounts {
                 root = root.child(account_card(ctrl.clone(), acct));
@@ -216,10 +215,11 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
         AccountStatus::Reconnecting => (IconKind::Sync, "Reconnecting", Tone::Run, false),
     };
 
-    let mut c = card();
-    if is_err {
-        c = c.border_l(px(4.0)).border_l_color(p.err_bd);
-    }
+    let c = if is_err {
+        accented_card(p.err_bd)
+    } else {
+        card()
+    };
 
     let mappings_text = if acct.mapping_count == 1 {
         "1 on this Mac".to_owned()
@@ -245,7 +245,7 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
         .flex_wrap()
         .items_center()
         .gap(px(8.0))
-        .pt(px(4.0))
+        .mt(px(CARD_ACTION_MARGIN))
         .child(app_button(
             "Reconnect…",
             if is_err {
@@ -290,7 +290,11 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
     );
 
     if remove_disabled {
-        actions = actions.child(text(remove_reason).text_size(px(12.0)).text_color(p.muted));
+        actions = actions.child(
+            text(remove_reason)
+                .text_size(px(S_SMALL))
+                .text_color(p.muted),
+        );
     }
 
     c.child(
@@ -302,30 +306,17 @@ fn account_card(ctrl: AppController, acct: &AccountSnapshot) -> View {
             .child(card_title(acct.id.to_string()))
             .child(status_pill(pill_icon, pill_label, pill_tone)),
     )
-    .child(acct_kv("Google account", &acct.email))
-    .child(acct_kv("Shared parent folder", &acct.shared_parent_label))
-    .child(acct_kv("Access", &acct.access_summary))
-    .child(acct_kv("Mappings", &mappings_text))
+    .child(
+        view()
+            .flex_col()
+            .gap(px(KV_ROW_GAP))
+            .child(kv_row("Google account", text(acct.email.clone())))
+            .child(kv_row(
+                "Shared parent folder",
+                text(acct.shared_parent_label.clone()),
+            ))
+            .child(kv_row("Access", text(acct.access_summary.clone())))
+            .child(kv_row("Mappings", text(mappings_text))),
+    )
     .child(actions)
-}
-
-fn acct_kv(label: &str, value: &str) -> View {
-    let p = Palette::current();
-    view()
-        .flex_row()
-        .items_start()
-        .gap(px(12.0))
-        .child(
-            text(label.to_owned())
-                .w(px(140.0))
-                .flex_none()
-                .text_size(px(12.5))
-                .text_color(p.muted),
-        )
-        .child(
-            text(value.to_owned())
-                .flex_1()
-                .text_size(px(12.5))
-                .text_color(p.fg),
-        )
 }
