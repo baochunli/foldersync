@@ -1,14 +1,55 @@
 # State and recovery
 
-The app will own private local mapping and run records. Each mapping
-generation will keep its own rclone work directory. Preserve that directory
-after an interrupted run and keep recovery copies separate from live sync
-trees.
+The app will own private local mapping and run records. Each mapping generation
+will keep its own rclone work directory. Preserve that directory after an
+interrupted run and keep recovery copies separate from live sync trees.
 
 After a crash or disconnect, revalidate endpoints and volume identity before
 continuing. A missing or damaged work directory, or a change to a mapping's
 identity, requires an explicit recovery decision. Initialization and resync
 must be deliberate actions.
+
+## Implemented state dimensions (`sync-core`)
+
+`sync_core::state::MappingState` models readiness, execution, and user intent
+as three separate dimensions:
+
+| Dimension | Implemented states |
+| --- | --- |
+| `Readiness` | `Unconfigured`, `NeedsInitialization`, `Ready`, `VolumeUnavailable`, `AuthenticationRequired`, `EndpointChanged`, `RecoveryRequired` |
+| `Execution` | `Idle`, `Queued`, `Running`, `Stopping`, `Interrupted` |
+| `Intent` | `Enabled`, `Paused` |
+
+## User actions
+
+| Action | Implemented transition |
+| --- | --- |
+| `CloseWindow` | No mapping state change; manager continues running. |
+| `Pause` | Sets `Intent::Paused`; cancels a `Queued` run to `Idle` but lets a `Running` or `Stopping` run finish. |
+| `Resume` | Sets `Intent::Enabled`; transitions `Idle` to `Queued` (`ScheduleRun`) only when `Readiness::Ready`. |
+| `RunNow` | Transitions `Idle` to `Queued` (`ScheduleRun`) only when `Ready` and `Enabled`. |
+| `StopRun` | Moves `Running` to `Stopping` (`RequestGracefulStop`) or `Queued` to `Idle`. |
+| `ForceStop` | Moves `Running` or `Stopping` to `Execution::Interrupted` and `Readiness::RecoveryRequired` (`ForceTerminateChild`). |
+| `QuitRequested` | Stops scheduling (`StopScheduling`); moves `Running` to `Stopping` (`StopSchedulingAndRequestGracefulStop`) and drops `Queued` back to `Idle` without altering `Intent`. |
+
+## Observed outcomes and recovery invariants
+
+| Outcome (`RunOutcome`) | Implemented transition |
+| --- | --- |
+| `Success`, `SuccessWithConflicts`, `RetryableFailure` | `Execution::Idle`; preserves current `Readiness` and `Intent`. |
+| `AuthenticationFailure` | `Execution::Idle`; activates the `AuthenticationRequired` hold while preserving other unresolved holds. |
+| `VolumeMismatch` | `Execution::Idle`; activates only the `VolumeUnavailable` hold (reconnecting the verified known volume clears it without extra endpoint approval). |
+| `EndpointMismatch` | `Execution::Idle`; always activates the `EndpointChanged` hold (even while `VolumeUnavailable` is active); only `EndpointValidated` clears it. |
+| `InvalidConfiguration`, `CriticalFailure`, `UnknownFailure`, `CorruptState` | `Execution::Idle`; latches `Readiness::RecoveryRequired`. |
+| `Interrupted` | `Execution::Interrupted`; latches `Readiness::RecoveryRequired`. |
+
+Key enforced invariants:
+
+- Unresolved readiness gates (`NeedsInitialization`, `AuthenticationRequired`, `EndpointChanged`, `VolumeUnavailable`, `RecoveryRequired`) remain active independently until each gate's own check passes.
+- Reconnecting a volume (`ObservedEvent::VolumeAvailable`) never clears `Intent::Paused`.
+- No transition clears `Intent::Paused` except `UserAction::Resume`.
+- Once `Readiness::RecoveryRequired` is set, no user action or other event clears it except `ObservedEvent::RecoveryCompleted`.
+- `status_text` reports explicit household status (`"Waiting for <volume>"`, `"Scanning <name>"`, `"Last completed at HH:MM"`, `"Completed with conflicts"`, `"Recovery required"`) and never claims `"Everything is up to date"`.
 
 **TODO** verify cancellation and restart behavior, recovery copies, and resync
 procedures using disposable fixtures.

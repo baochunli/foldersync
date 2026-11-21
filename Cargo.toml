@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*", "apps/*"]
+# apps/finder-extension is the Swift Finder Sync extension (built by its own build.sh), not a Cargo package.
+exclude = ["apps/finder-extension"]
 resolver = "3"
 
 [workspace.package]
