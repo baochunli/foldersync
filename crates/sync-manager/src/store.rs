@@ -1026,6 +1026,23 @@ impl SqliteStateStore {
         })
     }
 
+    pub fn get_run(&self, run_id: &RunId) -> Result<Option<RunRecord>, ManagerError> {
+        self.conn
+            .query_row(
+                "SELECT id, mapping_id, generation_id, mode, status, started_at, finished_at,
+                        workdir_path, backup_dir1, backup_dir2, run_dir, log_path,
+                        child_pid, child_start_time_kind, child_start_time_value, child_executable,
+                        engine_version, engine_sha256, engine_platform,
+                        exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                 FROM runs WHERE id = ?1",
+                params![run_id.as_str()],
+                Self::map_run_row,
+            )
+            .optional()
+            .map_err(|e| storage_err("Failed to query run", e))
+    }
+
     pub fn list_unfinished_runs(&self) -> Result<Vec<RunRecord>, ManagerError> {
         let mut stmt = self
             .conn
@@ -1105,6 +1122,26 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    fn map_recovery_case_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecoveryCaseRecord> {
+        Ok(RecoveryCaseRecord {
+            id: row.get(0)?,
+            mapping_id: MappingId::new(row.get::<_, String>(1)?),
+            run_id: row.get::<_, Option<String>>(2)?.map(RunId::new),
+            status: row.get(3)?,
+            reason_kind: row.get(4)?,
+            cause: row.get(5)?,
+            next_step: row.get(6)?,
+            workdir_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+            backup_dir1: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+            backup_dir2: row.get(9)?,
+            log_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
+            orphan_pid: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+            created_at: row.get(12)?,
+            resolved_at: row.get(13)?,
+            resolution_note: row.get(14)?,
+        })
+    }
+
     pub fn list_open_recovery_cases(
         &self,
         mapping_id: &MappingId,
@@ -1121,28 +1158,245 @@ impl SqliteStateStore {
             )
             .map_err(|e| storage_err("Failed to query open recovery cases", e))?;
         let rows = stmt
-            .query_map(params![mapping_id.as_str()], |row| {
-                Ok(RecoveryCaseRecord {
-                    id: row.get(0)?,
-                    mapping_id: MappingId::new(row.get::<_, String>(1)?),
-                    run_id: row.get::<_, Option<String>>(2)?.map(RunId::new),
-                    status: row.get(3)?,
-                    reason_kind: row.get(4)?,
-                    cause: row.get(5)?,
-                    next_step: row.get(6)?,
-                    workdir_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
-                    backup_dir1: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
-                    backup_dir2: row.get(9)?,
-                    log_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
-                    orphan_pid: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
-                    created_at: row.get(12)?,
-                    resolved_at: row.get(13)?,
-                    resolution_note: row.get(14)?,
-                })
-            })
+            .query_map(params![mapping_id.as_str()], Self::map_recovery_case_row)
             .map_err(|e| storage_err("Failed to read recovery cases", e))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| storage_err("Failed to collect recovery cases", e))
+    }
+
+    pub fn list_all_open_recovery_cases(&self) -> Result<Vec<RecoveryCaseRecord>, ManagerError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, mapping_id, run_id, status, reason_kind, cause, next_step,
+                        workdir_path, backup_dir1, backup_dir2, log_path, orphan_pid,
+                        created_at, resolved_at, resolution_note
+                 FROM recovery_cases
+                 WHERE status = 'open'
+                 ORDER BY created_at DESC, rowid DESC",
+            )
+            .map_err(|e| storage_err("Failed to query all open recovery cases", e))?;
+        let rows = stmt
+            .query_map([], Self::map_recovery_case_row)
+            .map_err(|e| storage_err("Failed to read all recovery cases", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| storage_err("Failed to collect all recovery cases", e))
+    }
+
+    /// Atomically commits a run's terminal status, optional updated mapping
+    /// state/hold, and optional recovery case in a single SQLite transaction.
+    pub fn commit_run_terminal(
+        &mut self,
+        run: &RunRecord,
+        mapping: Option<&MappingRecord>,
+        recovery_case: Option<&RecoveryCaseRecord>,
+    ) -> Result<(), ManagerError> {
+        let conflict_json = serde_json::to_string(&run.conflict_paths)
+            .map_err(|e| storage_err("Failed to serialize conflict_paths", e))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| storage_err("Failed to start terminal commit transaction", e))?;
+
+        tx.execute(
+            "UPDATE runs SET
+                status = ?2,
+                finished_at = ?3,
+                exit_code = ?4,
+                exit_signal = ?5,
+                outcome_kind = ?6,
+                outcome_detail = ?7,
+                conflict_paths_json = ?8,
+                last_verified_phase = ?9,
+                files_checked = ?10,
+                files_transferred = ?11,
+                bytes_transferred = ?12,
+                conflict_count = ?13
+             WHERE id = ?1",
+            params![
+                run.id.as_str(),
+                run.status,
+                run.finished_at,
+                run.exit_code,
+                run.exit_signal,
+                run.outcome_kind,
+                run.outcome_detail,
+                conflict_json,
+                run.last_verified_phase,
+                run.files_checked as i64,
+                run.files_transferred as i64,
+                run.bytes_transferred as i64,
+                run.conflict_count as i64,
+            ],
+        )
+        .map_err(|e| storage_err("Failed to update finished run row in transaction", e))?;
+
+        if let Some(m) = mapping {
+            let state_json = serde_json::to_string(&m.state)
+                .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
+            let last_outcome_json = m
+                .last_run_outcome
+                .map(|o| serde_json::to_string(&o))
+                .transpose()
+                .map_err(|e| storage_err("Failed to serialize last_run_outcome", e))?;
+            tx.execute(
+                "UPDATE mappings SET
+                    scheduling_enabled = ?2,
+                    state_json = ?3,
+                    intent = ?4,
+                    readiness = ?5,
+                    execution = ?6,
+                    active_generation_id = ?7,
+                    last_run_id = ?8,
+                    last_run_outcome = ?9,
+                    last_run_completed_at = ?10,
+                    last_run_summary_text = ?11,
+                    updated_at = ?12
+                 WHERE id = ?1",
+                params![
+                    m.id.as_str(),
+                    i64::from(m.scheduling_enabled),
+                    state_json,
+                    intent_str(m.state.intent),
+                    readiness_str(m.state.readiness()),
+                    execution_str(m.state.execution),
+                    m.active_generation_id.as_ref().map(|g| g.as_str()),
+                    m.last_run_id.as_ref().map(|r| r.as_str()),
+                    last_outcome_json,
+                    m.last_run_completed_at,
+                    m.last_run_summary_text,
+                    m.updated_at,
+                ],
+            )
+            .map_err(|e| storage_err("Failed to update mapping state in transaction", e))?;
+        }
+
+        if let Some(case) = recovery_case {
+            tx.execute(
+                "INSERT INTO recovery_cases (
+                    id, mapping_id, run_id, status, reason_kind, cause, next_step,
+                    workdir_path, backup_dir1, backup_dir2, log_path, orphan_pid,
+                    created_at, resolved_at, resolution_note
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    case.id,
+                    case.mapping_id.as_str(),
+                    case.run_id.as_ref().map(|r| r.as_str()),
+                    case.status,
+                    case.reason_kind,
+                    case.cause,
+                    case.next_step,
+                    case.workdir_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    case.backup_dir1
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    case.backup_dir2,
+                    case.log_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    case.orphan_pid.map(i64::from),
+                    case.created_at,
+                    case.resolved_at,
+                    case.resolution_note,
+                ],
+            )
+            .map_err(|e| storage_err("Failed to insert recovery case in transaction", e))?;
+        }
+
+        tx.commit()
+            .map_err(|e| storage_err("Failed to commit terminal transaction", e))?;
+        Ok(())
+    }
+
+    /// Atomically commits a mapping runtime update and optional recovery case
+    /// in a single SQLite transaction.
+    pub fn commit_mapping_and_recovery(
+        &mut self,
+        m: &MappingRecord,
+        recovery_case: Option<&RecoveryCaseRecord>,
+    ) -> Result<(), ManagerError> {
+        let state_json = serde_json::to_string(&m.state)
+            .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
+        let last_outcome_json = m
+            .last_run_outcome
+            .map(|o| serde_json::to_string(&o))
+            .transpose()
+            .map_err(|e| storage_err("Failed to serialize last_run_outcome", e))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| storage_err("Failed to start mapping/recovery transaction", e))?;
+
+        tx.execute(
+            "UPDATE mappings SET
+                scheduling_enabled = ?2,
+                state_json = ?3,
+                intent = ?4,
+                readiness = ?5,
+                execution = ?6,
+                active_generation_id = ?7,
+                last_run_id = ?8,
+                last_run_outcome = ?9,
+                last_run_completed_at = ?10,
+                last_run_summary_text = ?11,
+                updated_at = ?12
+             WHERE id = ?1",
+            params![
+                m.id.as_str(),
+                i64::from(m.scheduling_enabled),
+                state_json,
+                intent_str(m.state.intent),
+                readiness_str(m.state.readiness()),
+                execution_str(m.state.execution),
+                m.active_generation_id.as_ref().map(|g| g.as_str()),
+                m.last_run_id.as_ref().map(|r| r.as_str()),
+                last_outcome_json,
+                m.last_run_completed_at,
+                m.last_run_summary_text,
+                m.updated_at,
+            ],
+        )
+        .map_err(|e| storage_err("Failed to update mapping state in transaction", e))?;
+
+        if let Some(case) = recovery_case {
+            tx.execute(
+                "INSERT INTO recovery_cases (
+                    id, mapping_id, run_id, status, reason_kind, cause, next_step,
+                    workdir_path, backup_dir1, backup_dir2, log_path, orphan_pid,
+                    created_at, resolved_at, resolution_note
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    case.id,
+                    case.mapping_id.as_str(),
+                    case.run_id.as_ref().map(|r| r.as_str()),
+                    case.status,
+                    case.reason_kind,
+                    case.cause,
+                    case.next_step,
+                    case.workdir_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    case.backup_dir1
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    case.backup_dir2,
+                    case.log_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    case.orphan_pid.map(i64::from),
+                    case.created_at,
+                    case.resolved_at,
+                    case.resolution_note,
+                ],
+            )
+            .map_err(|e| storage_err("Failed to insert recovery case in transaction", e))?;
+        }
+
+        tx.commit()
+            .map_err(|e| storage_err("Failed to commit mapping/recovery transaction", e))?;
+        Ok(())
     }
 
     /// Test helper to insert a synthetic schema version row for downgrade checks.
@@ -1176,5 +1430,166 @@ mod tests {
             ManagerError::UnsupportedSchemaVersion { found, max_supported, .. }
             if found == LATEST_SCHEMA_VERSION + 1 && max_supported == LATEST_SCHEMA_VERSION
         ));
+    }
+
+    #[test]
+    fn commit_run_terminal_rolls_back_atomically_on_constraint_error() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.sqlite");
+        let mut store = SqliteStateStore::open(&db).unwrap();
+
+        let dev = DeviceRecord {
+            id: DeviceId::new("dev-1"),
+            name: "test".to_string(),
+            created_at: "2026-11-20T00:00:00Z".to_string(),
+        };
+        store.ensure_device(&dev).unwrap();
+        store
+            .upsert_account(&AccountRecord {
+                id: AccountId::new("acc-1"),
+                display_name: "Local".to_string(),
+                kind: "local_fixture".to_string(),
+                remote_name: "local".to_string(),
+                remote_root_folder_id: "root".to_string(),
+                config_path: tmp.path().join("rclone.conf"),
+                auth_status: "ready".to_string(),
+                created_at: "2026-11-20T00:00:00Z".to_string(),
+                updated_at: "2026-11-20T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let mapping = MappingRecord {
+            id: MappingId::new("m1"),
+            device_id: dev.id.clone(),
+            account_id: AccountId::new("acc-1"),
+            collection: CloudCollection {
+                display_path: "Data/Research".to_string(),
+                folder_id: "col-1".to_string(),
+                ancestor_ids: vec![],
+            },
+            local_binding: LocalBinding {
+                volume: VolumeIdentity::new(VolumeKind::Internal, "vol-1"),
+                mount_path: PathBuf::from("/tmp"),
+                relative_dir: PathBuf::from("research"),
+            },
+            remote_endpoint_kind: "local_dir".to_string(),
+            remote_endpoint_value: "/tmp/remote".to_string(),
+            local_recovery_root: PathBuf::from("/tmp/rec1"),
+            cloud_recovery_path: "/tmp/rec2".to_string(),
+            schedule_interval_secs: 300,
+            scheduling_enabled: false,
+            state: MappingState::new(Readiness::Ready, Execution::Running, Intent::Enabled),
+            active_generation_id: None,
+            exclusions: vec![],
+            max_delete_percent: 10,
+            last_run_id: None,
+            last_run_outcome: None,
+            last_run_completed_at: None,
+            last_run_summary_text: None,
+            created_at: "2026-11-20T00:00:00Z".to_string(),
+            updated_at: "2026-11-20T00:00:00Z".to_string(),
+        };
+        store.insert_mapping(&mapping).unwrap();
+        let gen_rec = GenerationRecord {
+            id: GenerationId::new("g1"),
+            mapping_id: mapping.id.clone(),
+            generation_number: 1,
+            fingerprint: "0".repeat(64),
+            config: ConfigGeneration {
+                path1: PathBuf::from("/tmp/research"),
+                path2: "/tmp/remote".to_string(),
+                remote_root_folder_id: "root".to_string(),
+                selected_folder_id: "col-1".to_string(),
+                local_binding: mapping.local_binding.clone(),
+                effective_filters: Default::default(),
+                compare_policy: sync_core::ComparePolicy::SizeModtime,
+                supported_types: sync_core::SupportedTypesPolicy::default(),
+                conflict_policy: sync_core::ConflictPolicy::default(),
+                recovery_policy: sync_core::RecoveryPolicy::default(),
+                engine_compatibility: sync_core::EngineCompatibility {
+                    engine_name: "rclone".to_string(),
+                    engine_version: "1.76.0".to_string(),
+                    profile_version: "v1".to_string(),
+                },
+            },
+            initial_direction: Some("path1".to_string()),
+            workdir_path: tmp.path().join("wd"),
+            filters_file_path: tmp.path().join("filters.txt"),
+            created_at: "2026-11-20T00:00:00Z".to_string(),
+        };
+        store.insert_generation(&gen_rec).unwrap();
+        let mut run = RunRecord {
+            id: RunId::new("run-1"),
+            mapping_id: mapping.id.clone(),
+            generation_id: gen_rec.id.clone(),
+            mode: "normal".to_string(),
+            status: "running".to_string(),
+            started_at: "2026-11-20T00:00:00Z".to_string(),
+            finished_at: None,
+            workdir_path: gen_rec.workdir_path,
+            backup_dir1: tmp.path().join("b1"),
+            backup_dir2: tmp.path().join("b2").to_string_lossy().into_owned(),
+            run_dir: tmp.path().join("r1"),
+            log_path: tmp.path().join("r1/output.ndjson"),
+            child_pid: Some(1234),
+            child_start_time: None,
+            child_executable: None,
+            engine_version: None,
+            engine_sha256: None,
+            engine_platform: None,
+            exit_code: None,
+            exit_signal: None,
+            outcome_kind: None,
+            outcome_detail: None,
+            conflict_paths: vec![],
+            last_verified_phase: "spawned".to_string(),
+            files_checked: 0,
+            files_transferred: 0,
+            bytes_transferred: 0,
+            conflict_count: 0,
+        };
+        store.insert_run_start(&run).unwrap();
+
+        // Force a foreign-key violation on recovery_case.mapping_id -> entire transaction must roll back!
+        run.status = "interrupted".to_string();
+        let mut updated_mapping = mapping.clone();
+        updated_mapping.state = MappingState::new(
+            Readiness::RecoveryRequired,
+            Execution::Interrupted,
+            Intent::Enabled,
+        );
+        let bad_case = RecoveryCaseRecord {
+            id: "rc-bad".to_string(),
+            mapping_id: MappingId::new("nonexistent-mapping"),
+            run_id: Some(run.id.clone()),
+            status: "open".to_string(),
+            reason_kind: "interrupted".to_string(),
+            cause: "test".to_string(),
+            next_step: "test".to_string(),
+            workdir_path: None,
+            backup_dir1: None,
+            backup_dir2: None,
+            log_path: None,
+            orphan_pid: None,
+            created_at: "2026-11-20T00:01:00Z".to_string(),
+            resolved_at: None,
+            resolution_note: None,
+        };
+        assert!(
+            store
+                .commit_run_terminal(&run, Some(&updated_mapping), Some(&bad_case))
+                .is_err()
+        );
+
+        // Verify neither `runs` nor `mappings` was partially mutated.
+        assert_eq!(store.get_run(&run.id).unwrap().unwrap().status, "running");
+        assert_eq!(
+            store
+                .get_mapping(&mapping.id)
+                .unwrap()
+                .unwrap()
+                .state
+                .readiness(),
+            Readiness::Ready
+        );
     }
 }

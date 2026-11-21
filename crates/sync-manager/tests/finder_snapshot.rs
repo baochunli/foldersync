@@ -121,7 +121,7 @@ fn finder_status_defaults_to_state_dir_subdirectory() {
     cfg.launcher = Arc::new(FakeBisyncLauncher::new());
 
     let mgr = SyncManager::open(cfg).unwrap();
-    assert_eq!(mgr.finder_status_dir(), state_dir.join("finder"));
+    assert_eq!(mgr.finder_status_dir(), mgr.state_dir().join("finder"));
     assert!(state_dir.join("finder/status.json").is_file());
     mgr.shutdown().unwrap();
 }

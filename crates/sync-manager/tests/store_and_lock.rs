@@ -51,9 +51,12 @@ fn state_lock_is_exclusive_and_uses_private_permissions() {
     let tmp = TempDir::new().unwrap();
     let state_dir = tmp.path().join("state");
 
-    // Explicit override always wins and never touches real Application Support.
+    // Explicit override always wins (canonicalized) and never touches real Application Support.
     let resolved = resolve_state_dir(Some(&state_dir)).unwrap();
-    assert_eq!(resolved, state_dir);
+    assert_eq!(
+        resolved,
+        fs::canonicalize(tmp.path()).unwrap().join("state")
+    );
 
     let lock1 = StateLock::acquire(&state_dir).expect("first lock should succeed");
     let dir_mode = fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;

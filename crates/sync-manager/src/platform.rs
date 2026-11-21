@@ -1,12 +1,13 @@
 //! Platform state-directory resolution, private permissions (0700/0600),
-//! exclusive OS file locking (`flock`), and live process identity inspection.
+//! path-ID/containment validation, exclusive OS file locking (`flock`), and
+//! live process identity inspection.
 
 use std::{
     collections::HashMap,
     env,
     fs::{self, File, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -26,24 +27,168 @@ use crate::error::ManagerError;
 
 static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const MAX_SAFE_ID_LEN: usize = 128;
+
+/// Validates an identifier used as a single path component (mapping ID, account
+/// ID, run ID, device ID): non-empty, <= 128 chars, starts with ASCII
+/// alphanumeric, and contains only `[A-Za-z0-9_-]`.
+pub fn validate_safe_path_id(field: &str, value: &str) -> Result<(), ManagerError> {
+    if value.is_empty() || value.len() > MAX_SAFE_ID_LEN {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "{field} `{value}` must be between 1 and {MAX_SAFE_ID_LEN} characters long."
+            ),
+            next_step: "Use a short identifier containing only ASCII letters, digits, `-`, or `_`."
+                .to_string(),
+        });
+    }
+    let mut chars = value.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if !first_ok || !rest_ok {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "{field} `{value}` contains unsupported characters or path syntax."
+            ),
+            next_step:
+                "Start the identifier with an ASCII letter or digit and use only ASCII letters, digits, `-`, or `_` (no slashes, spaces, or `..`)."
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolves `path` to an absolute path by joining `current_dir` when relative
+/// and canonicalizing its longest existing ancestor (rejecting empty paths,
+/// NUL bytes, and unresolvable ancestors).
+pub fn resolve_absolute_path(field: &str, path: &Path) -> Result<PathBuf, ManagerError> {
+    if path.as_os_str().is_empty() {
+        return Err(ManagerError::Io {
+            cause: format!("{field} path cannot be empty."),
+            next_step: format!("Provide a valid path for {field}."),
+        });
+    }
+    if path.to_string_lossy().contains('\0') {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!("{field} path contains a NUL character."),
+            next_step: format!("Provide a valid filesystem path for {field}."),
+        });
+    }
+
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|err| ManagerError::Io {
+                cause: format!("Failed to resolve current working directory for {field}: {err}."),
+                next_step: format!("Pass an absolute path for {field}."),
+            })?
+            .join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::Prefix(p) => normalized.push(p.as_os_str()),
+            Component::RootDir => normalized.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    let mut current = normalized.as_path();
+    let mut tail = Vec::new();
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => {
+                let mut resolved = fs::canonicalize(current).map_err(|err| ManagerError::Io {
+                    cause: format!(
+                        "Could not canonicalize existing ancestor `{}` for {field}: {err}.",
+                        current.display()
+                    ),
+                    next_step: format!("Check permissions and symlinks along {field}."),
+                })?;
+                for part in tail.into_iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(ManagerError::Io {
+                        cause: format!(
+                            "No existing ancestor directory found for {field} (`{}`).",
+                            path.display()
+                        ),
+                        next_step: format!(
+                            "Provide a valid path under an existing directory for {field}."
+                        ),
+                    });
+                };
+                tail.push(name.to_os_string());
+                let Some(parent) = current.parent() else {
+                    return Err(ManagerError::Io {
+                        cause: format!(
+                            "No existing ancestor directory found for {field} (`{}`).",
+                            path.display()
+                        ),
+                        next_step: format!(
+                            "Provide a valid path under an existing directory for {field}."
+                        ),
+                    });
+                };
+                current = parent;
+            }
+            Err(err) => {
+                return Err(ManagerError::Io {
+                    cause: format!(
+                        "Could not inspect `{}` for {field}: {err}.",
+                        current.display()
+                    ),
+                    next_step: format!("Check filesystem permissions for {field}."),
+                });
+            }
+        }
+    }
+}
+
+/// Verifies that `derived` resolves strictly inside `root` (never equal to or
+/// escaping `root`) before any directory creation or file write.
+pub fn ensure_contained_path(
+    field: &str,
+    root: &Path,
+    derived: &Path,
+) -> Result<PathBuf, ManagerError> {
+    let resolved_root = resolve_absolute_path("root", root)?;
+    let resolved_derived = resolve_absolute_path(field, derived)?;
+    if resolved_derived == resolved_root || !resolved_derived.starts_with(&resolved_root) {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Derived {field} path `{}` escapes its allowed root `{}`.",
+                resolved_derived.display(),
+                resolved_root.display()
+            ),
+            next_step: "Use a safe single-component identifier without path traversal.".to_string(),
+        });
+    }
+    Ok(resolved_derived)
+}
+
 /// Resolves the FolderSync state directory:
 /// explicit override -> `FOLDERSYNC_STATE_DIR` -> platform application data/state directory.
+/// Always resolves overrides to a canonical absolute path before any directory creation.
 pub fn resolve_state_dir(explicit: Option<&Path>) -> Result<PathBuf, ManagerError> {
     if let Some(dir) = explicit {
-        if dir.as_os_str().is_empty() {
-            return Err(ManagerError::Io {
-                cause: "State directory override cannot be empty.".to_string(),
-                next_step: "Pass a valid directory path for --state-dir or FOLDERSYNC_STATE_DIR."
-                    .to_string(),
-            });
-        }
-        return Ok(dir.to_path_buf());
+        return resolve_absolute_path("state_dir", dir);
     }
 
     if let Some(env_dir) = env::var_os("FOLDERSYNC_STATE_DIR")
         && !env_dir.is_empty()
     {
-        return Ok(PathBuf::from(env_dir));
+        return resolve_absolute_path("FOLDERSYNC_STATE_DIR", Path::new(&env_dir));
     }
 
     let base = BaseDirs::new().ok_or_else(|| ManagerError::Io {
@@ -123,8 +268,8 @@ pub fn set_private_file_permissions(path: &Path) -> Result<(), ManagerError> {
     Ok(())
 }
 
-/// Writes `bytes` to `path` with private `0600` permissions on Unix.
-pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagerError> {
+/// Creates or truncates a private `0600` file and returns the open handle.
+pub fn open_private_write_file(path: &Path) -> Result<File, ManagerError> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
@@ -134,10 +279,17 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagerError>
     {
         opts.mode(0o600);
     }
-    let mut file = opts.open(path).map_err(|err| ManagerError::Io {
+    let file = opts.open(path).map_err(|err| ManagerError::Io {
         cause: format!("Failed to open `{}` for writing: {err}.", path.display()),
         next_step: "Check available disk space and permissions in the state directory.".to_string(),
     })?;
+    set_private_file_permissions(path)?;
+    Ok(file)
+}
+
+/// Writes `bytes` to `path` with private `0600` permissions on Unix.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagerError> {
+    let mut file = open_private_write_file(path)?;
     file.write_all(bytes).map_err(|err| ManagerError::Io {
         cause: format!("Failed to write `{}`: {err}.", path.display()),
         next_step: "Check available disk space and retry.".to_string(),
@@ -304,9 +456,17 @@ pub enum ProcessProbeResult {
     Unavailable(String),
 }
 
-/// Inspects live OS processes by PID for orphan/PID-reuse reconciliation (§14).
+/// Inspects live OS processes by PID and workdir reference for orphan/PID-reuse
+/// reconciliation (§14).
 pub trait ProcessInspector: Send + Sync {
     fn inspect(&self, pid: u32) -> ProcessProbeResult;
+
+    /// Read-only best-effort investigation of surviving processes whose command
+    /// line references `workdir` (used for missing-PID crash diagnostics, §14).
+    /// Returns `None` when process-table scanning is unavailable.
+    fn find_processes_referencing_workdir(&self, _workdir: &Path) -> Option<Vec<u32>> {
+        None
+    }
 }
 
 /// Real OS process inspector using `proc_pidinfo`/`proc_pidpath` on macOS and
@@ -316,7 +476,6 @@ pub struct OsProcessInspector;
 
 #[cfg(target_os = "macos")]
 fn read_process_executable(pid: u32) -> Option<PathBuf> {
-    // PROC_PIDPATHINFO_MAXSIZE is 4096 bytes on macOS.
     let mut buf = vec![0u8; 4096];
     let ret = unsafe {
         libc::proc_pidpath(
@@ -379,12 +538,74 @@ impl ProcessInspector for OsProcessInspector {
             )
         }
     }
+
+    fn find_processes_referencing_workdir(&self, workdir: &Path) -> Option<Vec<u32>> {
+        let needle = workdir.to_string_lossy();
+        if needle.is_empty() {
+            return None;
+        }
+        let self_pid = std::process::id();
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut matches = Vec::new();
+            let entries = fs::read_dir("/proc").ok()?;
+            for entry in entries.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                if pid == self_pid {
+                    continue;
+                }
+                if let Ok(raw) = fs::read(entry.path().join("cmdline")) {
+                    let cmdline = String::from_utf8_lossy(&raw);
+                    if cmdline.contains(needle.as_ref()) {
+                        matches.push(pid);
+                    }
+                }
+            }
+            Some(matches)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let output = std::process::Command::new("/bin/ps")
+                .args(["-axo", "pid=,args="])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut matches = Vec::new();
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                let Some((pid_str, args)) = trimmed.split_once(char::is_whitespace) else {
+                    continue;
+                };
+                let Ok(pid) = pid_str.parse::<u32>() else {
+                    continue;
+                };
+                if pid != self_pid && args.contains(needle.as_ref()) {
+                    matches.push(pid);
+                }
+            }
+            Some(matches)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = self_pid;
+            None
+        }
+    }
 }
 
 /// Deterministic test double for [`ProcessInspector`].
 #[derive(Debug, Default)]
 pub struct FakeProcessInspector {
     processes: Mutex<HashMap<u32, ProcessProbeResult>>,
+    workdir_matches: Mutex<HashMap<PathBuf, Vec<u32>>>,
 }
 
 impl FakeProcessInspector {
@@ -394,6 +615,13 @@ impl FakeProcessInspector {
 
     pub fn set_process(&self, pid: u32, result: ProcessProbeResult) {
         self.processes.lock().unwrap().insert(pid, result);
+    }
+
+    pub fn set_workdir_processes(&self, workdir: impl Into<PathBuf>, pids: Vec<u32>) {
+        self.workdir_matches
+            .lock()
+            .unwrap()
+            .insert(workdir.into(), pids);
     }
 }
 
@@ -405,6 +633,10 @@ impl ProcessInspector for FakeProcessInspector {
             .get(&pid)
             .cloned()
             .unwrap_or(ProcessProbeResult::NotFound)
+    }
+
+    fn find_processes_referencing_workdir(&self, workdir: &Path) -> Option<Vec<u32>> {
+        self.workdir_matches.lock().unwrap().get(workdir).cloned()
     }
 }
 
@@ -428,5 +660,15 @@ mod tests {
             info.executable.is_some(),
             "OS inspector should report executable path for current process"
         );
+    }
+
+    #[test]
+    fn validates_safe_path_ids() {
+        assert!(validate_safe_path_id("mapping_id", "research-1_a").is_ok());
+        assert!(validate_safe_path_id("mapping_id", "../escape").is_err());
+        assert!(validate_safe_path_id("mapping_id", "/abs").is_err());
+        assert!(validate_safe_path_id("mapping_id", "a/b").is_err());
+        assert!(validate_safe_path_id("mapping_id", "-dash").is_err());
+        assert!(validate_safe_path_id("mapping_id", "").is_err());
     }
 }

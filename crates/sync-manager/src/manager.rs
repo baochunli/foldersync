@@ -4,7 +4,8 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     fs,
-    path::{Component, Path, PathBuf},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -13,7 +14,7 @@ use std::{
 use chrono::DateTime;
 use rclone_adapter::{
     BackupDir2, InitPreference, LogEvent, Outcome, OutputLimits, OutputLine, Path2, RunMode,
-    SpawnOptions, classify_run_outcome, parse_log_line,
+    SpawnOptions, StreamKind, classify_run_outcome, parse_log_line,
 };
 use serde::{Deserialize, Serialize};
 use sync_core::{
@@ -34,12 +35,13 @@ use crate::{
     finder::FinderStatusWriter,
     init::{
         decide_init_direction, establish_local_pair_markers, inspect_local_endpoint,
-        render_filters_file,
+        render_filters_file, verify_endpoint_access_marker,
     },
     launcher::{BisyncLauncher, LaunchPlan, LaunchStopper, RealBisyncLauncher},
     platform::{
-        OsProcessInspector, ProcessInspector, ProcessProbeResult, StateLock, ensure_private_dir,
-        resolve_state_dir, write_private_file,
+        OsProcessInspector, ProcessInspector, ProcessProbeResult, StateLock, ensure_contained_path,
+        ensure_private_dir, open_private_write_file, resolve_absolute_path, resolve_state_dir,
+        validate_safe_path_id, write_private_file,
     },
     snapshot::{
         DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, ManagerEvent, MappingCounters,
@@ -189,6 +191,11 @@ impl AddMappingCommand {
         local_recovery_root: impl Into<PathBuf>,
         remote_recovery_root: impl Into<PathBuf>,
     ) -> Result<Self, ManagerError> {
+        let id = id.into();
+        let account_id = account_id.into();
+        validate_safe_path_id("mapping_id", id.as_str())?;
+        validate_safe_path_id("account_id", account_id.as_str())?;
+
         let local_dir = local_dir.into();
         let remote_dir = remote_dir.into();
         let canonical_local = fs::canonicalize(&local_dir).map_err(|err| ManagerError::Io {
@@ -229,11 +236,16 @@ impl AddMappingCommand {
             }
         })?);
 
+        let local_recovery_root =
+            resolve_absolute_path("local_recovery_root", &local_recovery_root.into())?;
+        let remote_recovery_root =
+            resolve_absolute_path("remote_recovery_root", &remote_recovery_root.into())?;
+
         let collection_path = collection_path.into();
         let folder_id = format!("local-col-{}", collection_path.replace('/', "_"));
         Ok(Self {
-            id: id.into(),
-            account_id: account_id.into(),
+            id,
+            account_id,
             collection: CloudCollection {
                 display_path: collection_path,
                 folder_id,
@@ -245,8 +257,8 @@ impl AddMappingCommand {
                 relative_dir,
             },
             remote_endpoint: RemoteEndpoint::LocalDir(canonical_remote),
-            local_recovery_root: local_recovery_root.into(),
-            cloud_recovery_path: remote_recovery_root.into().to_string_lossy().into_owned(),
+            local_recovery_root,
+            cloud_recovery_path: remote_recovery_root.to_string_lossy().into_owned(),
             extra_exclusions: BTreeSet::new(),
             max_delete_percent: DEFAULT_MAX_DELETE_PERCENT,
             schedule_interval: DEFAULT_ACTIVE_SCHEDULE_INTERVAL,
@@ -333,50 +345,280 @@ struct AncestorAwarePathResolver;
 
 impl PathResolver for AncestorAwarePathResolver {
     fn canonicalize(&self, path: &Path) -> Result<PathBuf, PathResolutionError> {
-        if let Ok(c) = fs::canonicalize(path) {
-            return Ok(c);
+        resolve_absolute_path("path", path).map_err(|err| PathResolutionError {
+            path: path.to_path_buf(),
+            message: err.cause(),
+        })
+    }
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+struct LayoutCandidate<'a> {
+    mapping_id: &'a MappingId,
+    local_binding: &'a LocalBinding,
+    remote_endpoint: RemoteEndpoint,
+    local_recovery_root: PathBuf,
+    cloud_recovery_path: &'a str,
+}
+
+/// Validates the COMPLETE layout across all mappings: Path1, local-fixture
+/// Path2, local recovery roots, local remote-recovery roots, `state_dir`, and
+/// `finder_dir`, BEFORE creating any recovery directory or writing any marker.
+fn validate_complete_layout(
+    existing: &[MappingRecord],
+    extra: Option<&LayoutCandidate<'_>>,
+    state_dir: &Path,
+    finder_dir: &Path,
+) -> Result<(), ManagerError> {
+    let mut all_candidates: Vec<LayoutCandidate<'_>> = Vec::with_capacity(existing.len() + 1);
+    for m in existing {
+        let ep = RemoteEndpoint::from_db_cols(&m.remote_endpoint_kind, &m.remote_endpoint_value)?;
+        all_candidates.push(LayoutCandidate {
+            mapping_id: &m.id,
+            local_binding: &m.local_binding,
+            remote_endpoint: ep,
+            local_recovery_root: m.local_recovery_root.clone(),
+            cloud_recovery_path: m.cloud_recovery_path.as_str(),
+        });
+    }
+    if let Some(cand) = extra {
+        all_candidates.push(LayoutCandidate {
+            mapping_id: cand.mapping_id,
+            local_binding: cand.local_binding,
+            remote_endpoint: cand.remote_endpoint.clone(),
+            local_recovery_root: cand.local_recovery_root.clone(),
+            cloud_recovery_path: cand.cloud_recovery_path,
+        });
+    }
+
+    // 1. Run sync-core's local layout validation for all Path1 + local_recovery_root + state_dir.
+    let layout_entries: Vec<LocalLayoutEntry> = all_candidates
+        .iter()
+        .map(|c| LocalLayoutEntry {
+            mapping_id: c.mapping_id.clone(),
+            local_binding: c.local_binding.clone(),
+            local_recovery_root: c.local_recovery_root.clone(),
+        })
+        .collect();
+    validate_local_layout(&layout_entries, state_dir, &AncestorAwarePathResolver)
+        .map_err(ManagerError::ValidationList)?;
+
+    // 2. Resolve every sync tree (Path1 + LocalDir Path2), every recovery root, state_dir, and finder_dir.
+    let resolved_state = resolve_absolute_path("state_dir", state_dir)?;
+    let resolved_finder = resolve_absolute_path("finder_status_dir", finder_dir)?;
+
+    struct ResolvedEntry {
+        id: String,
+        path1: PathBuf,
+        path2: Option<PathBuf>,
+        local_rec: PathBuf,
+        remote_rec: Option<PathBuf>,
+    }
+
+    let mut resolved = Vec::with_capacity(all_candidates.len());
+    for c in &all_candidates {
+        let path1 = resolve_absolute_path("path1", &c.local_binding.resolved_path())?;
+        let local_rec = resolve_absolute_path("local_recovery_root", &c.local_recovery_root)?;
+        let (path2, remote_rec) = match &c.remote_endpoint {
+            RemoteEndpoint::LocalDir(p2) => {
+                let r_p2 = resolve_absolute_path("path2", p2)?;
+                let r_rec2 = resolve_absolute_path(
+                    "remote_recovery_root",
+                    Path::new(c.cloud_recovery_path),
+                )?;
+                (Some(r_p2), Some(r_rec2))
+            }
+            RemoteEndpoint::DriveRemote { .. } | RemoteEndpoint::OtherRemote { .. } => (None, None),
+        };
+        resolved.push(ResolvedEntry {
+            id: c.mapping_id.as_str().to_string(),
+            path1,
+            path2,
+            local_rec,
+            remote_rec,
+        });
+    }
+
+    let reject = |cause: String, next_step: &str| {
+        Err(ManagerError::PreflightRejected {
+            cause,
+            next_step: next_step.to_string(),
+        })
+    };
+
+    // Check every mapping's sync roots & recovery roots against state_dir, finder_dir, and each other.
+    for entry in &resolved {
+        // Local recovery vs state_dir / finder_dir
+        if paths_overlap(&entry.local_rec, &resolved_state) {
+            return reject(
+                format!(
+                    "Local recovery directory `{}` for mapping `{}` overlaps FolderSync state directory `{}`.",
+                    entry.local_rec.display(),
+                    entry.id,
+                    resolved_state.display()
+                ),
+                "Choose a local recovery directory outside FolderSync's state directory.",
+            );
         }
-        let mut normalized = PathBuf::new();
-        for comp in path.components() {
-            match comp {
-                Component::Prefix(p) => normalized.push(p.as_os_str()),
-                Component::RootDir => normalized.push(comp.as_os_str()),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    normalized.pop();
-                }
-                Component::Normal(part) => normalized.push(part),
+        if paths_overlap(&entry.path1, &resolved_finder) {
+            return reject(
+                format!(
+                    "Local folder `{}` for mapping `{}` overlaps Finder status directory `{}`.",
+                    entry.path1.display(),
+                    entry.id,
+                    resolved_finder.display()
+                ),
+                "Keep synchronized folders separate from FolderSync's Finder handoff directory.",
+            );
+        }
+
+        if let Some(p2) = &entry.path2 {
+            if paths_overlap(&entry.path1, p2) {
+                return reject(
+                    format!(
+                        "Local folder `{}` and remote destination `{}` overlap for mapping `{}`.",
+                        entry.path1.display(),
+                        p2.display(),
+                        entry.id
+                    ),
+                    "Choose separate, non-nested directories for local and remote endpoints.",
+                );
+            }
+            if paths_overlap(p2, &resolved_state) {
+                return reject(
+                    format!(
+                        "Remote destination `{}` for mapping `{}` overlaps FolderSync state directory `{}`.",
+                        p2.display(),
+                        entry.id,
+                        resolved_state.display()
+                    ),
+                    "Choose a remote destination outside FolderSync's private state directory.",
+                );
+            }
+            if paths_overlap(p2, &resolved_finder) {
+                return reject(
+                    format!(
+                        "Remote destination `{}` for mapping `{}` overlaps Finder status directory `{}`.",
+                        p2.display(),
+                        entry.id,
+                        resolved_finder.display()
+                    ),
+                    "Choose a remote destination outside the Finder handoff directory.",
+                );
             }
         }
-        let mut current = normalized.as_path();
-        let mut tail = Vec::new();
-        loop {
-            match fs::canonicalize(current) {
-                Ok(mut base) => {
-                    for part in tail.into_iter().rev() {
-                        base.push(part);
-                    }
-                    return Ok(base);
+
+        if let Some(rec2) = &entry.remote_rec {
+            if paths_overlap(rec2, &resolved_state) {
+                return reject(
+                    format!(
+                        "Remote recovery directory `{}` for mapping `{}` overlaps FolderSync state directory `{}`.",
+                        rec2.display(),
+                        entry.id,
+                        resolved_state.display()
+                    ),
+                    "Choose a remote recovery directory outside FolderSync's state directory.",
+                );
+            }
+            // Prevent backup_dir1 and backup_dir2 overlapping within the same mapping.
+            if paths_overlap(&entry.local_rec, rec2) {
+                return reject(
+                    format!(
+                        "Local recovery directory `{}` and remote recovery directory `{}` overlap for mapping `{}`.",
+                        entry.local_rec.display(),
+                        rec2.display(),
+                        entry.id
+                    ),
+                    "Choose disjoint local and remote recovery directories.",
+                );
+            }
+        }
+    }
+
+    // Cross-mapping checks: every sync root (Path1 or Path2) must be disjoint from
+    // every other sync root (Path1 or Path2) and from every recovery root (local or remote).
+    for (i, a) in resolved.iter().enumerate() {
+        for (j, b) in resolved.iter().enumerate() {
+            if i != j {
+                if let (Some(p2a), Some(p2b)) = (&a.path2, &b.path2)
+                    && paths_overlap(p2a, p2b)
+                {
+                    return reject(
+                        format!(
+                            "Remote destinations `{}` (`{}`) and `{}` (`{}`) overlap.",
+                            p2a.display(),
+                            a.id,
+                            p2b.display(),
+                            b.id
+                        ),
+                        "Choose disjoint remote directories for each mapping.",
+                    );
                 }
-                Err(_) => {
-                    let Some(name) = current.file_name() else {
-                        return Err(PathResolutionError {
-                            path: path.to_path_buf(),
-                            message: "no existing ancestor directory found".to_string(),
-                        });
-                    };
-                    tail.push(name.to_os_string());
-                    let Some(parent) = current.parent() else {
-                        return Err(PathResolutionError {
-                            path: path.to_path_buf(),
-                            message: "no existing ancestor directory found".to_string(),
-                        });
-                    };
-                    current = parent;
+                if let Some(p2b) = &b.path2
+                    && paths_overlap(&a.path1, p2b)
+                {
+                    return reject(
+                        format!(
+                            "Local folder `{}` (`{}`) overlaps remote destination `{}` (`{}`).",
+                            a.path1.display(),
+                            a.id,
+                            p2b.display(),
+                            b.id
+                        ),
+                        "Choose disjoint local and remote directories across all mappings.",
+                    );
+                }
+            }
+            // Recovery directories vs ALL sync roots (including same mapping).
+            if let Some(p2a) = &a.path2
+                && paths_overlap(p2a, &b.local_rec)
+            {
+                return reject(
+                    format!(
+                        "Local recovery directory `{}` (`{}`) overlaps remote destination `{}` (`{}`).",
+                        b.local_rec.display(),
+                        b.id,
+                        p2a.display(),
+                        a.id
+                    ),
+                    "Place recovery directories outside every synchronized tree.",
+                );
+            }
+            if let Some(rec2b) = &b.remote_rec {
+                if paths_overlap(&a.path1, rec2b) {
+                    return reject(
+                        format!(
+                            "Remote recovery directory `{}` (`{}`) overlaps local folder `{}` (`{}`).",
+                            rec2b.display(),
+                            b.id,
+                            a.path1.display(),
+                            a.id
+                        ),
+                        "Place remote recovery directories outside every synchronized tree.",
+                    );
+                }
+                if let Some(p2a) = &a.path2
+                    && paths_overlap(p2a, rec2b)
+                {
+                    return reject(
+                        format!(
+                            "Remote recovery directory `{}` (`{}`) overlaps remote destination `{}` (`{}`).",
+                            rec2b.display(),
+                            b.id,
+                            p2a.display(),
+                            a.id
+                        ),
+                        "Place remote recovery directories outside every synchronized tree.",
+                    );
                 }
             }
         }
     }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +673,11 @@ impl SyncManager {
     /// (including Finder `status.json`), and starts the background worker.
     pub fn open(config: ManagerConfig) -> Result<Self, ManagerError> {
         let state_dir = resolve_state_dir(config.state_dir.as_deref())?;
+        let finder_dir = match config.finder_status_dir {
+            Some(dir) => resolve_absolute_path("finder_status_dir", &dir)?,
+            None => state_dir.join("finder"),
+        };
+
         let lock = StateLock::acquire(&state_dir)?;
 
         ensure_private_dir(&state_dir.join("accounts"))?;
@@ -438,13 +685,9 @@ impl SyncManager {
         ensure_private_dir(&state_dir.join("runs"))?;
         ensure_private_dir(&state_dir.join("recovery-records"))?;
 
-        let finder_dir = config
-            .finder_status_dir
-            .unwrap_or_else(|| state_dir.join("finder"));
-        ensure_private_dir(&finder_dir)?;
         let finder_writer = FinderStatusWriter::new(finder_dir);
 
-        let store = SqliteStateStore::open(&state_dir.join("state.sqlite"))?;
+        let mut store = SqliteStateStore::open(&state_dir.join("state.sqlite"))?;
         let now = config.clock.now_rfc3339();
         let default_device = DeviceRecord {
             id: DeviceId::new(format!("device-{}", Uuid::new_v4())),
@@ -455,14 +698,16 @@ impl SyncManager {
 
         let event_bus = EventBus::new(config.event_buffer_capacity);
         reconcile_startup_state(
-            &store,
+            &mut store,
             config.process_inspector.as_ref(),
             config.clock.as_ref(),
             &event_bus,
         )?;
 
         let initial_snapshot = Arc::new(build_snapshot(&store, 1, None, config.clock.as_ref())?);
-        finder_writer.write_snapshot(&initial_snapshot)?;
+        if let Err(err) = finder_writer.write_snapshot(&initial_snapshot) {
+            eprintln!("Warning: failed to write initial Finder status snapshot: {err}");
+        }
 
         let inner = Arc::new(ManagerInner {
             state_dir,
@@ -517,19 +762,20 @@ impl SyncManager {
         display_name: impl Into<String>,
     ) -> Result<AccountRecord, ManagerError> {
         let account_id = account_id.into();
-        if account_id.is_empty() {
-            return Err(ManagerError::PreflightRejected {
-                cause: "Account identifier must not be empty.".to_string(),
-                next_step: "Provide a non-empty account identifier.".to_string(),
-            });
-        }
-        let account_dir = self
-            .inner
-            .state_dir
-            .join("accounts")
-            .join(account_id.as_str());
+        validate_safe_path_id("account_id", account_id.as_str())?;
+
+        let accounts_root = self.inner.state_dir.join("accounts");
+        let account_dir = ensure_contained_path(
+            "account_dir",
+            &accounts_root,
+            &accounts_root.join(account_id.as_str()),
+        )?;
         ensure_private_dir(&account_dir)?;
-        let config_path = account_dir.join("rclone.conf");
+        let config_path = ensure_contained_path(
+            "account_config",
+            &account_dir,
+            &account_dir.join("rclone.conf"),
+        )?;
         if !config_path.exists() {
             write_private_file(&config_path, b"")?;
         }
@@ -729,12 +975,9 @@ impl SyncManager {
         &self,
         cmd: AddMappingCommand,
     ) -> Result<CommandAcceptance, ManagerError> {
-        if cmd.id.is_empty() {
-            return Err(ManagerError::PreflightRejected {
-                cause: "Mapping identifier must not be empty.".to_string(),
-                next_step: "Provide a short, unique identifier for the mapping.".to_string(),
-            });
-        }
+        validate_safe_path_id("mapping_id", cmd.id.as_str())?;
+        validate_safe_path_id("account_id", cmd.account_id.as_str())?;
+
         // Validate max_delete_percent via sync-core (0..=100) and rclone-adapter (1..=100).
         let max_del = MaxDeletePercent::new(cmd.max_delete_percent)?;
         if max_del.value() == 0 {
@@ -747,19 +990,41 @@ impl SyncManager {
 
         // Local root must already exist (never auto-create missing roots).
         validate_local_binding(&cmd.local_binding, &StdPathResolver)?;
-        if let RemoteEndpoint::LocalDir(remote_dir) = &cmd.remote_endpoint
-            && !remote_dir.is_dir()
-        {
-            return Err(ManagerError::Io {
-                cause: format!(
-                    "Remote fixture directory `{}` does not exist.",
-                    remote_dir.display()
-                ),
-                next_step:
-                    "Create or choose an existing destination directory before adding the mapping."
-                        .to_string(),
-            });
-        }
+        let local_recovery_root =
+            resolve_absolute_path("local_recovery_root", &cmd.local_recovery_root)?;
+        let (remote_endpoint, cloud_recovery_path) = match cmd.remote_endpoint {
+            RemoteEndpoint::LocalDir(remote_dir) => {
+                if !remote_dir.is_dir() {
+                    return Err(ManagerError::Io {
+                        cause: format!(
+                            "Remote fixture directory `{}` does not exist.",
+                            remote_dir.display()
+                        ),
+                        next_step:
+                            "Create or choose an existing destination directory before adding the mapping."
+                                .to_string(),
+                    });
+                }
+                let canonical_remote =
+                    fs::canonicalize(&remote_dir).map_err(|err| ManagerError::Io {
+                        cause: format!(
+                            "Failed to canonicalize remote fixture directory `{}`: {err}.",
+                            remote_dir.display()
+                        ),
+                        next_step: "Verify the destination folder exists and is accessible."
+                            .to_string(),
+                    })?;
+                let resolved_remote_rec = resolve_absolute_path(
+                    "remote_recovery_root",
+                    Path::new(&cmd.cloud_recovery_path),
+                )?;
+                (
+                    RemoteEndpoint::LocalDir(canonical_remote),
+                    resolved_remote_rec.to_string_lossy().into_owned(),
+                )
+            }
+            other => (other, cmd.cloud_recovery_path),
+        };
 
         let mut guard = self.inner.state.lock().unwrap();
         if guard.store.get_mapping(&cmd.id)?.is_some() {
@@ -778,25 +1043,19 @@ impl SyncManager {
         }
 
         let existing = guard.store.list_mappings()?;
-        let mut layout_entries: Vec<LocalLayoutEntry> = existing
-            .iter()
-            .map(|m| LocalLayoutEntry {
-                mapping_id: m.id.clone(),
-                local_binding: m.local_binding.clone(),
-                local_recovery_root: m.local_recovery_root.clone(),
-            })
-            .collect();
-        layout_entries.push(LocalLayoutEntry {
-            mapping_id: cmd.id.clone(),
-            local_binding: cmd.local_binding.clone(),
-            local_recovery_root: cmd.local_recovery_root.clone(),
-        });
-        validate_local_layout(
-            &layout_entries,
+        let candidate = LayoutCandidate {
+            mapping_id: &cmd.id,
+            local_binding: &cmd.local_binding,
+            remote_endpoint: remote_endpoint.clone(),
+            local_recovery_root: local_recovery_root.clone(),
+            cloud_recovery_path: &cloud_recovery_path,
+        };
+        validate_complete_layout(
+            &existing,
+            Some(&candidate),
             &self.inner.state_dir,
-            &AncestorAwarePathResolver,
-        )
-        .map_err(ManagerError::ValidationList)?;
+            self.inner.finder_writer.dir(),
+        )?;
 
         let mut cloud_assignments: Vec<DeviceCloudCollection> = existing
             .iter()
@@ -818,7 +1077,7 @@ impl SyncManager {
             }
         }
 
-        let (remote_kind, remote_value) = cmd.remote_endpoint.to_db_cols();
+        let (remote_kind, remote_value) = remote_endpoint.to_db_cols();
         let now = self.inner.clock.now_rfc3339();
         let initial_state = MappingState::new(
             Readiness::NeedsInitialization,
@@ -834,8 +1093,8 @@ impl SyncManager {
             local_binding: cmd.local_binding,
             remote_endpoint_kind: remote_kind,
             remote_endpoint_value: remote_value,
-            local_recovery_root: cmd.local_recovery_root,
-            cloud_recovery_path: cmd.cloud_recovery_path,
+            local_recovery_root,
+            cloud_recovery_path,
             schedule_interval_secs: cmd.schedule_interval.as_secs(),
             scheduling_enabled: false,
             state: initial_state,
@@ -867,6 +1126,20 @@ impl SyncManager {
 
     fn handle_initialize(&self, cmd: InitializeCommand) -> Result<CommandAcceptance, ManagerError> {
         let mut guard = self.inner.state.lock().unwrap();
+        if let Some(blocking) =
+            find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
+        {
+            return Err(ManagerError::ActiveJobConflict {
+                active_mapping_id: blocking.mapping_id.clone(),
+                cause: format!(
+                    "Cannot start initialization while mapping `{}` has an unresolved {} hold.",
+                    blocking.mapping_id, blocking.reason_kind
+                ),
+                next_step:
+                    "Inspect and resolve the orphaned or ambiguous sync process before starting any new job."
+                        .to_string(),
+            });
+        }
         if let Some(active) = &guard.active_run {
             return Err(ManagerError::ActiveJobConflict {
                 active_mapping_id: active.mapping_id.clone(),
@@ -898,6 +1171,7 @@ impl SyncManager {
                     cause: format!("Mapping `{}` does not exist.", cmd.mapping_id),
                     next_step: "Add the mapping before initializing it.".to_string(),
                 })?;
+        validate_safe_path_id("mapping_id", mapping.id.as_str())?;
 
         if mapping.state.readiness() != Readiness::NeedsInitialization
             || mapping.state.execution != Execution::Idle
@@ -924,23 +1198,16 @@ impl SyncManager {
                 next_step: "Reconnect the account before initializing.".to_string(),
             })?;
 
-        // Re-validate local binding and full layout with sync-core.
+        // Re-validate local binding, COMPLETE layout (Path1, Path2, both recovery roots, state dir, finder dir),
+        // and cloud collections BEFORE creating any directory or marker (§9).
         let canonical_local = validate_local_binding(&mapping.local_binding, &StdPathResolver)?;
         let all_mappings = guard.store.list_mappings()?;
-        let layout_entries: Vec<LocalLayoutEntry> = all_mappings
-            .iter()
-            .map(|m| LocalLayoutEntry {
-                mapping_id: m.id.clone(),
-                local_binding: m.local_binding.clone(),
-                local_recovery_root: m.local_recovery_root.clone(),
-            })
-            .collect();
-        validate_local_layout(
-            &layout_entries,
+        validate_complete_layout(
+            &all_mappings,
+            None,
             &self.inner.state_dir,
-            &AncestorAwarePathResolver,
-        )
-        .map_err(ManagerError::ValidationList)?;
+            self.inner.finder_writer.dir(),
+        )?;
 
         let cloud_assignments: Vec<DeviceCloudCollection> = all_mappings
             .iter()
@@ -951,22 +1218,32 @@ impl SyncManager {
             .collect();
         validate_cloud_collections(&cloud_assignments).map_err(ManagerError::ValidationList)?;
 
-        // Inspect endpoints, classify both sides, refuse both-populated, establish recovery & markers (§9).
+        let effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
+
+        // Inspect endpoints, classify both sides, refuse both-populated, then establish recovery & markers (§9).
         let remote_ep = RemoteEndpoint::from_db_cols(
             &mapping.remote_endpoint_kind,
             &mapping.remote_endpoint_value,
         )?;
         let direction = match &remote_ep {
             RemoteEndpoint::LocalDir(remote_root) => {
-                let local_inv = inspect_local_endpoint(&canonical_local, &mapping.collection)?;
-                let remote_inv = inspect_local_endpoint(remote_root, &mapping.collection)?;
+                let local_inv = inspect_local_endpoint(
+                    &canonical_local,
+                    &mapping.collection,
+                    &effective_filters,
+                )?;
+                let remote_inv =
+                    inspect_local_endpoint(remote_root, &mapping.collection, &effective_filters)?;
                 let dir = decide_init_direction(
                     &mapping.id,
                     &local_inv,
                     &remote_inv,
                     cmd.expected_direction,
                 )?;
-                // Establish recovery directories only inside explicit initialization.
+
+                // Qualify engine metadata BEFORE mutating endpoints (creating recovery dirs/markers).
+                let _ = self.inner.launcher.engine_metadata()?;
+
                 fs::create_dir_all(&mapping.local_recovery_root).map_err(|err| {
                     ManagerError::Io {
                         cause: format!(
@@ -1004,22 +1281,22 @@ impl SyncManager {
             }
         };
 
-        // Qualify engine metadata before freezing the generation.
         let engine_meta = self.inner.launcher.engine_metadata()?;
 
         let gen_num = guard.store.next_generation_number(&mapping.id)?;
         let gen_id = GenerationId::new(format!("{}-gen-{gen_num}", mapping.id));
-        let gen_dir = self
-            .inner
-            .state_dir
-            .join("mappings")
-            .join(mapping.id.as_str())
-            .join(format!("generation-{gen_num}"));
+        let mappings_root = self.inner.state_dir.join("mappings");
+        let gen_dir = ensure_contained_path(
+            "generation_dir",
+            &mappings_root,
+            &mappings_root
+                .join(mapping.id.as_str())
+                .join(format!("generation-{gen_num}")),
+        )?;
         let workdir_path = gen_dir.join("bisync");
         let filters_file_path = gen_dir.join("filters.txt");
         ensure_private_dir(&workdir_path)?;
 
-        let effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
         let filters_content = render_filters_file(&effective_filters);
         write_private_file(&filters_file_path, filters_content.as_bytes())?;
 
@@ -1085,6 +1362,21 @@ impl SyncManager {
 
     fn handle_run_now(&self, mapping_id: MappingId) -> Result<CommandAcceptance, ManagerError> {
         let mut guard = self.inner.state.lock().unwrap();
+        if let Some(blocking) =
+            find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
+        {
+            return Err(ManagerError::ActiveJobConflict {
+                active_mapping_id: blocking.mapping_id.clone(),
+                cause: format!(
+                    "Cannot start a sync run while mapping `{}` has an unresolved {} hold.",
+                    blocking.mapping_id, blocking.reason_kind
+                ),
+                next_step:
+                    "Inspect and resolve the orphaned or ambiguous sync process before starting any new job."
+                        .to_string(),
+            });
+        }
+
         let mut mapping =
             guard
                 .store
@@ -1153,22 +1445,22 @@ impl SyncManager {
             });
         };
 
-        // Preflight local root presence (never auto-create missing roots).
-        if !mapping.local_binding.resolved_path().is_dir() {
-            let next = apply_event(mapping.state, ObservedEvent::VolumeLost);
-            mapping.state = next.state;
+        let generation =
+            guard
+                .store
+                .get_generation(&gen_id)?
+                .ok_or_else(|| ManagerError::NotFound {
+                    cause: format!("Active generation `{gen_id}` is missing from database."),
+                    next_step: "Inspect recovery state for this mapping.".to_string(),
+                })?;
+
+        // Re-verify both roots and access-marker contents against stored generation before queueing (§9, §11).
+        if let Err((event, err)) = verify_endpoints_for_generation(&mapping, &generation) {
+            mapping.state = apply_event(mapping.state, event).state;
             mapping.updated_at = self.inner.clock.now_rfc3339();
             guard.store.update_mapping_runtime(&mapping)?;
             let _ = publish_updated_snapshot(&self.inner, &mut guard)?;
-            return Err(ManagerError::InvalidState {
-                mapping_id: mapping.id.clone(),
-                cause: format!(
-                    "Bound local folder `{}` is missing or its volume is unavailable.",
-                    mapping.local_binding.resolved_path().display()
-                ),
-                next_step: "Mount the expected volume and confirm the folder exists (FolderSync never auto-creates missing roots)."
-                    .to_string(),
-            });
+            return Err(*err);
         }
 
         let transition = apply_user_action(mapping.state, UserAction::RunNow);
@@ -1214,7 +1506,6 @@ impl SyncManager {
         let transition = apply_user_action(mapping.state, UserAction::Pause);
         mapping.state = transition.state;
         mapping.updated_at = self.inner.clock.now_rfc3339();
-        // Cancel any queued (not yet running) job for this mapping; let an active run finish (§14).
         guard.job_queue.retain(|j| j.mapping_id != mapping.id);
 
         // Persist BEFORE acknowledging!
@@ -1243,8 +1534,6 @@ impl SyncManager {
 
         let transition = apply_user_action(mapping.state, UserAction::Resume);
         mapping.state = transition.state;
-        // Scheduling is disabled in Group 3: resuming clears Intent::Paused without
-        // automatically launching a sync run.
         if transition.effect == TransitionEffect::ScheduleRun && !mapping.scheduling_enabled {
             mapping.state.execution = Execution::Idle;
         }
@@ -1263,7 +1552,8 @@ impl SyncManager {
     }
 
     fn handle_stop_run(&self, mapping_id: MappingId) -> Result<CommandAcceptance, ManagerError> {
-        let (stopper, snapshot) =
+        // 1. Commit stopping state & mark stop_requested BEFORE publishing Finder status.
+        let stopper =
             {
                 let mut guard = self.inner.state.lock().unwrap();
                 let mut mapping = guard.store.get_mapping(&mapping_id)?.ok_or_else(|| {
@@ -1293,7 +1583,7 @@ impl SyncManager {
                 guard.job_queue.retain(|j| j.mapping_id != mapping.id);
                 guard.store.update_mapping_runtime(&mapping)?;
 
-                let stopper = if transition.effect == TransitionEffect::RequestGracefulStop {
+                if transition.effect == TransitionEffect::RequestGracefulStop {
                     if let Some(active) = guard.active_run.as_mut()
                         && active.mapping_id == mapping.id
                     {
@@ -1304,14 +1594,21 @@ impl SyncManager {
                     }
                 } else {
                     None
-                };
-                let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
-                (stopper, snapshot)
+                }
             };
 
+        // 2. Deliver stop signal BEFORE Finder publication (HIGH #9).
         if let Some(stopper) = stopper {
             stopper.request_stop()?;
         }
+
+        // 3. Publish snapshot + non-fatal Finder write.
+        let snapshot = {
+            let mut guard = self.inner.state.lock().unwrap();
+            let snap = publish_updated_snapshot(&self.inner, &mut guard)?;
+            self.inner.idle_cv.notify_all();
+            snap
+        };
 
         Ok(CommandAcceptance {
             outcome: CommandOutcome::StopRequested { mapping_id },
@@ -1320,7 +1617,8 @@ impl SyncManager {
     }
 
     fn handle_force_stop(&self, mapping_id: MappingId) -> Result<CommandAcceptance, ManagerError> {
-        let (stopper, snapshot) = {
+        // 1. Atomically commit mapping hold + recovery case in ONE SQLite transaction.
+        let (stopper, opened_event) = {
             let mut guard = self.inner.state.lock().unwrap();
             let mut mapping =
                 guard
@@ -1357,19 +1655,18 @@ impl SyncManager {
                 && active.mapping_id == mapping.id
             {
                 active.force_stopped = true;
+                active.stop_requested = true;
                 run_id_for_case = Some(active.run_id.clone());
                 stopper = active.stopper.as_ref().map(Arc::clone);
             }
 
-            // Persist recovery hold and recovery case BEFORE acknowledging!
-            guard.store.update_mapping_runtime(&mapping)?;
-            if transition.effect == TransitionEffect::ForceTerminateChild {
+            let recovery_case = if transition.effect == TransitionEffect::ForceTerminateChild {
                 let gen_workdir = mapping
                     .active_generation_id
                     .as_ref()
                     .and_then(|gid| guard.store.get_generation(gid).ok().flatten())
                     .map(|g| g.workdir_path);
-                let case = RecoveryCaseRecord {
+                Some(RecoveryCaseRecord {
                     id: format!("rc-{}", Uuid::new_v4()),
                     mapping_id: mapping.id.clone(),
                     run_id: run_id_for_case,
@@ -1388,26 +1685,40 @@ impl SyncManager {
                     created_at: now.clone(),
                     resolved_at: None,
                     resolution_note: None,
-                };
-                guard.store.insert_recovery_case(&case)?;
-                self.inner
-                    .event_bus
-                    .publish_event(ManagerEvent::RecoveryOpened {
-                        mapping_id: mapping.id.clone(),
-                        case_id: case.id,
-                        reason_kind: case.reason_kind,
-                        cause: case.cause,
-                        timestamp: now,
-                    });
-            }
+                })
+            } else {
+                None
+            };
 
-            let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
-            (stopper, snapshot)
+            guard
+                .store
+                .commit_mapping_and_recovery(&mapping, recovery_case.as_ref())?;
+
+            let ev = recovery_case.map(|case| ManagerEvent::RecoveryOpened {
+                mapping_id: mapping.id.clone(),
+                case_id: case.id,
+                reason_kind: case.reason_kind,
+                cause: case.cause,
+                timestamp: now,
+            });
+            (stopper, ev)
         };
 
+        // 2. Deliver force-stop signal BEFORE Finder publication (HIGH #9).
         if let Some(stopper) = stopper {
             stopper.force_stop()?;
         }
+
+        // 3. Publish events & snapshot + non-fatal Finder write AFTER commit + signal.
+        if let Some(ev) = opened_event {
+            self.inner.event_bus.publish_event(ev);
+        }
+        let snapshot = {
+            let mut guard = self.inner.state.lock().unwrap();
+            let snap = publish_updated_snapshot(&self.inner, &mut guard)?;
+            self.inner.idle_cv.notify_all();
+            snap
+        };
 
         Ok(CommandAcceptance {
             outcome: CommandOutcome::ForceStopped { mapping_id },
@@ -1434,20 +1745,12 @@ impl SyncManager {
 
         let mut open_cases = Vec::with_capacity(raw_cases.len());
         for case in raw_cases {
-            let orphan_still_alive = case.orphan_pid.map(|pid| {
-                // Re-verify recorded PID + start_time + executable from its run row!
+            let orphan_still_alive = case.orphan_pid.and_then(|pid| {
                 let run_match = case
                     .run_id
                     .as_ref()
                     .and_then(|rid| recent_runs.iter().find(|r| &r.id == rid));
-                match (self.inner.process_inspector.inspect(pid), run_match) {
-                    (ProcessProbeResult::Live(info), Some(run)) => {
-                        run.child_start_time.is_some()
-                            && info.start_time == run.child_start_time
-                            && executables_match(&run.child_executable, &info.executable)
-                    }
-                    _ => false,
-                }
+                probe_orphan_liveness(self.inner.process_inspector.as_ref(), pid, run_match)
             });
             open_cases.push(RecoveryCaseView {
                 case,
@@ -1488,6 +1791,208 @@ impl Drop for SyncManager {
     fn drop(&mut self) {
         self.shutdown_internal();
     }
+}
+
+/// Verifies both roots against the stored generation and checks access-marker
+/// contents on both sides immediately before launch (HIGH #4).
+fn verify_endpoints_for_generation(
+    mapping: &MappingRecord,
+    generation: &GenerationRecord,
+) -> Result<(), (ObservedEvent, Box<ManagerError>)> {
+    let local_root = mapping.local_binding.resolved_path();
+    let local_meta = match fs::symlink_metadata(&local_root) {
+        Ok(m) => m,
+        Err(_) => {
+            return Err((
+                ObservedEvent::VolumeLost,
+                Box::new(ManagerError::InvalidState {
+                    mapping_id: mapping.id.clone(),
+                    cause: format!(
+                        "Bound local folder `{}` is missing or its volume is unavailable.",
+                        local_root.display()
+                    ),
+                    next_step:
+                        "Mount the expected volume and confirm the folder exists (FolderSync never auto-creates missing roots)."
+                            .to_string(),
+                }),
+            ));
+        }
+    };
+    if local_meta.file_type().is_symlink() || !local_meta.is_dir() {
+        return Err((
+            ObservedEvent::EndpointChanged,
+            Box::new(ManagerError::InvalidState {
+                mapping_id: mapping.id.clone(),
+                cause: format!(
+                    "Local path `{}` is no longer an ordinary directory.",
+                    local_root.display()
+                ),
+                next_step: "Inspect the local folder before resuming synchronization.".to_string(),
+            }),
+        ));
+    }
+
+    let canonical_local = fs::canonicalize(&local_root).map_err(|err| {
+        (
+            ObservedEvent::EndpointChanged,
+            Box::new(ManagerError::Io {
+                cause: format!(
+                    "Could not canonicalize local folder `{}` before launch: {err}.",
+                    local_root.display()
+                ),
+                next_step: "Verify the local volume and folder identity.".to_string(),
+            }),
+        )
+    })?;
+    if canonical_local != generation.config.path1 {
+        return Err((
+            ObservedEvent::EndpointChanged,
+            Box::new(ManagerError::InvalidState {
+                mapping_id: mapping.id.clone(),
+                cause: format!(
+                    "Local folder `{}` resolved to `{}`, which does not match stored generation root `{}`.",
+                    local_root.display(),
+                    canonical_local.display(),
+                    generation.config.path1.display()
+                ),
+                next_step: "Review the endpoint change before syncing.".to_string(),
+            }),
+        ));
+    }
+    if let Err(err) = verify_endpoint_access_marker(&canonical_local, &mapping.collection) {
+        return Err((ObservedEvent::EndpointChanged, Box::new(err)));
+    }
+
+    let remote_ep = RemoteEndpoint::from_db_cols(
+        &mapping.remote_endpoint_kind,
+        &mapping.remote_endpoint_value,
+    )
+    .map_err(|err| (ObservedEvent::EndpointChanged, Box::new(err)))?;
+
+    if let RemoteEndpoint::LocalDir(remote_root) = remote_ep {
+        let remote_meta = fs::symlink_metadata(&remote_root).map_err(|err| {
+            (
+                ObservedEvent::EndpointChanged,
+                Box::new(ManagerError::Io {
+                    cause: format!(
+                        "Remote destination `{}` is missing or inaccessible before launch: {err}.",
+                        remote_root.display()
+                    ),
+                    next_step: "Confirm the remote destination exists and is accessible."
+                        .to_string(),
+                }),
+            )
+        })?;
+        if remote_meta.file_type().is_symlink() || !remote_meta.is_dir() {
+            return Err((
+                ObservedEvent::EndpointChanged,
+                Box::new(ManagerError::InvalidState {
+                    mapping_id: mapping.id.clone(),
+                    cause: format!(
+                        "Remote destination `{}` is no longer an ordinary directory.",
+                        remote_root.display()
+                    ),
+                    next_step: "Review the remote destination before syncing.".to_string(),
+                }),
+            ));
+        }
+        let canonical_remote = fs::canonicalize(&remote_root).map_err(|err| {
+            (
+                ObservedEvent::EndpointChanged,
+                Box::new(ManagerError::Io {
+                    cause: format!(
+                        "Could not canonicalize remote destination `{}`: {err}.",
+                        remote_root.display()
+                    ),
+                    next_step: "Review the remote destination before syncing.".to_string(),
+                }),
+            )
+        })?;
+        let expected_remote = PathBuf::from(&generation.config.path2);
+        if canonical_remote != expected_remote {
+            return Err((
+                ObservedEvent::EndpointChanged,
+                Box::new(ManagerError::InvalidState {
+                    mapping_id: mapping.id.clone(),
+                    cause: format!(
+                        "Remote destination `{}` resolved to `{}`, which does not match stored generation root `{}`.",
+                        remote_root.display(),
+                        canonical_remote.display(),
+                        expected_remote.display()
+                    ),
+                    next_step: "Review the endpoint change before syncing.".to_string(),
+                }),
+            ));
+        }
+        if let Err(err) = verify_endpoint_access_marker(&canonical_remote, &mapping.collection) {
+            return Err((ObservedEvent::EndpointChanged, Box::new(err)));
+        }
+    }
+
+    Ok(())
+}
+
+/// Probes whether a recorded orphan PID is still the exact same process:
+/// - `Some(true)`: positively matches PID + start time + executable
+/// - `Some(false)`: positively exited (`NotFound`) or PID reused (start time/exe differs)
+/// - `None`: inconclusive (permission denied or missing identity metadata)
+fn probe_orphan_liveness(
+    inspector: &dyn ProcessInspector,
+    pid: u32,
+    run: Option<&RunRecord>,
+) -> Option<bool> {
+    match inspector.inspect(pid) {
+        ProcessProbeResult::NotFound => Some(false),
+        ProcessProbeResult::Unavailable(_) => None,
+        ProcessProbeResult::Live(live) => {
+            let run = run?;
+            let start_matches =
+                run.child_start_time.is_some() && live.start_time == run.child_start_time;
+            let start_differs = run.child_start_time.is_some()
+                && live.start_time.is_some()
+                && live.start_time != run.child_start_time;
+            let exe_matches = executables_match(&run.child_executable, &live.executable);
+            let exe_differs = executables_clearly_differ(&run.child_executable, &live.executable);
+
+            if start_matches && exe_matches {
+                Some(true)
+            } else if start_differs || exe_differs {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Returns any open `orphan_ambiguous` or live/inconclusive `orphan_running`
+/// case across ALL mappings that must block the global worker (§3, §14).
+fn find_blocking_global_orphan(
+    store: &SqliteStateStore,
+    inspector: &dyn ProcessInspector,
+) -> Result<Option<RecoveryCaseRecord>, ManagerError> {
+    for case in store.list_all_open_recovery_cases()? {
+        match case.reason_kind.as_str() {
+            "orphan_ambiguous" => return Ok(Some(case)),
+            "orphan_running" => {
+                let run = case
+                    .run_id
+                    .as_ref()
+                    .map(|rid| store.get_run(rid))
+                    .transpose()?
+                    .flatten();
+                let alive = case
+                    .orphan_pid
+                    .and_then(|pid| probe_orphan_liveness(inspector, pid, run.as_ref()));
+                // Block when positively alive (`Some(true)`) OR inconclusive (`None`).
+                if alive != Some(false) {
+                    return Ok(Some(case));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 fn default_device_name() -> String {
@@ -1532,8 +2037,59 @@ fn executables_clearly_differ(recorded: &Option<PathBuf>, live: &Option<PathBuf>
     !executables_match(&Some(rec.clone()), &Some(act.clone()))
 }
 
+fn write_run_outcome_json(run: &RunRecord) {
+    let outcome_doc = serde_json::json!({
+        "run_id": run.id.as_str(),
+        "status": run.status,
+        "outcome_kind": run.outcome_kind,
+        "outcome_detail": run.outcome_detail,
+        "last_verified_phase": run.last_verified_phase,
+        "exit_code": run.exit_code,
+        "exit_signal": run.exit_signal,
+        "conflict_paths": run.conflict_paths,
+        "files_checked": run.files_checked,
+        "files_transferred": run.files_transferred,
+        "bytes_transferred": run.bytes_transferred,
+        "finished_at": run.finished_at,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&outcome_doc)
+        && let Err(err) = write_private_file(&run.run_dir.join("outcome.json"), &bytes)
+    {
+        eprintln!(
+            "Warning: failed to write outcome.json for run `{}`: {err}",
+            run.id
+        );
+    }
+}
+
+/// Formats one captured output line as a guaranteed-valid single-line JSON
+/// object for `output.ndjson` (HIGH #8).
+fn format_ndjson_line(line: &OutputLine, timestamp: &str) -> String {
+    let trimmed = line.text.trim();
+    if !line.truncated
+        && trimmed.starts_with('{')
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && val.is_object()
+        && let Ok(compact) = serde_json::to_string(&val)
+    {
+        return compact;
+    }
+
+    let stream = match line.stream {
+        StreamKind::Stdout => "stdout",
+        StreamKind::Stderr => "stderr",
+    };
+    serde_json::to_string(&serde_json::json!({
+        "stream": stream,
+        "raw": line.text,
+        "truncated": line.truncated,
+        "timestamp": timestamp,
+    }))
+    .unwrap_or_else(|_| r#"{"raw":"<serialization-error>"}"#.to_string())
+}
+
 fn reconcile_startup_state(
-    store: &SqliteStateStore,
+    store: &mut SqliteStateStore,
     inspector: &dyn ProcessInspector,
     clock: &dyn Clock,
     event_bus: &EventBus,
@@ -1551,17 +2107,32 @@ fn reconcile_startup_state(
         };
 
         let (phase, reason_kind, cause, next_step, orphan_pid) = match run.child_pid {
-            None => (
-                "reconciled_ambiguous".to_string(),
-                "orphan_ambiguous".to_string(),
-                format!(
-                    "FolderSync exited after recording run `{}` and before recording the child process PID; process ownership is ambiguous.{lock_note}",
-                    run.id
-                ),
-                "Inspect active processes and the preserved bisync work directory before clearing recovery."
-                    .to_string(),
-                None,
-            ),
+            None => {
+                // Investigate surviving processes referencing this exact workdir (§14).
+                let proc_note = match inspector.find_processes_referencing_workdir(&run.workdir_path)
+                {
+                    Some(pids) if !pids.is_empty() => format!(
+                        " Surviving process(es) referencing this work directory were observed: PID(s) {:?}.",
+                        pids
+                    ),
+                    Some(_) => {
+                        " No surviving process referencing this work directory was observed, but missing PID prevents proof of ownership."
+                            .to_string()
+                    }
+                    None => " Process-table workdir scan was unavailable.".to_string(),
+                };
+                (
+                    "reconciled_ambiguous".to_string(),
+                    "orphan_ambiguous".to_string(),
+                    format!(
+                        "FolderSync exited after recording run `{}` and before recording the child process PID; process ownership is ambiguous.{lock_note}{proc_note}",
+                        run.id
+                    ),
+                    "Inspect active processes and the preserved bisync work directory before clearing recovery."
+                        .to_string(),
+                    None,
+                )
+            }
             Some(pid) => match inspector.inspect(pid) {
                 ProcessProbeResult::NotFound => (
                     "reconciled_exited".to_string(),
@@ -1575,8 +2146,8 @@ fn reconcile_startup_state(
                     None,
                 ),
                 ProcessProbeResult::Live(live) => {
-                    let start_matches = run.child_start_time.is_some()
-                        && live.start_time == run.child_start_time;
+                    let start_matches =
+                        run.child_start_time.is_some() && live.start_time == run.child_start_time;
                     let start_differs = run.child_start_time.is_some()
                         && live.start_time.is_some()
                         && live.start_time != run.child_start_time;
@@ -1592,7 +2163,7 @@ fn reconcile_startup_state(
                                 "Orphaned rclone process (PID {pid}) from run `{}` is still running.{lock_note}",
                                 run.id
                             ),
-                            "Wait for or stop the exact orphaned process before starting another run on this mapping."
+                            "Wait for or stop the exact orphaned process before starting another sync job."
                                 .to_string(),
                             Some(pid),
                         )
@@ -1641,9 +2212,8 @@ fn reconcile_startup_state(
         run.outcome_kind = Some("interrupted".to_string());
         run.outcome_detail = Some(cause.clone());
         run.last_verified_phase = phase;
-        store.update_run_finished(&run)?;
 
-        if let Some(mut mapping) = store.get_mapping(&run.mapping_id)? {
+        let updated_mapping = if let Some(mut mapping) = store.get_mapping(&run.mapping_id)? {
             let next = apply_event(
                 mapping.state,
                 ObservedEvent::RunFinished(RunOutcome::Interrupted),
@@ -1654,9 +2224,11 @@ fn reconcile_startup_state(
             mapping.last_run_completed_at = Some(now.clone());
             mapping.last_run_summary_text = Some("Interrupted — recovery required".to_string());
             mapping.updated_at = now.clone();
-            store.update_mapping_runtime(&mapping)?;
             reconciled_mappings.insert(mapping.id.clone());
-        }
+            Some(mapping)
+        } else {
+            None
+        };
 
         let case = RecoveryCaseRecord {
             id: format!("rc-{}", Uuid::new_v4()),
@@ -1675,7 +2247,11 @@ fn reconcile_startup_state(
             resolved_at: None,
             resolution_note: None,
         };
-        store.insert_recovery_case(&case)?;
+
+        // Commit run terminal status + mapping hold + recovery case in ONE SQLite transaction (HIGH #7).
+        store.commit_run_terminal(&run, updated_mapping.as_ref(), Some(&case))?;
+        write_run_outcome_json(&run);
+
         event_bus.publish_event(ManagerEvent::RecoveryOpened {
             mapping_id: run.mapping_id,
             case_id: case.id,
@@ -1703,7 +2279,6 @@ fn reconcile_startup_state(
                 );
                 mapping.state = next.state;
                 mapping.updated_at = now.clone();
-                store.update_mapping_runtime(&mapping)?;
                 let case = RecoveryCaseRecord {
                     id: format!("rc-{}", Uuid::new_v4()),
                     mapping_id: mapping.id.clone(),
@@ -1723,7 +2298,7 @@ fn reconcile_startup_state(
                     resolved_at: None,
                     resolution_note: None,
                 };
-                store.insert_recovery_case(&case)?;
+                store.commit_mapping_and_recovery(&mapping, Some(&case))?;
             }
             Execution::Idle | Execution::Interrupted => {}
         }
@@ -1767,12 +2342,16 @@ fn build_snapshot(
 
         let display_name = m.collection.display_name().to_string();
         let volume_name = m.local_binding.volume_display_name();
-        let text = status_text(
+        let mut text = status_text(
             &m.state,
             &display_name,
             &volume_name,
             last_run_summary.as_ref(),
         );
+        // Never promise automatic retry while scheduling is disabled (HIGH #11).
+        if !m.scheduling_enabled && text == "Last run failed — will retry" {
+            text = "Last run failed — retry manually".to_string();
+        }
         let actions = available_actions(&m.state);
 
         let counters = MappingCounters {
@@ -1816,6 +2395,8 @@ fn build_snapshot(
     })
 }
 
+/// Rebuilds and publishes the immutable `StatusSnapshot`, treating Finder
+/// `status.json` write errors as non-fatal logged warnings (HIGH #9).
 fn publish_updated_snapshot(
     inner: &ManagerInner,
     guard: &mut SharedState,
@@ -1828,7 +2409,6 @@ fn publish_updated_snapshot(
         active,
         inner.clock.as_ref(),
     )?);
-    inner.finder_writer.write_snapshot(&snap)?;
     guard.latest_snapshot = Arc::clone(&snap);
     inner.event_bus.publish_snapshot(Arc::clone(&snap));
     inner
@@ -1837,36 +2417,65 @@ fn publish_updated_snapshot(
             sequence: snap.sequence,
             timestamp: snap.generated_at.clone(),
         });
+    if let Err(err) = inner.finder_writer.write_snapshot(&snap) {
+        eprintln!("Warning: failed to publish Finder status.json: {err}");
+    }
     Ok(snap)
+}
+
+enum DequeueOutcome {
+    Shutdown,
+    Skip,
+    Prepared(Box<PreparedRun>),
 }
 
 fn worker_loop(inner: Arc<ManagerInner>) {
     loop {
-        let job = {
+        // Atomic dequeue -> eligibility recheck -> pre-spawn DB row -> active_run claim
+        // all under ONE mutex acquisition (HIGH #5).
+        let outcome = {
             let mut guard = inner.state.lock().unwrap();
             while !guard.shutdown && guard.job_queue.is_empty() {
                 guard = inner.worker_cv.wait(guard).unwrap();
             }
             if guard.shutdown {
-                break;
+                DequeueOutcome::Shutdown
+            } else if let Some(job) = guard.job_queue.pop_front() {
+                match claim_and_prepare_locked(&inner, &mut guard, &job) {
+                    Ok(Some(prepared)) => {
+                        guard.worker_busy = true;
+                        DequeueOutcome::Prepared(Box::new(prepared))
+                    }
+                    Ok(None) => {
+                        if guard.active_run.is_none() && guard.job_queue.is_empty() {
+                            inner.idle_cv.notify_all();
+                        }
+                        DequeueOutcome::Skip
+                    }
+                    Err(err) => {
+                        record_prepare_failure_locked(&inner, &mut guard, &job, err);
+                        if guard.active_run.is_none() && guard.job_queue.is_empty() {
+                            inner.idle_cv.notify_all();
+                        }
+                        DequeueOutcome::Skip
+                    }
+                }
+            } else {
+                DequeueOutcome::Skip
             }
-            let job = guard.job_queue.pop_front();
-            if job.is_some() {
-                guard.worker_busy = true;
-            }
-            job
         };
 
-        let Some(job) = job else {
-            continue;
-        };
-
-        execute_single_job(&inner, job);
-
-        let mut guard = inner.state.lock().unwrap();
-        guard.worker_busy = false;
-        if guard.active_run.is_none() && guard.job_queue.is_empty() {
-            inner.idle_cv.notify_all();
+        match outcome {
+            DequeueOutcome::Shutdown => break,
+            DequeueOutcome::Skip => continue,
+            DequeueOutcome::Prepared(prepared) => {
+                execute_prepared_job(&inner, *prepared);
+                let mut guard = inner.state.lock().unwrap();
+                guard.worker_busy = false;
+                if guard.active_run.is_none() && guard.job_queue.is_empty() {
+                    inner.idle_cv.notify_all();
+                }
+            }
         }
     }
 }
@@ -1876,21 +2485,57 @@ struct PreparedRun {
     plan: LaunchPlan,
     mode_label: String,
     is_init: bool,
+    log_file: fs::File,
 }
 
-fn prepare_run_before_spawn(
+/// Atomically rechecks eligibility (shutdown, pause, stop, global orphan,
+/// generation roots, access-marker contents), persists the pre-spawn `runs`
+/// row, transitions `Execution::Running`, and claims `guard.active_run` while
+/// holding the manager state mutex (HIGH #4, #5, #6).
+fn claim_and_prepare_locked(
     inner: &ManagerInner,
+    guard: &mut SharedState,
     job: &QueuedJob,
-) -> Result<PreparedRun, ManagerError> {
-    let mut guard = inner.state.lock().unwrap();
-    let mut mapping =
-        guard
-            .store
-            .get_mapping(&job.mapping_id)?
-            .ok_or_else(|| ManagerError::NotFound {
-                cause: format!("Mapping `{}` no longer exists.", job.mapping_id),
-                next_step: "Refresh mapping list.".to_string(),
-            })?;
+) -> Result<Option<PreparedRun>, ManagerError> {
+    if guard.shutdown {
+        return Ok(None);
+    }
+
+    let Some(mut mapping) = guard.store.get_mapping(&job.mapping_id)? else {
+        return Ok(None);
+    };
+
+    // Recheck eligibility right before claiming active slot (HIGH #5).
+    if mapping.state.execution != Execution::Queued {
+        return Ok(None);
+    }
+    let is_init = matches!(job.mode, RunMode::Initialize(_));
+    if !is_init
+        && (mapping.state.intent == Intent::Paused || mapping.state.readiness() != Readiness::Ready)
+    {
+        mapping.state.execution = Execution::Idle;
+        mapping.updated_at = inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(&mapping)?;
+        let _ = publish_updated_snapshot(inner, guard);
+        return Ok(None);
+    }
+    if is_init && mapping.state.readiness() != Readiness::NeedsInitialization {
+        mapping.state.execution = Execution::Idle;
+        mapping.updated_at = inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(&mapping)?;
+        let _ = publish_updated_snapshot(inner, guard);
+        return Ok(None);
+    }
+
+    // Re-check global orphan block right before launch (HIGH #6).
+    if find_blocking_global_orphan(&guard.store, inner.process_inspector.as_ref())?.is_some() {
+        mapping.state.execution = Execution::Idle;
+        mapping.updated_at = inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(&mapping)?;
+        let _ = publish_updated_snapshot(inner, guard);
+        return Ok(None);
+    }
+
     let generation = guard
         .store
         .get_generation(&job.generation_id)?
@@ -1906,24 +2551,50 @@ fn prepare_run_before_spawn(
             next_step: "Reconnect account.".to_string(),
         })?;
 
+    // Immediately before EVERY launch (Run once AND init), re-verify both roots
+    // against stored generation and check access-marker contents on both sides (HIGH #4).
+    if let Err((event, _err)) = verify_endpoints_for_generation(&mapping, &generation) {
+        mapping.state = apply_event(mapping.state, event).state;
+        mapping.state.execution = Execution::Idle;
+        mapping.updated_at = inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(&mapping)?;
+        let _ = publish_updated_snapshot(inner, guard);
+        return Ok(None);
+    }
+
     let run_id = RunId::new(format!("run-{}", Uuid::new_v4()));
-    let run_dir = inner.state_dir.join("runs").join(run_id.as_str());
+    validate_safe_path_id("run_id", run_id.as_str())?;
+    validate_safe_path_id("mapping_id", mapping.id.as_str())?;
+    validate_safe_path_id("device_id", mapping.device_id.as_str())?;
+
+    let runs_root = inner.state_dir.join("runs");
+    let run_dir = ensure_contained_path("run_dir", &runs_root, &runs_root.join(run_id.as_str()))?;
     ensure_private_dir(&run_dir)?;
-    let log_path = run_dir.join("output.ndjson");
+    let log_path = ensure_contained_path("log_path", &run_dir, &run_dir.join("output.ndjson"))?;
+    let log_file = open_private_write_file(&log_path)?;
 
     let remote_ep = RemoteEndpoint::from_db_cols(
         &mapping.remote_endpoint_kind,
         &mapping.remote_endpoint_value,
     )?;
-    let backup_dir1 = mapping
-        .local_recovery_root
-        .join(mapping.id.as_str())
-        .join(run_id.as_str());
+    let backup_dir1 = ensure_contained_path(
+        "backup_dir1",
+        &mapping.local_recovery_root,
+        &mapping
+            .local_recovery_root
+            .join(mapping.id.as_str())
+            .join(run_id.as_str()),
+    )?;
     let (backup_dir2, backup_dir2_str) = match &remote_ep {
         RemoteEndpoint::LocalDir(_) => {
-            let p = PathBuf::from(&mapping.cloud_recovery_path)
-                .join(mapping.device_id.as_str())
-                .join(run_id.as_str());
+            let rec_root = PathBuf::from(&mapping.cloud_recovery_path);
+            let p = ensure_contained_path(
+                "backup_dir2",
+                &rec_root,
+                &rec_root
+                    .join(mapping.device_id.as_str())
+                    .join(run_id.as_str()),
+            )?;
             let s = p.to_string_lossy().into_owned();
             (BackupDir2::LocalDir(p), s)
         }
@@ -1945,10 +2616,10 @@ fn prepare_run_before_spawn(
         }
     };
 
-    let (mode_label, is_init) = match job.mode {
-        RunMode::Normal => ("normal".to_string(), false),
-        RunMode::Initialize(InitPreference::Path1) => ("init_path1".to_string(), true),
-        RunMode::Initialize(InitPreference::Path2) => ("init_path2".to_string(), true),
+    let mode_label = match job.mode {
+        RunMode::Normal => "normal".to_string(),
+        RunMode::Initialize(InitPreference::Path1) => "init_path1".to_string(),
+        RunMode::Initialize(InitPreference::Path2) => "init_path2".to_string(),
     };
 
     let started_at = inner.clock.now_rfc3339();
@@ -1983,8 +2654,7 @@ fn prepare_run_before_spawn(
         conflict_count: 0,
     };
 
-    // CRITICAL (§12, §14): Persist run-start row (run id, generation, workdir, recovery paths)
-    // BEFORE spawning the child process!
+    // Persist run-start row (run id, generation, workdir, recovery paths) BEFORE spawn (§12, §14).
     guard.store.insert_run_start(&run)?;
 
     if is_init {
@@ -2002,7 +2672,7 @@ fn prepare_run_before_spawn(
         stop_requested: false,
         force_stopped: false,
     });
-    let _ = publish_updated_snapshot(inner, &mut guard)?;
+    let _ = publish_updated_snapshot(inner, guard);
     inner.event_bus.publish_event(ManagerEvent::RunStarted {
         mapping_id: mapping.id.clone(),
         run_id: run_id.clone(),
@@ -2024,66 +2694,77 @@ fn prepare_run_before_spawn(
         backup_dir2,
     };
 
-    Ok(PreparedRun {
+    Ok(Some(PreparedRun {
         run,
         plan,
         mode_label,
         is_init,
-    })
+        log_file,
+    }))
 }
 
-fn execute_single_job(inner: &Arc<ManagerInner>, job: QueuedJob) {
-    let prepared = match prepare_run_before_spawn(inner, &job) {
-        Ok(p) => p,
-        Err(err) => {
-            let mut guard = inner.state.lock().unwrap();
-            if let Ok(Some(mut m)) = guard.store.get_mapping(&job.mapping_id) {
-                let next = apply_event(
-                    m.state,
-                    ObservedEvent::RunFinished(RunOutcome::InvalidConfiguration),
-                );
-                m.state = next.state;
-                m.updated_at = inner.clock.now_rfc3339();
-                let _ = guard.store.update_mapping_runtime(&m);
-                let case = RecoveryCaseRecord {
-                    id: format!("rc-{}", Uuid::new_v4()),
-                    mapping_id: m.id,
-                    run_id: None,
-                    status: "open".to_string(),
-                    reason_kind: "invalid_config".to_string(),
-                    cause: err.cause(),
-                    next_step: err.next_step(),
-                    workdir_path: None,
-                    backup_dir1: None,
-                    backup_dir2: None,
-                    log_path: None,
-                    orphan_pid: None,
-                    created_at: inner.clock.now_rfc3339(),
-                    resolved_at: None,
-                    resolution_note: None,
-                };
-                let _ = guard.store.insert_recovery_case(&case);
-                let _ = publish_updated_snapshot(inner, &mut guard);
-            }
+fn record_prepare_failure_locked(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    job: &QueuedJob,
+    err: ManagerError,
+) {
+    if let Ok(Some(mut m)) = guard.store.get_mapping(&job.mapping_id) {
+        let next = apply_event(
+            m.state,
+            ObservedEvent::RunFinished(RunOutcome::InvalidConfiguration),
+        );
+        m.state = next.state;
+        let now = inner.clock.now_rfc3339();
+        m.updated_at = now.clone();
+        let case = RecoveryCaseRecord {
+            id: format!("rc-{}", Uuid::new_v4()),
+            mapping_id: m.id.clone(),
+            run_id: None,
+            status: "open".to_string(),
+            reason_kind: "invalid_config".to_string(),
+            cause: err.cause(),
+            next_step: err.next_step(),
+            workdir_path: None,
+            backup_dir1: None,
+            backup_dir2: None,
+            log_path: None,
+            orphan_pid: None,
+            created_at: now,
+            resolved_at: None,
+            resolution_note: None,
+        };
+        if let Err(db_err) = guard.store.commit_mapping_and_recovery(&m, Some(&case)) {
+            eprintln!("Error committing prepare failure recovery hold: {db_err}");
             return;
         }
-    };
+        let _ = publish_updated_snapshot(inner, guard);
+    }
+}
 
-    let (line_tx, line_rx) = mpsc::sync_channel::<OutputLine>(512);
+fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
+    let (line_tx, line_rx) = mpsc::sync_channel::<OutputLine>(1024);
     let forwarder_inner = Arc::clone(inner);
     let fwd_mapping = prepared.run.mapping_id.clone();
     let fwd_run = prepared.run.id.clone();
+    let mut log_file = prepared.log_file;
+    // Stream valid NDJSON lines to disk live during the run (HIGH #8).
     let forwarder = thread::spawn(move || {
         while let Ok(line) = line_rx.recv() {
+            let ts = forwarder_inner.clock.now_rfc3339();
+            let ndjson_line = format_ndjson_line(&line, &ts);
+            let _ = writeln!(log_file, "{ndjson_line}");
+            let _ = log_file.flush();
             forwarder_inner
                 .event_bus
                 .publish_event(ManagerEvent::RunOutputLine {
                     mapping_id: fwd_mapping.clone(),
                     run_id: fwd_run.clone(),
                     line: line.text,
-                    timestamp: forwarder_inner.clock.now_rfc3339(),
+                    timestamp: ts,
                 });
         }
+        let _ = log_file.sync_all();
     });
 
     let spawn_result = inner.launcher.launch(
@@ -2103,22 +2784,6 @@ fn execute_single_job(inner: &Arc<ManagerInner>, job: QueuedJob) {
         }
     };
 
-    // Write sanitized argv and engine identity under runs/<run-id>/argv.json.
-    let argv_doc = serde_json::json!({
-        "run_id": prepared.run.id.as_str(),
-        "mode": prepared.mode_label,
-        "argv": launched.sanitized_argv,
-        "engine": {
-            "version": launched.engine.version,
-            "sha256": launched.engine.sha256,
-            "platform": launched.engine.platform,
-            "executable": launched.engine.executable,
-        }
-    });
-    if let Ok(bytes) = serde_json::to_vec_pretty(&argv_doc) {
-        let _ = write_private_file(&prepared.run.run_dir.join("argv.json"), &bytes);
-    }
-
     // Test fault-injection hook simulating an abrupt manager crash right after
     // spawn BEFORE updating child_pid / start_time in SQLite (§14).
     if launched.simulate_crash_before_pid_record {
@@ -2130,7 +2795,7 @@ fn execute_single_job(inner: &Arc<ManagerInner>, job: QueuedJob) {
         return;
     }
 
-    // Record child identity (PID + start time + executable + engine identity) right after spawn.
+    // Commit child identity to SQLite FIRST before any post-spawn file work (HIGH #8).
     let mut run = prepared.run;
     run.child_pid = Some(launched.identity.pid);
     run.child_start_time = launched.identity.start_time;
@@ -2144,10 +2809,16 @@ fn execute_single_job(inner: &Arc<ManagerInner>, job: QueuedJob) {
     let stopper = launched.stop_handle();
     let (pending_force_stop, pending_graceful_stop) = {
         let mut guard = inner.state.lock().unwrap();
-        let _ =
+        if let Err(err) =
             guard
                 .store
-                .update_run_child_identity(&run.id, &launched.identity, &launched.engine);
+                .update_run_child_identity(&run.id, &launched.identity, &launched.engine)
+        {
+            eprintln!(
+                "Error persisting child identity for run `{}`: {err}",
+                run.id
+            );
+        }
         if let Some(active) = guard.active_run.as_mut() {
             active.stopper = Some(Arc::clone(&stopper));
             (
@@ -2158,6 +2829,28 @@ fn execute_single_job(inner: &Arc<ManagerInner>, job: QueuedJob) {
             (false, guard.shutdown)
         }
     };
+
+    // Only AFTER child identity is committed, write runs/<run-id>/argv.json (HIGH #8).
+    let argv_doc = serde_json::json!({
+        "run_id": run.id.as_str(),
+        "mode": prepared.mode_label,
+        "argv": launched.sanitized_argv,
+        "engine": {
+            "version": launched.engine.version,
+            "sha256": launched.engine.sha256,
+            "platform": launched.engine.platform,
+            "executable": launched.engine.executable,
+        }
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&argv_doc)
+        && let Err(err) = write_private_file(&run.run_dir.join("argv.json"), &bytes)
+    {
+        eprintln!(
+            "Warning: failed to write argv.json for run `{}`: {err}",
+            run.id
+        );
+    }
+
     if pending_force_stop {
         let _ = stopper.force_stop();
     } else if pending_graceful_stop {
@@ -2187,26 +2880,33 @@ fn finish_with_launch_error(inner: &ManagerInner, mut run: RunRecord, err: Manag
     run.last_verified_phase = "launch_failed".to_string();
 
     let mut guard = inner.state.lock().unwrap();
-    let _ = guard.store.update_run_finished(&run);
     let already_force_stopped = guard.active_run.as_ref().is_some_and(|a| a.force_stopped);
     guard.active_run = None;
 
-    if let Ok(Some(mut mapping)) = guard.store.get_mapping(&run.mapping_id) {
-        let next = apply_event(
-            mapping.state,
-            ObservedEvent::RunFinished(RunOutcome::CriticalFailure),
-        );
-        mapping.state = next.state;
-        mapping.last_run_id = Some(run.id.clone());
-        mapping.last_run_outcome = Some(RunOutcome::CriticalFailure);
-        mapping.last_run_completed_at = Some(now.clone());
-        mapping.last_run_summary_text = Some("Failed to launch rclone".to_string());
-        mapping.updated_at = now.clone();
-        let _ = guard.store.update_mapping_runtime(&mapping);
-    }
+    let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
+        Ok(Some(mut mapping)) => {
+            let next = apply_event(
+                mapping.state,
+                ObservedEvent::RunFinished(RunOutcome::CriticalFailure),
+            );
+            mapping.state = next.state;
+            mapping.last_run_id = Some(run.id.clone());
+            mapping.last_run_outcome = Some(RunOutcome::CriticalFailure);
+            mapping.last_run_completed_at = Some(now.clone());
+            mapping.last_run_summary_text = Some("Failed to launch rclone".to_string());
+            mapping.updated_at = now.clone();
+            Some(mapping)
+        }
+        Ok(None) => None,
+        Err(db_err) => {
+            eprintln!("Error loading mapping for launch failure commit: {db_err}");
+            inner.idle_cv.notify_all();
+            return;
+        }
+    };
 
-    if !already_force_stopped {
-        let case = RecoveryCaseRecord {
+    let case = if !already_force_stopped {
+        Some(RecoveryCaseRecord {
             id: format!("rc-{}", Uuid::new_v4()),
             mapping_id: run.mapping_id.clone(),
             run_id: Some(run.id.clone()),
@@ -2222,10 +2922,35 @@ fn finish_with_launch_error(inner: &ManagerInner, mut run: RunRecord, err: Manag
             created_at: now.clone(),
             resolved_at: None,
             resolution_note: None,
-        };
-        let _ = guard.store.insert_recovery_case(&case);
+        })
+    } else {
+        None
+    };
+
+    // Commit run + mapping hold + recovery case atomically in ONE SQLite transaction (HIGH #7).
+    if let Err(db_err) =
+        guard
+            .store
+            .commit_run_terminal(&run, updated_mapping.as_ref(), case.as_ref())
+    {
+        eprintln!("Error committing launch failure atomically: {db_err}");
+        inner.idle_cv.notify_all();
+        return;
     }
+
+    // Write outcome.json on launch failure (HIGH #8).
+    write_run_outcome_json(&run);
+
     let _ = publish_updated_snapshot(inner, &mut guard);
+    if let Some(c) = case {
+        inner.event_bus.publish_event(ManagerEvent::RecoveryOpened {
+            mapping_id: run.mapping_id.clone(),
+            case_id: c.id,
+            reason_kind: c.reason_kind,
+            cause: c.cause,
+            timestamp: now.clone(),
+        });
+    }
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
         mapping_id: run.mapping_id,
         run_id: run.id,
@@ -2347,9 +3072,7 @@ fn map_adapter_outcome(
             }),
         ),
         Outcome::Interrupted {
-            graceful,
-            reason,
-            ..
+            graceful, reason, ..
         } => (
             RunOutcome::Interrupted,
             "interrupted",
@@ -2401,15 +3124,11 @@ fn finalize_completed_run(
     is_init: bool,
     run_out: rclone_adapter::RunOutput,
 ) {
-    // Persist NDJSON log output under runs/<run-id>/output.ndjson (0600).
-    let mut ndjson = String::new();
     let mut files_checked = 0u64;
     let mut files_transferred = 0u64;
     let mut bytes_transferred = 0u64;
 
     for line in &run_out.output.lines {
-        ndjson.push_str(&line.text);
-        ndjson.push('\n');
         if let LogEvent::Structured(ev) = parse_log_line(&line.text)
             && let Some(stats) = ev.stats
         {
@@ -2418,7 +3137,20 @@ fn finalize_completed_run(
             bytes_transferred = bytes_transferred.max(stats.bytes);
         }
     }
-    let _ = write_private_file(&run.log_path, ndjson.as_bytes());
+
+    // If observer channel dropped any lines under backpressure, record a valid NDJSON notice.
+    if run_out.output.observer_dropped_lines > 0
+        && let Ok(mut f) = fs::OpenOptions::new().append(true).open(&run.log_path)
+    {
+        let notice = serde_json::json!({
+            "stream": "manager",
+            "warning": "observer_dropped_lines",
+            "dropped": run_out.output.observer_dropped_lines,
+            "timestamp": inner.clock.now_rfc3339(),
+        });
+        let _ = writeln!(f, "{notice}");
+        let _ = f.sync_all();
+    }
 
     let classified = classify_run_outcome(&run_out);
     let (core_outcome, outcome_kind, outcome_detail, conflict_paths, recovery_seed) =
@@ -2442,22 +3174,6 @@ fn finalize_completed_run(
     run.files_transferred = files_transferred;
     run.bytes_transferred = bytes_transferred;
 
-    let outcome_doc = serde_json::json!({
-        "run_id": run.id.as_str(),
-        "outcome_kind": run.outcome_kind,
-        "outcome_detail": run.outcome_detail,
-        "exit_code": run.exit_code,
-        "exit_signal": run.exit_signal,
-        "conflict_paths": run.conflict_paths,
-        "files_checked": run.files_checked,
-        "files_transferred": run.files_transferred,
-        "bytes_transferred": run.bytes_transferred,
-        "finished_at": run.finished_at,
-    });
-    if let Ok(bytes) = serde_json::to_vec_pretty(&outcome_doc) {
-        let _ = write_private_file(&run.run_dir.join("outcome.json"), &bytes);
-    }
-
     let summary_text = match core_outcome {
         RunOutcome::Success => format!(
             "0 conflicts · {} files checked · {} transferred",
@@ -2471,46 +3187,51 @@ fn finalize_completed_run(
     };
 
     let mut guard = inner.state.lock().unwrap();
-    let _ = guard.store.update_run_finished(&run);
     let already_force_stopped = guard.active_run.as_ref().is_some_and(|a| a.force_stopped);
     guard.active_run = None;
 
-    if let Ok(Some(mut mapping)) = guard.store.get_mapping(&run.mapping_id) {
-        if already_force_stopped {
-            // Keep ForceStop's Interrupted + RecoveryRequired latch intact.
-            let next = apply_event(
-                mapping.state,
-                ObservedEvent::RunFinished(RunOutcome::Interrupted),
-            );
-            mapping.state = next.state;
-        } else if is_init && matches!(core_outcome, RunOutcome::Success) {
-            mapping.active_generation_id = Some(run.generation_id.clone());
-            mapping.state.execution = Execution::Idle;
-            mapping.state =
-                apply_event(mapping.state, ObservedEvent::InitializationCompleted).state;
-            // Scheduling stays disabled in Group 3.
-            mapping.scheduling_enabled = false;
-        } else {
-            mapping.state =
-                apply_event(mapping.state, ObservedEvent::RunFinished(core_outcome)).state;
+    let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
+        Ok(Some(mut mapping)) => {
+            if already_force_stopped {
+                let next = apply_event(
+                    mapping.state,
+                    ObservedEvent::RunFinished(RunOutcome::Interrupted),
+                );
+                mapping.state = next.state;
+            } else if is_init && matches!(core_outcome, RunOutcome::Success) {
+                mapping.active_generation_id = Some(run.generation_id.clone());
+                mapping.state.execution = Execution::Idle;
+                mapping.state =
+                    apply_event(mapping.state, ObservedEvent::InitializationCompleted).state;
+                mapping.scheduling_enabled = false;
+            } else {
+                mapping.state =
+                    apply_event(mapping.state, ObservedEvent::RunFinished(core_outcome)).state;
+            }
+
+            mapping.last_run_id = Some(run.id.clone());
+            mapping.last_run_outcome = Some(core_outcome);
+            mapping.last_run_completed_at = Some(now.clone());
+            mapping.last_run_summary_text = Some(summary_text);
+            mapping.updated_at = now.clone();
+            Some(mapping)
         }
+        Ok(None) => None,
+        Err(db_err) => {
+            eprintln!("Error loading mapping during run finalization: {db_err}");
+            inner.idle_cv.notify_all();
+            return;
+        }
+    };
 
-        mapping.last_run_id = Some(run.id.clone());
-        mapping.last_run_outcome = Some(core_outcome);
-        mapping.last_run_completed_at = Some(now.clone());
-        mapping.last_run_summary_text = Some(summary_text);
-        mapping.updated_at = now.clone();
-        let _ = guard.store.update_mapping_runtime(&mapping);
-    }
-
-    if !already_force_stopped && let Some(seed) = recovery_seed {
-        let case = RecoveryCaseRecord {
+    let case = if !already_force_stopped && let Some(seed) = recovery_seed {
+        Some(RecoveryCaseRecord {
             id: format!("rc-{}", Uuid::new_v4()),
             mapping_id: run.mapping_id.clone(),
             run_id: Some(run.id.clone()),
             status: "open".to_string(),
             reason_kind: seed.reason_kind.to_string(),
-            cause: seed.cause.clone(),
+            cause: seed.cause,
             next_step: seed.next_step,
             workdir_path: Some(run.workdir_path.clone()),
             backup_dir1: Some(run.backup_dir1.clone()),
@@ -2520,18 +3241,35 @@ fn finalize_completed_run(
             created_at: now.clone(),
             resolved_at: None,
             resolution_note: None,
-        };
-        let _ = guard.store.insert_recovery_case(&case);
+        })
+    } else {
+        None
+    };
+
+    // Atomically commit run + mapping state + recovery case in ONE SQLite transaction (HIGH #7).
+    // Publish ONLY after commit succeeds.
+    if let Err(db_err) =
+        guard
+            .store
+            .commit_run_terminal(&run, updated_mapping.as_ref(), case.as_ref())
+    {
+        eprintln!("Error committing completed run `{}`: {db_err}", run.id);
+        inner.idle_cv.notify_all();
+        return;
+    }
+
+    write_run_outcome_json(&run);
+
+    let _ = publish_updated_snapshot(inner, &mut guard);
+    if let Some(c) = case {
         inner.event_bus.publish_event(ManagerEvent::RecoveryOpened {
             mapping_id: run.mapping_id.clone(),
-            case_id: case.id,
-            reason_kind: case.reason_kind,
-            cause: seed.cause,
+            case_id: c.id,
+            reason_kind: c.reason_kind,
+            cause: c.cause,
             timestamp: now.clone(),
         });
     }
-
-    let _ = publish_updated_snapshot(inner, &mut guard);
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
         mapping_id: run.mapping_id,
         run_id: run.id,
