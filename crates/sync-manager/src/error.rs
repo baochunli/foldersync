@@ -56,6 +56,9 @@ pub enum ManagerError {
         cause: String,
         next_step: String,
     },
+    /// Another operation holds the Drive account's configuration lock.
+    #[error("{cause} Next step: {next_step}")]
+    AccountBusy { cause: String, next_step: String },
     /// SQLite storage or migration error.
     #[error("{cause} Next step: {next_step}")]
     Storage { cause: String, next_step: String },
@@ -109,6 +112,7 @@ impl ManagerError {
             | Self::AccessMarkerConflict { cause, .. }
             | Self::PreflightRejected { cause, .. }
             | Self::ActiveJobConflict { cause, .. }
+            | Self::AccountBusy { cause, .. }
             | Self::Storage { cause, .. }
             | Self::UnsupportedSchemaVersion { cause, .. }
             | Self::Engine { cause, .. }
@@ -134,6 +138,7 @@ impl ManagerError {
             | Self::AccessMarkerConflict { next_step, .. }
             | Self::PreflightRejected { next_step, .. }
             | Self::ActiveJobConflict { next_step, .. }
+            | Self::AccountBusy { next_step, .. }
             | Self::Storage { next_step, .. }
             | Self::UnsupportedSchemaVersion { next_step, .. }
             | Self::Engine { next_step, .. }

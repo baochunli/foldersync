@@ -861,7 +861,7 @@ impl SqliteStateStore {
         Ok(())
     }
 
-    /// Restore a retry streak from durable, classified engine outcomes for this baseline.
+    /// Restore a retry streak from durable outcomes that advanced the schedule.
     pub(crate) fn retry_runs(
         &self,
         generation: &GenerationId,
@@ -874,7 +874,9 @@ impl SqliteStateStore {
                     exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
                     last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
              FROM runs WHERE generation_id = ?1 AND finished_at IS NOT NULL
-               AND child_pid IS NOT NULL ORDER BY rowid DESC LIMIT 8",
+               AND (child_pid IS NOT NULL OR last_verified_phase IN
+                    ('pre_spawn_endpoint_check_failed', 'aborted_pre_spawn'))
+             ORDER BY rowid DESC LIMIT 8",
         ).map_err(|e| storage_err("Failed to query scheduling history", e))?;
         let rows = stmt
             .query_map([generation.as_str()], Self::map_run_row)

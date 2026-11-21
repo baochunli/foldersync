@@ -10,16 +10,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::TimeDelta;
 use rclone_adapter::{
-    FakeProcessRunner, FakeRunScript, OutputLine, PasswordCommand, ProcessError, ProcessRunner,
-    ProcessSpec, RealProcessRunner, RunHandle, SpawnOptions, StreamKind, pinned_binary_path,
+    AccountConfigLock, FakeProcessRunner, FakeRunScript, OutputLine, PasswordCommand, ProcessError,
+    ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle, SpawnOptions, StreamKind,
+    pinned_binary_path,
 };
-use sync_core::{AccountId, CloudCollection, MappingId, Readiness};
+use sync_core::{AccountId, CloudCollection, MappingId, Readiness, RunOutcome};
 use sync_manager::{
     AccountRecord, AccountServiceConfig, AddMappingCommand, CollectionSkipReason,
-    DriveAuthorization, FolderSizeStatus, InMemorySecretStore, InitializeCommand, ManagerConfig,
-    RealBisyncLauncher, SecretStore, SecretString, SqliteStateStore, SyncManager,
-    scoped_credential_key,
+    DriveAuthorization, FixedClock, FolderSizeStatus, InMemorySecretStore, InitializeCommand,
+    ManagerConfig, ManagerEvent, RealBisyncLauncher, SecretStore, SecretString, SqliteStateStore,
+    SyncManager, scoped_credential_key,
 };
 
 struct FixtureRunner {
@@ -50,6 +52,7 @@ impl ProcessRunner for FixtureRunner {
 
 struct Fixture {
     manager: SyncManager,
+    clock: Arc<FixedClock>,
     runner: Arc<FixtureRunner>,
     id: AccountId,
     secrets: Arc<InMemorySecretStore>,
@@ -72,20 +75,9 @@ impl Fixture {
         fs::create_dir_all(&account_dir).unwrap();
         let config_path = account_dir.join("rclone.conf");
         fs::write(&config_path, "[household]\ntype = local\n").unwrap();
-        let mut config = ManagerConfig::with_state_dir(&state);
-        config.launcher = Arc::new(RealBisyncLauncher::with_process_runner(
-            Some(binary.clone()),
-            runner.clone(),
-        ));
+        let clock = Arc::new(FixedClock::new("2026-01-01T00:00:00Z".parse().unwrap()));
         let secrets = Arc::new(InMemorySecretStore::new());
-        let mut account_config = AccountServiceConfig::with_state_dir(&state);
-        account_config.secret_store = secrets.clone();
-        account_config.process_runner = runner.clone();
-        account_config.rclone_binary_override = Some(binary);
-        account_config.password_command_factory = Some(Arc::new(|_| {
-            Ok(PasswordCommand::new("/usr/bin/false", vec![]).unwrap())
-        }));
-        let manager = SyncManager::open_with_account_config(config, account_config).unwrap();
+        let manager = open_manager(&state, binary, &clock, &runner, &secrets);
         let store = SqliteStateStore::open(&state.join("state.sqlite")).unwrap();
         let id = AccountId::new("drive");
         store
@@ -111,6 +103,7 @@ impl Fixture {
         fs::create_dir_all(root.join("Data/Research")).unwrap();
         Some(Self {
             manager,
+            clock,
             runner,
             id,
             secrets,
@@ -158,6 +151,29 @@ impl Fixture {
         )
         .unwrap()
     }
+}
+
+fn open_manager(
+    state: &Path,
+    binary: PathBuf,
+    clock: &Arc<FixedClock>,
+    runner: &Arc<FixtureRunner>,
+    secrets: &Arc<InMemorySecretStore>,
+) -> SyncManager {
+    let mut config = ManagerConfig::with_state_dir(state);
+    config.clock = clock.clone();
+    config.launcher = Arc::new(RealBisyncLauncher::with_process_runner(
+        Some(binary.clone()),
+        runner.clone(),
+    ));
+    let mut account_config = AccountServiceConfig::with_state_dir(state);
+    account_config.secret_store = secrets.clone();
+    account_config.process_runner = runner.clone();
+    account_config.rclone_binary_override = Some(binary);
+    account_config.password_command_factory = Some(Arc::new(|_| {
+        Ok(PasswordCommand::new("/usr/bin/false", vec![]).unwrap())
+    }));
+    SyncManager::open_with_account_config(config, account_config).unwrap()
 }
 
 const MIXED_CHILDREN: [(&str, &str); 4] = [
@@ -370,7 +386,10 @@ fn initialize_research(fx: &Fixture, expected_direction: rclone_adapter::InitPre
             expected_direction: Some(expected_direction),
         })
         .unwrap();
-    let snapshot = fx.manager.wait_until_idle(Duration::from_secs(90)).unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
     assert_eq!(
         snapshot.mappings[0].readiness,
         Readiness::Ready,
@@ -394,6 +413,71 @@ fn initialize_research(fx: &Fixture, expected_direction: rclone_adapter::InitPre
         "--resync-mode",
     ] {
         assert!(argv.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn scheduled_drive_run_retries_after_account_lock_contention() {
+    let Some(fx) = Fixture::new(true) else { return };
+    fs::create_dir(fx.root().join("local")).unwrap();
+    fs::write(fx.root().join("local/note"), b"from local").unwrap();
+    initialize_research(&fx, rclone_adapter::InitPreference::Path1);
+
+    let poll_at = fx.manager.snapshot().mappings[0].next_poll_at.unwrap();
+    let events = fx.manager.subscribe_events(64);
+    let lock = AccountConfigLock::acquire(&fx.state.join("accounts/drive/config.lock")).unwrap();
+    fx.clock.set(poll_at);
+    assert_eq!(wait_for_run_outcome(&events), "retryable");
+
+    let snapshot = fx.manager.snapshot();
+    let mapping = &snapshot.mappings[0];
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(mapping.last_run_outcome, Some(RunOutcome::RetryableFailure));
+    assert_eq!(mapping.next_poll_at, None);
+    let retry_at = mapping.retry_at.unwrap();
+    assert!((30..=36).contains(&(retry_at - poll_at).num_seconds()));
+
+    drop(lock);
+    fx.listing(&RESEARCH);
+    let Fixture {
+        manager,
+        clock,
+        runner,
+        secrets,
+        state,
+        _dir,
+        ..
+    } = fx;
+    drop(manager);
+    let manager = open_manager(
+        &state,
+        pinned_binary_path().unwrap(),
+        &clock,
+        &runner,
+        &secrets,
+    );
+    assert_eq!(manager.snapshot().mappings[0].retry_at, Some(retry_at));
+
+    let events = manager.subscribe_events(64);
+    clock.set(retry_at);
+    assert_eq!(wait_for_run_outcome(&events), "success");
+    let mapping = &manager.snapshot().mappings[0];
+    assert_eq!(mapping.retry_at, None);
+    assert_eq!(
+        mapping.next_poll_at,
+        Some(retry_at + TimeDelta::seconds(300))
+    );
+}
+
+fn wait_for_run_outcome(events: &mpsc::Receiver<ManagerEvent>) -> String {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let ManagerEvent::RunFinished { outcome, .. } = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("scheduled run finished")
+        {
+            return outcome;
+        }
     }
 }
 

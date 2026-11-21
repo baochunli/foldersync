@@ -29,7 +29,7 @@ use crate::{
     },
     qualification::{
         EngineIdentity, QualificationError, QualificationManifest,
-        verify_binary_integrity_with_manifest,
+        verify_binary_identity_with_manifest, verify_executable_metadata,
     },
     request::{PasswordCommand, RequestError, validate_remote_name_str},
 };
@@ -160,7 +160,8 @@ impl DriveAuthRequest {
         &self,
         manifest: &QualificationManifest,
     ) -> Result<ProcessSpec, DriveAuthError> {
-        verify_binary_integrity_with_manifest(&self.engine, manifest)?;
+        verify_binary_identity_with_manifest(&self.engine, manifest)?;
+        verify_executable_metadata(&self.engine)?;
         let account_dir = self.config_path.parent().ok_or(ConfigError::InvalidInput {
             field: "config_path",
             reason: "must have a parent directory",
@@ -381,7 +382,7 @@ pub(crate) fn run_drive_auth_with_manifest_locked(
 mod tests {
     use super::*;
     use crate::{
-        process::{FakeProcessRunner, FakeRunScript, StreamKind},
+        process::{FakeProcessRunner, FakeRunScript, RealProcessRunner, StreamKind},
         qualification::{host_platform_key, qualify_binary_with_runner, sha256_file},
     };
     #[cfg(unix)]
@@ -567,6 +568,18 @@ mod tests {
             run_drive_auth_with_manifest_locked(&req, &manifest, &lock, &runner_no_token, None)
                 .unwrap_err();
         assert!(matches!(err, DriveAuthError::TokenNotSaved { .. }));
+
+        fs::write(&fake_bin, b"replacement after qualification").unwrap();
+        let err =
+            run_drive_auth_with_manifest_locked(&req, &manifest, &lock, &RealProcessRunner, None)
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DriveAuthError::Process(ProcessError::BinaryIntegrityMismatch { .. })
+            ),
+            "{err}"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

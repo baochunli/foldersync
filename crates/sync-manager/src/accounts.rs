@@ -842,9 +842,12 @@ impl AccountService {
         id: &AccountId,
     ) -> Result<AccountConfigLock, AccountError> {
         let path = self.account_lock_path(id)?;
-        AccountConfigLock::try_acquire(&path)?.ok_or_else(|| AccountError::InvalidInput {
-            cause: "Another operation is using this account.".to_owned(),
-            next_step: "Try again when the account operation finishes.".to_owned(),
+        AccountConfigLock::try_acquire(&path)?.ok_or_else(|| {
+            ManagerError::AccountBusy {
+                cause: "Another operation is using this account.".to_owned(),
+                next_step: "Try again when the account operation finishes.".to_owned(),
+            }
+            .into()
         })
     }
 
@@ -1879,8 +1882,10 @@ mod tests {
         };
         let tmp = TempDir::new().unwrap();
         let engine_path = tmp.path().join("rclone");
+        let secrets = Arc::new(InMemorySecretStore::new());
         let mut cfg = AccountServiceConfig::with_state_dir(tmp.path().join("state"));
-        cfg.secret_store = Arc::new(InMemorySecretStore::new());
+        cfg.secret_store = secrets.clone();
+        cfg.password_command_factory = Some(make_helper_factory(tmp.path(), secrets));
         cfg.rclone_binary_override = Some(engine_path.clone());
         let svc = AccountService::new(cfg).unwrap();
 
@@ -1890,9 +1895,32 @@ mod tests {
         ));
         fs::copy(pinned, &engine_path).unwrap();
         let original = svc.qualify_engine().unwrap();
+        let source = tmp.path().join("source.conf");
+        fs::write(&source, "[fixture]\ntype = local\n").unwrap();
+        let account = svc
+            .import_account(ImportAccountRequest {
+                id: AccountId::new("fixture"),
+                display_name: "Local fixture".into(),
+                source_config_path: source,
+                source_remote_name: "fixture".into(),
+                target_remote_name: "fixture".into(),
+                root_folder_id: None,
+                allow_global_default_source: false,
+            })
+            .unwrap();
 
         fs::write(&engine_path, b"replacement after qualification").unwrap();
         assert_eq!(svc.qualify_engine().unwrap(), original);
+        for error in [
+            svc.check_account(&account.id).unwrap_err(),
+            svc.resolve_remote_path(&account.id, "Data").unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, AccountError::Engine { cause, .. }
+                    if cause.contains("SHA-256 mismatch immediately before launch")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

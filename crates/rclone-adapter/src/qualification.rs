@@ -839,17 +839,18 @@ mod tests {
         let result = qualify_engine_at(
             Some(&fixture.executable),
             || None,
-            |_| {
-                Err(QualificationError::InvalidManifest(
-                    "signature failed".into(),
-                ))
+            |path| {
+                Err(QualificationError::BundleSignature {
+                    path: path.to_path_buf(),
+                    reason: "signature failed".into(),
+                })
             },
             &fixture.manifest,
             &runner,
         );
         assert!(matches!(
             result,
-            Err(QualificationError::InvalidManifest(_))
+            Err(QualificationError::BundleSignature { path, .. }) if path == fixture.app
         ));
         assert!(runner.spawned_specs().is_empty());
     }

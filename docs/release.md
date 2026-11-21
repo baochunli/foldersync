@@ -2,7 +2,7 @@
 
 FolderSync packages a self-contained macOS `.app` bundle containing the NSH 0.6.1 desktop application, a verified pinned `rclone` binary (`1.76.0`), the embedded Swift Finder Sync extension (`FolderSyncFinder.appex`), and verbatim third-party license notices.
 
-> **Current packaging boundary:** The desktop UI uses `ManagerSource` by default. The adapter exposes `qualify_pinned_binary()` for startup verification of the signed helper. Packaged sync and account operations still require manager wiring to use this entry point.
+> The desktop app uses the live manager by default and runs sync and account operations with the verified bundled rclone helper. The desktop executable also serves as the account credential helper. The manager publishes the status used by the embedded Finder extension.
 >
 > **Verification status:** Ad hoc local packaging (`packaging/build-app.sh`) and deep strict signature verification (`codesign --verify --deep --strict`) are verified locally on macOS `arm64`. Developer ID signing, Apple notarization, stapling, Gatekeeper assessment on a second Mac, and production upgrade/rollback pilots require an Apple Developer account and are owner-only release steps.
 
@@ -100,10 +100,10 @@ Credentials, Apple IDs, app-specific passwords, and Team IDs are **never** store
      --keychain-profile "foldersync-notary"
    ```
    `packaging/notarize.sh` takes only the Keychain profile NAME, verifies `codesign --verify --deep --strict`, refuses ad hoc bundles or bundles without Hardened Runtime, creates `target/package/FolderSync-notarize.zip` with `ditto -c -k --keepParent`, submits via `xcrun notarytool submit --keychain-profile <name> --wait`, staples and validates with `xcrun stapler`, and runs `spctl --assess --type execute --verbose=4`.
-4. **Operational verification on a second Mac (after manager integration of the bundled helper):**
+4. **Operational verification on a second Mac:**
    - Copy the notarized `FolderSync.app` to `/Applications` on a clean Mac without developer tools.
    - Verify Gatekeeper opens the app without quarantine bypasses.
-   - Verify filesystem access from the installed `.app` and `Contents/Helpers/rclone` to internal folders, protected folders, and an external APFS volume (plan §19), verify installed-app Keychain credentials and notifications, and enable `FolderSync Finder` in System Settings to verify live root badges and context menu actions end to end.
+   - Follow the [installed-app qualification checklist](qualification.md#3-packaged-desktop-app--finder-sync-acceptance-owner-only-plan-19-20) for filesystem access, Keychain credentials, Attention, and the `FolderSync Finder` extension.
 
 ## Credentials and Privacy Boundaries (Plan §19)
 
@@ -118,7 +118,7 @@ Upgrade the application and bundled `rclone` engine deliberately:
 1. **Stop scheduling and drain active jobs:** Pause scheduling and let any active run finish cleanly (or stop it explicitly), then quit FolderSync so the exclusive OS state lock (`manager.lock`) is released.
 2. **Create a consistent local state checkpoint:** With all writers stopped, back up `~/Library/Application Support/FolderSync/` (`state.sqlite`, `accounts/`, `mappings/` including opaque `bisync/` workdirs, `runs/`, and `recovery-records/`) together as one unit. Never copy bisync state from another computer.
 3. **Verify compatibility:** Confirm SQLite schema migrations (`schema_migrations` is forward-only; opening a newer DB with an older binary fails explicitly rather than downgrading silently) and rclone bisync listing compatibility for the new pinned `rclone` version.
-4. **Re-run qualification:** Run `tests/qualification/run-local.sh`, CI, and (for engine or backend changes) the owner Drive qualification suite (`tests/qualification/run-drive.sh`) before distribution.
+4. **Re-run qualification:** Run `tests/qualification/run-local.sh` and CI. For engine or backend changes, complete the [owner Drive qualification checks](qualification.md#1-real-google-drive-qualification-testsqualificationrun-drivesh) before distribution.
 5. **Pilot before rollout:** Test the new bundle on one disposable mapping first, then one real mapping, before rolling out to other household computers.
 
 ### Rollback Procedure
