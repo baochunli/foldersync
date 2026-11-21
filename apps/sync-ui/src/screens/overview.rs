@@ -252,6 +252,20 @@ fn volume_group_card(
 
     let meta_block = if missing {
         let last_seen = vol.last_seen_label.as_deref().unwrap_or("earlier");
+        let all_paused = !rows.is_empty()
+            && rows
+                .iter()
+                .all(|m| m.state.intent == sync_core::Intent::Paused);
+        let any_paused = rows
+            .iter()
+            .any(|m| m.state.intent == sync_core::Intent::Paused);
+        let reconnect_note = if all_paused {
+            format!("Last seen {last_seen} · paused mappings stay paused when it returns")
+        } else if any_paused {
+            format!("Last seen {last_seen} · connect it to continue unpaused mappings")
+        } else {
+            format!("Last seen {last_seen} · connect it and sync continues on its own")
+        };
         view()
             .flex_1()
             .flex_col()
@@ -273,13 +287,7 @@ fn volume_group_card(
                         Tone::Attn,
                     )),
             )
-            .child(
-                text(format!(
-                    "Last seen {last_seen} · connect it and sync continues on its own"
-                ))
-                .text_size(px(12.0))
-                .text_color(p.attn),
-            )
+            .child(text(reconnect_note).text_size(px(12.0)).text_color(p.attn))
     } else {
         view()
             .flex_1()
@@ -406,7 +414,8 @@ fn mapping_row(
     let path_tid = format!("path-{}", m.id);
     let col_identity = table_cell()
         .flex_1()
-        .min_w(px(180.0))
+        .min_w(px(140.0))
+        .overflow_hidden()
         .flex_row()
         .items_center()
         .gap(px(10.0))
@@ -416,6 +425,7 @@ fn mapping_row(
                 .flex_col()
                 .gap(px(1.0))
                 .flex_1()
+                .min_w(px(0.0))
                 .child(if is_draft {
                     text(m.display_name.clone())
                         .text_size(px(13.5))
@@ -436,7 +446,7 @@ fn mapping_row(
     // Column 2: status pill + status line + why/next line + optional thin indeterminate bar
     let mut col_status = table_cell()
         .flex_1()
-        .min_w(px(200.0))
+        .min_w(px(155.0))
         .overflow_hidden()
         .flex_col()
         .gap(px(3.0));
@@ -506,20 +516,20 @@ fn mapping_row(
 
     // Column 3: last completed timestamp
     let col_last = table_cell()
-        .w(px(120.0))
+        .w(px(96.0))
         .flex_none()
         .flex_col()
         .gap(px(1.0))
         .child(
             text(m.last_completed_label.clone())
-                .text_size(px(12.5))
+                .text_size(px(12.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(p.fg)
                 .tabular_nums(),
         )
         .child(if m.last_completed_label != "Never" {
             text("last completed")
-                .text_size(px(11.5))
+                .text_size(px(11.0))
                 .text_color(p.muted)
                 .into_element()
         } else {
@@ -528,9 +538,10 @@ fn mapping_row(
 
     // Column 4: action buttons (§6 table)
     let mut col_actions = table_cell()
-        .w(px(210.0))
+        .w(px(164.0))
         .flex_none()
         .flex_row()
+        .flex_wrap()
         .items_center()
         .justify_end()
         .gap(px(6.0));
@@ -653,8 +664,8 @@ fn mapping_row(
         .w_full()
         .flex_row()
         .items_center()
-        .gap(px(12.0))
-        .px(px(16.0))
+        .gap(px(10.0))
+        .px(px(12.0))
         .py(px(11.0))
         .min_h(px(52.0))
         .hover(move |s| s.bg(p.sunk.opacity(0.65)))

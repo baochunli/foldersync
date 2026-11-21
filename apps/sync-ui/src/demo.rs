@@ -417,6 +417,15 @@ impl DemoSource {
             UiCommand::SetOpenAtLogin(enabled) => {
                 snap.preferences.open_at_login = enabled;
                 snap.preferences.open_at_login_pending = false;
+                let state_str = if enabled { "enabled" } else { "disabled" };
+                self.push_event(
+                    &mut snap,
+                    "14:46",
+                    format!(
+                        "Open at login {state_str} (demo state only; macOS Login Items unchanged)"
+                    ),
+                    None,
+                );
             }
             UiCommand::SetNotifications(enabled) => {
                 snap.preferences.notifications_enabled = enabled;
@@ -425,10 +434,21 @@ impl DemoSource {
                 snap.preferences.bandwidth_limit_mb_s = limit;
             }
             UiCommand::WizardSetStep(step) => {
-                snap.wizard.step = step;
+                recompute_wizard_checks(&mut snap);
+                if snap.wizard.can_visit_step(step) {
+                    snap.wizard.step = step;
+                }
             }
             UiCommand::WizardSelectAccount(acct) => {
                 snap.wizard.selected_account = acct;
+                snap.wizard.no_other_sync_confirmed = false;
+                snap.wizard.cloud_recovery_path = format!(
+                    "{}:Recovery/{}/{}",
+                    snap.wizard.selected_account,
+                    snap.wizard.selected_folder.to_ascii_lowercase(),
+                    snap.device_id
+                );
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSelectFolder(folder) => {
                 snap.wizard.selected_folder = folder.clone();
@@ -441,27 +461,15 @@ impl DemoSource {
                     folder.to_ascii_lowercase(),
                     snap.device_id
                 );
-                snap.wizard.location_checks = evaluate_location_checks(&snap.wizard.local_path);
+                snap.wizard.no_other_sync_confirmed = false;
+                sync_wizard_volume_from_path(&mut snap);
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSetLocalPath(path) => {
-                snap.wizard.local_path = path.clone();
-                snap.wizard.location_checks = evaluate_location_checks(&path);
-                if path.starts_with("/Volumes/ArchiveSSD") {
-                    snap.wizard.volume_name = "ArchiveSSD".to_owned();
-                    snap.wizard.volume_kind = VolumeKind::External;
-                    snap.wizard.volume_free_gb = 260;
-                    snap.wizard.volume_total_gb = 8000;
-                } else if path.starts_with("~/") || path.starts_with("/Users/") {
-                    snap.wizard.volume_name = "Internal SSD".to_owned();
-                    snap.wizard.volume_kind = VolumeKind::Internal;
-                    snap.wizard.volume_free_gb = 212;
-                    snap.wizard.volume_total_gb = 994;
-                } else {
-                    snap.wizard.volume_name = "WorkSSD".to_owned();
-                    snap.wizard.volume_kind = VolumeKind::External;
-                    snap.wizard.volume_free_gb = 1400;
-                    snap.wizard.volume_total_gb = 2000;
-                }
+                snap.wizard.local_path = path;
+                snap.wizard.no_other_sync_confirmed = false;
+                sync_wizard_volume_from_path(&mut snap);
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardToggleSubfolder(sub_id) => {
                 if sub_id == "root" {
@@ -479,6 +487,8 @@ impl DemoSource {
                 {
                     node.included = !node.included;
                 }
+                snap.wizard.no_other_sync_confirmed = false;
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardToggleDefaultExclusions => {
                 snap.wizard.show_default_exclusions = !snap.wizard.show_default_exclusions;
@@ -487,18 +497,24 @@ impl DemoSource {
                 let trimmed = pattern.trim().to_owned();
                 if !trimmed.is_empty() && !snap.wizard.custom_patterns.contains(&trimmed) {
                     snap.wizard.custom_patterns.push(trimmed);
+                    snap.wizard.no_other_sync_confirmed = false;
                 }
             }
             UiCommand::WizardSetLocalRecoveryPath(path) => {
                 snap.wizard.local_recovery_path = path;
+                snap.wizard.no_other_sync_confirmed = false;
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSetReviewScenario(scenario) => {
                 snap.wizard.review_scenario = scenario;
+                snap.wizard.no_other_sync_confirmed = false;
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSetNoOtherSyncConfirmed(confirmed) => {
                 snap.wizard.no_other_sync_confirmed = confirmed;
             }
             UiCommand::WizardStartFirstSync => {
+                recompute_wizard_checks(&mut snap);
                 if snap.wizard.can_start_first_sync() {
                     snap.wizard.step = WizardStep::FirstSync;
                     snap.wizard.first_sync_percent = 33;
@@ -520,20 +536,19 @@ impl DemoSource {
                     .count()
                     <= 1;
                 snap.wizard = default_wizard_draft(skip_acct);
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::DemoSetActivityPhase(phase) => {
+                // Always keep the previewed active run consistent with its real mapping_id (`research`).
                 if let Some(run) = &mut snap.active_run {
+                    let target_id = run.mapping_id.clone();
                     match phase {
                         DemoActivityPhase::Scanning => {
-                            run.mapping_name = "Research".to_owned();
-                            run.volume_name = "WorkSSD".to_owned();
                             run.phase = RunPhase::Scanning {
                                 elapsed_secs: 3 * 60 + 12,
                             };
                         }
                         DemoActivityPhase::TransferringKnown => {
-                            run.mapping_name = "Family".to_owned();
-                            run.volume_name = "Internal SSD".to_owned();
                             run.phase = RunPhase::TransferringKnown {
                                 transferred_label: "1.2 GB".to_owned(),
                                 total_label: "3.4 GB".to_owned(),
@@ -542,24 +557,70 @@ impl DemoSource {
                             };
                         }
                         DemoActivityPhase::TransferringUnknown => {
-                            run.mapping_name = "Photos-Family".to_owned();
-                            run.volume_name = "PhotoSSD".to_owned();
                             run.phase = RunPhase::TransferringUnknown {
                                 transferred_label: "820 MB".to_owned(),
                                 elapsed_secs: 6 * 60 + 5,
                             };
                         }
                         DemoActivityPhase::Stopping => {
-                            run.mapping_name = "Research".to_owned();
-                            run.volume_name = "WorkSSD".to_owned();
                             run.phase = RunPhase::Stopping { elapsed_secs: 24 };
                         }
+                    }
+                    if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == target_id) {
+                        m.state.execution = if matches!(phase, DemoActivityPhase::Stopping) {
+                            Execution::Stopping
+                        } else {
+                            Execution::Running
+                        };
+                        m.available_actions = available_actions(&m.state);
                     }
                 }
             }
             UiCommand::DemoStepMappingState(id) => {
+                let mut stepped_info = None;
                 if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == id) {
                     step_mapping_demo_state(m);
+                    stepped_info = Some((
+                        m.id.clone(),
+                        m.display_name.clone(),
+                        m.volume_name.clone(),
+                        m.state.execution,
+                    ));
+                }
+                if let Some((mid, name, vol_name, exec)) = stepped_info {
+                    match exec {
+                        Execution::Running => {
+                            snap.active_run = Some(ActiveRunSnapshot {
+                                run_id: RunId::new(format!("run-demo-{mid}")),
+                                mapping_id: mid,
+                                mapping_name: name,
+                                volume_name: vol_name,
+                                started_label: "14:46".to_owned(),
+                                trigger_label: "demo preview".to_owned(),
+                                phase: RunPhase::Scanning { elapsed_secs: 64 },
+                            });
+                        }
+                        Execution::Stopping => {
+                            snap.active_run = Some(ActiveRunSnapshot {
+                                run_id: RunId::new(format!("run-demo-{mid}")),
+                                mapping_id: mid,
+                                mapping_name: name,
+                                volume_name: vol_name,
+                                started_label: "14:46".to_owned(),
+                                trigger_label: "demo preview".to_owned(),
+                                phase: RunPhase::Stopping { elapsed_secs: 24 },
+                            });
+                        }
+                        _ => {
+                            if snap
+                                .active_run
+                                .as_ref()
+                                .is_some_and(|r| r.mapping_id == mid)
+                            {
+                                snap.active_run = None;
+                            }
+                        }
+                    }
                 }
                 rebuild_attention(&mut snap);
             }
@@ -574,6 +635,10 @@ impl DemoSource {
                         }
                     }
                 }
+            }
+            UiCommand::DemoAction(msg) => {
+                snap.status_notice = Some(msg.clone());
+                self.push_event(&mut snap, "14:46", msg, None);
             }
             UiCommand::RequestControlledQuit => {
                 snap.scheduling_paused = true;
@@ -609,49 +674,227 @@ impl DemoSource {
     }
 }
 
-/// Evaluates Location step checks against the chosen path (pure demo validation).
-pub fn evaluate_location_checks(path: &str) -> Vec<LocationCheck> {
+fn normalize_path(path: &str) -> String {
     let trimmed = path.trim();
-    let is_volume_root = trimmed == "/"
-        || trimmed == "/Volumes/WorkSSD"
-        || trimmed == "/Volumes/ArchiveSSD"
-        || trimmed == "/Volumes/PhotoSSD";
-    let overlaps = trimmed == "~/FolderSync/Documents"
-        || trimmed == "~/FolderSync/Family"
-        || trimmed == "/Volumes/WorkSSD/Research";
+    if trimmed == "/" {
+        "/".to_owned()
+    } else {
+        trimmed.trim_end_matches('/').to_owned()
+    }
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let na = normalize_path(a);
+    let nb = normalize_path(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    na == nb
+        || na.starts_with(&format!("{nb}/"))
+        || nb.starts_with(&format!("{na}/"))
+        || na == "/"
+        || nb == "/"
+}
+
+fn is_volume_root(path: &str) -> bool {
+    let norm = normalize_path(path);
+    if norm == "/" || norm == "/Volumes" {
+        return true;
+    }
+    if let Some(rest) = norm.strip_prefix("/Volumes/") {
+        return !rest.is_empty() && !rest.contains('/');
+    }
+    false
+}
+
+fn resolve_volume_for_path<'a>(
+    path: &str,
+    volumes: &'a [VolumeSnapshot],
+) -> Option<&'a VolumeSnapshot> {
+    let norm = normalize_path(path);
+    if let Some(rest) = norm.strip_prefix("/Volumes/") {
+        let vol_name = rest.split('/').next().unwrap_or("");
+        return volumes.iter().find(|v| v.display_name == vol_name);
+    }
+    volumes
+        .iter()
+        .find(|v| v.identity.kind == VolumeKind::Internal)
+}
+
+fn sync_wizard_volume_from_path(snap: &mut UiSnapshot) {
+    if let Some(vol) = resolve_volume_for_path(&snap.wizard.local_path, &snap.volumes).cloned() {
+        snap.wizard.volume_name = vol.display_name;
+        snap.wizard.volume_kind = vol.identity.kind;
+        snap.wizard.volume_fs = vol.filesystem;
+        snap.wizard.volume_free_gb = vol.free_gb;
+        snap.wizard.volume_total_gb = vol.total_gb;
+    }
+}
+
+fn recompute_wizard_checks(snap: &mut UiSnapshot) {
+    let included_gb = snap.wizard.included_gb();
+    snap.wizard.location_checks = evaluate_location_checks(
+        &snap.wizard.local_path,
+        &snap.mappings,
+        &snap.volumes,
+        included_gb,
+        snap.wizard.review_scenario,
+    );
+    snap.wizard.recovery_checks = evaluate_recovery_checks(
+        &snap.wizard.local_recovery_path,
+        &snap.wizard.local_path,
+        &snap.mappings,
+        &snap.volumes,
+    );
+}
+
+/// Evaluates Location step checks against the chosen path and demo fixtures.
+pub fn evaluate_location_checks(
+    path: &str,
+    mappings: &[MappingSnapshot],
+    volumes: &[VolumeSnapshot],
+    included_gb: f64,
+    review_scenario: ReviewScenario,
+) -> Vec<LocationCheck> {
+    let norm = normalize_path(path);
+    let vol_root = is_volume_root(&norm);
+    let resolved_vol = resolve_volume_for_path(&norm, volumes);
+    let vol_connected = resolved_vol.is_some_and(|v| v.connected);
+    let vol_name = resolved_vol
+        .map(|v| v.display_name.as_str())
+        .unwrap_or("the target volume");
+
+    let overlapping = mappings
+        .iter()
+        .filter(|m| !m.is_variant_showcase)
+        .find(|m| paths_overlap(&norm, &m.local_path));
+
+    let exists_and_empty_ok =
+        !norm.is_empty() && vol_connected && review_scenario != ReviewScenario::BothPopulated;
+    let exists_and_empty_msg = if norm.is_empty() {
+        "Choose a local folder before continuing.".to_owned()
+    } else if !vol_connected {
+        format!("{vol_name} is not connected in this demo snapshot. Choose a connected volume.")
+    } else if review_scenario == ReviewScenario::BothPopulated {
+        "Both the local folder and cloud folder already contain files. Choose an empty local folder.".to_owned()
+    } else {
+        "Folder exists and contains no files (per demo fixture).".to_owned()
+    };
+
+    let enough_space_ok =
+        resolved_vol.is_some_and(|v| v.connected && (v.free_gb as f64) >= included_gb);
+    let space_msg = match resolved_vol {
+        Some(v) if !v.connected => {
+            format!(
+                "Free space on {} is unknown while the drive is not connected.",
+                v.display_name
+            )
+        }
+        Some(v) if (v.free_gb as f64) < included_gb => format!(
+            "{} has {} free, which is less than the {:.1} GB selected.",
+            v.display_name, v.free_label, included_gb
+        ),
+        Some(v) => format!(
+            "{} has {} free for about {:.1} GB selected.",
+            v.display_name, v.free_label, included_gb
+        ),
+        None => "Target volume is not recognized in demo volumes.".to_owned(),
+    };
 
     vec![
         LocationCheck {
-            ok: !trimmed.is_empty(),
-            message: "Folder exists and contains no files.".to_owned(),
+            ok: exists_and_empty_ok,
+            message: exists_and_empty_msg,
         },
         LocationCheck {
-            ok: !overlaps,
-            message: if overlaps {
-                format!("{trimmed} overlaps with an existing mapping. Choose a separate folder.")
-            } else {
-                "Not inside another mapping, and no mapping is inside it.".to_owned()
+            ok: overlapping.is_none(),
+            message: match overlapping {
+                Some(m) => format!(
+                    "{norm} overlaps with existing mapping “{}” ({}). Choose a separate folder.",
+                    m.display_name, m.local_path
+                ),
+                None => "Not inside another mapping, and no mapping is inside it.".to_owned(),
             },
         },
         LocationCheck {
-            ok: !is_volume_root,
-            message: if is_volume_root {
+            ok: !vol_root,
+            message: if vol_root {
                 format!(
-                    "{trimmed} is the top of the volume. Choose or create a folder inside it, such as {trimmed}/Projects."
+                    "{norm} is the top of the volume. Choose or create a folder inside it, such as {norm}/Projects."
                 )
             } else {
                 "Not the top of the volume.".to_owned()
             },
         },
         LocationCheck {
+            ok: enough_space_ok,
+            message: space_msg,
+        },
+        LocationCheck {
             ok: true,
             message: "No folder of another sync app was detected.".to_owned(),
         },
         LocationCheck {
-            ok: true,
-            message:
-                "Volume identity recorded. When WorkSSD is reconnected, sync continues without asking."
-                    .to_owned(),
+            ok: vol_connected,
+            message: if vol_connected {
+                format!(
+                    "Volume identity recorded. When {vol_name} is reconnected, sync continues without asking."
+                )
+            } else {
+                format!("Cannot record volume identity while {vol_name} is not connected.")
+            },
+        },
+    ]
+}
+
+/// Evaluates Recovery step checks against the chosen local recovery path and demo fixtures.
+pub fn evaluate_recovery_checks(
+    local_recovery_path: &str,
+    draft_local_path: &str,
+    mappings: &[MappingSnapshot],
+    volumes: &[VolumeSnapshot],
+) -> Vec<LocationCheck> {
+    let norm = normalize_path(local_recovery_path);
+    let vol_root = is_volume_root(&norm);
+    let resolved_vol = resolve_volume_for_path(&norm, volumes);
+    let vol_connected = resolved_vol.is_some_and(|v| v.connected);
+
+    let overlaps_draft =
+        !draft_local_path.trim().is_empty() && paths_overlap(&norm, draft_local_path);
+    let overlaps_existing = mappings
+        .iter()
+        .filter(|m| !m.is_variant_showcase)
+        .find(|m| paths_overlap(&norm, &m.local_path));
+
+    let outside_ok =
+        !norm.is_empty() && !vol_root && !overlaps_draft && overlaps_existing.is_none();
+    let outside_msg = if norm.is_empty() {
+        "Choose a local recovery folder outside every synced folder.".to_owned()
+    } else if vol_root {
+        format!("{norm} is the top of a volume. Choose a recovery subfolder inside it.")
+    } else if overlaps_draft {
+        "Local recovery folder must be outside the folder being set up.".to_owned()
+    } else if let Some(m) = overlaps_existing {
+        format!(
+            "Local recovery folder overlaps existing mapping “{}” ({}). Choose another location.",
+            m.display_name, m.local_path
+        )
+    } else {
+        "Outside every synced folder.".to_owned()
+    };
+
+    vec![
+        LocationCheck {
+            ok: outside_ok,
+            message: outside_msg,
+        },
+        LocationCheck {
+            ok: vol_connected && !norm.is_empty(),
+            message: if vol_connected && !norm.is_empty() {
+                "Target volume is connected and writable (per demo fixture).".to_owned()
+            } else {
+                "Local recovery folder must be on a connected volume.".to_owned()
+            },
         },
     ]
 }
@@ -756,7 +999,7 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         },
         selected_account: AccountId::new("household"),
         selected_folder: "Projects".to_owned(),
-        location_checks: evaluate_location_checks(&local_path),
+        location_checks: Vec::new(),
         local_path,
         volume_name: "WorkSSD".to_owned(),
         volume_kind: VolumeKind::External,
@@ -814,6 +1057,7 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         show_default_exclusions: false,
         local_recovery_path: "/Volumes/WorkSSD/FolderSyncRecovery/Projects".to_owned(),
         cloud_recovery_path: "household:Recovery/projects/studio-mac".to_owned(),
+        recovery_checks: Vec::new(),
         review_scenario: ReviewScenario::CloudToLocal,
         no_other_sync_confirmed: false,
         first_sync_percent: 33,
@@ -1703,6 +1947,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
         reconnecting_account: None,
         status_notice: None,
     };
+    recompute_wizard_checks(&mut snap);
     rebuild_attention(&mut snap);
     snap
 }

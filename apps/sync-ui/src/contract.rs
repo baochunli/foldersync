@@ -900,6 +900,7 @@ pub struct WizardDraft {
     pub show_default_exclusions: bool,
     pub local_recovery_path: String,
     pub cloud_recovery_path: String,
+    pub recovery_checks: Vec<LocationCheck>,
     pub review_scenario: ReviewScenario,
     pub no_other_sync_confirmed: bool,
     pub first_sync_percent: u8,
@@ -936,12 +937,34 @@ impl WizardDraft {
 
     /// Whether Location step checks all pass.
     pub fn location_valid(&self) -> bool {
-        self.location_checks.iter().all(|c| c.ok)
+        !self.location_checks.is_empty() && self.location_checks.iter().all(|c| c.ok)
+    }
+
+    /// Whether Recovery step checks all pass.
+    pub fn recovery_valid(&self) -> bool {
+        !self.recovery_checks.is_empty() && self.recovery_checks.iter().all(|c| c.ok)
+    }
+
+    /// Whether the user may jump to `target` without skipping past a failing step.
+    pub fn can_visit_step(&self, target: WizardStep) -> bool {
+        if target <= WizardStep::Location {
+            return true;
+        }
+        if !self.location_valid() {
+            return false;
+        }
+        if target > WizardStep::Recovery && !self.recovery_valid() {
+            return false;
+        }
+        true
     }
 
     /// Whether the Start first sync button may be enabled.
     pub fn can_start_first_sync(&self) -> bool {
-        self.review_scenario != ReviewScenario::BothPopulated && self.no_other_sync_confirmed
+        self.location_valid()
+            && self.recovery_valid()
+            && self.review_scenario != ReviewScenario::BothPopulated
+            && self.no_other_sync_confirmed
     }
 }
 
@@ -1135,8 +1158,48 @@ pub enum UiCommand {
     DemoStepMappingState(MappingId),
     /// Advance throttled demo elapsed timer by 1 second (no filesystem mutation).
     DemoTickElapsed,
+    /// Record a simulated system action (Reveal, Open URL, Export) in Activity without touching the OS.
+    DemoAction(String),
     /// Controlled quit handler (no-op against demo data; marks active run stopping).
     RequestControlledQuit,
+}
+
+/// Determines whether the main window should be shown at launch when
+/// `nsh.json` starts it hidden (`defaultVisible: false`, spec §3).
+///
+/// Always shows when no account or mapping exists yet (Welcome flow) or on a
+/// manual launch; stays hidden in the menu bar on a login launch when mappings
+/// are already configured.
+pub fn should_show_window_at_launch(snap: &UiSnapshot, launched_at_login: bool) -> bool {
+    snap.accounts.is_empty() || snap.mappings.is_empty() || !launched_at_login
+}
+
+/// Returns the mapping targeted by `⌘R` (Sync now): only the currently displayed
+/// mapping in `MappingDetail` when its `Sync now` action is enabled; `None` otherwise (§8).
+pub fn selected_sync_now_target(route: &ScreenRoute, snap: &UiSnapshot) -> Option<MappingId> {
+    let ScreenRoute::MappingDetail(id) = route else {
+        return None;
+    };
+    let m = snap.mapping(id)?;
+    let pres = m.presented_status(snap.active_run.as_ref());
+    pres.sync_now_enabled.then(|| id.clone())
+}
+
+/// Returns the mapping targeted by `⌘.` (Stop): only the displayed running mapping
+/// in `MappingDetail` or the active running mapping displayed on `Activity`.
+pub fn selected_stop_target(route: &ScreenRoute, snap: &UiSnapshot) -> Option<MappingId> {
+    match route {
+        ScreenRoute::MappingDetail(id) => {
+            let m = snap.mapping(id)?;
+            (m.state.execution == Execution::Running).then(|| id.clone())
+        }
+        ScreenRoute::Activity => snap
+            .active_run
+            .as_ref()
+            .filter(|r| !matches!(r.phase, RunPhase::Stopping { .. }))
+            .map(|r| r.mapping_id.clone()),
+        _ => None,
+    }
 }
 
 /// Progress display variants on the Activity screen (§5.5).

@@ -18,9 +18,11 @@ use nsh_core::{
     },
     prelude::*,
 };
-use sync_core::{Execution, Intent, Readiness};
 
-use crate::contract::{ScreenRoute, UiCommand};
+use crate::contract::{
+    ScreenRoute, UiCommand, selected_stop_target, selected_sync_now_target,
+    should_show_window_at_launch,
+};
 use crate::demo::DemoSource;
 use crate::screens::{
     AppController, accounts::accounts_view, activity::activity_view, attention::attention_view,
@@ -54,6 +56,18 @@ pub fn App() -> impl IntoElement {
     win.on_close_press(move |_| {
         main_window().hide();
     });
+
+    // Spec §3: `nsh.json` starts the window hidden (`defaultVisible: false`).
+    // Show it when no account or mapping exists yet, or on a manual launch (not a login launch).
+    let launched_at_login = std::env::args().any(|a| a == "--login-launch")
+        || std::env::var_os("FOLDERSYNC_LOGIN_LAUNCH").is_some();
+    if ctrl
+        .snapshot
+        .with_untracked(|s| should_show_window_at_launch(s, launched_at_login))
+    {
+        main_window().show();
+        main_window().focus();
+    }
 
     // Controlled shutdown handler shared by tray Quit, ⌘Q, and system quit (§5.9).
     set_quit_request_options(
@@ -95,6 +109,7 @@ pub fn App() -> impl IntoElement {
                     MenuItem::new(status_line).disabled(true),
                     MenuItem::separator(),
                     MenuItem::new("Show window").on_select(|| {
+                        main_window().show();
                         main_window().focus();
                     }),
                     MenuItem::new("Sync ready mappings")
@@ -119,98 +134,102 @@ pub fn App() -> impl IntoElement {
     }
 
     // Application menu providing keyboard shortcuts while the window is active (§8):
-    // ⌘N Add mapping…, ⌘R Sync now, ⌘. Stop, ⌘, Preferences.
+    // ⌘N Add mapping…, ⌘R Sync now (selected mapping only), ⌘. Stop (displayed run), ⌘, Preferences.
     {
         let c_menu = ctrl.clone();
-        let c_add = c_menu.clone();
-        let c_sync = c_menu.clone();
-        let c_stop = c_menu.clone();
-        let c_prefs = c_menu.clone();
-        let c_quit = c_menu.clone();
+        effect(move || {
+            let route = c_menu.route.get();
+            let snap = c_menu.snapshot.get();
+            let sync_target = selected_sync_now_target(&route, &snap);
+            let stop_target = selected_stop_target(&route, &snap);
 
-        set_application_menu(vec![
-            MenuItem::submenu(
-                "FolderSync",
-                [
-                    MenuItem::role(MenuRole::About),
-                    MenuItem::separator(),
-                    MenuItem::new("Preferences…")
-                        .shortcut("mod+,")
-                        .on_select(move || {
-                            c_prefs.navigate(ScreenRoute::Preferences);
-                        }),
-                    MenuItem::separator(),
-                    MenuItem::role(MenuRole::Hide),
-                    MenuItem::role(MenuRole::HideOthers),
-                    MenuItem::role(MenuRole::ShowAll),
-                    MenuItem::separator(),
-                    MenuItem::new("Quit FolderSync")
-                        .shortcut("mod+q")
-                        .on_select(move || {
-                            c_quit.request_controlled_quit();
-                        }),
-                ],
-            ),
-            MenuItem::submenu(
-                "Mappings",
-                [
-                    MenuItem::new("Add mapping…")
-                        .shortcut("mod+n")
-                        .on_select(move || {
-                            c_add.open_wizard();
-                        }),
-                    MenuItem::new("Sync now")
-                        .shortcut("mod+r")
-                        .on_select(move || {
-                            let target = match c_sync.route.get_untracked() {
-                                ScreenRoute::MappingDetail(id) => Some(id),
-                                _ => c_sync.snapshot.with_untracked(|s| {
-                                    s.mappings
-                                        .iter()
-                                        .find(|m| {
-                                            !m.is_variant_showcase
-                                                && m.state.readiness() == Readiness::Ready
-                                                && m.state.execution == Execution::Idle
-                                                && m.state.intent == Intent::Enabled
-                                        })
-                                        .map(|m| m.id.clone())
-                                }),
-                            };
-                            if let Some(id) = target {
-                                c_sync.send(UiCommand::SyncNow(id));
-                            }
-                        }),
-                    MenuItem::new("Stop").shortcut("mod+.").on_select(move || {
-                        let active = c_stop.snapshot.with_untracked(|s| {
-                            s.active_run.as_ref().map(|r| r.mapping_id.clone())
-                        });
-                        if let Some(id) = active {
-                            c_stop.send(UiCommand::StopRun(id));
-                        }
-                    }),
-                ],
-            ),
-            MenuItem::submenu(
-                "Edit",
-                [
-                    MenuItem::role(MenuRole::Undo),
-                    MenuItem::role(MenuRole::Redo),
-                    MenuItem::separator(),
-                    MenuItem::role(MenuRole::Cut),
-                    MenuItem::role(MenuRole::Copy),
-                    MenuItem::role(MenuRole::Paste),
-                    MenuItem::role(MenuRole::SelectAll),
-                ],
-            ),
-            MenuItem::submenu(
-                "Window",
-                [
-                    MenuItem::role(MenuRole::Minimize),
-                    MenuItem::role(MenuRole::Zoom),
-                    MenuItem::role(MenuRole::Close),
-                ],
-            ),
-        ]);
+            let c_add = c_menu.clone();
+            let c_sync = c_menu.clone();
+            let c_stop = c_menu.clone();
+            let c_prefs = c_menu.clone();
+            let c_quit = c_menu.clone();
+
+            let sync_disabled = sync_target.is_none();
+            let stop_disabled = stop_target.is_none();
+
+            set_application_menu(vec![
+                MenuItem::submenu(
+                    "FolderSync",
+                    [
+                        MenuItem::role(MenuRole::About),
+                        MenuItem::separator(),
+                        MenuItem::new("Preferences…")
+                            .shortcut("mod+,")
+                            .on_select(move || {
+                                c_prefs.navigate(ScreenRoute::Preferences);
+                            }),
+                        MenuItem::separator(),
+                        MenuItem::role(MenuRole::Hide),
+                        MenuItem::role(MenuRole::HideOthers),
+                        MenuItem::role(MenuRole::ShowAll),
+                        MenuItem::separator(),
+                        MenuItem::new("Quit FolderSync")
+                            .shortcut("mod+q")
+                            .on_select(move || {
+                                c_quit.request_controlled_quit();
+                            }),
+                    ],
+                ),
+                MenuItem::submenu(
+                    "Mappings",
+                    [
+                        MenuItem::new("Add mapping…")
+                            .shortcut("mod+n")
+                            .on_select(move || {
+                                c_add.open_wizard();
+                            }),
+                        MenuItem::new("Sync now")
+                            .shortcut("mod+r")
+                            .disabled(sync_disabled)
+                            .on_select(move || {
+                                if let Some(id) = sync_target.clone() {
+                                    c_sync.send(UiCommand::SyncNow(id));
+                                }
+                            }),
+                        MenuItem::new("Stop")
+                            .shortcut("mod+.")
+                            .disabled(stop_disabled)
+                            .on_select(move || {
+                                if let Some(id) = stop_target.clone() {
+                                    c_stop.send(UiCommand::StopRun(id));
+                                }
+                            }),
+                    ],
+                ),
+                MenuItem::submenu(
+                    "Edit",
+                    [
+                        MenuItem::role(MenuRole::Undo),
+                        MenuItem::role(MenuRole::Redo),
+                        MenuItem::separator(),
+                        MenuItem::role(MenuRole::Cut),
+                        MenuItem::role(MenuRole::Copy),
+                        MenuItem::role(MenuRole::Paste),
+                        MenuItem::role(MenuRole::SelectAll),
+                    ],
+                ),
+                MenuItem::submenu(
+                    "Window",
+                    [
+                        MenuItem::new("Show window")
+                            .shortcut("mod+0")
+                            .on_select(|| {
+                                main_window().show();
+                                main_window().focus();
+                            }),
+                        MenuItem::separator(),
+                        MenuItem::role(MenuRole::Minimize),
+                        MenuItem::role(MenuRole::Zoom),
+                        MenuItem::role(MenuRole::Close),
+                    ],
+                ),
+            ]);
+        });
     }
 
     // Throttled 1 Hz progress refresh (~1 update/sec per §5.5 & §16).
@@ -252,7 +271,7 @@ pub fn App() -> impl IntoElement {
                     scroll().flex_1().w_full().child(
                         view()
                             .w_full()
-                            .px(px(26.0))
+                            .px(px(20.0))
                             .pt(px(8.0))
                             .pb(px(32.0))
                             .child(dynamic(move || match c_content.route.get() {
@@ -392,5 +411,110 @@ mod tests {
         let s3 = demo.dispatch(UiCommand::SetSchedulingPaused(true));
         assert!(s3.scheduling_paused);
         assert_eq!(s3.tray_status_line(), "Scheduling paused");
+    }
+
+    #[test]
+    fn wizard_gating_blocks_invalid_steps_and_resets_consent_on_plan_change() {
+        use crate::contract::WizardStep;
+        let demo = DemoSource::new(DemoPreset::AllStates);
+
+        // Fail location check (volume root) -> cannot jump past Location to Review and cannot Start.
+        let s = demo.dispatch(UiCommand::WizardSetLocalPath("/Volumes/WorkSSD".to_owned()));
+        assert!(!s.wizard.location_valid());
+        assert!(!s.wizard.can_visit_step(WizardStep::Subfolders));
+        assert!(!s.wizard.can_visit_step(WizardStep::Review));
+        let jumped = demo.dispatch(UiCommand::WizardSetStep(WizardStep::Review));
+        assert_ne!(jumped.wizard.step, WizardStep::Review);
+
+        // Fail location check via nested overlap inside an existing mapping.
+        let overlap = demo.dispatch(UiCommand::WizardSetLocalPath(
+            "~/FolderSync/Documents/Nested".to_owned(),
+        ));
+        assert!(!overlap.wizard.location_valid());
+
+        // Restore valid path, confirm consent, then verify changing recovery path resets consent.
+        let valid = demo.dispatch(UiCommand::WizardSetLocalPath(
+            "/Volumes/WorkSSD/Projects".to_owned(),
+        ));
+        assert!(valid.wizard.location_valid());
+        assert!(valid.wizard.recovery_valid());
+        let consented = demo.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+        assert!(consented.wizard.can_start_first_sync());
+
+        // Recovery path overlapping the local folder fails recovery checks and resets consent.
+        let bad_rec = demo.dispatch(UiCommand::WizardSetLocalRecoveryPath(
+            "/Volumes/WorkSSD/Projects/Recovery".to_owned(),
+        ));
+        assert!(!bad_rec.wizard.recovery_valid());
+        assert!(!bad_rec.wizard.no_other_sync_confirmed);
+        assert!(!bad_rec.wizard.can_start_first_sync());
+        assert!(!bad_rec.wizard.can_visit_step(WizardStep::Review));
+    }
+
+    #[test]
+    fn shortcuts_and_run_controls_target_displayed_mapping_only() {
+        use crate::contract::{
+            DemoActivityPhase, ScreenRoute, selected_stop_target, selected_sync_now_target,
+        };
+        let demo = DemoSource::new(DemoPreset::AllStates);
+        let snap = demo.snapshot();
+
+        // ⌘R must be disabled outside MappingDetail (Overview, Accounts, Activity, etc.).
+        assert_eq!(
+            selected_sync_now_target(&ScreenRoute::Overview, &snap),
+            None
+        );
+        assert_eq!(
+            selected_sync_now_target(&ScreenRoute::Accounts, &snap),
+            None
+        );
+        assert_eq!(
+            selected_sync_now_target(&ScreenRoute::Activity, &snap),
+            None
+        );
+
+        // ⌘R targets the displayed MappingDetail only when Sync now is enabled.
+        assert_eq!(
+            selected_sync_now_target(
+                &ScreenRoute::MappingDetail(MappingId::new("documents")),
+                &snap
+            ),
+            Some(MappingId::new("documents"))
+        );
+        assert_eq!(
+            selected_sync_now_target(
+                &ScreenRoute::MappingDetail(MappingId::new("photos-archive")),
+                &snap
+            ),
+            None
+        );
+
+        // Switching Activity progress preview preserves the displayed mapping's ID (`research`).
+        let preview = demo.dispatch(UiCommand::DemoSetActivityPhase(
+            DemoActivityPhase::TransferringKnown,
+        ));
+        let active = preview.active_run.as_ref().unwrap();
+        assert_eq!(active.mapping_id, MappingId::new("research"));
+        assert_eq!(active.mapping_name, "Research");
+        assert_eq!(
+            selected_stop_target(&ScreenRoute::Activity, &preview),
+            Some(MappingId::new("research"))
+        );
+        assert_eq!(selected_stop_target(&ScreenRoute::Accounts, &preview), None);
+    }
+
+    #[test]
+    fn launch_visibility_respects_default_hidden_on_login_launch() {
+        use crate::contract::should_show_window_at_launch;
+
+        let configured = DemoSource::new(DemoPreset::HouseholdOnly).snapshot();
+        assert!(!should_show_window_at_launch(&configured, true));
+        assert!(should_show_window_at_launch(&configured, false));
+
+        let no_acct = DemoSource::new(DemoPreset::WelcomeNoAccount).snapshot();
+        assert!(should_show_window_at_launch(&no_acct, true));
+
+        let no_map = DemoSource::new(DemoPreset::WelcomeNoMappings).snapshot();
+        assert!(should_show_window_at_launch(&no_map, true));
     }
 }

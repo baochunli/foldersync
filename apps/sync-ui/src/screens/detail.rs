@@ -11,9 +11,11 @@ use nsh_core::{
     element::desktop::{MenuItem, popup_menu},
     prelude::*,
 };
-use sync_core::{DEFAULT_MAX_DELETE_PERCENT, MappingId};
+use sync_core::{DEFAULT_MAX_DELETE_PERCENT, MappingId, Readiness};
 
-use crate::contract::{IconKind, MappingSnapshot, ScreenRoute, UiCommand, UiSnapshot};
+use crate::contract::{
+    IconKind, MappingSnapshot, ScreenRoute, StatusLink, StatusModifier, UiCommand, UiSnapshot,
+};
 use crate::screens::AppController;
 use crate::theme::{
     BtnKind, Palette, app_button, card, card_title, focus_ring, icon, link_button, mono_text,
@@ -66,11 +68,16 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     );
     if let Some(link) = pres.secondary_link {
         let ctrl_l = ctrl.clone();
-        status_row = status_row.child(link_button(link.label(), 12.5, move || {
-            ctrl_l.navigate(ScreenRoute::Attention);
+        let id_rec = m.id.clone();
+        status_row = status_row.child(link_button(link.label(), 12.5, move || match link {
+            StatusLink::StartRecovery => ctrl_l.navigate(ScreenRoute::Recovery(id_rec.clone())),
+            StatusLink::ShowConflicts | StatusLink::Reconnect | StatusLink::ReviewEndpoint => {
+                ctrl_l.navigate(ScreenRoute::Attention)
+            }
         }));
     }
 
+    let name_force = m.display_name.clone();
     let primary_action = if pres.show_stop {
         app_button(
             "Stop",
@@ -81,6 +88,18 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             None,
             move || ctrl_sync.send(UiCommand::StopRun(id_sync.clone())),
         )
+        .test_id("detail-stop-btn")
+    } else if pres.show_force_stop {
+        app_button(
+            "Force stop…",
+            BtnKind::Default,
+            false,
+            false,
+            Some(IconKind::Stop),
+            None,
+            move || ctrl_sync.confirm_force_stop(id_sync.clone(), name_force.clone()),
+        )
+        .test_id("detail-force-stop-btn")
     } else {
         app_button(
             "Sync now",
@@ -91,6 +110,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             pres.sync_now_tooltip,
             move || ctrl_sync.send(UiCommand::SyncNow(id_sync.clone())),
         )
+        .test_id("detail-sync-now")
     };
 
     let pause_resume_action = if pres.show_resume {
@@ -115,6 +135,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         )
     };
 
+    let cloud_more = m.cloud_path.clone();
     let more_btn = app_button(
         "More ▾",
         BtnKind::Default,
@@ -123,16 +144,23 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         None,
         None,
         move || {
+            let c_rev = ctrl_more.clone();
+            let c_open = ctrl_more.clone();
             let c_rm = ctrl_more.clone();
             let id_rm = id_more.clone();
             let nm_rm = name_more.clone();
             let lp = local_more.clone();
+            let cp = cloud_more.clone();
             drop(popup_menu(vec![
                 MenuItem::new("Reveal in Finder").on_select(move || {
-                    drop(reveal_path(lp.clone()));
+                    c_rev.send(UiCommand::DemoAction(format!(
+                        "Simulated Reveal in Finder for {lp} (demo mode)"
+                    )));
                 }),
                 MenuItem::new("Open cloud folder").on_select(move || {
-                    drop(open_url("https://drive.google.com"));
+                    c_open.send(UiCommand::DemoAction(format!(
+                        "Simulated Open cloud folder for {cp} (demo mode)"
+                    )));
                 }),
                 MenuItem::separator(),
                 MenuItem::new("Remove mapping…").on_select(move || {
@@ -143,8 +171,46 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     )
     .test_id("detail-more-btn");
 
-    // Locations card
+    // Locations card — derive cloud ID and volume identity status from snapshot (never hardcoded).
     let lp_reveal = m.local_path.clone();
+    let cp_open = m.cloud_path.clone();
+    let c_loc_rev = ctrl.clone();
+    let c_loc_open = ctrl.clone();
+
+    let cloud_changed = m.state.readiness() == Readiness::EndpointChanged
+        && !matches!(
+            m.modifier,
+            StatusModifier::EndpointChange {
+                is_cloud: false,
+                ..
+            }
+        );
+    let (cloud_id_note, cloud_id_note_color) = if cloud_changed {
+        ("· changed since setup", p.attn)
+    } else {
+        ("· matches setup", p.muted)
+    };
+
+    let vol_snap = snap.volumes.iter().find(|v| v.identity == m.volume_id);
+    let vol_fs = vol_snap.map(|v| v.filesystem.as_str()).unwrap_or("Unknown");
+    let local_changed = m.state.readiness() == Readiness::EndpointChanged
+        && matches!(
+            m.modifier,
+            StatusModifier::EndpointChange {
+                is_cloud: false,
+                ..
+            }
+        );
+    let vol_status_note = if vol_snap.is_some_and(|v| !v.connected)
+        || m.state.readiness() == Readiness::VolumeUnavailable
+    {
+        "not connected"
+    } else if local_changed {
+        "local folder changed since setup"
+    } else {
+        "identity matches setup"
+    };
+
     let locations_card = card()
         .flex_1()
         .child(
@@ -167,9 +233,9 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .gap(px(6.0))
                 .child(mono_text(m.cloud_folder_id.clone(), 11.5, p.fg))
                 .child(
-                    text("· matches setup")
+                    text(cloud_id_note)
                         .text_size(px(12.0))
-                        .text_color(p.muted),
+                        .text_color(cloud_id_note_color),
                 )
                 .into_element(),
         ))
@@ -186,7 +252,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         ))
         .child(kv_row(
             "Volume",
-            text(format!("{} · APFS · identity matches setup", m.volume_name))
+            text(format!("{} · {vol_fs} · {vol_status_note}", m.volume_name))
                 .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
@@ -204,7 +270,9 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     None,
                     None,
                     move || {
-                        drop(reveal_path(lp_reveal.clone()));
+                        c_loc_rev.send(UiCommand::DemoAction(format!(
+                            "Simulated Reveal in Finder for {lp_reveal} (demo mode)"
+                        )));
                     },
                 ))
                 .child(app_button(
@@ -215,7 +283,9 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     None,
                     None,
                     move || {
-                        drop(open_url("https://drive.google.com"));
+                        c_loc_open.send(UiCommand::DemoAction(format!(
+                            "Simulated Open cloud folder for {cp_open} (demo mode)"
+                        )));
                     },
                 )),
         );
@@ -451,8 +521,11 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .into_element(),
         ));
 
-    // Recovery locations & Supported files card
+    // Recovery locations & Supported files card (full plan §18 policy)
     let rec_local = m.local_recovery_path.clone();
+    let rec_cloud = m.cloud_recovery_path.clone();
+    let c_rec_rev = ctrl.clone();
+    let c_rec_open = ctrl.clone();
     let symlink_line = if let Some(sym) = m.found_symlinks.first() {
         format!(
             "Symbolic links are not followed. {} found and excluded: {sym}",
@@ -491,7 +564,9 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                         )
                         .child(text("·").text_size(px(12.0)).text_color(p.muted))
                         .child(link_button("Reveal", 12.0, move || {
-                            drop(reveal_path(rec_local.clone()));
+                            c_rec_rev.send(UiCommand::DemoAction(format!(
+                                "Simulated Reveal in Finder for {rec_local} (demo mode)"
+                            )));
                         })),
                 )
                 .into_element(),
@@ -514,7 +589,9 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                         )
                         .child(text("·").text_size(px(12.0)).text_color(p.muted))
                         .child(link_button("Open", 12.0, move || {
-                            drop(open_url("https://drive.google.com"));
+                            c_rec_open.send(UiCommand::DemoAction(format!(
+                                "Simulated Open cloud recovery folder {rec_cloud} (demo mode)"
+                            )));
                         })),
                 )
                 .into_element(),
@@ -527,17 +604,31 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             .text_color(p.muted),
         )
         .child(view().pt(px(6.0)).child(section_label("Supported files")))
-        .child(policy_bullet("Ordinary files are synced."))
         .child(policy_bullet(
-            "Google Docs, Sheets, Slides and Drive shortcuts are skipped.",
+            "Ordinary documents, source files, images, videos and archives are synced.",
         ))
         .child(policy_bullet(&symlink_line))
-        .child(policy_bullet("Empty folders are not copied yet."))
         .child(policy_bullet(
-            "Finder tags, extended attributes and permissions are not kept.",
+            "Hard-link relationships are not preserved across syncs.",
         ))
         .child(policy_bullet(
-            "Names that clash by case or Unicode form stop the run for review.",
+            "Google Drive shortcuts are skipped; their targets are not synced.",
+        ))
+        .child(policy_bullet(
+            "Google Docs, Sheets and Slides stay outside the managed file scope.",
+        ))
+        .child(policy_bullet("Empty folders are not copied yet."))
+        .child(policy_bullet(
+            "Finder tags, resource forks, ACLs, permissions and extended attributes are not preserved in v1.",
+        ))
+        .child(policy_bullet(
+            "Exclude active databases, virtual machine images and application libraries.",
+        ))
+        .child(policy_bullet(
+            "Folders managed by another sync provider (such as iCloud, Dropbox or Drive for Desktop) are rejected as local roots.",
+        ))
+        .child(policy_bullet(
+            "Duplicate names or case/Unicode clashes stop the run for review.",
         ))
         .child(
             text(format!("Exclusions: {exclusions_summary}"))

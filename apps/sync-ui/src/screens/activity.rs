@@ -89,13 +89,56 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
             .filter(|m| !m.is_variant_showcase && m.state.execution == sync_core::Execution::Queued)
             .map(|m| m.display_name.clone())
             .collect();
-        let queue_body = if queued_names.is_empty() {
-            "Nothing waiting. Next scheduled check: Documents at about 14:48.".to_owned()
-        } else {
+        let queue_body = if !queued_names.is_empty() {
             format!("Queued: {}", queued_names.join(", "))
+        } else if snap.scheduling_paused {
+            "Nothing waiting. Scheduling is paused — Sync now still works.".to_owned()
+        } else {
+            "Nothing waiting. Next scheduled check: Documents at about 14:48.".to_owned()
         };
 
-        let attn_count = snap.attention_badge_count();
+        // Count only mappings actually held from running separately from review-only conflicts (§12).
+        let held_count = snap
+            .mappings
+            .iter()
+            .filter(|m| {
+                !m.is_variant_showcase
+                    && matches!(
+                        m.state.readiness(),
+                        sync_core::Readiness::AuthenticationRequired
+                            | sync_core::Readiness::RecoveryRequired
+                            | sync_core::Readiness::EndpointChanged
+                            | sync_core::Readiness::VolumeUnavailable
+                    )
+            })
+            .count();
+        let conflict_count = snap
+            .mappings
+            .iter()
+            .filter(|m| {
+                !m.is_variant_showcase
+                    && m.state.readiness() == sync_core::Readiness::Ready
+                    && matches!(
+                        m.modifier,
+                        crate::contract::StatusModifier::UnreviewedConflicts { .. }
+                    )
+            })
+            .count();
+        let held_copy = match (held_count, conflict_count) {
+            (0, 0) => "No mappings are held.".to_owned(),
+            (1, 0) => "1 mapping is held and won't run until resolved.".to_owned(),
+            (h, 0) => format!("{h} mappings are held and won't run until resolved."),
+            (0, 1) => {
+                "No mappings are held. 1 mapping has unreviewed conflicts (Sync now still works)."
+                    .to_owned()
+            }
+            (0, c) => format!(
+                "No mappings are held. {c} mappings have unreviewed conflicts (Sync now still works)."
+            ),
+            (h, c) => format!(
+                "{h} mappings are held and won't run until resolved; {c} more has unreviewed conflicts (Sync now still works)."
+            ),
+        };
         let ctrl_attn = ctrl.clone();
         let queue_held = view()
             .flex_row()
@@ -108,24 +151,27 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                     .child(text(queue_body).text_size(px(12.5)).text_color(p.muted)),
             )
             .child(
-                card().flex_1().child(card_title("Held")).child(
-                    view()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            text(format!(
-                                "{attn_count} mappings won't run until their issue is resolved."
-                            ))
-                            .text_size(px(12.5))
-                            .text_color(p.fg)
-                            .tabular_nums(),
-                        )
-                        .child(link_button("Attention", 12.5, move || {
-                            ctrl_attn.navigate(ScreenRoute::Attention);
-                        })),
-                ),
+                card()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(card_title("Held"))
+                    .child(
+                        view()
+                            .flex_col()
+                            .items_start()
+                            .w_full()
+                            .gap(px(6.0))
+                            .child(
+                                text(held_copy)
+                                    .w_full()
+                                    .text_size(px(12.5))
+                                    .text_color(p.fg)
+                                    .tabular_nums(),
+                            )
+                            .child(link_button("Attention", 12.5, move || {
+                                ctrl_attn.navigate(ScreenRoute::Attention);
+                            })),
+                    ),
             );
 
         // Recent events bounded list (`virtual_list` per §5.5)
@@ -231,9 +277,9 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                                     "Reveal full log in Finder",
                                     BtnKind::Default,
                                     true,
-                                    false,
+                                    true,
                                     None,
-                                    Some("Demo mode: no local log file exists yet"),
+                                    Some("No local log file in demo mode"),
                                     || {},
                                 )),
                         ),
@@ -335,15 +381,18 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         .flex_wrap()
                         .gap(px(10.0))
                         .pt(px(4.0))
-                        .child(app_button(
-                            "Stop",
-                            BtnKind::Default,
-                            false,
-                            false,
-                            Some(IconKind::Stop),
-                            None,
-                            move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
-                        ))
+                        .child(
+                            app_button(
+                                "Stop",
+                                BtnKind::Default,
+                                false,
+                                false,
+                                Some(IconKind::Stop),
+                                None,
+                                move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
+                            )
+                            .test_id("activity-stop-btn"),
+                        )
                         .child(
                             text("Stopping lets the current step finish. It can take about 90 seconds and doesn't undo changes already made.")
                                 .text_size(px(12.0))
@@ -398,15 +447,20 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                     .text_color(p.muted)
                     .tabular_nums(),
                 )
-                .child(view().flex_row().pt(px(4.0)).child(app_button(
-                    "Stop",
-                    BtnKind::Default,
-                    false,
-                    false,
-                    Some(IconKind::Stop),
-                    None,
-                    move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
-                )))
+                .child(
+                    view().flex_row().pt(px(4.0)).child(
+                        app_button(
+                            "Stop",
+                            BtnKind::Default,
+                            false,
+                            false,
+                            Some(IconKind::Stop),
+                            None,
+                            move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
+                        )
+                        .test_id("activity-stop-btn"),
+                    ),
+                )
         }
         RunPhase::TransferringUnknown {
             transferred_label,
@@ -450,15 +504,20 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                     .text_color(p.muted)
                     .tabular_nums(),
                 )
-                .child(view().flex_row().pt(px(4.0)).child(app_button(
-                    "Stop",
-                    BtnKind::Default,
-                    false,
-                    false,
-                    Some(IconKind::Stop),
-                    None,
-                    move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
-                )))
+                .child(
+                    view().flex_row().pt(px(4.0)).child(
+                        app_button(
+                            "Stop",
+                            BtnKind::Default,
+                            false,
+                            false,
+                            Some(IconKind::Stop),
+                            None,
+                            move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
+                        )
+                        .test_id("activity-stop-btn"),
+                    ),
+                )
         }
         RunPhase::Stopping { elapsed_secs } => {
             let base_secs = *elapsed_secs;

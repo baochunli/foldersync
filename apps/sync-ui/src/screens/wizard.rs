@@ -2,8 +2,8 @@
 //! plus the post-start First sync checklist (`ui-spec.md` §5.4).
 
 use nsh_base::{
-    checkbox, input, radio, radio_group, table, table_body, table_cell, table_head, table_header,
-    table_row,
+    button, checkbox, input, radio, radio_group, table, table_body, table_cell, table_head,
+    table_header, table_row,
 };
 use nsh_core::{file_dialog::OpenDialog, prelude::*};
 use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, VolumeKind};
@@ -87,15 +87,16 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
                 move || c.navigate(ScreenRoute::Overview)
             }))
             .child(header)
-            .child(step_indicator(ctrl.clone(), draft.step))
+            .child(step_indicator(ctrl.clone(), draft))
             .child(body)
             .child(footer)
             .into_element()
     })
 }
 
-fn step_indicator(ctrl: AppController, current: WizardStep) -> View {
+fn step_indicator(ctrl: AppController, draft: &WizardDraft) -> View {
     let p = Palette::current();
+    let current = draft.step;
     let mut row = view()
         .flex_row()
         .flex_wrap()
@@ -105,6 +106,7 @@ fn step_indicator(ctrl: AppController, current: WizardStep) -> View {
     for (step, label) in WizardStep::SIX_STEPS {
         let is_current = step == current;
         let is_done = step < current;
+        let can_visit = draft.can_visit_step(step);
         let (pill_bg, pill_bd, pill_fg) = if is_current {
             (p.accent_soft, p.primary, p.primary)
         } else {
@@ -119,48 +121,63 @@ fn step_indicator(ctrl: AppController, current: WizardStep) -> View {
         };
         let c = ctrl.clone();
         let tid = format!("wizard-step-{}", step.number());
-        row = row.child(
-            view()
-                .test_id(&tid)
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .pl(px(4.0))
-                .pr(px(11.0))
-                .py(px(3.0))
-                .rounded_full()
-                .bg(pill_bg)
-                .border_1()
-                .border_color(pill_bd)
-                .cursor_pointer()
-                .focus_visible(focus_ring)
-                .on_press(move || c.send(UiCommand::WizardSetStep(step)))
-                .child(
-                    view()
-                        .w(px(18.0))
-                        .h(px(18.0))
-                        .rounded_full()
-                        .bg(dot_bg)
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            text(dot_text)
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(dot_fg),
-                        ),
-                )
-                .child(
-                    text(label)
-                        .text_size(px(12.0))
-                        .font_weight(if is_current {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .text_color(pill_fg),
-                ),
-        );
+        let a11y_label = if is_current {
+            format!("Step {} of 6: {label}, current step", step.number())
+        } else if is_done {
+            format!("Step {} of 6: {label}, completed", step.number())
+        } else if !can_visit {
+            format!(
+                "Step {} of 6: {label}, unavailable until earlier checks pass",
+                step.number()
+            )
+        } else {
+            format!("Step {} of 6: {label}", step.number())
+        };
+
+        let pill = button()
+            .test_id(&tid)
+            .disabled(!can_visit)
+            .accessibility_label(a11y_label)
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(4.0))
+            .pr(px(11.0))
+            .py(px(3.0))
+            .rounded_full()
+            .bg(pill_bg)
+            .border_1()
+            .border_color(pill_bd)
+            .cursor_pointer()
+            .disabled_style(|s| s.opacity(0.45))
+            .focus_visible(focus_ring)
+            .on_press(move || c.send(UiCommand::WizardSetStep(step)))
+            .child(
+                view()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded_full()
+                    .bg(dot_bg)
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        text(dot_text)
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(dot_fg),
+                    ),
+            )
+            .child(
+                text(label)
+                    .text_size(px(12.0))
+                    .font_weight(if is_current {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(pill_fg),
+            );
+        row = row.child(pill);
     }
     row
 }
@@ -637,30 +654,37 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft) -> View {
                         .text_size(px(11.5))
                         .text_color(p.muted),
                 )
-                .child(app_button(
-                    "Valid folder",
-                    BtnKind::Ghost,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || {
-                        c_good.send(UiCommand::WizardSetLocalPath(
-                            "/Volumes/WorkSSD/Projects".to_owned(),
-                        ));
-                    },
-                ))
-                .child(app_button(
-                    "Test volume root error",
-                    BtnKind::Ghost,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || {
-                        c_bad.send(UiCommand::WizardSetLocalPath("/Volumes/WorkSSD".to_owned()));
-                    },
-                )),
+                .child(
+                    app_button(
+                        "Valid folder",
+                        BtnKind::Ghost,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            c_good.send(UiCommand::WizardSetLocalPath(
+                                "/Volumes/WorkSSD/Projects".to_owned(),
+                            ));
+                        },
+                    )
+                    .test_id("wizard-demo-valid-folder"),
+                )
+                .child(
+                    app_button(
+                        "Test volume root error",
+                        BtnKind::Ghost,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            c_bad
+                                .send(UiCommand::WizardSetLocalPath("/Volumes/WorkSSD".to_owned()));
+                        },
+                    )
+                    .test_id("wizard-demo-invalid-root"),
+                ),
         )
 }
 
@@ -870,6 +894,8 @@ fn render_step_subfolders(
                         .bg(p.bg)
                         .border_1()
                         .border_color(p.border)
+                        .focus(focus_ring)
+                        .focus_visible(focus_ring)
                         .text_size(px(12.0))
                         .text_color(p.fg)
                         .placeholder("e.g. *.lrdata/")
@@ -922,14 +948,23 @@ fn render_step_subfolders(
         .flex_1()
         .child(card_title("Supported files"))
         .child(bullet(
-            "Ordinary files are synced. Symbolic links are not followed.",
+            "Ordinary documents, source files, images, videos and archives are synced.",
+        ))
+        .child(bullet(
+            "Symbolic links are not followed; hard-link relationships are not preserved.",
+        ))
+        .child(bullet(
+            "Google Docs, Sheets, Slides and Drive shortcuts are skipped.",
         ))
         .child(bullet("Empty folders are not copied yet."))
         .child(bullet(
-            "Finder tags, extended attributes and permissions are not kept.",
+            "Finder tags, resource forks, ACLs, permissions and extended attributes are not preserved in v1.",
         ))
         .child(bullet(
-            "Don't sync open databases, virtual machine disks or app libraries.",
+            "Don't sync active databases, virtual machine images or application libraries, or folders managed by another sync provider.",
+        ))
+        .child(bullet(
+            "Duplicate names or case/Unicode clashes stop the run for review.",
         ));
 
     view()
@@ -959,6 +994,27 @@ fn render_step_subfolders(
 fn render_step_recovery(ctrl: AppController, draft: &WizardDraft) -> View {
     let p = Palette::current();
     let c_change = ctrl.clone();
+    let mut rec_checks = view().pt(px(8.0)).flex_col().gap(px(6.0));
+    for chk in &draft.recovery_checks {
+        rec_checks = rec_checks.child(check_row(
+            if chk.ok {
+                IconKind::Check
+            } else {
+                IconKind::Octagon
+            },
+            if chk.ok { p.ok } else { p.err },
+            &chk.message,
+        ));
+    }
+    rec_checks = rec_checks.child(check_row(
+        IconKind::Alert,
+        p.attn,
+        &format!(
+            "The local recovery folder is on {}. If that drive fails, its recovery copies are lost too. Keep a separate backup of files you can't replace.",
+            draft.volume_name
+        ),
+    ));
+
     card()
         .child(
             view()
@@ -1011,22 +1067,7 @@ fn render_step_recovery(ctrl: AppController, draft: &WizardDraft) -> View {
                 )
                 .child(mono_text(draft.cloud_recovery_path.clone(), 12.0, p.fg)),
         )
-        .child(
-            view().pt(px(8.0)).flex_col().gap(px(6.0))
-                .child(check_row(
-                    IconKind::Check,
-                    p.ok,
-                    "Both are outside every synced folder, and both can be written.",
-                ))
-                .child(check_row(
-                    IconKind::Alert,
-                    p.attn,
-                    &format!(
-                        "The local recovery folder is on {}. If that drive fails, its recovery copies are lost too. Keep a separate backup of files you can't replace.",
-                        draft.volume_name
-                    ),
-                )),
-        )
+        .child(rec_checks)
 }
 
 fn render_step_review(ctrl: AppController, draft: &WizardDraft) -> View {
@@ -1178,6 +1219,7 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft) -> View {
             ),
         ReviewScenario::BothPopulated => {
             let c_choose = ctrl.clone();
+            let c_rev = ctrl.clone();
             let lp_rev = draft.local_path.clone();
             view()
                 .test_id("review-both-populated-blocked")
@@ -1230,7 +1272,9 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft) -> View {
                             None,
                             None,
                             move || {
-                                drop(reveal_path(lp_rev.clone()));
+                                c_rev.send(UiCommand::DemoAction(format!(
+                                    "Simulated Reveal in Finder for {lp_rev} (demo mode)"
+                                )));
                             },
                         )),
                 )
@@ -1245,6 +1289,9 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft) -> View {
     };
 
     let rec_local = draft.local_recovery_path.clone();
+    let rec_cloud = draft.cloud_recovery_path.clone();
+    let c_rec_rev = ctrl.clone();
+    let c_rec_open = ctrl.clone();
     let not_synced_text = if excluded.is_empty() {
         "macOS metadata and temporary files".to_owned()
     } else {
@@ -1272,7 +1319,9 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft) -> View {
                         .child(mono_text(draft.local_recovery_path.clone(), 11.5, p.fg))
                         .child(text("·").text_size(px(12.0)).text_color(p.muted))
                         .child(link_button("Reveal", 12.0, move || {
-                            drop(reveal_path(rec_local.clone()));
+                            c_rec_rev.send(UiCommand::DemoAction(format!(
+                                "Simulated Reveal in Finder for {rec_local} (demo mode)"
+                            )));
                         })),
                 )
                 .child(
@@ -1283,7 +1332,9 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft) -> View {
                         .child(mono_text(draft.cloud_recovery_path.clone(), 11.5, p.fg))
                         .child(text("·").text_size(px(12.0)).text_color(p.muted))
                         .child(link_button("Open", 12.0, move || {
-                            drop(open_url("https://drive.google.com"));
+                            c_rec_open.send(UiCommand::DemoAction(format!(
+                                "Simulated Open cloud recovery folder {rec_cloud} (demo mode)"
+                            )));
                         })),
                 )
                 .into_element(),
@@ -1564,6 +1615,15 @@ fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: 
         if draft.review_scenario != ReviewScenario::BothPopulated {
             let c_start = ctrl.clone();
             let can_start = draft.can_start_first_sync();
+            let tip = if !draft.location_valid() {
+                Some("Fix the failing location checks first")
+            } else if !draft.recovery_valid() {
+                Some("Fix the failing recovery location checks first")
+            } else if !draft.no_other_sync_confirmed {
+                Some("Confirm the checkbox first")
+            } else {
+                None
+            };
             row = row.child(
                 app_button(
                     "Start first sync",
@@ -1571,7 +1631,7 @@ fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: 
                     false,
                     !can_start,
                     None,
-                    (!can_start).then_some("Confirm the checkbox first"),
+                    tip,
                     move || c_start.send(UiCommand::WizardStartFirstSync),
                 )
                 .test_id("wizard-start-first-sync-btn"),
@@ -1579,7 +1639,14 @@ fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: 
         }
     } else if let Some(next) = draft.step.next() {
         let c_next = ctrl.clone();
-        let next_disabled = draft.step == WizardStep::Location && !draft.location_valid();
+        let next_disabled = !draft.can_visit_step(next);
+        let tip = if draft.step == WizardStep::Location && !draft.location_valid() {
+            Some("Fix the location checks first")
+        } else if draft.step == WizardStep::Recovery && !draft.recovery_valid() {
+            Some("Fix the recovery folder checks first")
+        } else {
+            None
+        };
         row = row.child(
             app_button(
                 "Continue",
@@ -1587,7 +1654,7 @@ fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: 
                 false,
                 next_disabled,
                 None,
-                next_disabled.then_some("Fix the location check first"),
+                tip,
                 move || c_next.send(UiCommand::WizardSetStep(next)),
             )
             .test_id("wizard-continue-btn"),

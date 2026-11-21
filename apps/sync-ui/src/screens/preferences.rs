@@ -24,6 +24,7 @@ pub fn preferences_view(ctrl: AppController) -> impl IntoElement {
     let bw_input = signal("20".to_owned());
     let selected_diag_mapping = signal("research".to_owned());
     let copied_opts = signal(false);
+    let export_notice = signal(Option::<String>::None);
 
     dynamic(move || {
         let snap = ctrl.snapshot.get();
@@ -103,7 +104,13 @@ pub fn preferences_view(ctrl: AppController) -> impl IntoElement {
 
         let content = match current_tab {
             PrefsTab::General => render_general(ctrl.clone(), &snap, bw_input),
-            PrefsTab::Diagnostics => render_diagnostics(&snap, selected_diag_mapping, copied_opts),
+            PrefsTab::Diagnostics => render_diagnostics(
+                ctrl.clone(),
+                &snap,
+                selected_diag_mapping,
+                copied_opts,
+                export_notice,
+            ),
         };
 
         view()
@@ -122,6 +129,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
     let prefs = &snap.preferences;
     let c_login = ctrl.clone();
     let c_notif = ctrl.clone();
+    let c_ext = ctrl.clone();
     let c_bw_none = ctrl.clone();
     let c_bw_lim = ctrl.clone();
     let c_bw_edit = ctrl.clone();
@@ -141,12 +149,9 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                 .child(app_switch(
                     prefs.open_at_login,
                     "Open at login",
-                    "FolderSync starts in the menu bar when you log in.",
+                    "FolderSync starts in the menu bar when you log in (demo toggle — does not change macOS Login Items).",
                     move |next| {
                         c_login.send(UiCommand::SetOpenAtLogin(next));
-                        spawn(async move {
-                            let _ = nsh_core::element::desktop::set_launch_at_login(next).await;
-                        });
                     },
                 ))
                 .child(if prefs.open_at_login_pending {
@@ -205,9 +210,9 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                     false,
                     None,
                     None,
-                    || {
-                        drop(open_url(
-                            "x-apple.systempreferences:com.apple.ExtensionsPreferences",
+                    move || {
+                        c_ext.send(UiCommand::DemoAction(
+                            "Simulated Open Extension Settings (demo mode)".to_owned(),
                         ));
                     },
                 )),
@@ -271,6 +276,8 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                             .bg(p.bg)
                             .border_1()
                             .border_color(p.border)
+                            .focus(focus_ring)
+                            .focus_visible(focus_ring)
                             .text_size(px(12.5))
                             .text_color(p.fg)
                             .label("Megabytes per second")
@@ -297,9 +304,11 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
 }
 
 fn render_diagnostics(
+    ctrl: AppController,
     snap: &UiSnapshot,
     selected_diag_mapping: Signal<String>,
     copied_opts: Signal<bool>,
+    export_notice: Signal<Option<String>>,
 ) -> View {
     let p = Palette::current();
     let prefs = &snap.preferences;
@@ -324,11 +333,12 @@ fn render_diagnostics(
         .child(diag_kv("Finder extension", &ext_version_line))
         .child(diag_kv("System", &prefs.system_summary));
 
-    let export_card = card()
+    let c_exp = ctrl.clone();
+    let mut export_card = card()
         .flex_1()
         .child(card_title("Export diagnostics"))
         .child(
-            text("Creates a file with versions, configuration without secrets, selected run logs and error details. It contains no file contents and no sign-in data. You choose where to save it and whom to send it to.")
+            text("Prepares versions, configuration without secrets, selected run logs and error details with no file contents or sign-in data. Demo mode simulates export without writing a file.")
                 .text_size(px(12.5))
                 .text_color(p.fg),
         )
@@ -340,19 +350,29 @@ fn render_diagnostics(
                 false,
                 None,
                 None,
-                || {
+                move || {
+                    let c = c_exp.clone();
                     let answer = pick_save_path(
                         SaveDialog::new()
-                            .title("Export FolderSync diagnostics")
+                            .title("Export FolderSync diagnostics (simulated)")
                             .file_name("foldersync-diagnostics.txt"),
                     );
                     spawn(async move {
-                        // Demo mode: opens native save dialog only; never writes to disk.
-                        let _ = answer.await;
+                        if let Ok(Some(path)) = answer.await {
+                            let msg = format!(
+                                "Simulated diagnostics export to {} (demo mode — no file written).",
+                                path.display()
+                            );
+                            export_notice.set(Some(msg.clone()));
+                            c.send(UiCommand::DemoAction(msg));
+                        }
                     });
                 },
             )),
         );
+    if let Some(notice) = export_notice.get() {
+        export_card = export_card.child(text(notice).text_size(px(12.0)).text_color(p.muted));
+    }
 
     let real_mappings: Vec<_> = snap
         .mappings

@@ -129,7 +129,7 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
     };
 
     view()
-        .w(px(218.0))
+        .w(px(200.0))
         .flex_none()
         .h_full()
         .bg(p.sidebar)

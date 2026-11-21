@@ -48,8 +48,10 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
         }
 
         if let Some(reconnecting_id) = &snap.reconnecting_account {
+            let c_open = ctrl.clone();
             let c_cancel = ctrl.clone();
             let c_complete = ctrl.clone();
+            let id_open = reconnecting_id.clone();
             let id_complete = reconnecting_id.clone();
             root = root.child(
                 card()
@@ -69,8 +71,10 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
                                 false,
                                 None,
                                 None,
-                                || {
-                                    drop(open_url("https://accounts.google.com"));
+                                move || {
+                                    c_open.send(UiCommand::DemoAction(format!(
+                                        "Simulated browser sign-in page for {id_open} (demo mode)"
+                                    )));
                                 },
                             ))
                             .child(app_button(

@@ -124,6 +124,14 @@ test("Interactive Pause/Resume, Scheduling hold banner, and window close keep-al
   await app.press("id:demo-toggle-scheduling");
   expect(app.shows("id:scheduling-paused-banner")).toBe(true);
   expect(app.texts().join("\n")).toContain("Scheduling paused. No mapping starts on its own. Sync now still works.");
+
+  // Closing the window hides it (keep-alive-on-close) and Show window reopens it (§3, #11)
+  expect(app.window("main").state()?.visible).toBe(true);
+  await app.window("main").pressClose();
+  expect(app.window("main").state()?.visible).toBe(false);
+  await app.keyboard.press("mod+0");
+  expect(app.window("main").state()?.visible).toBe(true);
+  expect(app.texts()).toContain("Overview");
 });
 
 test("Mapping detail hides Change subfolders and Activity raw log toggles open", async () => {
@@ -167,4 +175,78 @@ test("Preferences Diagnostics shows engine flags only there and Welcome states r
   await app.press("id:demo-welcome-empty");
   expect(app.texts()).toContain("Keep the Drive folders you choose on this Mac");
   expect(app.texts()).toContain("Connect Google Drive…");
+});
+
+test("Wizard gates Start and step pills on validation checks and resets consent on plan changes (#2)", async () => {
+  const app = await open(".", DESKTOP);
+
+  await app.press("id:add-mapping-btn");
+  // Move to Step 3 (Location)
+  await app.press("id:wizard-step-3");
+  expect(app.texts()).toContain("Where should Projects live?");
+
+  // Trigger invalid volume-root location -> Continue disabled and Review step pill is disabled (cannot skip past Location)
+  await app.press("id:wizard-demo-invalid-root");
+  expect(app.enabled("id:wizard-continue-btn")).toBe(false);
+  expect(app.shows("id:wizard-step-6")).toBe(true);
+  expect(app.enabled("id:wizard-step-6")).toBe(false);
+  expect(app.texts()).toContain("Where should Projects live?");
+  expect(app.texts()).not.toContain("Review “Projects”");
+
+  // Restore valid folder -> jump to Review, confirm checkbox -> Start enabled
+  await app.press("id:wizard-demo-valid-folder");
+  expect(app.enabled("id:wizard-continue-btn")).toBe(true);
+  await app.press("id:wizard-step-6");
+  expect(app.texts()).toContain("Review “Projects”");
+  expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
+
+  await app.press("id:wizard-no-other-sync-checkbox");
+  expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(true);
+
+  // Changing the reviewed plan (switching scenario and back) resets consent -> Start disabled again
+  await app.press("id:review-variant-upload");
+  expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
+});
+
+test("Activity Stop targets the displayed mapping, ⌘R targets only selected MappingDetail, and Detail supports Force stop and Recovery link (#5, #13)", async () => {
+  const app = await open(".", DESKTOP);
+
+  // ⌘R outside MappingDetail (e.g. Accounts) must do nothing (menu item disabled)
+  await app.press("id:nav-accounts");
+  await app.keyboard.press("mod+r");
+  await app.press("id:nav-overview");
+  // Documents is still idle (not queued)
+  expect(app.texts().join("\n")).toContain("Last completed at 14:38");
+
+  // ⌘R inside MappingDetail for Documents targets Documents only (queues it behind Research)
+  await app.press("id:open-detail-documents");
+  await app.keyboard.press("mod+r");
+  expect(app.texts().join("\n")).toContain("Runs after Research");
+
+  // Activity preview keeps the displayed mapping consistent with its Stop target (Research)
+  await app.press("id:nav-activity");
+  await app.press("id:activity-phase-known");
+  expect(app.texts()).toContain("Research");
+  expect(app.texts().join("\n")).toContain("Transferring · 1.2 GB of 3.4 GB");
+
+  // Stopping from Activity stops Research (the displayed mapping), transitioning to Stopping + Force stop…
+  await app.press("id:activity-stop-btn");
+  expect(app.texts().join("\n")).toContain("Stopping ·");
+  expect(app.texts()).toContain("Force stop…");
+
+  // Detail for Research (now Stopping) shows Force stop… too (#13)
+  await app.press("id:nav-overview");
+  await app.press("id:open-detail-research");
+  expect(app.shows("id:detail-force-stop-btn")).toBe(true);
+
+  // Detail for Archive shows cloud folder ID changed since setup (not hardcoded "matches setup") (#8)
+  await app.press("id:nav-overview");
+  await app.press("id:open-detail-archive");
+  expect(app.texts().join("\n")).toContain("changed since setup");
+
+  // Detail for Teaching routes "Start recovery…" to the Recovery checklist (#13)
+  await app.press("id:nav-overview");
+  await app.press("id:open-detail-teaching");
+  await app.press("text:Start recovery…");
+  expect(app.texts()).toContain("Recover “Teaching”");
 });

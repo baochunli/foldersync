@@ -2,7 +2,7 @@
 //! and the guided Start recovery checklist (`ui-spec.md` §5.6).
 
 use nsh_core::prelude::*;
-use sync_core::MappingId;
+use sync_core::{Intent, MappingId, Readiness};
 
 use crate::contract::{
     AttentionItem, AttentionKind, IconKind, RecoveryCauseKind, ScreenRoute, StatusModifier,
@@ -201,10 +201,13 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
         AttentionKind::EndpointChanged { is_cloud, .. } => {
             if let (Some(mid), Some(name)) = (&item.mapping_id, &item.mapping_name) {
                 let c1 = ctrl.clone();
+                let c_open = ctrl.clone();
                 let c2 = ctrl.clone();
                 let id1 = mid.clone();
                 let id2 = mid.clone();
                 let nm = name.clone();
+                let nm_open = name.clone();
+                let is_cloud_val = *is_cloud;
                 actions = actions
                     .child(app_button(
                         "Check again",
@@ -216,7 +219,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                         move || c1.send(UiCommand::CheckAgain(id1.clone())),
                     ))
                     .child(app_button(
-                        if *is_cloud {
+                        if is_cloud_val {
                             "Open cloud folder"
                         } else {
                             "Reveal in Finder"
@@ -226,8 +229,13 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                         false,
                         None,
                         None,
-                        || {
-                            drop(open_url("https://drive.google.com"));
+                        move || {
+                            let label = if is_cloud_val {
+                                format!("Simulated Open cloud folder for {nm_open} (demo mode)")
+                            } else {
+                                format!("Simulated Reveal in Finder for {nm_open} (demo mode)")
+                            };
+                            c_open.send(UiCommand::DemoAction(label));
                         },
                     ))
                     .child(app_button(
@@ -271,9 +279,9 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                                 "Show recovery copies",
                                 BtnKind::Default,
                                 true,
-                                false,
+                                true,
                                 None,
-                                Some("Demo mode: recovery copies stay outside the synced folder"),
+                                Some("Available when connected to the sync manager"),
                                 || {},
                             ));
                     }
@@ -325,9 +333,13 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
         }
         AttentionKind::Conflicts { .. } => {
             if let Some(mid) = &item.mapping_id {
+                let c_finder = ctrl.clone();
+                let c_cloud = ctrl.clone();
                 let c_run = ctrl.clone();
                 let c_rev = ctrl.clone();
                 let id_rev = mid.clone();
+                let nm_f = item.mapping_name.clone().unwrap_or_else(|| mid.to_string());
+                let nm_c = nm_f.clone();
                 actions = actions
                     .child(app_button(
                         "Reveal in Finder",
@@ -336,7 +348,11 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                         false,
                         None,
                         None,
-                        || {},
+                        move || {
+                            c_finder.send(UiCommand::DemoAction(format!(
+                                "Simulated Reveal in Finder for {nm_f} conflicts (demo mode)"
+                            )));
+                        },
                     ))
                     .child(app_button(
                         "Open cloud folder",
@@ -345,8 +361,10 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                         false,
                         None,
                         None,
-                        || {
-                            drop(open_url("https://drive.google.com"));
+                        move || {
+                            c_cloud.send(UiCommand::DemoAction(format!(
+                                "Simulated Open cloud folder for {nm_c} (demo mode)"
+                            )));
                         },
                     ))
                     .child(app_button(
@@ -374,6 +392,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
         }
         AttentionKind::LowSpaceAdvisory { recovery_path, .. } => {
             let rp = recovery_path.clone();
+            let c_rec = ctrl.clone();
             actions = actions.child(app_button(
                 "Reveal recovery folder",
                 BtnKind::Default,
@@ -382,7 +401,9 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                 None,
                 None,
                 move || {
-                    drop(reveal_path(rp.clone()));
+                    c_rec.send(UiCommand::DemoAction(format!(
+                        "Simulated Reveal in Finder for {rp} (demo mode)"
+                    )));
                 },
             ));
         }
@@ -408,13 +429,14 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                 .into_element();
         };
 
-        let (copies_count, ambiguous) = match &m.modifier {
+        let (cause_kind, copies_count, ambiguous) = match &m.modifier {
             StatusModifier::RecoveryCause {
+                kind,
                 recovery_copies_count,
                 ambiguous_ownership,
                 ..
-            } => (*recovery_copies_count, *ambiguous_ownership),
-            _ => (3, false),
+            } => (*kind, *recovery_copies_count, *ambiguous_ownership),
+            _ => (RecoveryCauseKind::Interrupted, 3, false),
         };
 
         let c_back = ctrl.clone();
@@ -424,22 +446,75 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
         let id_run = m.id.clone();
         let id_keep = m.id.clone();
 
-        let mut body = card()
-            .child(check_line(
+        // Derive every checklist item strictly from snapshot state (never claim unchecked items passed).
+        let is_paused = m.state.intent == Intent::Paused;
+        let hold_check = if is_paused {
+            check_line(
                 IconKind::Check,
                 p.ok,
                 &format!("{} is paused while you recover it.", m.display_name),
-            ))
-            .child(check_line(
+            )
+        } else {
+            check_line(
+                IconKind::Alert,
+                p.attn,
+                &format!(
+                    "{} is held for recovery (automatic sync will not run until you finish).",
+                    m.display_name
+                ),
+            )
+        };
+
+        let proc_check = if ambiguous {
+            check_line(
+                IconKind::Octagon,
+                p.err,
+                "Process ownership is uncertain — cannot confirm whether an earlier sync process still holds the lock.",
+            )
+        } else if cause_kind == RecoveryCauseKind::EarlierSyncRunning {
+            check_line(
+                IconKind::Octagon,
+                p.err,
+                "An earlier sync process is still running for this mapping.",
+            )
+        } else {
+            check_line(
                 IconKind::Check,
                 p.ok,
-                "No sync process from the interrupted run is still running.",
-            ))
-            .child(check_line(
+                "No sync process from the interrupted run is running (per snapshot).",
+            )
+        };
+
+        let vol_connected = snap
+            .volumes
+            .iter()
+            .find(|v| v.identity == m.volume_id)
+            .is_some_and(|v| v.connected);
+        let endpoint_ok = vol_connected && m.state.readiness() != Readiness::EndpointChanged;
+        let endpoint_check = if endpoint_ok {
+            check_line(
                 IconKind::Check,
                 p.ok,
-                "Local folder, volume and cloud folder match the setup.",
-            ))
+                "Volume is connected and recorded folder identities match setup (per snapshot).",
+            )
+        } else if !vol_connected {
+            check_line(
+                IconKind::Alert,
+                p.attn,
+                &format!("{} is not connected right now.", m.volume_name),
+            )
+        } else {
+            check_line(
+                IconKind::Alert,
+                p.attn,
+                "Folder identity changed since setup; review before resuming.",
+            )
+        };
+
+        let mut body = card()
+            .child(hold_check)
+            .child(proc_check)
+            .child(endpoint_check)
             .child(
                 view()
                     .flex_row()

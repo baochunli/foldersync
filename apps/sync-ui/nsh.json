@@ -10,6 +10,7 @@
     "activationPolicy": "accessory"
   },
   "window": {
+    "defaultVisible": false,
     "defaultSize": {
       "width": 1080,
       "height": 740
