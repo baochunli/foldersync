@@ -241,3 +241,88 @@ fn cli_init_and_run_once_end_to_end_with_pinned_rclone() {
         b"cli-v2-edited"
     );
 }
+
+#[test]
+fn cli_requires_non_empty_state_dir_and_never_uses_default() {
+    let tmp = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_sync-cli");
+
+    // Missing --state-dir must fail with usage error (exit 2) even for `status`.
+    let out = Command::new(bin)
+        .args(["status"])
+        .env("HOME", tmp.path())
+        .env_remove("FOLDERSYNC_STATE_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "status without --state-dir must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--state-dir"),
+        "stderr should explain --state-dir is required: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Empty --state-dir "" must also fail.
+    let out_empty = Command::new(bin)
+        .args(["status", "--state-dir", ""])
+        .env("HOME", tmp.path())
+        .env_remove("FOLDERSYNC_STATE_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        !out_empty.status.success(),
+        "status with empty --state-dir must be rejected"
+    );
+}
+
+#[test]
+fn cli_init_failure_exits_nonzero_without_printing_initialized() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+    let local_dir = tmp.path().join("local_docs");
+    let remote_dir = tmp.path().join("remote_docs");
+    let local_recovery = tmp.path().join("local_recovery");
+    let remote_recovery = tmp.path().join("remote_recovery");
+    fs::create_dir_all(&local_dir).unwrap();
+    fs::create_dir_all(&remote_dir).unwrap();
+    fs::create_dir_all(&local_recovery).unwrap();
+    fs::create_dir_all(&remote_recovery).unwrap();
+
+    // Populate both sides so init fails with BothSidesPopulated.
+    fs::write(local_dir.join("a.txt"), b"local").unwrap();
+    fs::write(remote_dir.join("b.txt"), b"remote").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_sync-cli");
+    let add = Command::new(bin)
+        .args([
+            "add-mapping",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--id",
+            "docs",
+            "--local-dir",
+            local_dir.to_str().unwrap(),
+            "--remote-dir",
+            remote_dir.to_str().unwrap(),
+            "--recovery-dir",
+            local_recovery.to_str().unwrap(),
+            "--remote-recovery-dir",
+            remote_recovery.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+
+    let init = Command::new(bin)
+        .args(["init", "docs", "--state-dir", state_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!init.status.success());
+    let stdout = String::from_utf8_lossy(&init.stdout);
+    assert!(
+        !stdout.contains("Initialized"),
+        "failed init must not print 'Initialized', got stdout: {stdout:?}"
+    );
+}

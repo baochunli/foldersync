@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
-use sync_core::{MappingId, Readiness};
+use sync_core::{MappingId, Readiness, RunOutcome};
 use sync_manager::{
     AddMappingCommand, InitializeCommand, ManagerConfig, ManagerError, SyncManager,
 };
@@ -103,8 +103,8 @@ Usage: sync-cli <command> [options]
 
 Commands:
   version                                 Print FolderSync version
-  status [--state-dir <dir>] [--json]     Show current mapping status snapshot
-  add-mapping [options]                   Add a local-to-local fixture mapping
+  status --state-dir <dir> [--json]       Show current mapping status snapshot
+  add-mapping --state-dir <dir> [options] Add a local-to-local fixture mapping
     --id <mapping-id>
     --local-dir <path>
     --remote-dir <path>
@@ -112,14 +112,13 @@ Commands:
     [--remote-recovery-dir <path>]
     [--collection <path>]
     [--max-delete-percent <1-100>]
-    [--state-dir <dir>]
-  init <mapping> [--state-dir <dir>]      Initialize a mapping (local-to-local)
-  run-once <mapping> [--state-dir <dir>]  Run one manual synchronization pass
-  pause <mapping> [--state-dir <dir>]     Persist pause intent for a mapping
-  resume <mapping> [--state-dir <dir>]    Clear pause intent for a mapping
+  init <mapping> --state-dir <dir>        Initialize a mapping (local-to-local)
+  run-once <mapping> --state-dir <dir>    Run one manual synchronization pass
+  pause <mapping> --state-dir <dir>       Persist pause intent for a mapping
+  resume <mapping> --state-dir <dir>      Clear pause intent for a mapping
 
 Options:
-  --state-dir <dir>                       Override FolderSync state directory
+  --state-dir <dir>                       Required state directory for fixture commands
   --finder-dir <dir>                      Override Finder status.json directory
   --help, -h                              Show this help message
   --version, -V                           Print version"
@@ -130,20 +129,17 @@ fn open_manager(
     state_dir: Option<PathBuf>,
     finder_dir: Option<PathBuf>,
 ) -> Result<SyncManager, CliError> {
-    let mut cfg = ManagerConfig {
-        state_dir,
-        finder_status_dir: finder_dir,
-        ..ManagerConfig::with_state_dir(PathBuf::new())
+    let state_dir = match state_dir {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => {
+            return Err(CliError::Usage(
+                "Missing required non-empty --state-dir <dir> (fixture CLI never uses the default application state directory)."
+                    .to_string(),
+            ));
+        }
     };
-    // Preserve None when no explicit --state-dir was given so resolve_state_dir
-    // checks FOLDERSYNC_STATE_DIR then platform defaults.
-    if cfg
-        .state_dir
-        .as_ref()
-        .is_some_and(|p| p.as_os_str().is_empty())
-    {
-        cfg.state_dir = None;
-    }
+    let mut cfg = ManagerConfig::with_state_dir(state_dir);
+    cfg.finder_status_dir = finder_dir;
     Ok(SyncManager::open(cfg)?)
 }
 
@@ -313,6 +309,14 @@ fn parse_mapping_and_flags(
     Ok((id, state_dir, finder_dir))
 }
 
+fn run_succeeded(readiness: Readiness, outcome: Option<RunOutcome>) -> bool {
+    readiness == Readiness::Ready
+        && matches!(
+            outcome,
+            Some(RunOutcome::Success | RunOutcome::SuccessWithConflicts)
+        )
+}
+
 fn cmd_init(args: &[String]) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
     let mgr = open_manager(state_dir, finder_dir)?;
@@ -325,16 +329,17 @@ fn cmd_init(args: &[String]) -> Result<(), CliError> {
         .mappings
         .iter()
         .find(|m| m.id.as_str() == id)
-        .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after init.")))?;
-    println!("Initialized `{}`: {}", mapping.id, mapping.status_text);
-    let ok = mapping.readiness == Readiness::Ready;
+        .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after init.")))?
+        .clone();
     mgr.shutdown()?;
-    if ok {
+
+    if run_succeeded(mapping.readiness, mapping.last_run_outcome) {
+        println!("Initialized `{}`: {}", mapping.id, mapping.status_text);
         Ok(())
     } else {
         Err(CliError::Failed(format!(
-            "Initialization ended in {:?}: {}",
-            mapping.readiness, mapping.status_text
+            "Initialization for `{}` did not succeed (readiness={:?}, outcome={:?}): {}",
+            mapping.id, mapping.readiness, mapping.last_run_outcome, mapping.status_text
         )))
     }
 }
@@ -348,19 +353,20 @@ fn cmd_run_once(args: &[String]) -> Result<(), CliError> {
         .mappings
         .iter()
         .find(|m| m.id.as_str() == id)
-        .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after run.")))?;
-    println!(
-        "Run completed for `{}`: {}",
-        mapping.id, mapping.status_text
-    );
-    let ok = mapping.readiness == Readiness::Ready;
+        .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after run.")))?
+        .clone();
     mgr.shutdown()?;
-    if ok {
+
+    if run_succeeded(mapping.readiness, mapping.last_run_outcome) {
+        println!(
+            "Run completed for `{}`: {}",
+            mapping.id, mapping.status_text
+        );
         Ok(())
     } else {
         Err(CliError::Failed(format!(
-            "Run ended in {:?}: {}",
-            mapping.readiness, mapping.status_text
+            "Run for `{}` failed (readiness={:?}, outcome={:?}): {}",
+            mapping.id, mapping.readiness, mapping.last_run_outcome, mapping.status_text
         )))
     }
 }
@@ -385,4 +391,27 @@ fn cmd_resume(args: &[String]) -> Result<(), CliError> {
     }
     mgr.shutdown()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_succeeded_rejects_retryable_and_other_failure_outcomes() {
+        assert!(run_succeeded(Readiness::Ready, Some(RunOutcome::Success)));
+        assert!(run_succeeded(
+            Readiness::Ready,
+            Some(RunOutcome::SuccessWithConflicts)
+        ));
+        assert!(!run_succeeded(
+            Readiness::Ready,
+            Some(RunOutcome::RetryableFailure)
+        ));
+        assert!(!run_succeeded(Readiness::Ready, None));
+        assert!(!run_succeeded(
+            Readiness::RecoveryRequired,
+            Some(RunOutcome::CriticalFailure)
+        ));
+    }
 }
