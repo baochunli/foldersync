@@ -373,20 +373,106 @@ public enum SnapshotEvaluator {
 
     private static let maxSnapshotBytes = 4 * 1024 * 1024
 
-    /// Walks every component in `location.relativeComponents` (and optional `extraComponents`)
-    /// from `location.parentDirectory` using `fstatat(..., AT_SYMLINK_NOFOLLOW)` and
-    /// `openat(..., O_RDONLY | O_DIRECTORY | O_NOFOLLOW)`, returning an open directory descriptor.
+    /// Normalizes only macOS root OS aliases (`/var -> /private/var`, `/tmp -> /private/tmp`)
+    /// at the very beginning of an absolute path, without following any user-controlled symlinks.
+    private static func normalizeSystemRootPrefix(_ rawPath: String) -> String {
+        var path = rawPath
+        while path.count > 1 && path.hasSuffix("/") {
+            path.removeLast()
+        }
+        let osAliases: [(String, String)] = [("/var", "/private/var"), ("/tmp", "/private/tmp")]
+        for (alias, target) in osAliases {
+            if path == alias || path.hasPrefix(alias + "/") {
+                var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+                let len = readlink(alias, &buf, buf.count - 1)
+                if len > 0 {
+                    let linkDest = String(cString: buf)
+                    if linkDest == target.dropFirst() || linkDest == target {
+                        return target + path.dropFirst(alias.count)
+                    }
+                }
+            }
+        }
+        return path
+    }
+
+    /// Walks every path component from `/` down to `normalizedPath` using `lstat` ONLY
+    /// (never calling `open()` on non-entitled parent directories inside the App Sandbox),
+    /// refusing any symlinked component anywhere in the ancestor chain.
+    private static func verifyNoSymlinkedAncestors(normalizedPath: String) throws -> stat {
+        guard normalizedPath.hasPrefix("/") else {
+            throw ActionValidationError.unsafeIdentifier
+        }
+        let parts = normalizedPath.split(separator: "/").map(String.init)
+        guard !parts.isEmpty else {
+            throw ActionValidationError.unsafeIdentifier
+        }
+        var current = ""
+        var lastStat = stat()
+        for part in parts {
+            if part == "." || part == ".." {
+                throw ActionValidationError.unsafeIdentifier
+            }
+            current += "/" + part
+            var st = stat()
+            if lstat(current, &st) != 0 {
+                let err = errno
+                // Inside macOS App Sandbox, lstat on a non-entitled intermediate ancestor
+                // may return EPERM/EACCES; fail closed on ENOENT/ENOTDIR, while symlink
+                // components return 0 with S_IFLNK when visible.
+                throw ActionValidationError.ioFailure(err)
+            }
+            let ftype = st.st_mode & S_IFMT
+            if ftype == S_IFLNK {
+                throw ActionValidationError.symlinkRefused
+            }
+            if ftype != S_IFDIR {
+                throw ActionValidationError.ioFailure(ENOTDIR)
+            }
+            lastStat = st
+        }
+        return lastStat
+    }
+
+    /// Validates all ancestors with `lstat` (without opening non-entitled parents),
+    /// opens ONLY the entitled handoff directory itself with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`,
+    /// re-verifies the ancestor chain and `(st_dev, st_ino)` identity, and optionally steps
+    /// into fd-anchored child directories (`extraComponents`, e.g. `["actions"]`).
     private static func openValidatedDirectoryFD(
         location: FinderHandoffLocation,
         extraComponents: [String] = [],
         createExtra: Bool = false
     ) throws -> Int32 {
-        var curFd = Darwin.open(location.parentDirectory.path, O_RDONLY | O_DIRECTORY)
+        let normalizedHandoff = normalizeSystemRootPrefix(location.resolvedURL.standardizedFileURL.path)
+        _ = try verifyNoSymlinkedAncestors(normalizedPath: normalizedHandoff)
+
+        var curFd = Darwin.open(normalizedHandoff, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         guard curFd >= 0 else {
+            if errno == ELOOP {
+                throw ActionValidationError.symlinkRefused
+            }
             throw ActionValidationError.ioFailure(errno)
         }
 
-        func step(component: String, allowCreate: Bool) throws {
+        // Re-check ancestors after open and verify the opened fd refers to the exact same directory.
+        var openedSt = stat()
+        guard fstat(curFd, &openedSt) == 0, (openedSt.st_mode & S_IFMT) == S_IFDIR else {
+            let err = errno
+            Darwin.close(curFd)
+            throw ActionValidationError.ioFailure(err)
+        }
+        do {
+            let postSt = try verifyNoSymlinkedAncestors(normalizedPath: normalizedHandoff)
+            if postSt.st_dev != openedSt.st_dev || postSt.st_ino != openedSt.st_ino {
+                Darwin.close(curFd)
+                throw ActionValidationError.symlinkRefused
+            }
+        } catch {
+            Darwin.close(curFd)
+            throw error
+        }
+
+        for component in extraComponents {
             guard !component.isEmpty && component != "." && component != ".." && !component.contains("/") else {
                 Darwin.close(curFd)
                 throw ActionValidationError.unsafeIdentifier
@@ -402,7 +488,7 @@ public enum SnapshotEvaluator {
                     Darwin.close(curFd)
                     throw ActionValidationError.ioFailure(ENOTDIR)
                 }
-            } else if errno == ENOENT && allowCreate {
+            } else if errno == ENOENT && createExtra {
                 if mkdirat(curFd, component, 0o700) != 0 && errno != EEXIST {
                     let err = errno
                     Darwin.close(curFd)
@@ -435,20 +521,13 @@ public enum SnapshotEvaluator {
                 }
                 throw ActionValidationError.ioFailure(errno)
             }
-            var openedSt = stat()
-            guard fstat(nextFd, &openedSt) == 0, (openedSt.st_mode & S_IFMT) == S_IFDIR else {
+            var childSt = stat()
+            guard fstat(nextFd, &childSt) == 0, (childSt.st_mode & S_IFMT) == S_IFDIR else {
                 let err = errno
                 Darwin.close(nextFd)
                 throw ActionValidationError.ioFailure(err)
             }
             curFd = nextFd
-        }
-
-        for comp in location.relativeComponents {
-            try step(component: comp, allowCreate: false)
-        }
-        for comp in extraComponents {
-            try step(component: comp, allowCreate: createExtra)
         }
         return curFd
     }

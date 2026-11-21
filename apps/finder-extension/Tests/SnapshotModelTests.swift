@@ -557,6 +557,67 @@ do {
         failed += 1
         fputs("FAIL: clean fd-anchored writeActionRequest failed: \(error)\n", stderr)
     }
+
+    // 9e. Symlinked ancestor ABOVE state root (e.g., Library/Application Support or dev handoff parent)
+    let fakeHome = tempRoot.appendingPathComponent("fake-home", isDirectory: true)
+    let fakeLib = fakeHome.appendingPathComponent("Library", isDirectory: true)
+    try! FileManager.default.createDirectory(at: fakeLib, withIntermediateDirectories: true)
+    let outsideAppSupport = tempRoot.appendingPathComponent("outside-app-support", isDirectory: true)
+    let outsideProdFinder = outsideAppSupport
+        .appendingPathComponent("FolderSync", isDirectory: true)
+        .appendingPathComponent("finder", isDirectory: true)
+    try! FileManager.default.createDirectory(at: outsideProdFinder, withIntermediateDirectories: true)
+    try! Data(validStatus.utf8).write(to: outsideProdFinder.appendingPathComponent("status.json"))
+
+    let symlinkAppSupport = fakeLib.appendingPathComponent("Application Support", isDirectory: true)
+    try! FileManager.default.createSymbolicLink(at: symlinkAppSupport, withDestinationURL: outsideAppSupport)
+
+    let prodLocWithSymAncestor = SnapshotEvaluator.resolveHandoffLocation(
+        configuredAbsolutePath: nil,
+        configuredHomeRelativePath: "Library/Application Support/FolderSync/finder",
+        realHomeDirectory: fakeHome
+    )
+    if case .failed(let reason) = SnapshotEvaluator.readSnapshotData(location: prodLocWithSymAncestor) {
+        expect(reason.contains("symlink"), "symlinked Library/Application Support must be refused on read, got \(reason)")
+    } else {
+        failed += 1
+        fputs("FAIL: readSnapshotData must refuse symlinked Library/Application Support ancestor\n", stderr)
+    }
+    do {
+        _ = try SnapshotEvaluator.writeActionRequest(actionReq, toLocation: prodLocWithSymAncestor)
+        failed += 1
+        fputs("FAIL: writeActionRequest must refuse symlinked Library/Application Support ancestor\n", stderr)
+    } catch ActionValidationError.symlinkRefused {
+        passed += 1
+    } catch {
+        failed += 1
+        fputs("FAIL: expected symlinkRefused for symlinked Library/Application Support, got \(error)\n", stderr)
+    }
+
+    // 9f. Symlinked parent of an absolute dev handoff directory
+    let devParentLink = tempRoot.appendingPathComponent("dev-parent-link", isDirectory: true)
+    try! FileManager.default.createSymbolicLink(at: devParentLink, withDestinationURL: outsideState)
+    let devLocWithSymParent = SnapshotEvaluator.resolveHandoffLocation(
+        configuredAbsolutePath: devParentLink.appendingPathComponent("finder").path,
+        configuredHomeRelativePath: nil,
+        realHomeDirectory: fakeHome
+    )
+    if case .failed(let reason) = SnapshotEvaluator.readSnapshotData(location: devLocWithSymParent) {
+        expect(reason.contains("symlink"), "symlinked dev handoff parent must be refused on read, got \(reason)")
+    } else {
+        failed += 1
+        fputs("FAIL: readSnapshotData must refuse symlinked dev handoff parent\n", stderr)
+    }
+    do {
+        _ = try SnapshotEvaluator.writeActionRequest(actionReq, toLocation: devLocWithSymParent)
+        failed += 1
+        fputs("FAIL: writeActionRequest must refuse symlinked dev handoff parent\n", stderr)
+    } catch ActionValidationError.symlinkRefused {
+        passed += 1
+    } catch {
+        failed += 1
+        fputs("FAIL: expected symlinkRefused for symlinked dev handoff parent, got \(error)\n", stderr)
+    }
 }
 
 print("SnapshotModelTests: \(passed) passed, \(failed) failed")
