@@ -28,7 +28,7 @@ use crate::{
     process::{ProcessError, ProcessRunner, ProcessSpec, SpawnOptions, minimal_isolated_env},
     qualification::{
         EngineIdentity, QualificationError, QualificationManifest,
-        verify_binary_integrity_with_manifest,
+        verify_binary_identity_with_manifest, verify_executable_metadata,
     },
     request::{PasswordCommand, RequestError, validate_remote_name_str},
 };
@@ -958,7 +958,8 @@ fn run_verified_rclone_config_cmd(
     args: Vec<OsString>,
     account_dir: &Path,
 ) -> Result<crate::process::RunOutput, ConfigError> {
-    verify_binary_integrity_with_manifest(engine, manifest)?;
+    verify_binary_identity_with_manifest(engine, manifest)?;
+    verify_executable_metadata(engine)?;
     let spec = ProcessSpec {
         program: engine.path().to_path_buf(),
         args,
