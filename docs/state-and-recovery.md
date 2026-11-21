@@ -173,7 +173,9 @@ the real application directory.
    and capacity are checked outside the manager mutex before request preparation
    and again immediately before launch. The worker then checks the active run
    identity and cancellation under the mutex and holds it through spawn and
-   the child identity commit.
+   the child identity commit. When **Stop** or **Force stop** cancels a claimed
+   run before launch, the manager records the interruption and starts the
+   next polling interval when the run is marked finished.
 2. **Post-spawn child identity:** Immediately after spawn, `sync-manager`
    commits `child_pid`, OS process start time (`proc_pidinfo(PROC_PIDTBSDINFO)`
    on macOS, `/proc/<pid>/stat` on Linux), executable path (`proc_pidpath` /
@@ -308,12 +310,14 @@ generations with a recorded successful initialization.
 ## Changing exclusions
 
 Preview a filter change to see the added and removed exclusions, both endpoint
-inventories, and the proposed first-sync direction. Confirming an eligible
-preview retires the old baseline from normal runs and repeats preflight using
-the proposed filters. Each attempt that reaches initialization gets its own
-generation, frozen filter file, and empty bisync work directory. Prior work
-directories remain available for inspection. Files newly excluded from sync
-stay in place.
+inventories, and the proposed first-sync direction. An unresolved orphan that
+blocks the worker also blocks applying the preview. The mapping keeps its
+current baseline and exclusions while that hold is open. Confirming an
+eligible preview retires the old baseline from normal runs and repeats
+preflight using the proposed filters. Each attempt that reaches initialization
+gets its own generation, frozen filter file, and empty bisync work directory.
+Prior work directories remain available for inspection. Files newly excluded
+from sync stay in place.
 
 The initializer supports upload to an empty destination, download to an empty
 local folder, and two empty folders. If both folders contain data, review and
@@ -325,9 +329,11 @@ initialize safely, scheduling remains off until the new setup succeeds.
 
 The manager uses the adapter's bundle-aware qualification. Packaged macOS apps
 use their sealed helper. Development resolves the pinned engine from `.tools`.
-The manager keeps the qualified identity for its lifetime and the adapter
-checks the executable again at launch. Each launched run records the engine
-version, digest, and platform in SQLite and the executable path in `argv.json`.
+The sync launcher and account service cache successful qualification for
+their lifetimes. Bisync checks the executable's digest once immediately
+before spawning. Account commands also verify the executable at launch.
+Each launched sync records the engine version, digest, and platform in SQLite
+and the executable path in `argv.json`.
 
 ## CLI companion (`sync-cli`)
 

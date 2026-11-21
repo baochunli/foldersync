@@ -395,7 +395,9 @@ pub(crate) fn verify_binary_integrity_with_manifest(
     verify_executable_digest(identity)
 }
 
-fn verify_executable_digest(identity: &EngineIdentity) -> Result<(), QualificationError> {
+pub(crate) fn verify_executable_metadata(
+    identity: &EngineIdentity,
+) -> Result<(), QualificationError> {
     let meta = if identity.bundled {
         bundle_file_metadata(&identity.path)?
     } else {
@@ -412,7 +414,11 @@ fn verify_executable_digest(identity: &EngineIdentity) -> Result<(), Qualificati
             return Err(QualificationError::NotExecutable(identity.path.clone()));
         }
     }
+    Ok(())
+}
 
+fn verify_executable_digest(identity: &EngineIdentity) -> Result<(), QualificationError> {
+    verify_executable_metadata(identity)?;
     let actual_sha256 = sha256_file(&identity.path)?;
     if actual_sha256 != identity.sha256 {
         return Err(QualificationError::Sha256Mismatch {
@@ -890,12 +896,11 @@ mod tests {
 
         fixture.write_manifest(&fixture.bundle_manifest());
         assert!(matches!(
-            request.spawn(&runner, SpawnOptions::default()),
-            Err(crate::LaunchError::Qualification(
-                QualificationError::Sha256Mismatch { .. }
+            request.spawn(&RealProcessRunner, SpawnOptions::default()),
+            Err(crate::LaunchError::Process(
+                ProcessError::BinaryIntegrityMismatch { .. }
             ))
         ));
-        assert!(runner.spawned_specs().is_empty());
     }
 
     #[cfg(unix)]

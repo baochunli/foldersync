@@ -12,8 +12,8 @@ use rclone_adapter::{ChildIdentity, ExitStatusInfo, ProcessStartTime};
 use sync_core::{Execution, MappingId, Readiness};
 use sync_manager::{
     AddMappingCommand, FakeBisyncLauncher, FakeLaunchScript, FakeProcessInspector,
-    InitializeCommand, LiveProcessInfo, ManagerConfig, ProcessProbeResult, SqliteStateStore,
-    SyncManager,
+    InitializeCommand, LiveProcessInfo, ManagerConfig, ManagerError, ProcessProbeResult,
+    SqliteStateStore, SyncManager,
 };
 use tempfile::TempDir;
 
@@ -290,7 +290,11 @@ fn reused_pid_with_different_start_time_is_not_trusted_on_restart() {
 #[test]
 fn live_matching_orphan_is_detected_and_blocks_second_job() {
     let env = TestEnv::new();
+    let selection = TestEnv::new();
+    fs::write(selection.local_dir.join("note.txt"), "fixture").unwrap();
+    let selection_id = MappingId::new("selection");
     let launcher = Arc::new(FakeBisyncLauncher::new());
+    launcher.push_script(FakeLaunchScript::default());
     launcher.push_script(FakeLaunchScript::default());
 
     let orphan_pid = 7777u32;
@@ -310,6 +314,25 @@ fn live_matching_orphan_is_detected_and_blocks_second_job() {
         })
         .unwrap();
         mgr.wait_until_idle(Duration::from_secs(5)).unwrap();
+        mgr.add_mapping(
+            AddMappingCommand::local_fixture(
+                selection_id.as_str(),
+                "local-1",
+                "Data/Selection",
+                &selection.local_dir,
+                &selection.remote_dir,
+                &selection.local_recovery,
+                &selection.remote_recovery,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        mgr.initialize(InitializeCommand {
+            mapping_id: selection_id.clone(),
+            expected_direction: None,
+        })
+        .unwrap();
+        mgr.wait_until_idle(Duration::from_secs(15)).unwrap();
         mgr.shutdown().unwrap();
     }
 
@@ -384,6 +407,26 @@ fn live_matching_orphan_is_detected_and_blocks_second_job() {
     assert_eq!(report.open_cases[0].case.reason_kind, "orphan_running");
     assert_eq!(report.open_cases[0].case.orphan_pid, Some(orphan_pid));
     assert_eq!(report.open_cases[0].orphan_still_alive, Some(true));
+
+    let preview = mgr
+        .propose_filter_change(&selection_id, ["/archive.tmp".to_owned()].into())
+        .unwrap();
+    assert!(preview.preflight().direction.is_ok());
+    let store = SqliteStateStore::open(&env.state_dir.join("state.sqlite")).unwrap();
+    let before = store.get_mapping(&selection_id).unwrap().unwrap();
+    let result = mgr.apply_filter_change(preview);
+    assert!(
+        matches!(&result, Err(ManagerError::ActiveJobConflict { active_mapping_id, .. })
+            if active_mapping_id.as_str() == "research"),
+        "expected a conflict with the live orphan, got {:?}",
+        result.as_ref().map(|acceptance| &acceptance.outcome)
+    );
+    let after = store.get_mapping(&selection_id).unwrap().unwrap();
+    assert_eq!(after.active_generation_id, before.active_generation_id);
+    assert_eq!(after.exclusions, before.exclusions);
+    assert_eq!(after.state, before.state);
+    assert!(after.scheduling_enabled);
+    assert_eq!(launcher.launched_plans().len(), 2);
     mgr.shutdown().unwrap();
 }
 

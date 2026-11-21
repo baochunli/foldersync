@@ -1465,6 +1465,21 @@ impl SyncManager {
                 next_step: "Wait for the active run to finish or resolve the hold, then review the selection again.".to_owned(),
             });
         }
+        if let Some(blocking) =
+            find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
+        {
+            return Err(ManagerError::ActiveJobConflict {
+                active_mapping_id: blocking.mapping_id.clone(),
+                cause: format!(
+                    "Cannot start first sync while `{}` has an unresolved hold ({}).",
+                    blocking.mapping_id,
+                    plain_recovery_reason_label(&blocking.reason_kind)
+                ),
+                next_step:
+                    "Open recovery details to resolve the earlier sync process before starting another sync."
+                        .to_string(),
+            });
+        }
         if preview.added_exclusions.is_empty() && preview.removed_exclusions.is_empty() {
             return Err(ManagerError::PreflightRejected {
                 cause: "The exclusion set has not changed.".to_owned(),
@@ -6112,6 +6127,9 @@ fn abort_before_spawn_locked(
         return;
     }
 
+    if let Some(schedule) = guard.schedules.get_mut(&run.mapping_id) {
+        schedule.finish(inner.clock.now_utc(), false, run.id.as_str());
+    }
     let _ = publish_updated_snapshot(inner, guard);
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
         mapping_id: run.mapping_id,
