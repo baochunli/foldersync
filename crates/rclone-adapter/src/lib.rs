@@ -1,7 +1,40 @@
 //! Owns rclone version qualification, typed argument construction, process
-//! lifetime, and output parsing for FolderSync.
+//! lifetime, output parsing, and outcome classification for FolderSync.
+
+pub mod log_parser;
+pub mod outcome;
+pub mod process;
+pub mod qualification;
+pub mod request;
 
 use std::{env, path::PathBuf};
+
+pub use log_parser::{
+    BisyncMarker, ConflictSide, LogEvent, LogLevel, StructuredLogEvent, TransferStats,
+    parse_log_line, parse_log_stream, strip_ansi_codes,
+};
+pub use outcome::{
+    EXIT_CODE_TABLE_VERSION, Outcome, RcloneExitCode, classify_exit_code, classify_outcome,
+    classify_run_outcome,
+};
+pub use process::{
+    BoundedLineBuffer, CapturedOutput, ChildIdentity, ExitStatusInfo, FakeProcessRunner,
+    FakeRunScript, OutputLimits, OutputLine, ProcessError, ProcessRunner, ProcessSpec,
+    ProcessStartTime, RealProcessRunner, RunHandle, RunOutput, SpawnOptions, StopHandle,
+    StreamKind, minimal_isolated_env, read_process_start_time,
+};
+pub use qualification::{
+    EngineIdentity, PlatformPin, QualificationError, QualificationManifest, host_platform_key,
+    parse_rclone_version, qualify_binary, qualify_pinned_binary, sha256_file,
+    verify_binary_integrity,
+};
+pub use request::{
+    BackupDir2, BisyncRequest, BisyncRequestBuilder, InitPreference, LaunchError, PasswordCommand,
+    Path2, RequestError, RunMode,
+};
+
+/// Exact rclone release pinned in `packaging/qualification-manifest.toml`.
+pub const PINNED_RCLONE_VERSION: &str = "1.76.0";
 
 const DEFAULT_BINARY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
