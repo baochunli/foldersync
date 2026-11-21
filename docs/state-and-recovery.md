@@ -341,7 +341,9 @@ generations with a recorded successful initialization.
 ## Changing exclusions
 
 Preview a filter change to see the added and removed exclusions, both endpoint
-inventories, and the proposed first-sync direction. An unresolved orphan that
+inventories, and the proposed first-sync direction. Subfolder counts and
+sizes include currently excluded files. The transfer estimate uses the
+proposed exclusions. An unresolved orphan that
 blocks the worker also blocks applying the preview. The mapping keeps its
 current baseline and exclusions while that hold is open. Confirming an
 eligible preview retires the old baseline from normal runs and repeats

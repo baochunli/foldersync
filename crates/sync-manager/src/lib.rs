@@ -17,8 +17,9 @@ pub mod store;
 
 pub use accounts::{
     AccountCheckReport, AccountError, AccountService, AccountServiceConfig, AddDriveAccountRequest,
-    CollectionCandidate, DriveAccountResult, DriveAuthorization, ImportAccountRequest,
-    PasswordCommandFactory, RESERVED_LOCAL_FIXTURE_ACCOUNT_ID,
+    CollectionCandidate, CollectionListing, CollectionSkipReason, DriveAccountResult,
+    DriveAuthorization, ImportAccountRequest, PasswordCommandFactory,
+    RESERVED_LOCAL_FIXTURE_ACCOUNT_ID, SkippedCollection,
 };
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::ManagerError;

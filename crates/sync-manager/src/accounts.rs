@@ -8,6 +8,7 @@
 //! `SyncManager` / UI wiring layer (`connect-t4`) can call cleanly.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -418,6 +419,27 @@ pub struct CollectionCandidate {
     pub modified_at: String,
 }
 
+/// Selectable folders and the sibling names skipped during browsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionListing {
+    pub candidates: Vec<CollectionCandidate>,
+    pub skipped: Vec<SkippedCollection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedCollection {
+    pub name: String,
+    pub reason: CollectionSkipReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CollectionSkipReason {
+    #[serde(rename = "unsupported name")]
+    UnsupportedName,
+    #[serde(rename = "duplicate")]
+    Duplicate,
+}
+
 /// Account operation started by the manager's cancellable authorization API.
 pub enum DriveAuthorization {
     Connect(AddDriveAccountRequest),
@@ -478,44 +500,63 @@ impl LockedDrive<'_> {
             .to_owned())
     }
 
-    fn candidates(&self, data_id: &str) -> Result<Vec<CollectionCandidate>, AccountError> {
+    fn candidates(&self, data_id: &str) -> Result<CollectionListing, AccountError> {
         let entries = list_dirs_with_runner(&self.request, "Data", &self.runner)?;
-        if let Some(duplicate) = find_duplicate_dir_names(&entries).into_iter().next() {
-            return Err(AccountError::AmbiguousDuplicate {
-                path: format!("Data/{}", duplicate.name),
-                component: duplicate.name,
-                matching_ids: duplicate.matching_ids,
+        let duplicates: BTreeSet<_> = find_duplicate_dir_names(&entries)
+            .into_iter()
+            .map(|duplicate| duplicate.name)
+            .collect();
+        let mut listing = CollectionListing {
+            candidates: Vec::new(),
+            skipped: duplicates
+                .iter()
+                .map(|name| SkippedCollection {
+                    name: name.clone(),
+                    reason: CollectionSkipReason::Duplicate,
+                })
+                .collect(),
+        };
+        for entry in entries.into_iter().filter(|entry| entry.is_dir) {
+            if duplicates.contains(&entry.name) {
+                continue;
+            }
+            if validate_collection_name(&entry.name).is_err() {
+                listing.skipped.push(SkippedCollection {
+                    name: entry.name,
+                    reason: CollectionSkipReason::UnsupportedName,
+                });
+                continue;
+            }
+            listing.candidates.push(self.candidate(data_id, entry)?);
+        }
+        Ok(listing)
+    }
+
+    fn candidate(
+        &self,
+        data_id: &str,
+        entry: LsJsonEntry,
+    ) -> Result<CollectionCandidate, AccountError> {
+        if entry.path != entry.name {
+            return Err(AccountError::InvalidInput {
+                cause: "The Data listing returned a folder outside its immediate children.".into(),
+                next_step: "Refresh the folder list and review the shared Data folder.".into(),
             });
         }
-        entries
-            .into_iter()
-            .filter(|entry| entry.is_dir)
-            .map(|entry| {
-                validate_collection_name(&entry.name)?;
-                if entry.path != entry.name {
-                    return Err(AccountError::InvalidInput {
-                        cause: "The Data listing returned a folder outside its immediate children."
-                            .into(),
-                        next_step: "Refresh the folder list and review the shared Data folder."
-                            .into(),
-                    });
-                }
-                let folder_id = entry.id.unwrap_or_default();
-                validate_drive_folder_id(&folder_id)?;
-                Ok(CollectionCandidate {
-                    collection: CloudCollection {
-                        display_path: format!("Data/{}", entry.name),
-                        folder_id,
-                        ancestor_ids: vec![
-                            self.account.remote_root_folder_id.clone(),
-                            data_id.to_owned(),
-                        ],
-                    },
-                    name: entry.name,
-                    modified_at: entry.mod_time,
-                })
-            })
-            .collect()
+        let folder_id = entry.id.unwrap_or_default();
+        validate_drive_folder_id(&folder_id)?;
+        Ok(CollectionCandidate {
+            collection: CloudCollection {
+                display_path: format!("Data/{}", entry.name),
+                folder_id,
+                ancestor_ids: vec![
+                    self.account.remote_root_folder_id.clone(),
+                    data_id.to_owned(),
+                ],
+            },
+            name: entry.name,
+            modified_at: entry.mod_time,
+        })
     }
 }
 
@@ -1650,7 +1691,7 @@ impl AccountService {
     pub fn list_collection_candidates(
         &self,
         id: &AccountId,
-    ) -> Result<Vec<CollectionCandidate>, AccountError> {
+    ) -> Result<CollectionListing, AccountError> {
         let _state_lock = self.maybe_lock_state()?;
         let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
         let drive = self.locked_drive(id, &control)?;
@@ -1696,14 +1737,27 @@ impl AccountService {
                 actual_id: actual_data_id,
             });
         }
-        drive
-            .candidates(&data_id)?
+        let entries = list_dirs_with_runner(&drive.request, "Data", &drive.runner)?;
+        let mut matches = entries
             .into_iter()
-            .find(|candidate| candidate.name == name)
-            .ok_or_else(|| AccountError::FolderNotFound {
-                path: format!("Data/{name}"),
+            .filter(|entry| entry.is_dir && entry.name == name)
+            .peekable();
+        let path = format!("Data/{name}");
+        let entry = matches.next().ok_or_else(|| AccountError::FolderNotFound {
+            path: path.clone(),
+            component: name.to_owned(),
+        })?;
+        if matches.peek().is_some() {
+            let matching_ids = std::iter::once(entry.id)
+                .chain(matches.map(|entry| entry.id))
+                .collect();
+            return Err(AccountError::AmbiguousDuplicate {
+                path,
                 component: name.to_owned(),
-            })
+                matching_ids,
+            });
+        }
+        drive.candidate(&data_id, entry)
     }
 
     pub(crate) fn measure_collection(
@@ -1716,6 +1770,7 @@ impl AccountService {
         let data_id = drive.data_id()?;
         let mut candidates = drive
             .candidates(&data_id)?
+            .candidates
             .into_iter()
             .filter(|candidate| candidate.collection.folder_id == folder_id);
         let selection = candidates

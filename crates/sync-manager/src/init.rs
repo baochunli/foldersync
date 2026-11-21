@@ -876,11 +876,13 @@ pub(crate) fn inspect_drive_endpoint(
                 });
         }
     }
-    for entry in entries.iter().filter(|entry| {
-        entry.path != ACCESS_MARKER_FILENAME && !is_excluded(&entry.path, exclusions)
-    }) {
-        if !entry.is_dir {
-            let size = u64::try_from(entry.size).map_err(|_| ManagerError::PreflightRejected {
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
+    {
+        let size = u64::try_from(entry.size);
+        if !entry.is_dir && !is_excluded(&entry.path, exclusions) {
+            let size = size.map_err(|_| ManagerError::PreflightRejected {
                 cause: format!("The Drive file `{}` did not report a size.", entry.path),
                 next_step: "Review the file or exclude it before starting first sync.".into(),
             })?;
@@ -894,7 +896,9 @@ pub(crate) fn inspect_drive_endpoint(
                 subfolder.has_children = true;
             } else {
                 subfolder.file_count += 1;
-                subfolder.total_bytes = subfolder.total_bytes.saturating_add(entry.size as u64);
+                subfolder.total_bytes = subfolder
+                    .total_bytes
+                    .saturating_add(size.unwrap_or_default());
             }
         }
     }

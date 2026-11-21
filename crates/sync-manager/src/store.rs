@@ -899,6 +899,26 @@ impl SqliteStateStore {
     }
 
     pub fn update_mapping_runtime(&self, m: &MappingRecord) -> Result<(), ManagerError> {
+        Self::write_mapping_runtime(&self.conn, m)
+    }
+
+    pub(crate) fn update_mapping_runtimes(
+        &mut self,
+        mappings: &[MappingRecord],
+    ) -> Result<(), ManagerError> {
+        let transaction = self
+            .conn
+            .transaction()
+            .map_err(|err| storage_err("Failed to start mapping state transaction", err))?;
+        for mapping in mappings {
+            Self::write_mapping_runtime(&transaction, mapping)?;
+        }
+        transaction
+            .commit()
+            .map_err(|err| storage_err("Failed to commit mapping states", err))
+    }
+
+    fn write_mapping_runtime(conn: &Connection, m: &MappingRecord) -> Result<(), ManagerError> {
         let state_json = serde_json::to_string(&m.state)
             .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
         let last_outcome_json = m
@@ -907,9 +927,8 @@ impl SqliteStateStore {
             .transpose()
             .map_err(|e| storage_err("Failed to serialize last_run_outcome", e))?;
 
-        self.conn
-            .execute(
-                "UPDATE mappings SET
+        conn.execute(
+            "UPDATE mappings SET
                     scheduling_enabled = ?2,
                     state_json = ?3,
                     intent = ?4,
@@ -924,25 +943,25 @@ impl SqliteStateStore {
                     updated_at = ?13,
                     exclusions_json = ?14
                  WHERE id = ?1",
-                params![
-                    m.id.as_str(),
-                    i64::from(m.scheduling_enabled),
-                    state_json,
-                    intent_str(m.state.intent),
-                    readiness_str(m.state.readiness()),
-                    execution_str(m.state.execution),
-                    m.active_generation_id.as_ref().map(|g| g.as_str()),
-                    m.last_run_id.as_ref().map(|r| r.as_str()),
-                    last_outcome_json,
-                    m.last_run_completed_at,
-                    m.last_run_summary_text,
-                    m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
-                    m.updated_at,
-                    serde_json::to_string(&m.exclusions)
-                        .map_err(|e| storage_err("Failed to serialize exclusions", e))?,
-                ],
-            )
-            .map_err(|e| storage_err("Failed to update mapping state", e))?;
+            params![
+                m.id.as_str(),
+                i64::from(m.scheduling_enabled),
+                state_json,
+                intent_str(m.state.intent),
+                readiness_str(m.state.readiness()),
+                execution_str(m.state.execution),
+                m.active_generation_id.as_ref().map(|g| g.as_str()),
+                m.last_run_id.as_ref().map(|r| r.as_str()),
+                last_outcome_json,
+                m.last_run_completed_at,
+                m.last_run_summary_text,
+                m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
+                m.updated_at,
+                serde_json::to_string(&m.exclusions)
+                    .map_err(|e| storage_err("Failed to serialize exclusions", e))?,
+            ],
+        )
+        .map_err(|e| storage_err("Failed to update mapping state", e))?;
         Ok(())
     }
 

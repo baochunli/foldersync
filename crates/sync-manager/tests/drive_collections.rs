@@ -1,7 +1,10 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -12,20 +15,25 @@ use rclone_adapter::{
 };
 use sync_core::{AccountId, CloudCollection, MappingId, Readiness};
 use sync_manager::{
-    AccountRecord, AccountServiceConfig, AddMappingCommand, DriveAuthorization, FolderSizeStatus,
-    InMemorySecretStore, InitializeCommand, ManagerConfig, RealBisyncLauncher, SecretStore,
-    SecretString, SqliteStateStore, SyncManager, scoped_credential_key,
+    AccountRecord, AccountServiceConfig, AddMappingCommand, CollectionSkipReason,
+    DriveAuthorization, FolderSizeStatus, InMemorySecretStore, InitializeCommand, ManagerConfig,
+    RealBisyncLauncher, SecretStore, SecretString, SqliteStateStore, SyncManager,
+    scoped_credential_key,
 };
 
 struct FixtureRunner {
     fake: FakeProcessRunner,
     root: PathBuf,
+    mkdir_calls: AtomicUsize,
 }
 
 impl ProcessRunner for FixtureRunner {
     fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
         let args = &spec.args;
         let command = args[0].to_str().unwrap();
+        if command == "mkdir" {
+            self.mkdir_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let directory_listing = args.iter().any(|arg| arg == "--dirs-only");
         if directory_listing
             || command == "config"
@@ -56,6 +64,7 @@ impl Fixture {
         let runner = Arc::new(FixtureRunner {
             fake: FakeProcessRunner::new(),
             root: root.clone(),
+            mkdir_calls: AtomicUsize::new(0),
         });
         let state = root.join("state");
         let account_dir = state.join("accounts/drive");
@@ -150,11 +159,30 @@ impl Fixture {
     }
 }
 
+const MIXED_CHILDREN: [(&str, &str); 4] = [
+    ("Research", "research-id"),
+    ("Archive", "archive-1"),
+    ("Archive", "archive-2"),
+    ("Draft?", "draft-id"),
+];
+
 #[test]
-fn browse_lists_only_data_children_and_rejects_duplicate_names() {
+fn browse_keeps_usable_data_children_among_incompatible_siblings() {
     let Some(fx) = Fixture::new(true) else { return };
-    fx.listing(&[("Research", "research-id")]);
-    let candidates = fx.manager.list_collection_candidates(&fx.id).unwrap();
+    fx.listing(&MIXED_CHILDREN);
+    let listing = fx.manager.list_collection_candidates(&fx.id).unwrap();
+    assert_eq!(
+        listing
+            .skipped
+            .iter()
+            .map(|skip| (skip.name.as_str(), skip.reason))
+            .collect::<Vec<_>>(),
+        [
+            ("Archive", CollectionSkipReason::Duplicate),
+            ("Draft?", CollectionSkipReason::UnsupportedName),
+        ],
+    );
+    let candidates = listing.candidates;
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].collection.folder_id, "research-id");
     assert_eq!(
@@ -163,32 +191,34 @@ fn browse_lists_only_data_children_and_rejects_duplicate_names() {
     );
     assert_eq!(candidates[0].name, "Research");
     assert_eq!(candidates[0].modified_at, "2026-01-02T03:04:05Z");
-
-    fx.listing(&[("Research", "research-id"), ("Research", "another-id")]);
-    assert!(
-        fx.manager
-            .list_collection_candidates(&fx.id)
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate")
-    );
 }
 
 #[test]
-fn create_refuses_duplicate_and_resolves_created_folder() {
+fn create_refuses_bad_names_before_mkdir_and_ignores_unrelated_siblings() {
     let Some(fx) = Fixture::new(true) else { return };
-    fx.dirs(&[("Data", "data-id")]);
     assert!(
         fx.manager
-            .create_collection_folder(&fx.id, "Research")
+            .create_collection_folder(&fx.id, "Invalid?")
             .is_err()
     );
+    assert!(fx.runner.fake.spawned_specs().is_empty());
+
+    fs::write(fx.root().join("Data/Existing.txt"), b"existing file").unwrap();
+    for name in ["Research", "existing.txt"] {
+        fx.dirs(&[("Data", "data-id")]);
+        assert!(fx.manager.create_collection_folder(&fx.id, name).is_err());
+    }
+    assert_eq!(fx.runner.mkdir_calls.load(Ordering::Relaxed), 0);
+
     fx.dirs(&[("Data", "data-id")]);
-    fx.listing(&[("Research", "research-id"), ("Notes", "notes-id")]);
+    let mut children = MIXED_CHILDREN.to_vec();
+    children.push(("Notes", "notes-id"));
+    fx.listing(&children);
     let created = fx
         .manager
         .create_collection_folder(&fx.id, "Notes")
         .unwrap();
+    assert_eq!(fx.runner.mkdir_calls.load(Ordering::Relaxed), 1);
     assert!(fx.root().join("Data/Notes").is_dir());
     assert_eq!(created.collection.folder_id, "notes-id");
 }
@@ -199,7 +229,7 @@ fn size_is_lazy_cancellable_and_cached() {
     fs::write(fx.root().join("Data/Research/note"), b"12345").unwrap();
     assert!(fx.manager.snapshot().folder_sizes.is_empty());
     for _ in 0..2 {
-        fx.listing(&[("Research", "research-id")]);
+        fx.listing(&MIXED_CHILDREN);
     }
     fx.manager
         .request_folder_size(&fx.id, "research-id")
@@ -455,6 +485,130 @@ fn first_sync_refuses_to_overwrite_an_unrecognized_marker() {
     assert_eq!(fs::read(cloud_marker).unwrap(), b"user file");
     assert!(!fx.root().join("local/RCLONE_TEST").exists());
     assert!(!fx.root().join("Recovery").exists());
+}
+
+#[test]
+fn drive_preview_counts_excluded_files_in_subfolder_totals() {
+    let Some(fx) = Fixture::new(true) else { return };
+    let remote = fx.root().join("Data/Research");
+    fs::create_dir_all(remote.join("Archive/Year")).unwrap();
+    fs::write(remote.join("Archive/Year/notes"), b"archive").unwrap();
+    fs::write(remote.join("active"), b"live").unwrap();
+    let mut mapping = fx.mapping("local", "research-id", "Data/Research");
+    mapping.extra_exclusions.insert("/Archive/**".into());
+    fx.listing(&RESEARCH);
+    let inventory = fx
+        .manager
+        .preflight_mapping_preview(&mapping, None)
+        .unwrap()
+        .remote_inventory
+        .unwrap();
+    assert_eq!((inventory.file_count, inventory.total_bytes), (1, 4));
+    let archive = &inventory.subfolders[0];
+    assert_eq!(archive.name, "Archive");
+    assert_eq!(
+        (
+            archive.file_count,
+            archive.total_bytes,
+            archive.has_children
+        ),
+        (1, 7, true)
+    );
+}
+
+fn put_mapping_on_authentication_hold(fx: &Fixture) -> (SqliteStateStore, AccountRecord) {
+    initialize_research(fx, rclone_adapter::InitPreference::Path1);
+    let store = SqliteStateStore::open(&fx.state.join("state.sqlite")).unwrap();
+    let mut account = store.get_account(&fx.id).unwrap().unwrap();
+    account.auth_status = "authentication_required".into();
+    store.upsert_account(&account).unwrap();
+    assert!(fx.manager.run_now("local").is_err());
+    assert_eq!(
+        fx.manager.snapshot().mappings[0].readiness,
+        Readiness::AuthenticationRequired
+    );
+    (store, account)
+}
+
+#[test]
+fn reconnect_restores_mapping_readiness_and_publishes_it() {
+    let Some(fx) = Fixture::new(true) else { return };
+    let (store, account) = put_mapping_on_authentication_hold(&fx);
+    fs::write(
+        &account.config_path,
+        "RCLONE_ENCRYPT_V0:
+FakeCiphertext==
+",
+    )
+    .unwrap();
+    fx.runner.fake.push_run(FakeRunScript::default()); // config reconnect
+    fx.runner.fake.push_run(FakeRunScript::default()); // config encryption check
+    fx.runner.fake.push_run(FakeRunScript {
+        lines: vec![OutputLine {
+            stream: StreamKind::Stdout,
+            text: "[household]
+type = drive
+token = XXX
+"
+            .into(),
+            truncated: false,
+        }],
+        ..Default::default()
+    });
+    fx.dirs(&[("Data", "data-id")]);
+    let snapshots = fx.manager.subscribe_snapshots(1);
+    let result = fx
+        .manager
+        .start_drive_authorization(DriveAuthorization::Reconnect(fx.id.clone()), None)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(result.account.auth_status, "ready");
+    assert_eq!(
+        snapshots
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .mappings[0]
+            .readiness,
+        Readiness::Ready
+    );
+    assert_eq!(
+        store
+            .get_mapping(&MappingId::new("local"))
+            .unwrap()
+            .unwrap()
+            .state
+            .readiness(),
+        Readiness::Ready
+    );
+}
+
+#[test]
+fn check_again_restores_readiness_after_verified_drive_sign_in() {
+    let Some(fx) = Fixture::new(true) else { return };
+    let (store, mut account) = put_mapping_on_authentication_hold(&fx);
+    assert!(fx.manager.check_again("local").is_err());
+    account.auth_status = "ready".into();
+    store.upsert_account(&account).unwrap();
+
+    fx.listing(&[("Research", "replacement-id")]);
+    assert!(fx.manager.check_again("local").is_err());
+    assert_eq!(
+        fx.manager.snapshot().mappings[0].readiness,
+        Readiness::AuthenticationRequired
+    );
+    fx.listing(&RESEARCH);
+    let checked = fx.manager.check_again("local").unwrap();
+    assert_eq!(checked.snapshot.mappings[0].readiness, Readiness::Ready);
+    assert_eq!(
+        store
+            .get_mapping(&MappingId::new("local"))
+            .unwrap()
+            .unwrap()
+            .state
+            .readiness(),
+        Readiness::Ready
+    );
 }
 
 #[test]

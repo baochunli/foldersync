@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::{
     accounts::{
-        AccountError, AccountService, AccountServiceConfig, CollectionCandidate,
+        AccountError, AccountService, AccountServiceConfig, CollectionCandidate, CollectionListing,
         DRIVE_COMMAND_TIMEOUT, DriveAccountResult, DriveAuthorization, LockedDrive,
         validate_drive_folder_id,
     },
@@ -1904,7 +1904,7 @@ impl SyncManager {
     pub fn list_collection_candidates(
         &self,
         account: &AccountId,
-    ) -> Result<Vec<CollectionCandidate>, ManagerError> {
+    ) -> Result<CollectionListing, ManagerError> {
         self.inner
             .accounts
             .list_collection_candidates(account)
@@ -2069,9 +2069,34 @@ impl SyncManager {
                         .reconnect_drive_account_using(&id, on_auth_url, Some(&worker_control)),
                 };
                 let mut guard = inner.state.lock().unwrap();
+                let result = outcome.map_err(drive_error).and_then(|outcome| {
+                    if outcome.account.auth_status == "ready" {
+                        let now = inner.clock.now_rfc3339();
+                        let mut updates = guard.store.list_mappings()?;
+                        updates.retain_mut(|mapping| {
+                            if mapping.account_id != outcome.account.id {
+                                return false;
+                            }
+                            let restored =
+                                apply_event(mapping.state, ObservedEvent::AuthenticationRestored)
+                                    .state;
+                            if restored == mapping.state {
+                                return false;
+                            }
+                            mapping.state = restored;
+                            mapping.updated_at.clone_from(&now);
+                            true
+                        });
+                        if !updates.is_empty() {
+                            guard.store.update_mapping_runtimes(&updates)?;
+                        }
+                        publish_updated_snapshot(&inner, &mut guard)?;
+                    }
+                    Ok(outcome)
+                });
                 guard.authorization = None;
                 inner.idle_cv.notify_all();
-                let _ = sender.send(outcome.map_err(drive_error));
+                let _ = sender.send(result);
             });
         if let Err(error) = spawned {
             guard.authorization = None;
@@ -3513,6 +3538,18 @@ impl SyncManager {
         };
         result.map_err(|(_, err)| *err)?;
 
+        // A successful Drive endpoint check includes a ready account and a
+        // verified generation. Recheck readiness before clearing the hold.
+        if mapping.state.readiness() == Readiness::AuthenticationRequired
+            && mapping.remote_endpoint_kind == "drive_remote"
+            && guard
+                .store
+                .get_account(&mapping.account_id)?
+                .is_some_and(|account| account.auth_status == "ready")
+        {
+            mapping.state = apply_event(mapping.state, ObservedEvent::AuthenticationRestored).state;
+        }
+
         match mapping.state.readiness() {
             Readiness::EndpointChanged => {
                 mapping.state = apply_event(mapping.state, ObservedEvent::EndpointValidated).state;
@@ -4379,6 +4416,7 @@ fn lookup_mapping(store: &SqliteStateStore, id: &MappingId) -> Result<MappingRec
 
 fn same_volume_inputs(previous: &MappingRecord, current: &MappingRecord) -> bool {
     previous.local_binding == current.local_binding
+        && previous.account_id == current.account_id
         && previous.active_generation_id == current.active_generation_id
         && previous.remote_endpoint_kind == current.remote_endpoint_kind
         && previous.remote_endpoint_value == current.remote_endpoint_value

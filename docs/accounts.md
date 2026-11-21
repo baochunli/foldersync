@@ -72,10 +72,12 @@ folder using `sync-cli`.
 ## Drive folder selection in the manager
 
 A ready Drive account can list immediate child folders of the shared
-`Data` folder. Each result includes the folder ID, name, modification time,
-and ancestor IDs. The manager rejects ambiguous sibling names. Creating a
-folder checks the names already used in `Data`, then verifies the new folder's
-ID under the same parent. These operations use the account's config lock.
+`Data` folder. Each candidate includes the folder ID, name, modification time,
+and ancestor IDs. The listing reports skipped names as **duplicate** or
+**unsupported name**. The remaining candidates can be selected and sized.
+Creating a folder validates its requested name and checks the names already
+used in `Data` before creating it, then verifies the new folder's ID under
+the same parent. These operations use the account's config lock.
 An operation reports the account as busy if another operation holds that lock.
 
 Request the size of one selected folder when needed. The manager runs a
@@ -95,8 +97,10 @@ manager publishes calculating, known, and failed states through its snapshot
 stream.
 
 The manager's cancellable authorization API supports initial sign-in and
-reconnect. Canceling an active sign-in stops the rclone child and leaves the
-account eligible for another attempt. Controlled manager shutdown requests
+reconnect. Successful sign-in clears the account's mapping sign-in holds.
+**Check again** can also clear the hold after verifying the ready account
+and the saved Drive folder. Canceling an active sign-in stops the rclone child
+and leaves the account eligible for another attempt. Controlled manager shutdown requests
 the same cancellation and allows up to one second for cleanup, subject to its
 shutdown timeout. The desktop wizard's account controls are wired separately.
 
