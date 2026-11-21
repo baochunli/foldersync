@@ -7,9 +7,8 @@ final class FolderSyncFinderExtension: FIFinderSync {
     private let logger = Logger(subsystem: "dev.foldersync.app.finder-extension", category: "extension")
     private let stateLock = NSLock()
 
+    private let handoffLocation: FinderHandoffLocation
     private let sharedDirectoryURL: URL
-    private let snapshotFileURL: URL
-    private let actionsDirectoryURL: URL
     private let hostBundleIdentifier: String
     private let snapshotUpdatedNotification: String
     private let actionRequestedNotification: String
@@ -23,13 +22,11 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     override init() {
         let info = Bundle.main.infoDictionary ?? [:]
-        self.sharedDirectoryURL = SnapshotEvaluator.resolveSharedDirectoryURL(
+        self.handoffLocation = SnapshotEvaluator.resolveHandoffLocation(
             configuredAbsolutePath: info["FolderSyncSharedDir"] as? String,
             configuredHomeRelativePath: info["FolderSyncSharedHomeRelativeDir"] as? String
         )
-
-        self.snapshotFileURL = self.sharedDirectoryURL.appendingPathComponent("status.json")
-        self.actionsDirectoryURL = self.sharedDirectoryURL.appendingPathComponent("actions", isDirectory: true)
+        self.sharedDirectoryURL = self.handoffLocation.resolvedURL
 
         if let configuredHost = info["FolderSyncHostBundleIdentifier"] as? String, !configuredHost.isEmpty {
             self.hostBundleIdentifier = configuredHost
@@ -120,9 +117,9 @@ final class FolderSyncFinderExtension: FIFinderSync {
     }
 
     private func readSnapshotFromDisk() -> SnapshotReadResult {
-        let result = SnapshotEvaluator.readSnapshotData(at: snapshotFileURL)
+        let result = SnapshotEvaluator.readSnapshotData(location: handoffLocation)
         if case .failed(let reason) = result {
-            logger.notice("Snapshot read failed at \(self.snapshotFileURL.path, privacy: .public): \(reason, privacy: .public)")
+            logger.notice("Snapshot read failed at \(self.sharedDirectoryURL.path, privacy: .public)/status.json: \(reason, privacy: .public)")
         }
         return result
     }
@@ -331,7 +328,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
         }
 
         do {
-            let written = try SnapshotEvaluator.writeActionRequest(request, toDirectory: actionsDirectoryURL)
+            let written = try SnapshotEvaluator.writeActionRequest(request, toLocation: handoffLocation)
             let center = CFNotificationCenterGetDarwinNotifyCenter()
             CFNotificationCenterPostNotification(
                 center,

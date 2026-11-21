@@ -156,7 +156,23 @@ public enum ActionValidationError: Error, Equatable {
     case invalidActionRequest
     case unsafeIdentifier
     case symlinkRefused
+    case nonRegularFile
     case ioFailure(Int32)
+}
+
+/// Anchored handoff location resolved once at startup so every read, directory
+/// creation, and atomic publish walks from `parentDirectory` through every
+/// component in `relativeComponents` via `fstatat(..., AT_SYMLINK_NOFOLLOW)`
+/// and `openat(..., O_DIRECTORY | O_NOFOLLOW)`.
+public struct FinderHandoffLocation: Equatable {
+    public let parentDirectory: URL
+    public let relativeComponents: [String]
+
+    public var resolvedURL: URL {
+        relativeComponents.reduce(parentDirectory) { acc, comp in
+            acc.appendingPathComponent(comp, isDirectory: true)
+        }
+    }
 }
 
 public struct ActionRequest: Codable, Equatable {
@@ -241,6 +257,65 @@ public enum SnapshotEvaluator {
         return FileManager.default.homeDirectoryForCurrentUser
     }
 
+    /// Builds an anchored handoff location from an existing parent directory and
+    /// relative components from the state root down (e.g., `["FolderSync", "finder"]`).
+    public static func handoffLocation(
+        parentDirectory: URL,
+        relativeComponents: [String]
+    ) -> FinderHandoffLocation {
+        FinderHandoffLocation(
+            parentDirectory: parentDirectory,
+            relativeComponents: relativeComponents
+        )
+    }
+
+    /// Resolves the Finder handoff location once at startup so the state root and
+    /// every component beneath it are validated via `lstat`/`fstatat` + `openat`.
+    public static func resolveHandoffLocation(
+        configuredAbsolutePath: String?,
+        configuredHomeRelativePath: String?,
+        realHomeDirectory: URL? = nil
+    ) -> FinderHandoffLocation {
+        if let abs = configuredAbsolutePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !abs.isEmpty {
+            let url = URL(fileURLWithPath: abs, isDirectory: true).standardizedFileURL
+            return FinderHandoffLocation(
+                parentDirectory: url.deletingLastPathComponent(),
+                relativeComponents: [url.lastPathComponent]
+            )
+        }
+
+        let home = realHomeDirectory ?? realUserHomeDirectoryURL()
+        let rawRel = configuredHomeRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmedRel = rawRel.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let rawComponents = trimmedRel.split(separator: "/").map(String.init)
+        let relIsSafe = !rawComponents.isEmpty
+            && !rawComponents.contains("..")
+            && !rawComponents.contains(".")
+            && !trimmedRel.contains("\0")
+        let effectiveComponents = relIsSafe
+            ? rawComponents
+            : defaultSharedHomeRelativePath.split(separator: "/").map(String.init)
+
+        // Anchor at <realHome>/Library/Application Support when the default prefix is used,
+        // validating from the FolderSync state root down (`["FolderSync", "finder"]`).
+        if effectiveComponents.count >= 3
+            && effectiveComponents[0] == "Library"
+            && effectiveComponents[1] == "Application Support" {
+            let parent = home
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("Application Support", isDirectory: true)
+            return FinderHandoffLocation(
+                parentDirectory: parent,
+                relativeComponents: Array(effectiveComponents.dropFirst(2))
+            )
+        }
+        return FinderHandoffLocation(
+            parentDirectory: home,
+            relativeComponents: effectiveComponents
+        )
+    }
+
     /// Resolves the Finder handoff directory (`<state dir>/finder`):
     /// 1. Explicit `FolderSyncSharedDir` absolute override (used in isolated dev/temp runs).
     /// 2. `FolderSyncSharedHomeRelativeDir` (defaults to `Library/Application Support/FolderSync/finder`)
@@ -250,21 +325,11 @@ public enum SnapshotEvaluator {
         configuredHomeRelativePath: String?,
         realHomeDirectory: URL? = nil
     ) -> URL {
-        if let abs = configuredAbsolutePath?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !abs.isEmpty {
-            return URL(fileURLWithPath: abs, isDirectory: true)
-        }
-
-        let home = realHomeDirectory ?? realUserHomeDirectoryURL()
-        let rawRel = configuredHomeRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let trimmedRel = rawRel.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let components = trimmedRel.split(separator: "/")
-        let relIsSafe = !components.isEmpty
-            && !components.contains("..")
-            && !components.contains(".")
-            && !trimmedRel.contains("\0")
-        let effectiveRel = relIsSafe ? trimmedRel : defaultSharedHomeRelativePath
-        return home.appendingPathComponent(effectiveRel, isDirectory: true)
+        resolveHandoffLocation(
+            configuredAbsolutePath: configuredAbsolutePath,
+            configuredHomeRelativePath: configuredHomeRelativePath,
+            realHomeDirectory: realHomeDirectory
+        ).resolvedURL
     }
 
     /// Disposable default shared directory used by the throwaway mock host when
@@ -306,12 +371,116 @@ public enum SnapshotEvaluator {
         return (st.st_mode & S_IFMT) == S_IFLNK
     }
 
-    /// Reads and validates `status.json` while refusing symlinks (`O_NOFOLLOW` + `lstat`).
-    public static func readSnapshotData(at fileURL: URL) -> SnapshotReadResult {
-        if isSymbolicLink(at: fileURL.deletingLastPathComponent()) || isSymbolicLink(at: fileURL) {
-            return .failed(reason: "Status unavailable (symlink refused)")
+    private static let maxSnapshotBytes = 4 * 1024 * 1024
+
+    /// Walks every component in `location.relativeComponents` (and optional `extraComponents`)
+    /// from `location.parentDirectory` using `fstatat(..., AT_SYMLINK_NOFOLLOW)` and
+    /// `openat(..., O_RDONLY | O_DIRECTORY | O_NOFOLLOW)`, returning an open directory descriptor.
+    private static func openValidatedDirectoryFD(
+        location: FinderHandoffLocation,
+        extraComponents: [String] = [],
+        createExtra: Bool = false
+    ) throws -> Int32 {
+        var curFd = Darwin.open(location.parentDirectory.path, O_RDONLY | O_DIRECTORY)
+        guard curFd >= 0 else {
+            throw ActionValidationError.ioFailure(errno)
         }
-        let fd = Darwin.open(fileURL.path, O_RDONLY | O_NOFOLLOW)
+
+        func step(component: String, allowCreate: Bool) throws {
+            guard !component.isEmpty && component != "." && component != ".." && !component.contains("/") else {
+                Darwin.close(curFd)
+                throw ActionValidationError.unsafeIdentifier
+            }
+            var st = stat()
+            if fstatat(curFd, component, &st, AT_SYMLINK_NOFOLLOW) == 0 {
+                let ftype = st.st_mode & S_IFMT
+                if ftype == S_IFLNK {
+                    Darwin.close(curFd)
+                    throw ActionValidationError.symlinkRefused
+                }
+                if ftype != S_IFDIR {
+                    Darwin.close(curFd)
+                    throw ActionValidationError.ioFailure(ENOTDIR)
+                }
+            } else if errno == ENOENT && allowCreate {
+                if mkdirat(curFd, component, 0o700) != 0 && errno != EEXIST {
+                    let err = errno
+                    Darwin.close(curFd)
+                    throw ActionValidationError.ioFailure(err)
+                }
+                if fstatat(curFd, component, &st, AT_SYMLINK_NOFOLLOW) != 0 {
+                    let err = errno
+                    Darwin.close(curFd)
+                    throw ActionValidationError.ioFailure(err)
+                }
+                if (st.st_mode & S_IFMT) == S_IFLNK {
+                    Darwin.close(curFd)
+                    throw ActionValidationError.symlinkRefused
+                }
+                if (st.st_mode & S_IFMT) != S_IFDIR {
+                    Darwin.close(curFd)
+                    throw ActionValidationError.ioFailure(ENOTDIR)
+                }
+            } else {
+                let err = errno
+                Darwin.close(curFd)
+                throw ActionValidationError.ioFailure(err)
+            }
+
+            let nextFd = openat(curFd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            Darwin.close(curFd)
+            guard nextFd >= 0 else {
+                if errno == ELOOP {
+                    throw ActionValidationError.symlinkRefused
+                }
+                throw ActionValidationError.ioFailure(errno)
+            }
+            var openedSt = stat()
+            guard fstat(nextFd, &openedSt) == 0, (openedSt.st_mode & S_IFMT) == S_IFDIR else {
+                let err = errno
+                Darwin.close(nextFd)
+                throw ActionValidationError.ioFailure(err)
+            }
+            curFd = nextFd
+        }
+
+        for comp in location.relativeComponents {
+            try step(component: comp, allowCreate: false)
+        }
+        for comp in extraComponents {
+            try step(component: comp, allowCreate: createExtra)
+        }
+        return curFd
+    }
+
+    /// Reads and validates `status.json` via a validated directory descriptor,
+    /// opening with `O_RDONLY | O_NONBLOCK | O_NOFOLLOW` and requiring a regular
+    /// file (`fstat` `S_IFREG`) before reading so FIFOs/sockets never hang Finder.
+    public static func readSnapshotData(location: FinderHandoffLocation) -> SnapshotReadResult {
+        let dirFd: Int32
+        do {
+            dirFd = try openValidatedDirectoryFD(location: location)
+        } catch ActionValidationError.symlinkRefused {
+            return .failed(reason: "Status unavailable (symlink refused)")
+        } catch {
+            return .failed(reason: "Status unavailable")
+        }
+        defer { Darwin.close(dirFd) }
+
+        var leafSt = stat()
+        if fstatat(dirFd, "status.json", &leafSt, AT_SYMLINK_NOFOLLOW) == 0 {
+            let ftype = leafSt.st_mode & S_IFMT
+            if ftype == S_IFLNK {
+                return .failed(reason: "Status unavailable (symlink refused)")
+            }
+            if ftype != S_IFREG {
+                return .failed(reason: "Status unavailable (non-regular file)")
+            }
+        } else {
+            return .failed(reason: "Status unavailable")
+        }
+
+        let fd = openat(dirFd, "status.json", O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
         guard fd >= 0 else {
             if errno == ELOOP {
                 return .failed(reason: "Status unavailable (symlink refused)")
@@ -321,16 +490,47 @@ public enum SnapshotEvaluator {
         defer { Darwin.close(fd) }
 
         var st = stat()
-        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
+        guard fstat(fd, &st) == 0 else {
             return .failed(reason: "Status unavailable")
         }
+        guard (st.st_mode & S_IFMT) == S_IFREG else {
+            return .failed(reason: "Status unavailable (non-regular file)")
+        }
+        if st.st_size > maxSnapshotBytes {
+            return .failed(reason: "Status unavailable (snapshot too large)")
+        }
 
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-        let data = handle.readDataToEndOfFile()
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 16384)
+        while true {
+            let n = Darwin.read(fd, &buf, buf.count)
+            if n > 0 {
+                if data.count + n > maxSnapshotBytes {
+                    return .failed(reason: "Status unavailable (snapshot too large)")
+                }
+                data.append(buf, count: n)
+            } else if n == 0 {
+                break
+            } else {
+                if errno == EINTR { continue }
+                return .failed(reason: "Status unavailable")
+            }
+        }
+
         guard let decoded = decode(data: data) else {
             return .failed(reason: "Status unavailable (invalid snapshot)")
         }
         return .valid(decoded)
+    }
+
+    /// Convenience wrapper for reading a `status.json` URL with fd-anchored validation.
+    public static func readSnapshotData(at fileURL: URL) -> SnapshotReadResult {
+        let dirURL = fileURL.deletingLastPathComponent().standardizedFileURL
+        let loc = FinderHandoffLocation(
+            parentDirectory: dirURL.deletingLastPathComponent(),
+            relativeComponents: [dirURL.lastPathComponent]
+        )
+        return readSnapshotData(location: loc)
     }
 
     public static func formatISO8601(_ date: Date) -> String {
@@ -490,6 +690,34 @@ public enum SnapshotEvaluator {
         return request
     }
 
+    /// Writes and publishes an action request strictly via validated directory
+    /// descriptors (`openat` + `O_CREAT | O_EXCL | O_NOFOLLOW` + `renameat`),
+    /// refusing any symlink from the state root down.
+    public static func writeActionRequest(
+        _ request: ActionRequest,
+        toLocation location: FinderHandoffLocation
+    ) throws -> URL {
+        guard request.isValid else {
+            throw ActionValidationError.invalidActionRequest
+        }
+        guard isSafePathComponentId(request.id) else {
+            throw ActionValidationError.unsafeIdentifier
+        }
+
+        let actionsFd = try openValidatedDirectoryFD(
+            location: location,
+            extraComponents: ["actions"],
+            createExtra: true
+        )
+        defer { Darwin.close(actionsFd) }
+
+        let finalURL = location.resolvedURL
+            .appendingPathComponent("actions", isDirectory: true)
+            .appendingPathComponent("action-\(request.id).json")
+        try writeActionFile(request, intoActionsFD: actionsFd)
+        return finalURL
+    }
+
     public static func writeActionRequest(
         _ request: ActionRequest,
         toDirectory directory: URL
@@ -500,31 +728,46 @@ public enum SnapshotEvaluator {
         guard isSafePathComponentId(request.id) else {
             throw ActionValidationError.unsafeIdentifier
         }
-        let fm = FileManager.default
-        let parentDir = directory.deletingLastPathComponent()
-        if isSymbolicLink(at: parentDir) || isSymbolicLink(at: directory) {
-            throw ActionValidationError.symlinkRefused
-        }
-        try fm.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
+        let stdDir = directory.standardizedFileURL
+        let parentDir = stdDir.deletingLastPathComponent()
+        let grandParent = parentDir.deletingLastPathComponent()
+        let loc = FinderHandoffLocation(
+            parentDirectory: grandParent,
+            relativeComponents: [parentDir.lastPathComponent]
         )
-        if isSymbolicLink(at: directory) {
-            throw ActionValidationError.symlinkRefused
-        }
+        let actionsFd = try openValidatedDirectoryFD(
+            location: loc,
+            extraComponents: [stdDir.lastPathComponent],
+            createExtra: true
+        )
+        defer { Darwin.close(actionsFd) }
 
+        try writeActionFile(request, intoActionsFD: actionsFd)
+        return stdDir.appendingPathComponent("action-\(request.id).json")
+    }
+
+    private static func writeActionFile(
+        _ request: ActionRequest,
+        intoActionsFD actionsFd: Int32
+    ) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(request)
 
-        let finalURL = directory.appendingPathComponent("action-\(request.id).json")
-        let tmpURL = directory.appendingPathComponent(".action-\(request.id).tmp")
-        if isSymbolicLink(at: finalURL) || isSymbolicLink(at: tmpURL) {
+        let finalName = "action-\(request.id).json"
+        let tmpName = ".action-\(request.id).tmp"
+
+        var st = stat()
+        if fstatat(actionsFd, finalName, &st, AT_SYMLINK_NOFOLLOW) == 0,
+           (st.st_mode & S_IFMT) == S_IFLNK {
+            throw ActionValidationError.symlinkRefused
+        }
+        if fstatat(actionsFd, tmpName, &st, AT_SYMLINK_NOFOLLOW) == 0,
+           (st.st_mode & S_IFMT) == S_IFLNK {
             throw ActionValidationError.symlinkRefused
         }
 
-        let fd = Darwin.open(tmpURL.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        let fd = openat(actionsFd, tmpName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
         guard fd >= 0 else {
             if errno == ELOOP {
                 throw ActionValidationError.symlinkRefused
@@ -535,7 +778,7 @@ public enum SnapshotEvaluator {
         defer {
             Darwin.close(fd)
             if writeFailed {
-                try? fm.removeItem(at: tmpURL)
+                _ = unlinkat(actionsFd, tmpName, 0)
             }
         }
         try data.withUnsafeBytes { rawBuf in
@@ -556,14 +799,14 @@ public enum SnapshotEvaluator {
             throw ActionValidationError.ioFailure(errno)
         }
 
-        if isSymbolicLink(at: finalURL) {
+        if fstatat(actionsFd, finalName, &st, AT_SYMLINK_NOFOLLOW) == 0,
+           (st.st_mode & S_IFMT) == S_IFLNK {
             writeFailed = true
             throw ActionValidationError.symlinkRefused
         }
-        if Darwin.rename(tmpURL.path, finalURL.path) != 0 {
+        if renameat(actionsFd, tmpName, actionsFd, finalName) != 0 {
             writeFailed = true
             throw ActionValidationError.ioFailure(errno)
         }
-        return finalURL
     }
 }
