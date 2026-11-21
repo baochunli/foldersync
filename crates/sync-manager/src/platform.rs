@@ -1,0 +1,432 @@
+//! Platform state-directory resolution, private permissions (0700/0600),
+//! exclusive OS file locking (`flock`), and live process identity inspection.
+
+use std::{
+    collections::HashMap,
+    env,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+#[cfg(unix)]
+use std::os::unix::{
+    fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    io::AsRawFd,
+};
+
+use directories::BaseDirs;
+use rclone_adapter::{ProcessStartTime, read_process_start_time};
+
+use crate::error::ManagerError;
+
+static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Resolves the FolderSync state directory:
+/// explicit override -> `FOLDERSYNC_STATE_DIR` -> platform application data/state directory.
+pub fn resolve_state_dir(explicit: Option<&Path>) -> Result<PathBuf, ManagerError> {
+    if let Some(dir) = explicit {
+        if dir.as_os_str().is_empty() {
+            return Err(ManagerError::Io {
+                cause: "State directory override cannot be empty.".to_string(),
+                next_step: "Pass a valid directory path for --state-dir or FOLDERSYNC_STATE_DIR."
+                    .to_string(),
+            });
+        }
+        return Ok(dir.to_path_buf());
+    }
+
+    if let Some(env_dir) = env::var_os("FOLDERSYNC_STATE_DIR")
+        && !env_dir.is_empty()
+    {
+        return Ok(PathBuf::from(env_dir));
+    }
+
+    let base = BaseDirs::new().ok_or_else(|| ManagerError::Io {
+        cause: "Could not resolve the platform application support directory.".to_string(),
+        next_step: "Set FOLDERSYNC_STATE_DIR to an explicit writable directory.".to_string(),
+    })?;
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(base.data_dir().join("FolderSync"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(base
+            .state_dir()
+            .unwrap_or_else(|| base.data_local_dir())
+            .join("FolderSync"))
+    }
+}
+
+/// Ensures `path` exists with private `0700` permissions on Unix.
+pub fn ensure_private_dir(path: &Path) -> Result<(), ManagerError> {
+    #[cfg(unix)]
+    {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|err| ManagerError::Io {
+                cause: format!(
+                    "Failed to create private directory `{}`: {err}.",
+                    path.display()
+                ),
+                next_step: "Confirm the parent directory is writable by your user account."
+                    .to_string(),
+            })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
+            ManagerError::Io {
+                cause: format!(
+                    "Failed to set private 0700 permissions on `{}`: {err}.",
+                    path.display()
+                ),
+                next_step: "Verify ownership and filesystem permissions on the state directory."
+                    .to_string(),
+            }
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path).map_err(|err| ManagerError::Io {
+            cause: format!("Failed to create directory `{}`: {err}.", path.display()),
+            next_step: "Confirm the parent directory is writable.".to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Ensures `path` has private `0600` file permissions on Unix.
+pub fn set_private_file_permissions(path: &Path) -> Result<(), ManagerError> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+            ManagerError::Io {
+                cause: format!(
+                    "Failed to set private 0600 permissions on `{}`: {err}.",
+                    path.display()
+                ),
+                next_step: "Verify ownership and permissions inside the state directory."
+                    .to_string(),
+            }
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Writes `bytes` to `path` with private `0600` permissions on Unix.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagerError> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).map_err(|err| ManagerError::Io {
+        cause: format!("Failed to open `{}` for writing: {err}.", path.display()),
+        next_step: "Check available disk space and permissions in the state directory.".to_string(),
+    })?;
+    file.write_all(bytes).map_err(|err| ManagerError::Io {
+        cause: format!("Failed to write `{}`: {err}.", path.display()),
+        next_step: "Check available disk space and retry.".to_string(),
+    })?;
+    file.sync_all().map_err(|err| ManagerError::Io {
+        cause: format!("Failed to flush `{}` to disk: {err}.", path.display()),
+        next_step: "Check disk health and retry.".to_string(),
+    })?;
+    set_private_file_permissions(path)?;
+    Ok(())
+}
+
+/// Atomically writes `bytes` to `path` via a sibling temp file (`0600`, `sync_all`, rename).
+pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), ManagerError> {
+    let parent = path.parent().ok_or_else(|| ManagerError::Io {
+        cause: format!("Target path `{}` has no parent directory.", path.display()),
+        next_step: "Specify a valid file path inside an existing directory.".to_string(),
+    })?;
+    ensure_private_dir(parent)?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("status");
+    let seq = ATOMIC_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+
+    let write_res = (|| -> Result<(), ManagerError> {
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path).map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to create temporary file `{}`: {err}.",
+                tmp_path.display()
+            ),
+            next_step: "Verify directory permissions and free disk space.".to_string(),
+        })?;
+        file.write_all(bytes).map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to write temporary file `{}`: {err}.",
+                tmp_path.display()
+            ),
+            next_step: "Verify free disk space and retry.".to_string(),
+        })?;
+        file.sync_all().map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to sync temporary file `{}`: {err}.",
+                tmp_path.display()
+            ),
+            next_step: "Check disk health and retry.".to_string(),
+        })?;
+        drop(file);
+        set_private_file_permissions(&tmp_path)?;
+        fs::rename(&tmp_path, path).map_err(|err| ManagerError::Io {
+            cause: format!("Failed to atomically replace `{}`: {err}.", path.display()),
+            next_step: "Confirm no conflicting file lock blocks renaming inside the directory."
+                .to_string(),
+        })?;
+        Ok(())
+    })();
+
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_res
+}
+
+/// Exclusive OS file lock held for the lifetime of a `SyncManager` instance.
+#[derive(Debug)]
+pub struct StateLock {
+    file: File,
+    lock_path: PathBuf,
+}
+
+impl StateLock {
+    /// Acquires a non-blocking exclusive OS lock (`flock`) inside `state_dir`.
+    pub fn acquire(state_dir: &Path) -> Result<Self, ManagerError> {
+        ensure_private_dir(state_dir)?;
+        let lock_path = state_dir.join("manager.lock");
+
+        let mut opts = OpenOptions::new();
+        opts.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&lock_path).map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to open state lock file `{}`: {err}.",
+                lock_path.display()
+            ),
+            next_step: "Verify permissions on the FolderSync state directory.".to_string(),
+        })?;
+        set_private_file_permissions(&lock_path)?;
+
+        #[cfg(unix)]
+        {
+            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                let raw = err.raw_os_error();
+                if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+                    return Err(ManagerError::StateLocked {
+                        lock_path: lock_path.clone(),
+                        cause: format!(
+                            "Another FolderSync instance already holds the state lock at `{}`.",
+                            lock_path.display()
+                        ),
+                        next_step:
+                            "Quit the running FolderSync app or CLI command before starting another instance."
+                                .to_string(),
+                    });
+                }
+                return Err(ManagerError::Io {
+                    cause: format!(
+                        "Failed to acquire exclusive OS lock on `{}`: {err}.",
+                        lock_path.display()
+                    ),
+                    next_step: "Verify the state directory resides on a local filesystem supporting file locks."
+                        .to_string(),
+                });
+            }
+        }
+
+        // Write diagnostic PID after acquiring the OS flock (ownership is enforced by flock, never PID existence).
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "pid={}", std::process::id());
+        let _ = file.sync_all();
+
+        Ok(Self { file, lock_path })
+    }
+
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+/// Live OS process identity observed during startup reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProcessInfo {
+    pub pid: u32,
+    pub start_time: Option<ProcessStartTime>,
+    pub executable: Option<PathBuf>,
+}
+
+/// Result of inspecting a recorded PID against the OS process table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessProbeResult {
+    NotFound,
+    Live(LiveProcessInfo),
+    Unavailable(String),
+}
+
+/// Inspects live OS processes by PID for orphan/PID-reuse reconciliation (§14).
+pub trait ProcessInspector: Send + Sync {
+    fn inspect(&self, pid: u32) -> ProcessProbeResult;
+}
+
+/// Real OS process inspector using `proc_pidinfo`/`proc_pidpath` on macOS and
+/// `/proc/<pid>` on Linux.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OsProcessInspector;
+
+#[cfg(target_os = "macos")]
+fn read_process_executable(pid: u32) -> Option<PathBuf> {
+    // PROC_PIDPATHINFO_MAXSIZE is 4096 bytes on macOS.
+    let mut buf = vec![0u8; 4096];
+    let ret = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len() as u32,
+        )
+    };
+    if ret > 0 {
+        let len = (ret as usize).min(buf.len());
+        let s = String::from_utf8_lossy(&buf[..len]);
+        let trimmed = s.trim_end_matches('\0');
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_executable(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn read_process_executable(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+impl ProcessInspector for OsProcessInspector {
+    fn inspect(&self, pid: u32) -> ProcessProbeResult {
+        #[cfg(unix)]
+        {
+            let kill_res = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if kill_res != 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::ESRCH) => return ProcessProbeResult::NotFound,
+                    Some(libc::EPERM) => {
+                        return ProcessProbeResult::Unavailable(format!(
+                            "Permission denied inspecting pid {pid}"
+                        ));
+                    }
+                    _ => return ProcessProbeResult::Unavailable(err.to_string()),
+                }
+            }
+            let start_time = read_process_start_time(pid);
+            let executable = read_process_executable(pid);
+            ProcessProbeResult::Live(LiveProcessInfo {
+                pid,
+                start_time,
+                executable,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            ProcessProbeResult::Unavailable(
+                "Process inspection is not implemented on this platform".to_string(),
+            )
+        }
+    }
+}
+
+/// Deterministic test double for [`ProcessInspector`].
+#[derive(Debug, Default)]
+pub struct FakeProcessInspector {
+    processes: Mutex<HashMap<u32, ProcessProbeResult>>,
+}
+
+impl FakeProcessInspector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_process(&self, pid: u32, result: ProcessProbeResult) {
+        self.processes.lock().unwrap().insert(pid, result);
+    }
+}
+
+impl ProcessInspector for FakeProcessInspector {
+    fn inspect(&self, pid: u32) -> ProcessProbeResult {
+        self.processes
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .cloned()
+            .unwrap_or(ProcessProbeResult::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_process_inspector_reads_current_process_identity() {
+        let inspector = OsProcessInspector;
+        let pid = std::process::id();
+        let ProcessProbeResult::Live(info) = inspector.inspect(pid) else {
+            panic!("current process should be reported Live");
+        };
+        assert_eq!(info.pid, pid);
+        assert!(
+            info.start_time.is_some(),
+            "OS inspector should report start time for current process"
+        );
+        assert!(
+            info.executable.is_some(),
+            "OS inspector should report executable path for current process"
+        );
+    }
+}
