@@ -29,7 +29,8 @@ Usage: $(basename "$0") [options]
 
 Options:
   --out <dir>         Output directory for FolderSync.app; must resolve physically inside
-                      <repo>/target/ with no symlinked components (default: <repo>/target/package)
+                      <repo>/target/ with no symlinked components or control characters
+                      (default: <repo>/target/package)
   --bundle-id <id>    Host app bundle identifier (default: dev.foldersync.app;
                       extension uses <id>.finder-extension)
   --sign <identity>   codesign identity (default: "-" for ad hoc signing;
@@ -72,19 +73,22 @@ for tool in codesign plutil shasum swiftc xcrun python3; do
   fi
 done
 
-# Physically validate --out inside <repo>/target/ with zero symlinked components
-# BEFORE any mkdir, mktemp, copy, or rm.
-resolve_contained_in_target() {
-  python3 - "$REPO_ROOT" "$1" <<'PY'
+# Validate a path in-place (NO command substitution, which strips trailing newlines):
+# rejects newlines/control characters up front, verifies <repo>/target is not a symlink,
+# verifies physical containment inside <repo>/target/, and rejects any symlinked
+# component from target/ down before any write, mkdir, mktemp, or rm.
+validate_contained_in_target() {
+  python3 - "$REPO_ROOT" "$1" "$2" <<'PY'
 import os
 import stat
 import sys
 
 repo_root = os.path.realpath(sys.argv[1])
-raw_out = sys.argv[2]
+label = sys.argv[2]
+raw_path = sys.argv[3]
 
-if not raw_out or "\x00" in raw_out:
-    sys.stderr.write("Error: --out must be a non-empty valid path inside target/.\n")
+if not raw_path or any(ord(c) < 32 or ord(c) == 127 for c in raw_path):
+    sys.stderr.write(f"Error: {label} must be non-empty and contain no newlines or control characters.\n")
     sys.exit(2)
 
 target_root = os.path.join(repo_root, "target")
@@ -94,53 +98,39 @@ if os.path.lexists(target_root):
         sys.stderr.write(f"Error: refusing symlinked or non-directory target root: {target_root}\n")
         sys.exit(2)
 
-abs_out = os.path.abspath(raw_out)
-# Walk up to deepest existing ancestor without following symlinks on absent tail.
-cur = abs_out
+abs_path = os.path.abspath(raw_path)
+cur = abs_path
 tail = []
 while not os.path.lexists(cur):
     parent, name = os.path.split(cur)
     if parent == cur:
-        sys.stderr.write(f"Error: cannot resolve ancestor for --out {raw_out}\n")
+        sys.stderr.write(f"Error: cannot resolve ancestor for {label}\n")
         sys.exit(2)
     tail.append(name)
     cur = parent
 
 real_ancestor = os.path.realpath(cur)
-phys_out = os.path.join(real_ancestor, *reversed(tail)) if tail else real_ancestor
+phys_path = os.path.join(real_ancestor, *reversed(tail)) if tail else real_ancestor
 
-if phys_out != target_root and not phys_out.startswith(target_root + os.sep):
-    sys.stderr.write(f"Error: refusing --out outside {target_root}: {raw_out} (resolved: {phys_out})\n")
+if phys_path != target_root and not phys_path.startswith(target_root + os.sep):
+    sys.stderr.write(f"Error: refusing {label} outside {target_root}: {raw_path} (resolved: {phys_path})\n")
     sys.exit(2)
 
-# Verify no component from target_root down (in raw path or resolved path) is a symlink.
-rel = os.path.relpath(phys_out, target_root)
-if rel != ".":
-    parts = rel.split(os.sep)
-    check = target_root
-    for part in parts:
-        check = os.path.join(check, part)
-        if os.path.lexists(check):
-            st = os.lstat(check)
-            if stat.S_ISLNK(st.st_mode):
-                sys.stderr.write(f"Error: refusing symlinked path component inside target/: {check}\n")
-                sys.exit(2)
-
-# Also check the raw abs_out directly in case abs_out itself was a symlink inside target/
-if abs_out.startswith(target_root + os.sep):
-    rel_raw = os.path.relpath(abs_out, target_root)
-    check = target_root
-    for part in rel_raw.split(os.sep):
-        check = os.path.join(check, part)
-        if os.path.lexists(check) and stat.S_ISLNK(os.lstat(check).st_mode):
-            sys.stderr.write(f"Error: refusing symlinked --out component: {check}\n")
-            sys.exit(2)
-
-print(phys_out)
+for candidate in (phys_path, abs_path):
+    if candidate == target_root or candidate.startswith(target_root + os.sep):
+        rel = os.path.relpath(candidate, target_root)
+        if rel != ".":
+            check = target_root
+            for part in rel.split(os.sep):
+                check = os.path.join(check, part)
+                if os.path.lexists(check) and stat.S_ISLNK(os.lstat(check).st_mode):
+                    sys.stderr.write(f"Error: refusing symlinked component inside target/: {check}\n")
+                    sys.exit(2)
 PY
 }
 
-OUT_DIR="$(resolve_contained_in_target "$OUT_DIR")"
+validate_contained_in_target "target" "${REPO_ROOT}/target"
+validate_contained_in_target "--out" "$OUT_DIR"
 
 if [[ ! -x "$NSH_BIN" ]]; then
   echo "Error: pinned NSH binary not found or not executable at $NSH_BIN" >&2
@@ -303,7 +293,8 @@ codesign "${SIGN_ARGS[@]}" "$STAGED_APP"
 echo "==> Verifying staged bundle signature (codesign --verify --deep --strict)"
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 
-FINAL_APP="$(resolve_contained_in_target "${OUT_DIR}/FolderSync.app")"
+FINAL_APP="${OUT_DIR}/FolderSync.app"
+validate_contained_in_target "final app bundle" "$FINAL_APP"
 rm -rf "$FINAL_APP"
 mv "$STAGED_APP" "$FINAL_APP"
 

@@ -28,7 +28,7 @@ Usage: $(basename "$0") [options]
 
 Options:
   --out <dir>              Output directory for built artifacts; must resolve physically
-                           inside <repo>/target/ with no symlinked components
+                           inside <repo>/target/ with no symlinked components or control chars
                            (default: <repo>/target/finder-extension)
   --appex-only             Build FolderSyncFinder.appex only (default)
   --with-mock-host         Also wrap the extension in a throwaway FolderSyncHost.app
@@ -47,9 +47,9 @@ Options:
                            non-"-" adds --options runtime --timestamp)
   --no-sign                Skip codesign (used when packaging/build-app.sh signs inner -> outer)
   --entitlements-out <p>   Copy the effective extension entitlements plist to <p>
-                           (must resolve physically inside <repo>/target/)
+                           (must resolve physically inside <repo>/target/, non-symlink leaf)
   --arch <arch>            Target architecture (default: host arch, e.g. arm64)
-  --test                   Compile and run SnapshotModelTests before building
+  --test                   Compile and run SnapshotModelTests and SandboxProbe before building
   -h, --help               Show this help
 EOF
 }
@@ -84,10 +84,12 @@ for tool in swiftc codesign plutil xcrun python3; do
   fi
 done
 
-# Physically validate output paths inside <repo>/target/ with zero symlinked components
-# BEFORE any mkdir, mktemp, copy, or rm.
-resolve_contained_in_target() {
-  python3 - "$REPO_ROOT" "$1" "$2" <<'PY'
+# Validate a path in-place (NO command substitution, which strips trailing newlines):
+# rejects newlines/control characters up front, verifies <repo>/target is not a symlink,
+# verifies physical containment inside <repo>/target/, and rejects any symlinked
+# component from target/ down before any write, mkdir, mktemp, or rm.
+validate_contained_in_target() {
+  python3 - "$REPO_ROOT" "$1" "$2" "$3" <<'PY'
 import os
 import stat
 import sys
@@ -95,9 +97,10 @@ import sys
 repo_root = os.path.realpath(sys.argv[1])
 label = sys.argv[2]
 raw_path = sys.argv[3]
+leaf_kind = sys.argv[4]  # "any", "dir", or "file"
 
-if not raw_path or "\x00" in raw_path:
-    sys.stderr.write(f"Error: {label} must be a non-empty valid path inside target/.\n")
+if not raw_path or any(ord(c) < 32 or ord(c) == 127 for c in raw_path):
+    sys.stderr.write(f"Error: {label} must be non-empty and contain no newlines or control characters.\n")
     sys.exit(2)
 
 target_root = os.path.join(repo_root, "target")
@@ -113,7 +116,7 @@ tail = []
 while not os.path.lexists(cur):
     parent, name = os.path.split(cur)
     if parent == cur:
-        sys.stderr.write(f"Error: cannot resolve ancestor for {label} {raw_path}\n")
+        sys.stderr.write(f"Error: cannot resolve ancestor for {label}\n")
         sys.exit(2)
     tail.append(name)
     cur = parent
@@ -125,32 +128,36 @@ if phys_path != target_root and not phys_path.startswith(target_root + os.sep):
     sys.stderr.write(f"Error: refusing {label} outside {target_root}: {raw_path} (resolved: {phys_path})\n")
     sys.exit(2)
 
-rel = os.path.relpath(phys_path, target_root)
-if rel != ".":
-    check = target_root
-    for part in rel.split(os.sep):
-        check = os.path.join(check, part)
-        if os.path.lexists(check) and stat.S_ISLNK(os.lstat(check).st_mode):
-            sys.stderr.write(f"Error: refusing symlinked path component inside target/: {check}\n")
-            sys.exit(2)
+for candidate in (phys_path, abs_path):
+    if candidate == target_root or candidate.startswith(target_root + os.sep):
+        rel = os.path.relpath(candidate, target_root)
+        if rel != ".":
+            check = target_root
+            for part in rel.split(os.sep):
+                check = os.path.join(check, part)
+                if os.path.lexists(check) and stat.S_ISLNK(os.lstat(check).st_mode):
+                    sys.stderr.write(f"Error: refusing symlinked component inside target/: {check}\n")
+                    sys.exit(2)
 
-if abs_path.startswith(target_root + os.sep):
-    rel_raw = os.path.relpath(abs_path, target_root)
-    check = target_root
-    for part in rel_raw.split(os.sep):
-        check = os.path.join(check, part)
-        if os.path.lexists(check) and stat.S_ISLNK(os.lstat(check).st_mode):
-            sys.stderr.write(f"Error: refusing symlinked {label} component: {check}\n")
-            sys.exit(2)
-
-print(phys_path)
+if os.path.lexists(abs_path):
+    st = os.lstat(abs_path)
+    if stat.S_ISLNK(st.st_mode):
+        sys.stderr.write(f"Error: refusing symlinked leaf for {label}: {abs_path}\n")
+        sys.exit(2)
+    if leaf_kind == "file" and not stat.S_ISREG(st.st_mode):
+        sys.stderr.write(f"Error: destination leaf for {label} must be absent or a regular file: {abs_path}\n")
+        sys.exit(2)
+    if leaf_kind == "dir" and not stat.S_ISDIR(st.st_mode):
+        sys.stderr.write(f"Error: destination leaf for {label} must be absent or a directory: {abs_path}\n")
+        sys.exit(2)
 PY
 }
 
-TARGET_ROOT="$(resolve_contained_in_target "target" "${REPO_ROOT}/target")"
-OUT_DIR="$(resolve_contained_in_target "--out" "$OUT_DIR")"
+TARGET_ROOT="${REPO_ROOT}/target"
+validate_contained_in_target "target" "$TARGET_ROOT" "dir"
+validate_contained_in_target "--out" "$OUT_DIR" "dir"
 if [[ -n "$ENTITLEMENTS_OUT" ]]; then
-  ENTITLEMENTS_OUT="$(resolve_contained_in_target "--entitlements-out" "$ENTITLEMENTS_OUT")"
+  validate_contained_in_target "--entitlements-out" "$ENTITLEMENTS_OUT" "file"
 fi
 
 SDK_PATH="$(xcrun --show-sdk-path)"
@@ -158,9 +165,14 @@ TARGET="${ARCH}-apple-macos${MIN_MACOS}"
 EXT_BUNDLE_ID="${HOST_BUNDLE_ID}.finder-extension"
 
 mkdir -p "$TARGET_ROOT" "$OUT_DIR"
+# Write all generated test binaries, entitlements, and staging bundles inside a
+# fresh mktemp -d staging directory under target/ so fixed filenames in --out
+# are never followed via shell redirection.
+BUILD_STAGE="$(mktemp -d "${TARGET_ROOT}/.finder-build-stage.XXXXXXXX")"
+trap 'rm -rf "$BUILD_STAGE"' EXIT
 
-TEST_BIN="${OUT_DIR}/SnapshotModelTests"
 if [[ "$RUN_TESTS" -eq 1 ]]; then
+  TEST_BIN="${BUILD_STAGE}/SnapshotModelTests"
   echo "==> Running SnapshotModelTests"
   swiftc -parse-as-library \
     -target "$TARGET" -sdk "$SDK_PATH" \
@@ -168,6 +180,32 @@ if [[ "$RUN_TESTS" -eq 1 ]]; then
     "${SCRIPT_DIR}/Tests/SnapshotModelTests.swift" \
     -o "$TEST_BIN"
   "$TEST_BIN"
+
+  echo "==> Running sandboxed handoff probe (ad hoc signed, parent dirs denied, no pluginkit)"
+  PROBE_BIN="${BUILD_STAGE}/SandboxProbe"
+  PROBE_ROOT="${BUILD_STAGE}/sandbox-probe-root"
+  PROBE_ENTITLED="${PROBE_ROOT}/state/finder"
+  PROBE_OUTSIDE="${PROBE_ROOT}/outside-state/finder"
+  mkdir -p "$PROBE_ENTITLED" "$PROBE_OUTSIDE"
+  ln -s "${PROBE_ROOT}/outside-state" "${PROBE_ROOT}/symlink-state"
+  REAL_PROBE_ROOT="$(cd "$PROBE_ROOT" && pwd -P)"
+  REAL_PROBE_ENTITLED="$(cd "$PROBE_ENTITLED" && pwd -P)"
+  PROBE_SB="${BUILD_STAGE}/SandboxProbe.sb"
+  cat > "$PROBE_SB" <<EOF
+(version 1)
+(allow default)
+(deny file-read-data file-write*
+  (require-all
+    (subpath "${REAL_PROBE_ROOT}")
+    (require-not (subpath "${REAL_PROBE_ENTITLED}"))))
+EOF
+  swiftc -parse-as-library \
+    -target "$TARGET" -sdk "$SDK_PATH" \
+    "${SCRIPT_DIR}/Sources/SnapshotModel.swift" \
+    "${SCRIPT_DIR}/Tests/SandboxProbe.swift" \
+    -o "$PROBE_BIN"
+  codesign --force --sign - "$PROBE_BIN"
+  sandbox-exec -f "$PROBE_SB" "$PROBE_BIN" "$REAL_PROBE_ENTITLED" "${REAL_PROBE_ROOT}/symlink-state/finder"
 fi
 
 REAL_SHARED_DIR=""
@@ -179,15 +217,13 @@ if [[ "$DEV_SHARED_DIR" -eq 1 || "$WITH_MOCK_HOST" -eq 1 ]]; then
 fi
 
 if [[ "$WITH_MOCK_HOST" -eq 1 ]]; then
-  APP_BUNDLE="$(resolve_contained_in_target "app bundle" "${OUT_DIR}/FolderSyncHost.app")"
-  APPEX_BUNDLE="${APP_BUNDLE}/Contents/PlugIns/FolderSyncFinder.appex"
-  rm -rf "$APP_BUNDLE"
-  mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APPEX_BUNDLE}/Contents/MacOS"
+  STAGED_APP="${BUILD_STAGE}/FolderSyncHost.app"
+  STAGED_APPEX="${STAGED_APP}/Contents/PlugIns/FolderSyncFinder.appex"
+  mkdir -p "${STAGED_APP}/Contents/MacOS" "${STAGED_APPEX}/Contents/MacOS"
 else
-  APP_BUNDLE=""
-  APPEX_BUNDLE="$(resolve_contained_in_target "appex bundle" "${OUT_DIR}/FolderSyncFinder.appex")"
-  rm -rf "$APPEX_BUNDLE"
-  mkdir -p "${APPEX_BUNDLE}/Contents/MacOS"
+  STAGED_APP=""
+  STAGED_APPEX="${BUILD_STAGE}/FolderSyncFinder.appex"
+  mkdir -p "${STAGED_APPEX}/Contents/MacOS"
 fi
 
 echo "==> Compiling Finder Sync extension (${TARGET}, ${EXT_BUNDLE_ID})"
@@ -195,20 +231,20 @@ swiftc -parse-as-library -application-extension \
   -target "$TARGET" -sdk "$SDK_PATH" \
   -framework Cocoa -framework FinderSync -framework Foundation \
   -Xlinker -e -Xlinker _NSExtensionMain \
-  -o "${APPEX_BUNDLE}/Contents/MacOS/FolderSyncFinder" \
+  -o "${STAGED_APPEX}/Contents/MacOS/FolderSyncFinder" \
   "${SCRIPT_DIR}/Sources/SnapshotModel.swift" \
   "${SCRIPT_DIR}/Sources/BadgeRenderer.swift" \
   "${SCRIPT_DIR}/Sources/FinderSyncExtension.swift"
 
-cp "${SCRIPT_DIR}/Info.plist" "${APPEX_BUNDLE}/Contents/Info.plist"
-plutil -replace CFBundleIdentifier -string "$EXT_BUNDLE_ID" "${APPEX_BUNDLE}/Contents/Info.plist"
-plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "${APPEX_BUNDLE}/Contents/Info.plist"
-plutil -replace CFBundleVersion -string "$APP_BUILD" "${APPEX_BUNDLE}/Contents/Info.plist"
-plutil -replace FolderSyncHostBundleIdentifier -string "$HOST_BUNDLE_ID" "${APPEX_BUNDLE}/Contents/Info.plist"
+cp "${SCRIPT_DIR}/Info.plist" "${STAGED_APPEX}/Contents/Info.plist"
+plutil -replace CFBundleIdentifier -string "$EXT_BUNDLE_ID" "${STAGED_APPEX}/Contents/Info.plist"
+plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "${STAGED_APPEX}/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$APP_BUILD" "${STAGED_APPEX}/Contents/Info.plist"
+plutil -replace FolderSyncHostBundleIdentifier -string "$HOST_BUNDLE_ID" "${STAGED_APPEX}/Contents/Info.plist"
 
+ENTITLEMENTS_PATH="${BUILD_STAGE}/FinderExtension.entitlements"
 if [[ -n "$REAL_SHARED_DIR" ]]; then
-  plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${APPEX_BUNDLE}/Contents/Info.plist"
-  ENTITLEMENTS_PATH="${OUT_DIR}/FinderExtension.generated.entitlements"
+  plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${STAGED_APPEX}/Contents/Info.plist"
   cat > "$ENTITLEMENTS_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -224,17 +260,18 @@ if [[ -n "$REAL_SHARED_DIR" ]]; then
 </plist>
 EOF
 else
-  ENTITLEMENTS_PATH="${OUT_DIR}/FinderExtension.effective.entitlements"
   cp "${SCRIPT_DIR}/FinderExtension.entitlements" "$ENTITLEMENTS_PATH"
 fi
 
 if [[ -n "$ENTITLEMENTS_OUT" ]]; then
+  validate_contained_in_target "--entitlements-out" "$ENTITLEMENTS_OUT" "file"
   mkdir -p "$(dirname "$ENTITLEMENTS_OUT")"
+  rm -f "$ENTITLEMENTS_OUT"
   cp "$ENTITLEMENTS_PATH" "$ENTITLEMENTS_OUT"
 fi
 
 plutil -lint "${SCRIPT_DIR}/FinderExtension.entitlements" >/dev/null
-plutil -lint "${APPEX_BUNDLE}/Contents/Info.plist" >/dev/null
+plutil -lint "${STAGED_APPEX}/Contents/Info.plist" >/dev/null
 plutil -lint "$ENTITLEMENTS_PATH" >/dev/null
 
 if [[ "$WITH_MOCK_HOST" -eq 1 ]]; then
@@ -242,16 +279,16 @@ if [[ "$WITH_MOCK_HOST" -eq 1 ]]; then
   swiftc -parse-as-library \
     -target "$TARGET" -sdk "$SDK_PATH" \
     -framework Cocoa -framework FinderSync -framework Foundation \
-    -o "${APP_BUNDLE}/Contents/MacOS/FolderSyncHost" \
+    -o "${STAGED_APP}/Contents/MacOS/FolderSyncHost" \
     "${SCRIPT_DIR}/Sources/SnapshotModel.swift" \
     "${SCRIPT_DIR}/Sources/HostAppMain.swift"
 
-  cp "${SCRIPT_DIR}/HostInfo.plist" "${APP_BUNDLE}/Contents/Info.plist"
-  plutil -replace CFBundleIdentifier -string "$HOST_BUNDLE_ID" "${APP_BUNDLE}/Contents/Info.plist"
-  plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "${APP_BUNDLE}/Contents/Info.plist"
-  plutil -replace CFBundleVersion -string "$APP_BUILD" "${APP_BUNDLE}/Contents/Info.plist"
-  plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${APP_BUNDLE}/Contents/Info.plist"
-  plutil -lint "${APP_BUNDLE}/Contents/Info.plist" >/dev/null
+  cp "${SCRIPT_DIR}/HostInfo.plist" "${STAGED_APP}/Contents/Info.plist"
+  plutil -replace CFBundleIdentifier -string "$HOST_BUNDLE_ID" "${STAGED_APP}/Contents/Info.plist"
+  plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "${STAGED_APP}/Contents/Info.plist"
+  plutil -replace CFBundleVersion -string "$APP_BUILD" "${STAGED_APP}/Contents/Info.plist"
+  plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${STAGED_APP}/Contents/Info.plist"
+  plutil -lint "${STAGED_APP}/Contents/Info.plist" >/dev/null
 fi
 
 if [[ "$SKIP_SIGN" -eq 0 ]]; then
@@ -261,15 +298,29 @@ if [[ "$SKIP_SIGN" -eq 0 ]]; then
   fi
 
   echo "==> Signing extension (identity: ${SIGN_IDENTITY})"
-  codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS_PATH" "$APPEX_BUNDLE"
+  codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS_PATH" "$STAGED_APPEX"
 
   if [[ "$WITH_MOCK_HOST" -eq 1 ]]; then
     echo "==> Signing throwaway mock host app (identity: ${SIGN_IDENTITY})"
-    codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE"
-    codesign --verify --deep --strict "$APP_BUNDLE"
+    codesign "${SIGN_ARGS[@]}" "$STAGED_APP"
+    codesign --verify --deep --strict "$STAGED_APP"
   else
-    codesign --verify --strict "$APPEX_BUNDLE"
+    codesign --verify --strict "$STAGED_APPEX"
   fi
+fi
+
+if [[ "$WITH_MOCK_HOST" -eq 1 ]]; then
+  APP_BUNDLE="${OUT_DIR}/FolderSyncHost.app"
+  APPEX_BUNDLE="${APP_BUNDLE}/Contents/PlugIns/FolderSyncFinder.appex"
+  validate_contained_in_target "app bundle" "$APP_BUNDLE" "dir"
+  rm -rf "$APP_BUNDLE"
+  mv "$STAGED_APP" "$APP_BUNDLE"
+else
+  APP_BUNDLE=""
+  APPEX_BUNDLE="${OUT_DIR}/FolderSyncFinder.appex"
+  validate_contained_in_target "appex bundle" "$APPEX_BUNDLE" "dir"
+  rm -rf "$APPEX_BUNDLE"
+  mv "$STAGED_APPEX" "$APPEX_BUNDLE"
 fi
 
 echo ""
