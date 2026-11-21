@@ -10,7 +10,7 @@ use std::{
 
 use rclone_adapter::InitPreference;
 use sync_core::{
-    ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, VolumeIdentity, VolumeKind,
+    ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, VolumeIdentity,
     validate_names,
 };
 
@@ -35,50 +35,10 @@ pub struct SubfolderInventory {
     pub has_children: bool,
 }
 
-/// Real filesystem disk space info for a local path (via `statvfs` on Unix).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DiskSpaceInfo {
-    pub total_bytes: u64,
-    pub free_bytes: u64,
-}
+pub use crate::platform::{DiskSpaceInfo, disk_space_for_path};
+use crate::platform::{OsVolumeProbe, VolumeProbe};
 
-/// Reads real total/available bytes on the filesystem containing `path`.
-pub fn disk_space_for_path(path: &Path) -> Option<DiskSpaceInfo> {
-    // Walk up to the longest existing ancestor if `path` doesn't exist yet.
-    let mut probe = path;
-    while !probe.exists() {
-        probe = probe.parent()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = CString::new(probe.as_os_str().as_bytes()).ok()?;
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
-        if rc != 0 {
-            return None;
-        }
-        let block_size = if stat.f_frsize > 0 {
-            stat.f_frsize as u64
-        } else {
-            stat.f_bsize as u64
-        };
-        let total_bytes = (stat.f_blocks as u64).saturating_mul(block_size);
-        let free_bytes = (stat.f_bavail as u64).saturating_mul(block_size);
-        Some(DiskSpaceInfo {
-            total_bytes,
-            free_bytes,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = probe;
-        None
-    }
-}
-
-/// Real volume identity and mount information detected for a local folder.
+/// Volume information and mount-relative location of an existing mapping folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedVolume {
     pub identity: VolumeIdentity,
@@ -86,260 +46,62 @@ pub struct DetectedVolume {
     pub mount_path: PathBuf,
     pub relative_dir: PathBuf,
     pub filesystem: String,
+    pub space: DiskSpaceInfo,
 }
 
-/// Detects the mounted volume kind, stable filesystem ID (or `"unknown"`),
-/// mount point, and relative path for an existing ordinary local directory,
-/// rejecting symbolic links and mounted volume roots (`/` or `/Volumes/<vol>`).
+/// Identifies the backing volume of an ordinary local directory.
 pub fn detect_volume_identity(path: &Path) -> Result<DetectedVolume, ManagerError> {
-    let meta = fs::symlink_metadata(path).map_err(|err| ManagerError::Io {
+    detect_volume_with(&OsVolumeProbe, path)
+}
+
+pub(crate) fn detect_volume_with(
+    probe: &dyn VolumeProbe,
+    path: &Path,
+) -> Result<DetectedVolume, ManagerError> {
+    let choose_subfolder = || ManagerError::PreflightRejected {
         cause: format!(
-            "Local folder `{}` does not exist or cannot be accessed: {err}.",
+            "Cannot use volume root `{}` as a mapping folder.",
             path.display()
         ),
-        next_step: "Select an existing local folder (FolderSync never auto-creates missing roots)."
-            .to_string(),
-    })?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
+        next_step: "Choose a dedicated subfolder inside the volume.".to_owned(),
+    };
+    if path == Path::new("/") || path == Path::new("/Volumes") {
+        return Err(choose_subfolder());
+    }
+    let inspect_error = |error| ManagerError::Io {
+        cause: format!(
+            "Could not inspect the volume for `{}`: {error}.",
+            path.display()
+        ),
+        next_step: "Select an existing folder on a supported mounted disk.".to_owned(),
+    };
+    let meta = fs::symlink_metadata(path).map_err(inspect_error)?;
+    if !meta.is_dir() {
         return Err(ManagerError::PreflightRejected {
             cause: format!(
-                "Local folder `{}` must be an ordinary directory, not a file or symbolic link.",
+                "Local folder `{}` must be an ordinary directory.",
                 path.display()
             ),
-            next_step: "Choose an ordinary directory for this mapping.".to_string(),
+            next_step: "Choose a directory without symbolic links.".to_owned(),
         });
     }
-
-    let canonical = fs::canonicalize(path).map_err(|err| ManagerError::Io {
-        cause: format!(
-            "Local folder `{}` cannot be resolved: {err}.",
-            path.display()
-        ),
-        next_step: "Confirm the folder exists and is accessible.".to_string(),
-    })?;
-
-    if canonical == Path::new("/") || canonical == Path::new("/Volumes") {
-        return Err(ManagerError::PreflightRejected {
-            cause: format!(
-                "Cannot use volume root `{}` as a mapping folder.",
-                canonical.display()
-            ),
-            next_step: "Choose a dedicated subdirectory instead of a volume root.".to_string(),
-        });
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::{CStr, CString};
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = CString::new(canonical.as_os_str().as_bytes()).map_err(|_| {
-            ManagerError::PreflightRejected {
-                cause: format!(
-                    "Local path `{}` contains an invalid NUL byte.",
-                    canonical.display()
-                ),
-                next_step: "Choose a different local folder.".to_string(),
-            }
-        })?;
-        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
-        if rc == 0 {
-            let mount_str = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
-            let fs_type = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
-            let raw_mount = PathBuf::from(&mount_str);
-            if canonical == raw_mount {
-                return Err(ManagerError::PreflightRejected {
-                    cause: format!(
-                        "Cannot use mounted volume root `{}` as a mapping folder.",
-                        canonical.display()
-                    ),
-                    next_step: "Choose a dedicated subfolder inside the volume instead."
-                        .to_string(),
-                });
-            }
-            // On macOS APFS firmlinks, paths under `/Users` or `/private/var` report
-            // `f_mntonname == "/System/Volumes/Data"` while their canonical path starts at `/`.
-            let (mount_path, relative_dir) = match canonical.strip_prefix(&raw_mount) {
-                Ok(rel) => (raw_mount.clone(), rel.to_path_buf()),
-                Err(_) if raw_mount == Path::new("/System/Volumes/Data") => {
-                    let rel = canonical
-                        .strip_prefix(Path::new("/"))
-                        .map(Path::to_path_buf)
-                        .map_err(|_| ManagerError::PreflightRejected {
-                            cause: format!(
-                                "Local folder `{}` could not be resolved relative to mount `/`.",
-                                canonical.display()
-                            ),
-                            next_step: "Choose a dedicated subfolder inside a mounted volume."
-                                .to_string(),
-                        })?;
-                    (PathBuf::from("/"), rel)
-                }
-                Err(_) => {
-                    return Err(ManagerError::PreflightRejected {
-                        cause: format!(
-                            "Local folder `{}` could not be resolved relative to mount `{}`.",
-                            canonical.display(),
-                            raw_mount.display()
-                        ),
-                        next_step: "Choose a dedicated subfolder inside a mounted volume."
-                            .to_string(),
-                    });
-                }
-            };
-            if relative_dir.as_os_str().is_empty() {
-                return Err(ManagerError::PreflightRejected {
-                    cause: format!(
-                        "Cannot use mounted volume root `{}` as a mapping folder.",
-                        canonical.display()
-                    ),
-                    next_step: "Choose a dedicated subfolder inside the volume instead."
-                        .to_string(),
-                });
-            }
-            let is_external = raw_mount.starts_with("/Volumes/");
-            let kind = if is_external {
-                VolumeKind::External
-            } else {
-                VolumeKind::Internal
-            };
-            let display_name = if is_external {
-                raw_mount
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("External Volume")
-                    .to_string()
-            } else if raw_mount == Path::new("/") || raw_mount == Path::new("/System/Volumes/Data")
-            {
-                "Internal SSD".to_string()
-            } else {
-                raw_mount
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Internal SSD")
-                    .to_string()
-            };
-            use std::os::unix::fs::MetadataExt;
-            let stable_id = fs::metadata(&canonical)
-                .map(|m| format!("vol-{:x}", m.dev()))
-                .unwrap_or_else(|_| "unknown".to_string());
-            let filesystem = if fs_type.is_empty() {
-                "unknown".to_string()
-            } else {
-                fs_type.to_uppercase()
-            };
-            return Ok(DetectedVolume {
-                identity: VolumeIdentity::new(kind, stable_id),
-                display_name,
-                mount_path,
-                relative_dir,
-                filesystem,
-            });
-        }
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let dir_meta = fs::metadata(&canonical).map_err(|err| ManagerError::Io {
-            cause: format!("Could not inspect `{}`: {err}.", canonical.display()),
-            next_step: "Confirm the folder exists and is accessible.".to_string(),
-        })?;
-        let dev_id = dir_meta.dev();
-        if let Some(parent) = canonical.parent()
-            && let Ok(p_meta) = fs::metadata(parent)
-            && p_meta.dev() != dev_id
-        {
-            return Err(ManagerError::PreflightRejected {
-                cause: format!(
-                    "Cannot use mounted volume root `{}` as a mapping folder.",
-                    canonical.display()
-                ),
-                next_step: "Choose a dedicated subfolder inside the volume instead.".to_string(),
-            });
-        }
-        let mut mount_path = canonical.clone();
-        while let Some(parent) = mount_path.parent() {
-            if parent == mount_path {
-                break;
-            }
-            match fs::metadata(parent) {
-                Ok(pm) if pm.dev() == dev_id => mount_path = parent.to_path_buf(),
-                _ => break,
-            }
-        }
-        let relative_dir = canonical
-            .strip_prefix(&mount_path)
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        if relative_dir.as_os_str().is_empty() {
-            return Err(ManagerError::PreflightRejected {
-                cause: format!(
-                    "Cannot use mounted volume root `{}` as a mapping folder.",
-                    canonical.display()
-                ),
-                next_step: "Choose a dedicated subfolder inside the volume instead.".to_string(),
-            });
-        }
-        let is_external = mount_path.starts_with("/Volumes/")
-            || mount_path.starts_with("/media/")
-            || mount_path.starts_with("/mnt/");
-        let kind = if is_external {
-            VolumeKind::External
-        } else {
-            VolumeKind::Internal
-        };
-        let display_name = if is_external {
-            mount_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("External Volume")
-                .to_string()
-        } else {
-            "Internal SSD".to_string()
-        };
-        return Ok(DetectedVolume {
-            identity: VolumeIdentity::new(kind, format!("dev-{dev_id:x}")),
-            display_name,
-            mount_path,
-            relative_dir,
-            filesystem: "unknown".to_string(),
-        });
-    }
-
-    #[allow(unreachable_code)]
-    {
-        let mount_path = canonical
-            .parent()
-            .ok_or_else(|| ManagerError::PreflightRejected {
-                cause: format!(
-                    "Cannot use filesystem root `{}` as a mapping folder.",
-                    canonical.display()
-                ),
-                next_step: "Choose a dedicated subdirectory instead of a volume root.".to_string(),
-            })?
-            .to_path_buf();
-        let relative_dir = PathBuf::from(canonical.file_name().ok_or_else(|| {
-            ManagerError::PreflightRejected {
-                cause: format!(
-                    "Local folder `{}` has no directory name.",
-                    canonical.display()
-                ),
-                next_step: "Choose a dedicated subdirectory.".to_string(),
-            }
-        })?);
-        Ok(DetectedVolume {
-            identity: VolumeIdentity::new(VolumeKind::Internal, "unknown"),
-            display_name: "unknown".to_string(),
-            mount_path,
-            relative_dir,
-            filesystem: "unknown".to_string(),
-        })
-    }
+    let canonical = fs::canonicalize(path).map_err(inspect_error)?;
+    let volume = probe.probe(&canonical).map_err(inspect_error)?;
+    let mount_path = volume.binding_mount(&canonical).to_path_buf();
+    let relative_dir = canonical
+        .strip_prefix(&mount_path)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(choose_subfolder)?
+        .to_path_buf();
+    Ok(DetectedVolume {
+        identity: volume.identity,
+        display_name: volume.display_name,
+        mount_path,
+        relative_dir,
+        filesystem: volume.filesystem,
+        space: volume.space,
+    })
 }
 
 /// Detailed preflight inventory for UI wizard review and selective sync (§9, §18).

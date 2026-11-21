@@ -79,7 +79,8 @@ jobs:
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           TMP_HOME="$(mktemp -d)"
           trap 'rm -rf "$TMP_HOME"' EXIT
-          HOME="$TMP_HOME" FOLDERSYNC_STATE_DIR="$TMP_HOME/state" "$NSH_BIN" test
+          # Headless UI tests assert on the demo fixtures; FOLDERSYNC_DEMO=1 selects the demo source.
+          HOME="$TMP_HOME" FOLDERSYNC_STATE_DIR="$TMP_HOME/state" FOLDERSYNC_DEMO=1 "$NSH_BIN" test
       - name: Build and unit-test Finder Sync extension
         shell: bash
         run: |

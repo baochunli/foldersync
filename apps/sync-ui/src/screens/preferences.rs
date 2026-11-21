@@ -3,13 +3,14 @@
 //! Raw engine flags, fingerprints, and redacted options live ONLY in Diagnostics.
 
 use nsh_base::{SelectItem, SelectValue, input, radio, radio_group, select, switch, tab, tabs};
-use nsh_core::{file_dialog::SaveDialog, prelude::*};
+use nsh_core::{LineHeight, file_dialog::SaveDialog, prelude::*};
 
 use crate::contract::{FinderExtensionStatus, IconKind, Tone, UiCommand, UiSnapshot};
 use crate::screens::AppController;
 use crate::theme::{
-    BtnKind, Palette, app_button, card, card_title, focus_ring, mono_text, page_title,
-    section_label, status_pill,
+    BLOCK_GAP, BtnKind, HEADER_BOTTOM_MARGIN, KV_ROW_GAP, Palette, S_CAPTION, S_COMPACT, S_SMALL,
+    S_TINY, W_EMPH, W_TITLE, app_button, card, card_title, focus_ring, kv_row, mono_text,
+    page_title, section_label, status_pill,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,11 +57,10 @@ pub fn preferences_view(ctrl: AppController) -> impl IntoElement {
                     })
                     .child(
                         text("General")
-                            .text_size(px(13.0))
                             .font_weight(if current_tab == PrefsTab::General {
-                                FontWeight::SEMIBOLD
+                                W_TITLE
                             } else {
-                                FontWeight::NORMAL
+                                W_EMPH
                             })
                             .text_color(if current_tab == PrefsTab::General {
                                 p.primary
@@ -88,11 +88,10 @@ pub fn preferences_view(ctrl: AppController) -> impl IntoElement {
                     })
                     .child(
                         text("Diagnostics")
-                            .text_size(px(13.0))
                             .font_weight(if current_tab == PrefsTab::Diagnostics {
-                                FontWeight::SEMIBOLD
+                                W_TITLE
                             } else {
-                                FontWeight::NORMAL
+                                W_EMPH
                             })
                             .text_color(if current_tab == PrefsTab::Diagnostics {
                                 p.primary
@@ -116,8 +115,13 @@ pub fn preferences_view(ctrl: AppController) -> impl IntoElement {
         view()
             .flex_col()
             .w_full()
-            .gap(px(14.0))
-            .child(page_title("Preferences"))
+            .gap(px(BLOCK_GAP))
+            .child(
+                view()
+                    .window_drag(true)
+                    .mb(px(HEADER_BOTTOM_MARGIN))
+                    .child(page_title("Preferences")),
+            )
             .child(tab_bar)
             .child(content)
             .into_element()
@@ -163,7 +167,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                 .child(if prefs.open_at_login_pending {
                     text("Waiting for approval in System Settings → Login Items.")
                         .pl(px(44.0))
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.attn)
                         .into_element()
                 } else {
@@ -184,13 +188,12 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                 .gap(px(2.0))
                 .child(
                     text("Notifications · not connected yet in this build")
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(W_TITLE)
                         .text_color(p.muted),
                 )
                 .child(
                     text("Desktop notifications are not connected to sync events in this build yet.")
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.muted),
                 )
                 .into_element()
@@ -216,15 +219,14 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                                 .gap(px(8.0))
                                 .child(
                                     text("Finder status")
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .font_weight(W_TITLE)
                                         .text_color(p.fg),
                                 )
                                 .child(status_pill(ext_pill_icon, ext_pill_label, ext_pill_tone)),
                         )
                         .child(
                             text("Badges and menu items on mapped folders. macOS controls whether the extension is on.")
-                                .text_size(px(12.0))
+                                .text_size(px(S_SMALL))
                                 .text_color(p.muted),
                         ),
                 )
@@ -262,7 +264,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                             }
                         })
                         .child(radio_dot(!limited))
-                        .child(text("No limit").text_size(px(13.0)).text_color(p.fg)),
+                        .child(text("No limit").text_color(p.fg)),
                 )
                 .child(
                     view()
@@ -288,7 +290,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                                     }
                                 })
                                 .child(radio_dot(limited))
-                                .child(text("Limit to").text_size(px(13.0)).text_color(p.fg)),
+                                .child(text("Limit to").text_color(p.fg)),
                         )
                         .child(
                             input()
@@ -302,7 +304,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                                 .border_color(p.border)
                                 .focus(focus_ring)
                                 .focus_visible(focus_ring)
-                                .text_size(px(12.5))
+                                .text_size(px(S_COMPACT))
                                 .text_color(p.fg)
                                 .label("Megabytes per second")
                                 .value(move || bw_input.get())
@@ -315,14 +317,14 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                                     }
                                 }),
                         )
-                        .child(text("MB/s").text_size(px(13.0)).text_color(p.fg)),
+                        .child(text("MB/s").text_color(p.fg)),
                 ),
         )
     } else {
         let _ = (c_bw_none, c_bw_lim, c_bw_edit, bw_input);
         card().child(card_title("Bandwidth")).child(
             text("Bandwidth limits are not connected to sync runs in this build yet.")
-                .text_size(px(12.5))
+                .text_size(px(S_COMPACT))
                 .text_color(p.muted),
         )
     };
@@ -353,17 +355,19 @@ fn render_diagnostics(
         FinderExtensionStatus::Unavailable => "Not installed".to_owned(),
     };
 
-    let versions_card = card()
-        .flex_1()
-        .child(card_title("Versions"))
-        .child(diag_kv("FolderSync", &prefs.app_version))
-        .child(diag_kv(
-            "Sync engine",
-            &format!("{}\n{}", prefs.engine_version, prefs.engine_checksum),
-        ))
-        .child(diag_kv("Interface", &prefs.nsh_version))
-        .child(diag_kv("Finder extension", &ext_version_line))
-        .child(diag_kv("System", &prefs.system_summary));
+    let versions_card = card().flex_1().child(card_title("Versions")).child(
+        view()
+            .flex_col()
+            .gap(px(KV_ROW_GAP))
+            .child(diag_kv("FolderSync", &prefs.app_version))
+            .child(diag_kv(
+                "Sync engine",
+                &format!("{}\n{}", prefs.engine_version, prefs.engine_checksum),
+            ))
+            .child(diag_kv("Interface", &prefs.nsh_version))
+            .child(diag_kv("Finder extension", &ext_version_line))
+            .child(diag_kv("System", &prefs.system_summary)),
+    );
 
     let c_exp = ctrl.clone();
     let is_demo = snap.is_demo_mode;
@@ -377,7 +381,7 @@ fn render_diagnostics(
         .child(card_title("Export diagnostics"))
         .child(
             text(export_desc)
-                .text_size(px(12.5))
+                .text_size(px(S_COMPACT))
                 .text_color(p.fg),
         )
         .child(
@@ -417,7 +421,7 @@ fn render_diagnostics(
             )),
         );
     if let Some(notice) = export_notice.get() {
-        export_card = export_card.child(text(notice).text_size(px(12.0)).text_color(p.muted));
+        export_card = export_card.child(text(notice).text_size(px(S_SMALL)).text_color(p.muted));
     }
 
     let real_mappings: Vec<_> = snap
@@ -450,7 +454,7 @@ fn render_diagnostics(
                     .flex_row()
                     .items_center()
                     .gap(px(10.0))
-                    .child(text("Mapping").text_size(px(12.5)).text_color(p.muted))
+                    .child(text("Mapping").text_size(px(S_COMPACT)).text_color(p.muted))
                     .child(
                         select()
                             .accessibility_label("Diagnostic mapping")
@@ -464,16 +468,21 @@ fn render_diagnostics(
                                     .gap(px(8.0))
                                     .min_w(px(160.0))
                                     .min_h(px(28.0))
-                                    .px(px(10.0))
-                                    .py(px(4.0))
+                                    .px(px(9.0))
+                                    .py(px(3.0))
+                                    .line_height(LineHeight::Normal)
                                     .rounded(px(7.0))
                                     .bg(p.bg)
                                     .border_1()
                                     .border_color(p.border)
                                     .cursor_pointer()
                                     .focus_visible(focus_ring)
-                                    .child(text(trigger_label).text_size(px(12.5)).text_color(p.fg))
-                                    .child(text("▾").text_size(px(11.0)).text_color(p.muted)),
+                                    .child(
+                                        text(trigger_label)
+                                            .text_size(px(S_COMPACT))
+                                            .text_color(p.fg),
+                                    )
+                                    .child(text("▾").text_size(px(S_TINY)).text_color(p.muted)),
                             )
                             .popup_style(move |s| {
                                 s.bg(p.card)
@@ -490,10 +499,15 @@ fn render_diagnostics(
                             }),
                     ),
             )
-            .child(diag_kv("Generation", &m.generation.to_string()))
-            .child(diag_kv("Fingerprint", &m.fingerprint))
-            .child(diag_kv("Local volume ID", &m.volume_id.stable_id))
-            .child(diag_kv("Cloud folder ID", &m.cloud_folder_id))
+            .child(
+                view()
+                    .flex_col()
+                    .gap(px(KV_ROW_GAP))
+                    .child(diag_kv("Generation", &m.generation.to_string()))
+                    .child(diag_kv("Fingerprint", &m.fingerprint))
+                    .child(diag_kv("Local volume ID", &m.volume_id.stable_id))
+                    .child(diag_kv("Cloud folder ID", &m.cloud_folder_id)),
+            )
             .child(
                 view()
                     .pt(px(6.0))
@@ -507,8 +521,9 @@ fn render_diagnostics(
                     .border_1()
                     .border_color(p.hair)
                     .rounded(px(8.0))
-                    .p(px(11.0))
-                    .child(mono_text(opts_text, 11.0, p.fg)),
+                    .px(px(11.0))
+                    .py(px(9.0))
+                    .child(mono_text(opts_text, S_TINY, p.fg)),
             )
             .child(view().flex_row().pt(px(4.0)).child(app_button(
                 if is_copied { "Copied" } else { "Copy" },
@@ -525,7 +540,7 @@ fn render_diagnostics(
     } else {
         mapping_card = mapping_card.child(
             text("No mappings configured yet.")
-                .text_size(px(12.5))
+                .text_size(px(S_COMPACT))
                 .text_color(p.muted),
         );
     }
@@ -585,15 +600,10 @@ fn app_switch(
                 .flex_col()
                 .gap(px(2.0))
                 .flex_1()
-                .child(
-                    text(title.to_owned())
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(p.fg),
-                )
+                .child(text(title.to_owned()).font_weight(W_TITLE).text_color(p.fg))
                 .child(
                     text(subtitle.to_owned())
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.muted),
                 ),
         )
@@ -623,22 +633,8 @@ fn radio_dot(checked: bool) -> View {
 }
 
 fn diag_kv(label: &str, value: &str) -> View {
-    let p = Palette::current();
-    view()
-        .flex_row()
-        .items_start()
-        .gap(px(12.0))
-        .py(px(2.0))
-        .child(
-            text(label.to_owned())
-                .w(px(130.0))
-                .flex_none()
-                .text_size(px(12.5))
-                .text_color(p.muted),
-        )
-        .child(
-            view()
-                .flex_1()
-                .child(mono_text(value.to_owned(), 11.5, p.fg)),
-        )
+    kv_row(
+        label.to_owned(),
+        mono_text(value.to_owned(), S_CAPTION, Palette::current().fg),
+    )
 }

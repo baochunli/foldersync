@@ -4,7 +4,9 @@ use nsh_core::prelude::*;
 
 use crate::contract::{IconKind, UiCommand, UiSnapshot};
 use crate::screens::AppController;
-use crate::theme::{BtnKind, Palette, WELCOME_ILLUSTRATION, app_button, page_title};
+use crate::theme::{
+    BtnKind, Palette, S_LEAD, S_SMALL, W_TITLE, WELCOME_ILLUSTRATION, app_button, page_title_large,
+};
 
 /// Renders either the "No account" Welcome screen or the "Account connected, no mappings" screen.
 pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
@@ -21,21 +23,23 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
             .pt(px(28.0))
             .pb(px(20.0))
             .px(px(16.0))
-            .gap(px(16.0))
             .child(
                 image(WELCOME_ILLUSTRATION)
                     .w(px(220.0))
                     .h(px(120.0))
+                    .mb(px(18.0))
                     .accessible(false),
             )
-            .child(page_title("Keep the Drive folders you choose on this Mac"))
+            .child(page_title_large("Keep the Drive folders you choose on this Mac").mb(px(6.0)))
             .child(
                 text(
                     "Pick folders from Google Drive and put each one on the drive you want, internal or external. They stay ordinary folders in Finder and sync both ways.",
                 )
-                .text_size(px(13.5))
+                .text_size(px(S_LEAD))
                 .text_color(p.muted)
-                .max_w(px(480.0)),
+                .max_w(px(470.0))
+                .mb(px(22.0))
+                .text_center(),
             )
             .child(
                 view()
@@ -43,6 +47,7 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
                     .gap(px(12.0))
                     .w_full()
                     .max_w(px(720.0))
+                    .mb(px(18.0))
                     .child(step_card(
                         "1",
                         false,
@@ -78,11 +83,12 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
                         }
                     },
                 )
-                .test_id("welcome-connect-btn"),
+                .test_id("welcome-connect-btn")
+                .mb(px(12.0)),
             )
             .child(
                 text("Nothing is downloaded or uploaded until you review and start each folder's first sync.")
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted),
             )
     } else {
@@ -96,13 +102,13 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
             .pt(px(24.0))
             .pb(px(20.0))
             .px(px(16.0))
-            .gap(px(16.0))
             .child(
                 view()
                     .flex_row()
                     .gap(px(12.0))
                     .w_full()
                     .max_w(px(720.0))
+                    .mb(px(18.0))
                     .child(step_card("✓", true, "Connect Google Drive", &acct_sub))
                     .child(step_card(
                         "2",
@@ -117,14 +123,16 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
                         "Internal SSD: 212 GB free · WorkSSD: 1.4 TB free",
                     )),
             )
-            .child(page_title("No folders on this Mac yet"))
+            .child(page_title_large("No folders on this Mac yet").mb(px(6.0)))
             .child(
                 text(
                     "Your Drive holds more than this Mac can store, so FolderSync never downloads everything. Choose the folders you want here.",
                 )
-                .text_size(px(13.5))
+                .text_size(px(S_LEAD))
                 .text_color(p.muted)
-                .max_w(px(480.0)),
+                .max_w(px(470.0))
+                .mb(px(22.0))
+                .text_center(),
             )
             .child(
                 app_button(
@@ -154,7 +162,8 @@ fn step_card(badge: &str, done: bool, title: &str, subtitle: &str) -> View {
         .border_1()
         .border_color(p.hair)
         .rounded(px(12.0))
-        .p(px(14.0))
+        .px(px(14.0))
+        .py(px(12.0))
         .flex_col()
         .gap(px(6.0))
         .child(
@@ -167,20 +176,15 @@ fn step_card(badge: &str, done: bool, title: &str, subtitle: &str) -> View {
                 .justify_center()
                 .child(
                     text(badge.to_owned())
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(S_SMALL))
+                        .font_weight(W_TITLE)
                         .text_color(badge_fg),
                 ),
         )
-        .child(
-            text(title.to_owned())
-                .text_size(px(13.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(p.fg),
-        )
+        .child(text(title.to_owned()).font_weight(W_TITLE).text_color(p.fg))
         .child(
             text(subtitle.to_owned())
-                .text_size(px(12.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.muted),
         )
 }

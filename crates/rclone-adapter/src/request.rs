@@ -846,7 +846,7 @@ impl BisyncRequestBuilder {
                 expected: host_platform.to_string(),
             });
         }
-        if engine.sha256() != host_pin.binary_sha256 {
+        if !engine.has_qualified_digest(host_pin) {
             return Err(RequestError::UnqualifiedEngineHash {
                 sha256: engine.sha256().to_string(),
             });

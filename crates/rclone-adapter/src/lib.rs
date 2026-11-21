@@ -10,7 +10,10 @@ pub mod process;
 pub mod qualification;
 pub mod request;
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 pub use auth::{
     AuthUrlCallback, DriveAuthError, DriveAuthOutcome, DriveAuthRequest, extract_auth_url,
@@ -63,11 +66,22 @@ const DEFAULT_BINARY: &str = concat!(
     "/../../.tools/rclone/1.76.0/rclone"
 );
 
-/// Resolves an explicit development override or the workspace's pinned binary
-/// to an absolute file path.
+/// Resolves the workspace's pinned binary to an absolute file path. Debug
+/// builds accept `FOLDERSYNC_RCLONE` as a development override.
+/// Use [`qualify_pinned_binary`] for bundle-aware startup qualification.
 pub fn pinned_binary_path() -> Option<PathBuf> {
-    let path = env::var_os("FOLDERSYNC_RCLONE")
-        .map_or_else(|| PathBuf::from(DEFAULT_BINARY), PathBuf::from);
+    workspace_binary_path(Path::new(DEFAULT_BINARY), cfg!(debug_assertions), || {
+        env::var_os("FOLDERSYNC_RCLONE").map(PathBuf::from)
+    })
+}
+
+fn workspace_binary_path(
+    default: &Path,
+    debug_build: bool,
+    override_path: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let override_path = debug_build.then(override_path).flatten();
+    let path = override_path.as_deref().unwrap_or(default);
     path.canonicalize().ok().filter(|path| path.is_file())
 }
 
@@ -77,9 +91,28 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn workspace_binary_override_is_only_used_in_debug_builds() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let default = workspace.join("Cargo.toml");
+        let override_path = workspace.join("src/lib.rs");
+        assert_eq!(
+            workspace_binary_path(&default, true, || Some(override_path.clone())),
+            Some(override_path.canonicalize().unwrap())
+        );
+        assert_eq!(
+            workspace_binary_path(&default, false, || panic!("read release override")),
+            Some(default.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
     fn resolves_the_pinned_binary_when_installed() {
-        let expected = env::var_os("FOLDERSYNC_RCLONE")
-            .map_or_else(|| PathBuf::from(DEFAULT_BINARY), PathBuf::from);
+        let expected = if cfg!(debug_assertions) {
+            env::var_os("FOLDERSYNC_RCLONE")
+        } else {
+            None
+        }
+        .map_or_else(|| PathBuf::from(DEFAULT_BINARY), PathBuf::from);
         if !expected.is_file() {
             eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
             return;

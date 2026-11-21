@@ -14,8 +14,10 @@ use crate::contract::{
 };
 use crate::screens::AppController;
 use crate::theme::{
-    BtnKind, Palette, app_button, capacity_meter, card, card_title, focus_ring, icon, link_button,
-    mono_text, page_title, progress_bar, section_label, status_pill,
+    BtnKind, KV_ROW_GAP, Palette, S_CAPTION, S_CARD_TITLE, S_COMPACT, S_QUESTION, S_SMALL, S_TINY,
+    W_BODY, W_STRONG, W_TITLE, accented_card, app_button, capacity_meter, card, card_title,
+    emphasized_line, focus_ring, icon, kv_row, link_button, mono_text, page_title, progress_bar,
+    section_label, status_pill,
 };
 
 /// Renders the Add-mapping wizard inside the main content area (sidebar stays visible).
@@ -68,9 +70,13 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
         };
 
         let p = Palette::current();
-        let mut header = view().flex_col().gap(px(3.0)).child(page_title(title));
+        let mut header = view()
+            .window_drag(true)
+            .flex_col()
+            .gap(px(3.0))
+            .child(page_title(title));
         if let Some(sub) = subtitle {
-            header = header.child(text(sub).text_size(px(13.0)).text_color(p.muted));
+            header = header.child(text(sub).text_color(p.muted));
         }
 
         let body = match draft.step {
@@ -88,12 +94,18 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
         view()
             .flex_col()
             .w_full()
-            .gap(px(16.0))
-            .child(link_button("‹ Overview", 12.5, {
-                let c = ctrl.clone();
-                move || c.navigate(ScreenRoute::Overview)
-            }))
-            .child(header)
+            .child(
+                view()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(8.0))
+                    .child(link_button("‹ Overview", S_SMALL, {
+                        let c = ctrl.clone();
+                        move || c.navigate(ScreenRoute::Overview)
+                    }))
+                    .child(header.w_full())
+                    .mb(px(16.0)),
+            )
             .child(step_indicator(ctrl.clone(), draft))
             .child(body)
             .child(footer)
@@ -108,6 +120,7 @@ fn step_indicator(ctrl: AppController, draft: &WizardDraft) -> View {
         .flex_row()
         .flex_wrap()
         .gap(px(6.0))
+        .mb(px(18.0))
         .accessibility_description("Add mapping steps");
 
     for (step, label) in WizardStep::SIX_STEPS {
@@ -169,19 +182,15 @@ fn step_indicator(ctrl: AppController, draft: &WizardDraft) -> View {
                     .justify_center()
                     .child(
                         text(dot_text)
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(S_TINY))
+                            .font_weight(W_TITLE)
                             .text_color(dot_fg),
                     ),
             )
             .child(
                 text(label)
-                    .text_size(px(12.0))
-                    .font_weight(if is_current {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
+                    .text_size(px(S_SMALL))
+                    .font_weight(if is_current { W_STRONG } else { W_BODY })
                     .text_color(pill_fg),
             );
         row = row.child(pill);
@@ -233,11 +242,10 @@ fn render_step_account(ctrl: AppController, snap: &UiSnapshot) -> View {
                         .gap(px(2.0))
                         .child(
                             text(format!("{} · {}", acct.id, acct.email))
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(W_TITLE)
                                 .text_color(p.fg),
                         )
-                        .child(text(sub).text_size(px(12.0)).text_color(p.muted)),
+                        .child(text(sub).text_size(px(S_SMALL)).text_color(p.muted)),
                 ),
         );
     }
@@ -246,8 +254,8 @@ fn render_step_account(ctrl: AppController, snap: &UiSnapshot) -> View {
     card()
         .child(
             text("Which Google account holds the folder?")
-                .text_size(px(15.0))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(S_QUESTION))
+                .font_weight(W_STRONG)
                 .text_color(p.fg),
         )
         .child(group)
@@ -297,17 +305,12 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
                     .flex_col()
                     .child(
                         text(item.name.clone())
-                            .text_size(px(13.0))
-                            .font_weight(if is_selected {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
+                            .font_weight(if is_selected { W_TITLE } else { W_BODY })
                             .text_color(if already_mapped { p.muted } else { p.fg }),
                     )
                     .child(if item.used_by_other_computer {
                         text("Used by another computer")
-                            .text_size(px(11.5))
+                            .text_size(px(S_CAPTION))
                             .text_color(p.muted)
                             .into_element()
                     } else {
@@ -317,12 +320,8 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
             .child(
                 table_cell().w(px(86.0)).items_end().child(
                     text(item.size_label.clone())
-                        .text_size(px(12.5))
-                        .font_weight(if is_selected {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        })
+                        .text_size(px(S_COMPACT))
+                        .font_weight(if is_selected { W_TITLE } else { W_BODY })
                         .text_color(if item.size_gb.is_none() {
                             p.muted
                         } else {
@@ -338,7 +337,7 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
                             .clone()
                             .unwrap_or_else(|| "Not on this Mac".to_owned()),
                     )
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(if already_mapped { p.muted } else { p.fg }),
                 ),
             );
@@ -385,7 +384,7 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
         )
         .child(
             text("Only folders directly inside Data are offered, so collections never overlap.")
-                .text_size(px(11.5))
+                .text_size(px(S_CAPTION))
                 .text_color(p.muted),
         );
 
@@ -445,7 +444,7 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
         .w(px(276.0))
         .flex_none()
         .child(card_title(format!("Where {selected_folder} fits")))
-        .child(text(size_header).text_size(px(12.0)).text_color(p.muted));
+        .child(text(size_header).text_size(px(S_SMALL)).text_color(p.muted));
 
     for vol in &snap.volumes {
         let icon_kind = if !vol.connected {
@@ -485,13 +484,13 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
                         .child(icon(icon_kind, 14.0, p.muted))
                         .child(
                             text(vol.display_name.clone())
-                                .text_size(px(12.5))
+                                .text_size(px(S_COMPACT))
                                 .text_color(p.fg),
                         ),
                 )
                 .child(
                     text(fit_text)
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(fit_color)
                         .tabular_nums(),
                 ),
@@ -500,7 +499,7 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
 
     fit_card = fit_card.child(
         text("You can leave out large subfolders in step 4.")
-            .text_size(px(11.5))
+            .text_size(px(S_CAPTION))
             .text_color(p.muted)
             .pt(px(4.0)),
     );
@@ -544,7 +543,7 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                 .child(
                     text(chk.message.clone())
                         .flex_1()
-                        .text_size(px(12.5))
+                        .text_size(px(S_COMPACT))
                         .text_color(if chk.ok { p.fg } else { p.err }),
                 ),
         );
@@ -580,10 +579,12 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                 .child(
                     text("Local folder")
                         .w(px(120.0))
-                        .text_size(px(12.5))
+                        .text_size(px(S_COMPACT))
                         .text_color(p.muted),
                 )
-                .child(mono_text(draft.local_path.clone(), 12.0, p.fg).test_id("wizard-local-path"))
+                .child(
+                    mono_text(draft.local_path.clone(), S_SMALL, p.fg).test_id("wizard-local-path"),
+                )
                 .child(
                     app_button(
                         "Choose folder…",
@@ -621,7 +622,7 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                 .child(
                     text("Volume")
                         .w(px(120.0))
-                        .text_size(px(12.5))
+                        .text_size(px(S_COMPACT))
                         .text_color(p.muted),
                 )
                 .child(
@@ -629,7 +630,7 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                         "{} · {} · {}",
                         draft.volume_name, vol_kind_str, draft.volume_fs
                     ))
-                    .text_size(px(12.5))
+                    .text_size(px(S_COMPACT))
                     .text_color(p.fg),
                 ),
         )
@@ -641,7 +642,7 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                 .child(
                     text("Space")
                         .w(px(120.0))
-                        .text_size(px(12.5))
+                        .text_size(px(S_COMPACT))
                         .text_color(p.muted),
                 )
                 .child(
@@ -651,7 +652,7 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                         .child(capacity_meter(used_pct, false, space_line.clone(), 280.0))
                         .child(
                             text(space_line)
-                                .text_size(px(12.0))
+                                .text_size(px(S_SMALL))
                                 .text_color(p.muted)
                                 .tabular_nums(),
                         ),
@@ -670,7 +671,7 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                 .border_color(p.hair)
                 .child(
                     text("Demo check preview:")
-                        .text_size(px(11.5))
+                        .text_size(px(S_CAPTION))
                         .text_color(p.muted),
                 )
                 .child(
@@ -775,10 +776,10 @@ fn render_step_subfolders(
                                     .flex_row()
                                     .items_center()
                                     .gap(px(6.0))
-                                    .child(text(label_text).text_size(px(13.0)).text_color(p.fg))
+                                    .child(text(label_text).text_color(p.fg))
                                     .child(if !node.included {
                                         text("· cloud only")
-                                            .text_size(px(11.5))
+                                            .text_size(px(S_CAPTION))
                                             .text_color(p.muted)
                                             .into_element()
                                     } else {
@@ -790,7 +791,7 @@ fn render_step_subfolders(
                 .child(
                     table_cell().w(px(80.0)).items_end().child(
                         text(node.size_label.clone())
-                            .text_size(px(12.5))
+                            .text_size(px(S_COMPACT))
                             .text_color(p.fg)
                             .tabular_nums(),
                     ),
@@ -834,21 +835,21 @@ fn render_step_subfolders(
             .gap(px(6.0))
             .child(
                 text(format!("{included_gb:.1} GB"))
-                    .text_size(px(16.0))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(S_QUESTION))
+                    .font_weight(W_STRONG)
                     .text_color(p.fg)
                     .tabular_nums(),
             )
             .child(
                 text(format!("of {total_gb:.1} GB"))
-                    .text_size(px(12.5))
+                    .text_size(px(S_COMPACT))
                     .text_color(p.muted)
                     .tabular_nums(),
             ),
         None => view().flex_row().child(
             text("Size measuring…")
-                .text_size(px(14.0))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(S_CARD_TITLE))
+                .font_weight(W_TITLE)
                 .text_color(p.muted),
         ),
     };
@@ -862,7 +863,7 @@ fn render_step_subfolders(
                 "{} keeps about {remaining_tb:.2} TB free",
                 draft.volume_name
             ))
-            .text_size(px(12.0))
+            .text_size(px(S_SMALL))
             .text_color(p.muted),
         )
         .child(view().pt(px(4.0)).child(section_label("Always excluded")))
@@ -874,7 +875,7 @@ fn render_step_subfolders(
                 .gap(px(6.0))
                 .child(
                     text("macOS metadata and temporary files")
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.fg),
                 )
                 .child(link_button(
@@ -883,7 +884,7 @@ fn render_step_subfolders(
                     } else {
                         "Show list"
                     },
-                    12.0,
+                    S_SMALL,
                     move || c_toggle_def.send(UiCommand::WizardToggleDefaultExclusions),
                 )),
         );
@@ -896,7 +897,7 @@ fn render_step_subfolders(
             .rounded(px(6.0))
             .p(px(8.0));
         for entry in DEFAULT_EXCLUSIONS {
-            list = list.child(mono_text(entry.pattern, 11.0, p.muted));
+            list = list.child(mono_text(entry.pattern, S_TINY, p.muted));
         }
         side_card = side_card.child(list);
     }
@@ -924,7 +925,7 @@ fn render_step_subfolders(
                         .border_color(p.border)
                         .focus(focus_ring)
                         .focus_visible(focus_ring)
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.fg)
                         .placeholder("e.g. *.lrdata/")
                         .value(move || pattern_input.get())
@@ -948,7 +949,7 @@ fn render_step_subfolders(
     if !draft.custom_patterns.is_empty() {
         side_card = side_card.child(mono_text(
             format!("Added: {}", draft.custom_patterns.join(", ")),
-            11.0,
+            S_TINY,
             p.muted,
         ));
     }
@@ -1071,10 +1072,10 @@ fn render_step_recovery(ctrl: AppController, draft: &WizardDraft) -> View {
                 .child(
                     text("On this Mac")
                         .w(px(120.0))
-                        .text_size(px(12.5))
+                        .text_size(px(S_COMPACT))
                         .text_color(p.muted),
                 )
-                .child(mono_text(draft.local_recovery_path.clone(), 12.0, p.fg))
+                .child(mono_text(draft.local_recovery_path.clone(), S_SMALL, p.fg))
                 .child(app_button(
                     "Change…",
                     BtnKind::Default,
@@ -1109,10 +1110,10 @@ fn render_step_recovery(ctrl: AppController, draft: &WizardDraft) -> View {
                 .child(
                     text("In the cloud")
                         .w(px(120.0))
-                        .text_size(px(12.5))
+                        .text_size(px(S_COMPACT))
                         .text_color(p.muted),
                 )
-                .child(mono_text(draft.cloud_recovery_path.clone(), 12.0, p.fg)),
+                .child(mono_text(draft.cloud_recovery_path.clone(), S_SMALL, p.fg)),
         )
         .child(rec_checks)
 }
@@ -1133,21 +1134,22 @@ fn format_bytes_short(bytes: u64) -> String {
     }
 }
 
-fn format_side_summary(
-    has_files: bool,
-    file_count: Option<usize>,
-    total_bytes: Option<u64>,
-    empty_note: &str,
-) -> String {
-    if !has_files {
-        return format!("Contains files: No · {empty_note}");
-    }
-    match (file_count, total_bytes) {
-        (Some(n), Some(b)) => format!("Contains files: Yes · {n} files, {}", format_bytes_short(b)),
-        (Some(n), None) => format!("Contains files: Yes · {n} files"),
-        (None, Some(b)) => format!("Contains files: Yes · about {}", format_bytes_short(b)),
-        (None, None) => "Contains files: Yes · size measuring".to_owned(),
-    }
+fn populated_side(file_count: Option<usize>, total_bytes: Option<u64>) -> Text {
+    let details = match (file_count, total_bytes) {
+        (Some(n), Some(b)) => format!("{n} files, {}", format_bytes_short(b)),
+        (Some(n), None) => format!("{n} files"),
+        (None, Some(b)) => format!("about {}", format_bytes_short(b)),
+        (None, None) => "size measuring".to_owned(),
+    };
+    review_files_line("Yes", details)
+}
+
+fn review_files_line(contains: &'static str, details: impl Into<SharedString>) -> Text {
+    text("Contains files: ")
+        .child(text(contains).font_weight(W_TITLE))
+        .child(text(" · "))
+        .child(text(details.into()))
+        .tabular_nums()
 }
 
 fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -> View {
@@ -1156,43 +1158,16 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
         .remote_folder_path
         .clone()
         .unwrap_or_else(|| format!("{}:Data/{}", draft.selected_account, draft.selected_folder));
+    let cloud_files = || populated_side(draft.cloud_file_count, draft.cloud_total_bytes);
+    let local_files = || populated_side(draft.local_file_count, draft.local_total_bytes);
+    let empty = || review_files_line("No", "empty");
     let (cloud_files_line, local_files_line) = match draft.review_scenario {
-        ReviewScenario::CloudToLocal => (
-            format_side_summary(
-                true,
-                draft.cloud_file_count,
-                draft.cloud_total_bytes,
-                "empty",
-            ),
-            "Contains files: No · empty".to_owned(),
-        ),
-        ReviewScenario::LocalToCloud => (
-            "Contains files: No · empty (new folder)".to_owned(),
-            format_side_summary(
-                true,
-                draft.local_file_count,
-                draft.local_total_bytes,
-                "empty",
-            ),
-        ),
-        ReviewScenario::BothPopulated => (
-            format_side_summary(
-                true,
-                draft.cloud_file_count,
-                draft.cloud_total_bytes,
-                "empty",
-            ),
-            format_side_summary(
-                true,
-                draft.local_file_count,
-                draft.local_total_bytes,
-                "empty",
-            ),
-        ),
-        ReviewScenario::BothEmpty => (
-            "Contains files: No · empty".to_owned(),
-            "Contains files: No · empty".to_owned(),
-        ),
+        ReviewScenario::CloudToLocal => (cloud_files(), empty()),
+        ReviewScenario::LocalToCloud => {
+            (review_files_line("No", "empty (new folder)"), local_files())
+        }
+        ReviewScenario::BothPopulated => (cloud_files(), local_files()),
+        ReviewScenario::BothEmpty => (empty(), empty()),
     };
 
     let sides = view()
@@ -1210,13 +1185,8 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         .child(icon(IconKind::Cloud, 16.0, p.muted))
                         .child(card_title("Cloud")),
                 )
-                .child(mono_text(cloud_path.clone(), 12.0, p.fg))
-                .child(
-                    text(cloud_files_line)
-                        .text_size(px(12.5))
-                        .text_color(p.fg)
-                        .tabular_nums(),
-                ),
+                .child(mono_text(cloud_path.clone(), S_SMALL, p.fg))
+                .child(cloud_files_line),
         )
         .child(
             card()
@@ -1229,13 +1199,8 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         .child(icon(IconKind::DriveExternal, 16.0, p.muted))
                         .child(card_title("This Mac")),
                 )
-                .child(mono_text(draft.local_path.clone(), 12.0, p.fg))
-                .child(
-                    text(local_files_line)
-                        .text_size(px(12.5))
-                        .text_color(p.fg)
-                        .tabular_nums(),
-                ),
+                .child(mono_text(draft.local_path.clone(), S_SMALL, p.fg))
+                .child(local_files_line),
         );
 
     let excluded = draft.excluded_names();
@@ -1251,7 +1216,8 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
             .border_1()
             .border_color(p.run_bd)
             .rounded(px(12.0))
-            .p(px(16.0))
+            .px(px(16.0))
+            .py(px(14.0))
             .flex_col()
             .gap(px(6.0))
             .child(
@@ -1262,18 +1228,15 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                     .child(icon(IconKind::Swap, 16.0, p.run))
                     .child(
                         text("First sync: download from the cloud")
-                            .text_size(px(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(S_CARD_TITLE))
+                            .font_weight(W_TITLE)
                             .text_color(p.run),
                     ),
             )
             .child(
-                text(format!(
-                    "The local folder is filled from Data/{}. Nothing in the cloud is changed by the first sync. After that, changes on either side sync both ways.",
-                    draft.selected_folder
-                ))
-                .text_size(px(13.0))
-                .text_color(p.fg),
+                text("The local folder is filled from ")
+                    .child(mono_text(format!("Data/{}", draft.selected_folder), S_CAPTION, p.fg))
+                    .child(text(". Nothing in the cloud is changed by the first sync. After that, changes on either side sync both ways.")),
             )
             .child(
                 text(match (draft.cloud_file_count, draft.total_gb_opt()) {
@@ -1292,7 +1255,7 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         "Preview: size is still measuring{left_out_note}. Files can change before the sync starts."
                     ),
                 })
-                .text_size(px(12.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.muted),
             ),
         ReviewScenario::LocalToCloud => view()
@@ -1300,7 +1263,8 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
             .border_1()
             .border_color(p.run_bd)
             .rounded(px(12.0))
-            .p(px(16.0))
+            .px(px(16.0))
+            .py(px(14.0))
             .flex_col()
             .gap(px(6.0))
             .child(
@@ -1311,40 +1275,29 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                     .child(icon(IconKind::Swap, 16.0, p.run))
                     .child(
                         text("First sync: upload to the cloud")
-                            .text_size(px(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(S_CARD_TITLE))
+                            .font_weight(W_TITLE)
                             .text_color(p.run),
                     ),
             )
             .child(
-                text(format!(
-                    "Data/{} is filled from the local folder. Local files are not changed by the first sync.",
-                    draft.selected_folder
-                ))
-                .text_size(px(13.0))
-                .text_color(p.fg),
+                text("")
+                    .child(mono_text(format!("Data/{}", draft.selected_folder), S_CAPTION, p.fg))
+                    .child(text(" is filled from the local folder. Local files are not changed by the first sync.")),
             )
             .child(
                 text("A marker file is added to both sides so other computers can join. This is an estimate; files can change before the sync starts.")
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted),
             ),
         ReviewScenario::BothPopulated => {
             let c_choose = ctrl.clone();
             let c_rev = ctrl.clone();
             let lp_rev = draft.local_path.clone();
-            view()
+            accented_card(p.err_bd)
                 .test_id("review-both-populated-blocked")
                 .role(AccessibilityRole::Alert)
-                .bg(p.card)
-                .border_1()
                 .border_color(p.err_bd)
-                .border_l(px(4.0))
-                .border_l_color(p.err_bd)
-                .rounded(px(12.0))
-                .p(px(16.0))
-                .flex_col()
-                .gap(px(8.0))
                 .child(
                     view()
                         .flex_row()
@@ -1353,14 +1306,13 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         .child(status_pill(IconKind::Octagon, "Can't start", Tone::Err))
                         .child(
                             text("Both sides already contain files")
-                                .text_size(px(14.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(S_CARD_TITLE))
+                                .font_weight(W_TITLE)
                                 .text_color(p.fg),
                         ),
                 )
                 .child(
                     text("FolderSync can't combine two existing folders in this version. Choose an empty local folder. To keep the existing local files, move them somewhere outside FolderSync first.")
-                        .text_size(px(13.0))
                         .text_color(p.fg),
                 )
                 .child(
@@ -1393,7 +1345,6 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
             .child(card_title("Both folders are empty"))
             .child(
                 text("Nothing to copy. FolderSync adds the marker files and starts syncing.")
-                    .text_size(px(13.0))
                     .text_color(p.fg),
             ),
     };
@@ -1425,8 +1376,8 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
         "FolderSync creates a new access marker file in both folders so future runs confirm both sides before syncing."
     };
 
-    let details = card()
-        .child(review_kv(
+    let details = view().flex_col().gap(px(KV_ROW_GAP))
+        .child(kv_row(
             "Recovery locations",
             view()
                 .flex_col()
@@ -1436,9 +1387,9 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
-                        .child(mono_text(draft.local_recovery_path.clone(), 11.5, p.fg))
-                        .child(text("·").text_size(px(12.0)).text_color(p.muted))
-                        .child(link_button("Reveal", 12.0, move || {
+                        .child(mono_text(draft.local_recovery_path.clone(), S_CAPTION, p.fg))
+                        .child(text("·").text_size(px(S_SMALL)).text_color(p.muted))
+                        .child(link_button("Reveal", S_SMALL, move || {
                             c_rec_rev.send(UiCommand::RevealPath(rec_local.clone()));
                         })),
                 )
@@ -1447,43 +1398,33 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
-                        .child(mono_text(draft.cloud_recovery_path.clone(), 11.5, p.fg))
-                        .child(text("·").text_size(px(12.0)).text_color(p.muted))
-                        .child(link_button("Open", 12.0, move || {
+                        .child(mono_text(draft.cloud_recovery_path.clone(), S_CAPTION, p.fg))
+                        .child(text("·").text_size(px(S_SMALL)).text_color(p.muted))
+                        .child(link_button("Open", S_SMALL, move || {
                             c_rec_open.send(UiCommand::OpenCloudUrl(rec_cloud.clone()));
                         })),
                 )
                 .into_element(),
         ))
-        .child(review_kv(
+        .child(kv_row(
             "Not synced",
             text(not_synced_text)
-                .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
         ))
-        .child(review_kv(
+        .child(kv_row(
             "Access marker",
             text(marker_copy)
-                .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
         ))
-        .child(review_kv(
+        .child(kv_row(
             "Protection",
             text(format!(
                 "Deletion limit: {DEFAULT_MAX_DELETE_PERCENT}% of tracked files · Keep both versions on conflict · Keep recovery copies"
             ))
-            .text_size(px(12.5))
             .text_color(p.fg)
             .into_element(),
-        ))
-        .child(review_kv(
-            "Automatic sync",
-            text("Starts only after the first sync is checked.")
-                .text_size(px(12.5))
-                .text_color(p.fg)
-                .into_element(),
         ));
 
     // Demo scenario switcher for Review variants (download, upload, both-populated, both-empty)
@@ -1512,7 +1453,7 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
             .gap(px(6.0))
             .child(
                 text("Demo review variant:")
-                    .text_size(px(11.5))
+                    .text_size(px(S_CAPTION))
                     .text_color(p.muted),
             )
             .child(make_btn(
@@ -1581,17 +1522,15 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                                 draft.local_path
                             ))
                             .flex_1()
-                            .text_size(px(13.0))
                             .text_color(p.fg),
                         ),
                 )
                 .child(
-                    text(format!(
-                        "If you can, ask others not to change Data/{} until the first sync finishes.",
-                        draft.selected_folder
-                    ))
+                    text("If you can, ask others not to change ")
+                    .child(mono_text(format!("Data/{}", draft.selected_folder), S_CAPTION, p.muted))
+                    .child(text(" until the first sync finishes."))
                     .pl(px(26.0))
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted),
                 ),
         );
@@ -1687,11 +1626,15 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             .child(check_row(IconKind::Check, p.ok, finish_mode_done));
     } else {
         let active_line = if draft.first_sync_stopping {
-            format!("Stopping first sync… · elapsed {elapsed}")
+            emphasized_line("Stopping", format!(" first sync… · elapsed {elapsed}"))
         } else if !preflight_done {
-            format!("Checking folders before syncing… · elapsed {elapsed}")
+            text(format!(
+                "Checking folders before syncing… · elapsed {elapsed}"
+            ))
+        } else if let Some(rest) = in_flight_line.strip_prefix(verb) {
+            emphasized_line(verb, rest.to_owned())
         } else {
-            in_flight_line
+            text(in_flight_line)
         };
         progress_card = progress_card
             .child(
@@ -1707,13 +1650,7 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                             .max_w(px(460.0))
                             .flex_col()
                             .gap(px(6.0))
-                            .child(
-                                text(active_line)
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(p.fg)
-                                    .tabular_nums(),
-                            )
+                            .child(active_line.tabular_nums())
                             .child(progress_bar(
                                 if snap.is_demo_mode {
                                     Some(f32::from(draft.first_sync_percent))
@@ -1799,7 +1736,6 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             )))
             .child(
                 text("You can close this window. The first sync continues while FolderSync runs.")
-                    .text_size(px(13.0))
                     .text_color(p.muted),
             ),
     );
@@ -1837,6 +1773,7 @@ fn render_wizard_footer(ctrl: AppController, draft: &WizardDraft, skip_account: 
         .items_center()
         .gap(px(8.0))
         .pt(px(14.0))
+        .mt(px(18.0))
         .border_t_1()
         .border_color(p.hair)
         .child(app_button(
@@ -1972,7 +1909,7 @@ fn check_row(icon_kind: IconKind, tint: AdaptiveColor, message: &str) -> View {
         .child(
             text(message.to_owned())
                 .flex_1()
-                .text_size(px(12.5))
+                .text_size(px(S_COMPACT))
                 .text_color(p.fg),
         )
 }
@@ -1983,28 +1920,11 @@ fn bullet(line: &str) -> View {
         .flex_row()
         .items_start()
         .gap(px(6.0))
-        .child(text("•").text_size(px(12.0)).text_color(p.muted))
+        .child(text("•").text_size(px(S_SMALL)).text_color(p.muted))
         .child(
             text(line.to_owned())
                 .flex_1()
-                .text_size(px(12.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.fg),
         )
-}
-
-fn review_kv(label: &str, value: AnyElement) -> View {
-    let p = Palette::current();
-    view()
-        .flex_row()
-        .items_start()
-        .gap(px(12.0))
-        .py(px(2.0))
-        .child(
-            text(label.to_owned())
-                .w(px(136.0))
-                .flex_none()
-                .text_size(px(12.5))
-                .text_color(p.muted),
-        )
-        .child(view().flex_1().child(value))
 }

@@ -9,27 +9,30 @@ recording both archive and executable SHA-256 digests for macOS arm64
 [Upstream release](https://github.com/rclone/rclone/releases/tag/v1.76.0) ·
 [Official checksums](https://downloads.rclone.org/v1.76.0/SHA256SUMS)
 
-Run `scripts/fetch-rclone.sh` to verify and install the pinned executable in
-`.tools/rclone/1.76.0/rclone`. `rclone-adapter` resolves that file to an
-absolute path (`FOLDERSYNC_RCLONE` may override it during development) and
-qualifies it against the **host platform's** manifest entry before launching any
-sync:
+Call `rclone_adapter::qualify_pinned_binary()` at startup and retain the
+returned `EngineIdentity` for subsequent launches. Resolution follows this order.
 
-1. Compute the executable's SHA-256 and compare it against the host platform
-   entry in `packaging/qualification-manifest.toml` **before** spawning it
-   (detects binary replacement).
-2. Run `<binary> version --config <throwaway-temp-config> --ask-password=false`
-   with stdin closed (`Stdio::null`) and an isolated environment (`env_clear` +
-   minimal allowlist with `HOME` pointed at the throwaway temp directory) so
-   startup never probes or creates `~/.config/rclone`, and verify the parsed
-   version matches `1.76.0`.
-3. Return an immutable `EngineIdentity` (private fields with read-only getters)
-   bound to the host platform and verified digest.
-4. Re-hash the executable on disk at the launch boundary of every sync run
-   (`BisyncRequest::spawn`, with `RealProcessRunner::spawn` also re-hashing
-   immediately before `exec`) against the checked-in manifest pin and refuse to
-   spawn if the bytes changed after qualification. Custom-manifest and
-   spec-builder hooks are restricted to crate-internal tests.
+1. In a macOS app, derive the bundle from the running executable under
+   `<App>.app/Contents/MacOS/`. Refuse symlinked path components and use that
+   bundle's `Contents/Helpers/rclone`. Verify the bundle with
+   `/usr/bin/codesign --verify --strict` before trusting
+   `Contents/Resources/rclone-manifest.json`. The sealed manifest must match the
+   pinned version, host platform, helper path, upstream archive digest, and
+   upstream executable digest. Its post-signing SHA-256 qualifies the helper.
+   A bundle verification error stops resolution. [Apple code-signing guide](https://developer.apple.com/library/archive/technotes/tn2206/)
+2. Outside an app, use the absolute workspace path for
+   `.tools/rclone/1.76.0/rclone`. Run `scripts/fetch-rclone.sh` to provision it.
+   Debug builds use `FOLDERSYNC_RCLONE` when set. Release builds ignore that
+   environment variable. Compare the executable SHA-256 to the host
+   platform's upstream `binary_sha256` pin.
+
+Both paths check SHA-256 before running
+`<binary> version --config <throwaway-temp-config> --ask-password=false` with
+closed stdin, a cleared environment, and an isolated `HOME`. The version must
+equal `1.76.0`. The immutable `EngineIdentity` records the resolved path, host
+platform, version, and verified digest. The adapter re-hashes the executable at
+each launch boundary, including immediately before spawning with
+`RealProcessRunner`. The startup digest is retained across launches.
 
 `rclone selfupdate` and `rclone` on `PATH` are never used.
 
@@ -144,8 +147,8 @@ policy or explicit content-audit command.
 
 `BisyncRequestBuilder::build()` rejects:
 
-- Unqualified engine version, non-host platform, or SHA-256 not matching the
-  host platform pin.
+- An engine identity outside the pinned version, host platform, or qualified
+  digest policy.
 - Relative or empty local paths (`path1`, `config_path`, `workdir`,
   `filters_file`, `backup_dir1`, and local `path2`/`backup_dir2`).
 - Identical or nested paths across `path1`, `path2`, `backup_dir1`,

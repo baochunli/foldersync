@@ -2,7 +2,7 @@
 
 FolderSync packages a self-contained macOS `.app` bundle containing the NSH 0.6.1 desktop application, a verified pinned `rclone` binary (`1.76.0`), the embedded Swift Finder Sync extension (`FolderSyncFinder.appex`), and verbatim third-party license notices.
 
-> **Current packaging boundary (demo UI):** At this commit, `packaging/build-app.sh` packages the **in-memory demo UI** (`apps/sync-ui` `DemoSource`) alongside the verified `Contents/Helpers/rclone` binary and `Contents/PlugIns/FolderSyncFinder.appex`. The packaged desktop host does **not** yet wire `sync-manager` for live Finder `status.json` / `actions/*.json` handoff, and `rclone-adapter` does **not** yet discover or verify the post-signing `Contents/Helpers/rclone` helper inside the bundle (it currently resolves `.tools/rclone/1.76.0/rclone` or `FOLDERSYNC_RCLONE` against the unsigned upstream digest). Manager-backed Finder handoff and bundled-helper discovery land after `connect-t4` and `drive-t4`; all operational owner checks below are **gated on that integration**.
+> **Current packaging boundary:** The desktop UI uses `ManagerSource` by default. The adapter exposes `qualify_pinned_binary()` for startup verification of the signed helper. Packaged sync and account operations still require manager wiring to use this entry point.
 >
 > **Verification status:** Ad hoc local packaging (`packaging/build-app.sh`) and deep strict signature verification (`codesign --verify --deep --strict`) are verified locally on macOS `arm64`. Developer ID signing, Apple notarization, stapling, Gatekeeper assessment on a second Mac, and production upgrade/rollback pilots require an Apple Developer account and are owner-only release steps.
 
@@ -23,19 +23,24 @@ Output is physically validated inside `<repo>/target/` with zero symlinked compo
 
 | Path inside `FolderSync.app` | Purpose |
 | --- | --- |
-| `Contents/MacOS/FolderSync` | NSH 0.6.1 pure-Rust macOS executable (`CFBundleIdentifier = dev.foldersync.app`; currently demo UI until `connect-t4`/`drive-t4` land) |
+| `Contents/MacOS/FolderSync` | NSH 0.6.1 pure-Rust macOS executable (`CFBundleIdentifier = dev.foldersync.app`) |
 | `Contents/Helpers/rclone` | Pinned `rclone` `1.76.0` executable copied from `.tools/rclone/1.76.0/rclone` after SHA-256 verification against `packaging/qualification-manifest.toml` |
-| `Contents/Resources/rclone-manifest.json` | Sealed metadata recording rclone version, platform, fixed relative path (`Contents/Helpers/rclone`), verified upstream manifest SHA-256, and post-signing bundled SHA-256 |
+| `Contents/Resources/rclone-manifest.json` | Sealed metadata recording rclone version, platform, fixed relative path (`Contents/Helpers/rclone`), upstream archive SHA-256, upstream executable SHA-256, and post-signing helper SHA-256 |
 | `Contents/PlugIns/FolderSyncFinder.appex` | Sandboxed macOS Finder Sync extension (`CFBundleIdentifier = dev.foldersync.app.finder-extension`, `FolderSyncHostBundleIdentifier = dev.foldersync.app`) |
 | `Contents/Resources/Notices/` | `NOTICE.txt`, `FOLDERSYNC-LICENSE.txt` (MIT), verbatim `NSH-LICENSE-APACHE-2.0.txt` (NSH `v0.6.1`), verbatim `RCLONE-LICENSE-MIT.txt` (rclone `v1.76.0`), and `PAPER-MONO-OFL.txt` (SIL OFL 1.1). Exact upstream URLs and SHA-256 digests are recorded in [`packaging/notices/SOURCES.md`](../packaging/notices/SOURCES.md). |
 
-> **Bundled rclone digest note:** Before copying, `packaging/build-app.sh` verifies `.tools/rclone/1.76.0/rclone` against the exact upstream `binary_sha256` in `packaging/qualification-manifest.toml`. Signing `Contents/Helpers/rclone` writes a macOS code signature into the Mach-O binary, which changes its byte SHA-256 relative to the upstream archive. Both `upstream_manifest_sha256` and `bundled_sha256` are recorded in `Contents/Resources/rclone-manifest.json` before sealing the outer `.app` bundle. Runtime bundled-helper discovery and verification against the signed helper will be wired in `connect-t4`/`drive-t4`.
+The build checks the upstream executable SHA-256 before copying and checks the
+staged copy before signing. Signing changes the helper's bytes. The build records
+`upstream_archive_sha256`, `upstream_manifest_sha256` (the upstream executable
+pin), and `bundled_sha256` (the signed helper) before sealing the outer app.
+Startup qualification verifies the seal and uses `bundled_sha256` for the
+packaged helper. [Engine profile](engine-profile.md)
 
 ## Ad Hoc vs. Developer ID Signing
 
 `packaging/build-app.sh` signs strictly **inner to outer** (never `codesign --deep` during signing, which would overwrite the Finder extension's entitlements):
 
-1. `Contents/Helpers/rclone`
+1. `Contents/Helpers/rclone` with `--options runtime` in both signing modes
 2. `Contents/Resources/rclone-manifest.json` written with the signed helper digest
 3. `Contents/PlugIns/FolderSyncFinder.appex` with its entitlements plist
 4. Outer `FolderSync.app`
@@ -46,6 +51,27 @@ Then the script validates the staged bundle with `codesign --verify --deep --str
 | --- | --- | --- | --- |
 | **Ad hoc (default)** | `packaging/build-app.sh` | `--force --sign -` | Local development and packaging verification on the build Mac. Cannot be notarized and will not pass Gatekeeper on another Mac. |
 | **Developer ID (owner release)** | `packaging/build-app.sh --sign "Developer ID Application: <Name> (<TEAM_ID>)"` | `--force --sign <identity> --options runtime --timestamp` | Household / external distribution outside the Mac App Store (plan §19). |
+
+### Local verification of the packaged helper
+
+The helper check uses the built app as a fixture and runs only the isolated
+`rclone version` probe. Run from the repository root after fetching pinned rclone.
+
+```bash
+(
+set -e
+NSH_BIN="$HOME/.local/bin/nsh"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+mkdir "$scratch/home" "$scratch/state"
+export HOME="$scratch/home" FOLDERSYNC_STATE_DIR="$scratch/state"
+packaging/build-app.sh --nsh-bin "$NSH_BIN" --dev-shared-dir
+codesign --verify --deep --strict target/package/FolderSync.app
+cargo test --locked -p rclone-adapter --lib qualifies_ad_hoc_packaged_helper -- --ignored
+)
+```
 
 ### Finder Extension Entitlements
 
@@ -74,10 +100,10 @@ Credentials, Apple IDs, app-specific passwords, and Team IDs are **never** store
      --keychain-profile "foldersync-notary"
    ```
    `packaging/notarize.sh` takes only the Keychain profile NAME, verifies `codesign --verify --deep --strict`, refuses ad hoc bundles or bundles without Hardened Runtime, creates `target/package/FolderSync-notarize.zip` with `ditto -c -k --keepParent`, submits via `xcrun notarytool submit --keychain-profile <name> --wait`, staples and validates with `xcrun stapler`, and runs `spctl --assess --type execute --verbose=4`.
-4. **Operational verification on a second Mac (gated on `connect-t4` / `drive-t4` host & helper integration):**
+4. **Operational verification on a second Mac (after manager integration of the bundled helper):**
    - Copy the notarized `FolderSync.app` to `/Applications` on a clean Mac without developer tools.
    - Verify Gatekeeper opens the app without quarantine bypasses.
-   - Once manager wiring and bundled-helper discovery land, verify filesystem access from the installed `.app` and `Contents/Helpers/rclone` to internal folders, protected folders, and an external APFS volume (plan §19), verify installed-app Keychain credentials and notifications, and enable `FolderSync Finder` in System Settings to verify live root badges and context menu actions end to end.
+   - Verify filesystem access from the installed `.app` and `Contents/Helpers/rclone` to internal folders, protected folders, and an external APFS volume (plan §19), verify installed-app Keychain credentials and notifications, and enable `FolderSync Finder` in System Settings to verify live root badges and context menu actions end to end.
 
 ## Credentials and Privacy Boundaries (Plan §19)
 

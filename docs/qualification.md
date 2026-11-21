@@ -111,12 +111,19 @@ tests/qualification/run-drive.sh \
 
 ### 2. Physical External Disk & Unplug Tests (Owner Only — Plan §11, §20)
 
-Perform on a dedicated disposable APFS external drive (e.g., `/Volumes/TestSSD/QualData` with sibling `/Volumes/TestSSD/FolderSyncRecovery`) while keeping an independent truth copy on the internal disk:
+Perform on a dedicated disposable APFS external drive (e.g., `/Volumes/TestSSD/QualData` with sibling `/Volumes/TestSSD/FolderSyncRecovery`) while keeping an independent truth copy on the internal disk. Use a disposable sync pair and start with at least 100 MiB free on its sync and local recovery volumes.
+
+Manager tests simulate missing, replacement, and renamed mounts, a reconnect
+while paused, low space, and a disconnect during a running child. The real
+probe smoke test reads the volume backing a temporary directory. Physical
+unplug behavior requires the checks below.
 
 - [ ] **Absent before launch:** Unmount the disk before launching FolderSync.
   - *Expected outcome:* Mapping enters `VolumeUnavailable` (`Waiting for <Volume>`), never auto-creates `/Volumes/<Name>`, and never deletes cloud files.
 - [ ] **Wrong disk with identical display name:** Mount a second USB disk given the exact same volume display name (`/Volumes/TestSSD`).
-  - *Expected outcome:* Persistent volume UUID binding rejects the wrong disk and holds safely without syncing or mutating either side.
+  - *Expected outcome:* The mapping shows “A different disk named TestSSD is connected” and holds without syncing or mutating either side.
+- [ ] **Same UUID at a renamed mount:** Rename and remount the expected disk, then try Sync now.
+  - *Expected outcome:* The mapping requires endpoint review. Its stored local path and generation stay at the location reviewed at setup.
 - [ ] **Reconnect preserves manual pause:** Pause the mapping, eject the disk, reconnect the verified disk.
   - *Expected outcome:* `Intent::Paused` remains `Paused` (never auto-resumes on volume mount).
 - [ ] **Mid-run unplug matrix (each phase separately):** Physically disconnect the external disk during:
@@ -126,7 +133,7 @@ Perform on a dedicated disposable APFS external drive (e.g., `/Volumes/TestSSD/Q
   4. During upload (local → Drive)
   5. During download (Drive → local)
   6. During deletion propagation
-  - *Expected outcome:* Manager stops scheduling, requests graceful child cancellation, preserves opaque `bisync` workdir and run records, and requires revalidation after reconnect. Post-unplug audit compares every file on both endpoints and in `Recovery/` against external truth-set SHA-256 hashes across two clean follow-up cycles. Per plan §11 and §15, if any phase causes silent data loss or unacceptable resurrection, keep automatic sync on removable roots unsupported until resolved.
+  - *Expected outcome:* The manager detects disk loss at the next poll, requests graceful child cancellation once, and preserves the `bisync` workdir, logs, and run record for review. Record the phase, disk UUID, unplug and stop times, engine version, and terminal outcome. After reconnecting, review recovery and compare every file on both endpoints and in `Recovery/` against the independent SHA-256 truth set through two clean follow-up cycles. A disconnect can occur before the next poll or while remote work is in flight. If any phase causes silent data loss or unacceptable resurrection, keep automatic sync on removable roots unsupported until resolved.
 
 ### 3. Packaged Desktop App & Finder Sync Acceptance (Owner Only — Gated on `connect-t4` / `drive-t4`, Plan §19, §20)
 
