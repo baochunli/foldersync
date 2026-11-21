@@ -159,6 +159,7 @@ if [[ "$ACTUAL_NSH_VERSION" != "nsh ${EXPECTED_NSH_VERSION}"* ]]; then
 fi
 
 RCLONE_VERSION="$(read_pin rclone version)"
+RCLONE_ARCHIVE_SHA="$(read_pin "rclone.${RCLONE_PLATFORM}" archive_sha256)"
 EXPECTED_RCLONE_SHA="$(read_pin "rclone.${RCLONE_PLATFORM}" binary_sha256)"
 RCLONE_SRC="${REPO_ROOT}/.tools/rclone/${RCLONE_VERSION}/rclone"
 
@@ -256,30 +257,40 @@ if [[ "$SIGN_IDENTITY" != "-" ]]; then
 fi
 
 echo "==> Signing inner -> outer (identity: ${SIGN_IDENTITY}, mode: ${SIGN_MODE})"
-# 1. Sign nested rclone helper executable first.
-codesign "${SIGN_ARGS[@]}" "${STAGED_APP}/Contents/Helpers/rclone"
+# 1. Sign the verified staged helper with hardened runtime in both modes.
+HELPER="${STAGED_APP}/Contents/Helpers/rclone"
+if [[ "$(shasum -a 256 "$HELPER" | awk '{print $1}')" != "$EXPECTED_RCLONE_SHA" ]]; then
+  echo "Error: staged rclone no longer matches the pinned upstream binary." >&2
+  exit 1
+fi
+HELPER_SIGN_ARGS=("${SIGN_ARGS[@]}")
+if [[ "$SIGN_MODE" == "adhoc" ]]; then
+  HELPER_SIGN_ARGS+=(--options runtime)
+fi
+codesign "${HELPER_SIGN_ARGS[@]}" "$HELPER"
 
-# Record both the verified upstream manifest SHA-256 and the post-signing bundled
-# SHA-256 inside Contents/Resources/rclone-manifest.json before sealing the outer app.
-BUNDLED_RCLONE_SHA="$(shasum -a 256 "${STAGED_APP}/Contents/Helpers/rclone" | awk '{print $1}')"
-python3 - "$STAGED_APP" "$RCLONE_VERSION" "$RCLONE_PLATFORM" "$EXPECTED_RCLONE_SHA" "$BUNDLED_RCLONE_SHA" "$SIGN_MODE" <<'PY'
+# Seal the upstream archive and binary pins and the post-signing helper digest.
+BUNDLED_RCLONE_SHA="$(shasum -a 256 "$HELPER" | awk '{print $1}')"
+python3 - "$STAGED_APP" "$RCLONE_VERSION" "$RCLONE_PLATFORM" "$RCLONE_ARCHIVE_SHA" "$EXPECTED_RCLONE_SHA" "$BUNDLED_RCLONE_SHA" "$SIGN_MODE" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-staged_app, ver, plat, upstream_sha, bundled_sha, sign_mode = sys.argv[1:7]
+staged_app, ver, plat, archive_sha, upstream_sha, bundled_sha, sign_mode = sys.argv[1:]
 manifest_out = Path(staged_app) / "Contents" / "Resources" / "rclone-manifest.json"
 payload = {
     "version": ver,
     "platform": plat,
     "bundle_relative_path": "Contents/Helpers/rclone",
+    "upstream_archive_sha256": archive_sha,
     "upstream_manifest_sha256": upstream_sha,
     "bundled_sha256": bundled_sha,
     "signing_mode": sign_mode,
     "packaged_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
-manifest_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+with manifest_out.open("x", encoding="utf-8") as output:
+    output.write(json.dumps(payload, indent=2) + "\n")
 PY
 
 # 2. Sign embedded Finder Sync extension with its sandbox/handoff entitlements.
