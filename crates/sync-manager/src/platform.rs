@@ -177,6 +177,356 @@ pub fn ensure_contained_path(
     Ok(resolved_derived)
 }
 
+/// Verifies that `target` stays inside `root` and that neither `target` nor any
+/// existing path component under `root` is a symbolic link (`symlink_metadata`).
+pub fn reject_symlinks_under_root(
+    field: &str,
+    root: &Path,
+    target: &Path,
+) -> Result<PathBuf, ManagerError> {
+    let canonical_root = fs::canonicalize(root).map_err(|err| ManagerError::Io {
+        cause: format!("Could not resolve state root `{}`: {err}.", root.display()),
+        next_step: "Verify the FolderSync state directory exists and is accessible.".to_string(),
+    })?;
+
+    // Compute the relative tail beneath `root` without following symlinks beneath `root`.
+    // If `target` uses an OS-level ancestor alias for `root` (e.g. macOS `/var` -> `/private/var`),
+    // locate the shallowest prefix of `target` that canonicalizes to `canonical_root` so every
+    // component beneath `root` is still checked strictly via `symlink_metadata`.
+    let rel = if let Ok(r) = target.strip_prefix(&canonical_root) {
+        r.to_path_buf()
+    } else if let Ok(r) = target.strip_prefix(root) {
+        r.to_path_buf()
+    } else {
+        let mut prefix = PathBuf::new();
+        let mut comps = target.components();
+        let mut matched_tail = None;
+        while let Some(comp) = comps.next() {
+            prefix.push(comp.as_os_str());
+            if fs::canonicalize(&prefix).ok().as_deref() == Some(canonical_root.as_path()) {
+                matched_tail = Some(comps.as_path().to_path_buf());
+                break;
+            }
+        }
+        matched_tail.ok_or_else(|| ManagerError::PreflightRejected {
+            cause: format!(
+                "{field} path `{}` is outside allowed root `{}`.",
+                target.display(),
+                canonical_root.display()
+            ),
+            next_step: "Keep all state files strictly inside the FolderSync state directory."
+                .to_string(),
+        })?
+    };
+
+    let mut cur = canonical_root.clone();
+    let mut has_component = false;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(part) => {
+                has_component = true;
+                cur.push(part);
+                match fs::symlink_metadata(&cur) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(ManagerError::PreflightRejected {
+                                cause: format!(
+                                    "Refused to follow symbolic link `{}` inside state root `{}` for {field}.",
+                                    cur.display(),
+                                    canonical_root.display()
+                                ),
+                                next_step:
+                                    "Remove the unexpected symbolic link inside FolderSync's state directory."
+                                        .to_string(),
+                            });
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(ManagerError::Io {
+                            cause: format!(
+                                "Failed to inspect `{}` for {field}: {err}.",
+                                cur.display()
+                            ),
+                            next_step: "Verify permissions inside the FolderSync state directory."
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "{field} path `{}` contains invalid traversal components.",
+                        target.display()
+                    ),
+                    next_step: "Use a safe path strictly inside the FolderSync state directory."
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    if !has_component {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "{field} path `{}` must be strictly inside `{}`.",
+                target.display(),
+                canonical_root.display()
+            ),
+            next_step: "Provide a child path inside the state directory.".to_string(),
+        });
+    }
+
+    Ok(cur)
+}
+
+/// Creates directory `target` strictly inside `root` with `0700` permissions,
+/// refusing any symbolic link or non-directory component under `root`.
+pub fn ensure_private_dir_under(
+    field: &str,
+    root: &Path,
+    target: &Path,
+) -> Result<PathBuf, ManagerError> {
+    let checked = reject_symlinks_under_root(field, root, target)?;
+    let canonical_root = fs::canonicalize(root).map_err(|err| ManagerError::Io {
+        cause: format!("Could not resolve state root `{}`: {err}.", root.display()),
+        next_step: "Verify the FolderSync state directory exists.".to_string(),
+    })?;
+    let rel =
+        checked
+            .strip_prefix(&canonical_root)
+            .map_err(|_| ManagerError::PreflightRejected {
+                cause: format!("{field} escaped state root `{}`.", canonical_root.display()),
+                next_step: "Keep state directories inside the FolderSync state directory."
+                    .to_string(),
+            })?;
+
+    let mut cur = canonical_root;
+    for comp in rel.components() {
+        if let Component::Normal(part) = comp {
+            cur.push(part);
+            match fs::symlink_metadata(&cur) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Err(ManagerError::PreflightRejected {
+                            cause: format!(
+                                "Path `{}` inside state root is not an ordinary directory.",
+                                cur.display()
+                            ),
+                            next_step:
+                                "Remove the unexpected file or symlink inside the state directory."
+                                    .to_string(),
+                        });
+                    }
+                    #[cfg(unix)]
+                    fs::set_permissions(&cur, fs::Permissions::from_mode(0o700)).map_err(
+                        |err| ManagerError::Io {
+                            cause: format!(
+                                "Failed to set private 0700 permissions on `{}`: {err}.",
+                                cur.display()
+                            ),
+                            next_step: "Verify ownership of the state directory.".to_string(),
+                        },
+                    )?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    #[cfg(unix)]
+                    {
+                        fs::DirBuilder::new()
+                            .mode(0o700)
+                            .create(&cur)
+                            .map_err(|err| ManagerError::Io {
+                                cause: format!(
+                                    "Failed to create private directory `{}`: {err}.",
+                                    cur.display()
+                                ),
+                                next_step: "Confirm the state directory is writable.".to_string(),
+                            })?;
+                        fs::set_permissions(&cur, fs::Permissions::from_mode(0o700)).map_err(
+                            |err| ManagerError::Io {
+                                cause: format!(
+                                    "Failed to set 0700 permissions on `{}`: {err}.",
+                                    cur.display()
+                                ),
+                                next_step: "Verify ownership of the state directory.".to_string(),
+                            },
+                        )?;
+                    }
+                    #[cfg(not(unix))]
+                    fs::create_dir(&cur).map_err(|err| ManagerError::Io {
+                        cause: format!("Failed to create directory `{}`: {err}.", cur.display()),
+                        next_step: "Confirm the state directory is writable.".to_string(),
+                    })?;
+                }
+                Err(err) => {
+                    return Err(ManagerError::Io {
+                        cause: format!("Failed to inspect `{}`: {err}.", cur.display()),
+                        next_step: "Check permissions inside the state directory.".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(checked)
+}
+
+/// Opens a private `0600` file strictly inside `root` for writing, rejecting
+/// symlinks in any component and using `O_NOFOLLOW` on Unix.
+pub fn open_private_write_file_under(
+    field: &str,
+    root: &Path,
+    target: &Path,
+) -> Result<File, ManagerError> {
+    let checked = reject_symlinks_under_root(field, root, target)?;
+    if let Some(parent) = checked.parent()
+        && parent != root
+        && fs::canonicalize(root).ok().as_deref() != Some(parent)
+    {
+        ensure_private_dir_under(field, root, parent)?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(&checked).map_err(|err| {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return ManagerError::PreflightRejected {
+                cause: format!(
+                    "Refused to open symlinked file `{}` for {field}.",
+                    checked.display()
+                ),
+                next_step: "Remove the unexpected symbolic link inside the state directory."
+                    .to_string(),
+            };
+        }
+        ManagerError::Io {
+            cause: format!("Failed to open `{}` for writing: {err}.", checked.display()),
+            next_step: "Check available disk space and permissions in the state directory."
+                .to_string(),
+        }
+    })?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to set private 0600 permissions on `{}`: {err}.",
+                checked.display()
+            ),
+            next_step: "Verify ownership inside the state directory.".to_string(),
+        })?;
+    Ok(file)
+}
+
+/// Writes `bytes` to `target` strictly inside `root`, rejecting symlinks (`O_NOFOLLOW`).
+pub fn write_private_file_under(
+    field: &str,
+    root: &Path,
+    target: &Path,
+    bytes: &[u8],
+) -> Result<(), ManagerError> {
+    let mut file = open_private_write_file_under(field, root, target)?;
+    file.write_all(bytes).map_err(|err| ManagerError::Io {
+        cause: format!("Failed to write `{}`: {err}.", target.display()),
+        next_step: "Check available disk space and retry.".to_string(),
+    })?;
+    file.sync_all().map_err(|err| ManagerError::Io {
+        cause: format!("Failed to flush `{}` to disk: {err}.", target.display()),
+        next_step: "Check disk health and retry.".to_string(),
+    })?;
+    Ok(())
+}
+
+/// Atomically writes `bytes` to `target` strictly inside `root` (`0600`, `O_NOFOLLOW`,
+/// `sync_all`, rename), refusing symlinks on any component under `root`.
+pub fn write_private_file_atomic_under(
+    field: &str,
+    root: &Path,
+    target: &Path,
+    bytes: &[u8],
+) -> Result<(), ManagerError> {
+    let checked = reject_symlinks_under_root(field, root, target)?;
+    let parent = checked.parent().ok_or_else(|| ManagerError::Io {
+        cause: format!(
+            "Target path `{}` has no parent directory.",
+            checked.display()
+        ),
+        next_step: "Specify a valid path inside the state directory.".to_string(),
+    })?;
+    if fs::canonicalize(root).ok().as_deref() != Some(parent) {
+        ensure_private_dir_under(field, root, parent)?;
+    }
+
+    let file_name = checked
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let seq = ATOMIC_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+
+    let write_res = (|| -> Result<(), ManagerError> {
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts.open(&tmp_path).map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to create temporary file `{}`: {err}.",
+                tmp_path.display()
+            ),
+            next_step: "Verify directory permissions and free disk space.".to_string(),
+        })?;
+        file.write_all(bytes).map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to write temporary file `{}`: {err}.",
+                tmp_path.display()
+            ),
+            next_step: "Verify free disk space and retry.".to_string(),
+        })?;
+        file.sync_all().map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to sync temporary file `{}`: {err}.",
+                tmp_path.display()
+            ),
+            next_step: "Check disk health and retry.".to_string(),
+        })?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|err| ManagerError::Io {
+                cause: format!(
+                    "Failed to set 0600 permissions on `{}`: {err}.",
+                    tmp_path.display()
+                ),
+                next_step: "Verify ownership inside the state directory.".to_string(),
+            })?;
+        drop(file);
+        // Re-check target leaf is not a symlink before rename.
+        reject_symlinks_under_root(field, root, &checked)?;
+        fs::rename(&tmp_path, &checked).map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to atomically replace `{}`: {err}.",
+                checked.display()
+            ),
+            next_step: "Confirm no conflicting file lock blocks renaming.".to_string(),
+        })?;
+        Ok(())
+    })();
+
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_res
+}
+
 /// Resolves the FolderSync state directory:
 /// explicit override -> `FOLDERSYNC_STATE_DIR` -> platform application data/state directory.
 /// Always resolves overrides to a canonical absolute path before any directory creation.

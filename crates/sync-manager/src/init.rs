@@ -31,56 +31,79 @@ pub struct EndpointInventory {
     pub has_valid_marker: bool,
 }
 
-/// Simple rclone-compatible exclusion matcher for onboarding symlink checks.
+/// Rclone-compatible exclusion matcher for onboarding symlink checks (§18).
 ///
-/// Supports exact paths/basenames (`link.txt`, `sub/link.txt`), subtree globs
-/// (`dir/**`), and `*` wildcards (`._*`, `*.tmp`, `sub/*.link`).
+/// Matches the filter rules rendered into `filters.txt`:
+/// - Leading `/` anchors the pattern to the sync root (`"/sub/link"` matches
+///   `"sub/link"` only, never `"other/sub/link"`).
+/// - Without leading `/`, a pattern matches at root or after any `/` boundary.
+/// - `*` matches any characters EXCEPT `/`; `**` matches across `/`.
 pub fn matches_exclusion_pattern(rel_path: &str, pattern: &str) -> bool {
     let pat = pattern.trim();
     if pat.is_empty() {
         return false;
     }
-    if let Some(prefix) = pat.strip_suffix("/**") {
+    let rel = rel_path.trim_start_matches('/');
+    let (anchored, body) = match pat.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, pat),
+    };
+    if body.is_empty() {
+        return false;
+    }
+
+    if let Some(prefix) = body.strip_suffix("/**") {
         let prefix = prefix.trim_end_matches('/');
-        if rel_path == prefix || rel_path.starts_with(&format!("{prefix}/")) {
+        if anchored {
+            return rclone_glob_match(prefix, rel)
+                || rclone_glob_match(&format!("{prefix}/**"), rel);
+        }
+        if rclone_glob_match(prefix, rel) || rclone_glob_match(&format!("{prefix}/**"), rel) {
             return true;
         }
+        return rclone_glob_match(&format!("**/{prefix}"), rel)
+            || rclone_glob_match(&format!("**/{prefix}/**"), rel);
     }
-    if pat.contains('/') {
-        wildcard_match(pat, rel_path)
+
+    if anchored {
+        rclone_glob_match(body, rel)
+    } else if body.contains('/') {
+        rclone_glob_match(body, rel) || rclone_glob_match(&format!("**/{body}"), rel)
     } else {
-        let basename = rel_path.rsplit('/').next().unwrap_or(rel_path);
-        wildcard_match(pat, rel_path) || wildcard_match(pat, basename)
+        // Unanchored single-segment pattern matches the path or any segment (basename or parent dir).
+        rclone_glob_match(body, rel)
+            || rel
+                .split('/')
+                .any(|segment| rclone_glob_match(body, segment))
     }
 }
 
-fn wildcard_match(pattern: &str, text: &str) -> bool {
+/// Glob matcher where `*` matches any char except `/` and `**` matches across `/`.
+fn rclone_glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let mut star_idx: Option<usize> = None;
-    let mut match_idx = 0usize;
+    let mut memo = vec![vec![None; t.len() + 1]; p.len() + 1];
+    glob_dp(&p, &t, 0, 0, &mut memo)
+}
 
-    while ti < t.len() {
-        if pi < p.len() && p[pi] == t[ti] {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star_idx = Some(pi);
-            match_idx = ti;
-            pi += 1;
-        } else if let Some(s) = star_idx {
-            pi = s + 1;
-            match_idx += 1;
-            ti = match_idx;
-        } else {
-            return false;
-        }
+fn glob_dp(p: &[char], t: &[char], pi: usize, ti: usize, memo: &mut [Vec<Option<bool>>]) -> bool {
+    if let Some(cached) = memo[pi][ti] {
+        return cached;
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
+    let res = if pi == p.len() {
+        ti == t.len()
+    } else if p[pi] == '*' && pi + 1 < p.len() && p[pi + 1] == '*' {
+        // `**` matches zero chars OR consumes any single char (including '/').
+        glob_dp(p, t, pi + 2, ti, memo) || (ti < t.len() && glob_dp(p, t, pi, ti + 1, memo))
+    } else if p[pi] == '*' {
+        // Single `*` matches zero chars OR consumes one non-'/' char.
+        glob_dp(p, t, pi + 1, ti, memo)
+            || (ti < t.len() && t[ti] != '/' && glob_dp(p, t, pi, ti + 1, memo))
+    } else {
+        ti < t.len() && p[pi] == t[ti] && glob_dp(p, t, pi + 1, ti + 1, memo)
+    };
+    memo[pi][ti] = Some(res);
+    res
 }
 
 fn is_excluded(rel_path: &str, exclusions: &BTreeSet<String>) -> bool {

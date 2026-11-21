@@ -82,14 +82,39 @@ impl LaunchedRun {
     }
 }
 
-/// Abstraction launching a validated bisync invocation.
+/// Prepared launch ready for immediate spawning once final pre-spawn checks pass.
+pub struct PreparedLaunch {
+    backend: Box<dyn PreparedLaunchBackend>,
+}
+
+trait PreparedLaunchBackend: Send {
+    fn spawn(self: Box<Self>, options: SpawnOptions) -> Result<LaunchedRun, ManagerError>;
+}
+
+impl PreparedLaunch {
+    /// Spawns the prepared child process.
+    pub fn spawn(self, options: SpawnOptions) -> Result<LaunchedRun, ManagerError> {
+        self.backend.spawn(options)
+    }
+}
+
+/// Abstraction preparing and launching a validated bisync invocation.
 pub trait BisyncLauncher: Send + Sync {
     /// Engine version/profile metadata for recording a configuration generation.
     fn engine_metadata(&self) -> Result<EngineMetadata, ManagerError>;
 
-    /// Launches a validated bisync run.
-    fn launch(&self, plan: &LaunchPlan, options: SpawnOptions)
-    -> Result<LaunchedRun, ManagerError>;
+    /// Qualifies the engine and validates the launch plan BEFORE the final
+    /// pre-spawn root/marker and cancellation check.
+    fn prepare(&self, plan: &LaunchPlan) -> Result<PreparedLaunch, ManagerError>;
+
+    /// Convenience helper combining `prepare` and `spawn`.
+    fn launch(
+        &self,
+        plan: &LaunchPlan,
+        options: SpawnOptions,
+    ) -> Result<LaunchedRun, ManagerError> {
+        self.prepare(plan)?.spawn(options)
+    }
 }
 
 /// Real launcher backed by `rclone-adapter`'s pinned binary qualification,
@@ -161,17 +186,34 @@ impl LaunchedRunBackend for RealLaunchedBackend {
     }
 }
 
+struct RealPreparedBackend {
+    req: BisyncRequest,
+    engine: EngineIdentity,
+    sanitized_argv: Vec<String>,
+}
+
+impl PreparedLaunchBackend for RealPreparedBackend {
+    fn spawn(self: Box<Self>, options: SpawnOptions) -> Result<LaunchedRun, ManagerError> {
+        let runner = RealProcessRunner;
+        let handle = self.req.spawn(&runner, options)?;
+        let identity = handle.identity().clone();
+        Ok(LaunchedRun {
+            identity,
+            sanitized_argv: self.sanitized_argv,
+            engine: EngineMetadata::from(&self.engine),
+            simulate_crash_before_pid_record: false,
+            backend: Box::new(RealLaunchedBackend { handle }),
+        })
+    }
+}
+
 impl BisyncLauncher for RealBisyncLauncher {
     fn engine_metadata(&self) -> Result<EngineMetadata, ManagerError> {
         let engine = self.resolve_and_qualify()?;
         Ok(EngineMetadata::from(&engine))
     }
 
-    fn launch(
-        &self,
-        plan: &LaunchPlan,
-        options: SpawnOptions,
-    ) -> Result<LaunchedRun, ManagerError> {
+    fn prepare(&self, plan: &LaunchPlan) -> Result<PreparedLaunch, ManagerError> {
         let engine = self.resolve_and_qualify()?;
         let req = BisyncRequest::builder()
             .engine(engine.clone())
@@ -192,21 +234,18 @@ impl BisyncLauncher for RealBisyncLauncher {
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        let runner = RealProcessRunner;
-        let handle = req.spawn(&runner, options)?;
-        let identity = handle.identity().clone();
 
-        Ok(LaunchedRun {
-            identity,
-            sanitized_argv,
-            engine: EngineMetadata::from(&engine),
-            simulate_crash_before_pid_record: false,
-            backend: Box::new(RealLaunchedBackend { handle }),
+        Ok(PreparedLaunch {
+            backend: Box::new(RealPreparedBackend {
+                req,
+                engine,
+                sanitized_argv,
+            }),
         })
     }
 }
 
-/// Callback invoked inside [`FakeBisyncLauncher::launch`] right before spawning.
+/// Callback invoked inside [`FakeBisyncLauncher`] during `prepare` or `spawn`.
 pub type SpawnCallback = Arc<dyn Fn(&LaunchPlan) + Send + Sync>;
 
 /// Scripted fake run for deterministic manager tests.
@@ -219,6 +258,7 @@ pub struct FakeLaunchScript {
     pub exit_status_on_force_stop: Option<ExitStatusInfo>,
     pub wait_for_stop: bool,
     pub simulate_crash_before_pid_record: bool,
+    pub on_prepare: Option<SpawnCallback>,
     pub on_spawn: Option<SpawnCallback>,
 }
 
@@ -247,6 +287,7 @@ impl Default for FakeLaunchScript {
             }),
             wait_for_stop: false,
             simulate_crash_before_pid_record: false,
+            on_prepare: None,
             on_spawn: None,
         }
     }
@@ -367,6 +408,55 @@ impl LaunchedRunBackend for FakeLaunchedBackend {
     }
 }
 
+struct FakePreparedBackend {
+    launcher_state: Arc<Mutex<FakeLauncherState>>,
+    plan: LaunchPlan,
+    script: FakeLaunchScript,
+    engine: EngineMetadata,
+}
+
+impl PreparedLaunchBackend for FakePreparedBackend {
+    fn spawn(self: Box<Self>, options: SpawnOptions) -> Result<LaunchedRun, ManagerError> {
+        self.launcher_state
+            .lock()
+            .unwrap()
+            .launched
+            .push(self.plan.clone());
+
+        if let Some(cb) = &self.script.on_spawn {
+            cb(&self.plan);
+        }
+
+        let identity = self.script.identity.clone();
+        let simulate_crash = self.script.simulate_crash_before_pid_record;
+        let stopper = Arc::new(FakeStopper {
+            launcher_state: Arc::clone(&self.launcher_state),
+            stop_state: Mutex::new((false, false)),
+            condvar: Condvar::new(),
+        });
+
+        let sanitized_argv = vec![
+            "bisync".to_string(),
+            self.plan.path1.to_string_lossy().into_owned(),
+            format!("{:?}", self.plan.path2),
+            "--workdir".to_string(),
+            self.plan.workdir.to_string_lossy().into_owned(),
+        ];
+
+        Ok(LaunchedRun {
+            identity,
+            sanitized_argv,
+            engine: self.engine,
+            simulate_crash_before_pid_record: simulate_crash,
+            backend: Box::new(FakeLaunchedBackend {
+                script: self.script,
+                stopper,
+                options,
+            }),
+        })
+    }
+}
+
 impl BisyncLauncher for FakeBisyncLauncher {
     fn engine_metadata(&self) -> Result<EngineMetadata, ManagerError> {
         Ok(EngineMetadata {
@@ -379,14 +469,9 @@ impl BisyncLauncher for FakeBisyncLauncher {
         })
     }
 
-    fn launch(
-        &self,
-        plan: &LaunchPlan,
-        options: SpawnOptions,
-    ) -> Result<LaunchedRun, ManagerError> {
+    fn prepare(&self, plan: &LaunchPlan) -> Result<PreparedLaunch, ManagerError> {
         let script = {
             let mut st = self.state.lock().unwrap();
-            st.launched.push(plan.clone());
             st.scripts.pop_front().ok_or_else(|| ManagerError::Engine {
                 cause: format!(
                     "FakeBisyncLauncher has no scripted run queued for `{}`.",
@@ -396,35 +481,16 @@ impl BisyncLauncher for FakeBisyncLauncher {
             })?
         };
 
-        if let Some(cb) = &script.on_spawn {
+        if let Some(cb) = &script.on_prepare {
             cb(plan);
         }
 
-        let identity = script.identity.clone();
-        let simulate_crash = script.simulate_crash_before_pid_record;
-        let stopper = Arc::new(FakeStopper {
-            launcher_state: Arc::clone(&self.state),
-            stop_state: Mutex::new((false, false)),
-            condvar: Condvar::new(),
-        });
-
-        let sanitized_argv = vec![
-            "bisync".to_string(),
-            plan.path1.to_string_lossy().into_owned(),
-            format!("{:?}", plan.path2),
-            "--workdir".to_string(),
-            plan.workdir.to_string_lossy().into_owned(),
-        ];
-
-        Ok(LaunchedRun {
-            identity,
-            sanitized_argv,
-            engine: self.engine_metadata()?,
-            simulate_crash_before_pid_record: simulate_crash,
-            backend: Box::new(FakeLaunchedBackend {
+        Ok(PreparedLaunch {
+            backend: Box::new(FakePreparedBackend {
+                launcher_state: Arc::clone(&self.state),
+                plan: plan.clone(),
                 script,
-                stopper,
-                options,
+                engine: self.engine_metadata()?,
             }),
         })
     }

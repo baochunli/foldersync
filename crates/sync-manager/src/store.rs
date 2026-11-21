@@ -1063,6 +1063,26 @@ impl SqliteStateStore {
             .map_err(|e| storage_err("Failed to collect unfinished runs", e))
     }
 
+    pub fn list_terminal_runs(&self) -> Result<Vec<RunRecord>, ManagerError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, mapping_id, generation_id, mode, status, started_at, finished_at,
+                        workdir_path, backup_dir1, backup_dir2, run_dir, log_path,
+                        child_pid, child_start_time_kind, child_start_time_value, child_executable,
+                        engine_version, engine_sha256, engine_platform,
+                        exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                 FROM runs WHERE status NOT IN ('starting', 'running') ORDER BY started_at DESC",
+            )
+            .map_err(|e| storage_err("Failed to query terminal runs", e))?;
+        let rows = stmt
+            .query_map([], Self::map_run_row)
+            .map_err(|e| storage_err("Failed to read terminal runs", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| storage_err("Failed to collect terminal runs", e))
+    }
+
     pub fn list_runs_for_mapping(
         &self,
         mapping_id: &MappingId,

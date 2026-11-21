@@ -40,8 +40,9 @@ use crate::{
     launcher::{BisyncLauncher, LaunchPlan, LaunchStopper, RealBisyncLauncher},
     platform::{
         OsProcessInspector, ProcessInspector, ProcessProbeResult, StateLock, ensure_contained_path,
-        ensure_private_dir, open_private_write_file, resolve_absolute_path, resolve_state_dir,
-        validate_safe_path_id, write_private_file,
+        ensure_private_dir_under, open_private_write_file_under, reject_symlinks_under_root,
+        resolve_absolute_path, resolve_state_dir, validate_safe_path_id,
+        write_private_file_atomic_under, write_private_file_under,
     },
     snapshot::{
         DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, ManagerEvent, MappingCounters,
@@ -356,6 +357,68 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
     a == b || a.starts_with(b) || b.starts_with(a)
 }
 
+/// Validates that a recovery root candidate is not an existing non-directory
+/// (regular file, symlink, etc.) and that its longest existing ancestor is a
+/// directory so `create_dir_all` can safely create it later.
+fn validate_recovery_root_dir_candidate(field: &str, path: &Path) -> Result<(), ManagerError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "{field} `{}` exists and is not an ordinary directory.",
+                        path.display()
+                    ),
+                    next_step:
+                        "Choose a directory path for recovery copies (not an existing file or symbolic link)."
+                            .to_string(),
+                });
+            }
+            return Ok(());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(ManagerError::Io {
+                cause: format!("Could not inspect {field} `{}`: {err}.", path.display()),
+                next_step: "Verify permissions on the recovery directory path.".to_string(),
+            });
+        }
+    }
+
+    let mut cur = path.parent();
+    while let Some(anc) = cur {
+        match fs::symlink_metadata(anc) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return Err(ManagerError::PreflightRejected {
+                        cause: format!(
+                            "Parent `{}` of {field} `{}` is not a directory.",
+                            anc.display(),
+                            path.display()
+                        ),
+                        next_step: "Choose a recovery directory under an existing directory."
+                            .to_string(),
+                    });
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                cur = anc.parent();
+            }
+            Err(err) => {
+                return Err(ManagerError::Io {
+                    cause: format!(
+                        "Could not inspect ancestor `{}` of {field}: {err}.",
+                        anc.display()
+                    ),
+                    next_step: "Verify permissions on the recovery directory path.".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 struct LayoutCandidate<'a> {
     mapping_id: &'a MappingId,
     local_binding: &'a LocalBinding,
@@ -421,14 +484,14 @@ fn validate_complete_layout(
     let mut resolved = Vec::with_capacity(all_candidates.len());
     for c in &all_candidates {
         let path1 = resolve_absolute_path("path1", &c.local_binding.resolved_path())?;
+        validate_recovery_root_dir_candidate("local_recovery_root", &c.local_recovery_root)?;
         let local_rec = resolve_absolute_path("local_recovery_root", &c.local_recovery_root)?;
         let (path2, remote_rec) = match &c.remote_endpoint {
             RemoteEndpoint::LocalDir(p2) => {
                 let r_p2 = resolve_absolute_path("path2", p2)?;
-                let r_rec2 = resolve_absolute_path(
-                    "remote_recovery_root",
-                    Path::new(c.cloud_recovery_path),
-                )?;
+                let raw_rec2 = Path::new(c.cloud_recovery_path);
+                validate_recovery_root_dir_candidate("remote_recovery_root", raw_rec2)?;
+                let r_rec2 = resolve_absolute_path("remote_recovery_root", raw_rec2)?;
                 (Some(r_p2), Some(r_rec2))
             }
             RemoteEndpoint::DriveRemote { .. } | RemoteEndpoint::OtherRemote { .. } => (None, None),
@@ -645,6 +708,8 @@ struct SharedState {
     active_run: Option<ActiveRunControl>,
     worker_busy: bool,
     shutdown: bool,
+    last_terminal_error: Option<(String, String)>,
+    storage_blocked_mappings: BTreeSet<MappingId>,
 }
 
 struct ManagerInner {
@@ -680,10 +745,14 @@ impl SyncManager {
 
         let lock = StateLock::acquire(&state_dir)?;
 
-        ensure_private_dir(&state_dir.join("accounts"))?;
-        ensure_private_dir(&state_dir.join("mappings"))?;
-        ensure_private_dir(&state_dir.join("runs"))?;
-        ensure_private_dir(&state_dir.join("recovery-records"))?;
+        ensure_private_dir_under("accounts", &state_dir, &state_dir.join("accounts"))?;
+        ensure_private_dir_under("mappings", &state_dir, &state_dir.join("mappings"))?;
+        ensure_private_dir_under("runs", &state_dir, &state_dir.join("runs"))?;
+        ensure_private_dir_under(
+            "recovery-records",
+            &state_dir,
+            &state_dir.join("recovery-records"),
+        )?;
 
         let finder_writer = FinderStatusWriter::new(finder_dir);
 
@@ -698,6 +767,7 @@ impl SyncManager {
 
         let event_bus = EventBus::new(config.event_buffer_capacity);
         reconcile_startup_state(
+            &state_dir,
             &mut store,
             config.process_inspector.as_ref(),
             config.clock.as_ref(),
@@ -725,6 +795,8 @@ impl SyncManager {
                 active_run: None,
                 worker_busy: false,
                 shutdown: false,
+                last_terminal_error: None,
+                storage_blocked_mappings: BTreeSet::new(),
             }),
             worker_cv: Condvar::new(),
             idle_cv: Condvar::new(),
@@ -764,20 +836,17 @@ impl SyncManager {
         let account_id = account_id.into();
         validate_safe_path_id("account_id", account_id.as_str())?;
 
-        let accounts_root = self.inner.state_dir.join("accounts");
-        let account_dir = ensure_contained_path(
-            "account_dir",
-            &accounts_root,
-            &accounts_root.join(account_id.as_str()),
-        )?;
-        ensure_private_dir(&account_dir)?;
-        let config_path = ensure_contained_path(
-            "account_config",
-            &account_dir,
-            &account_dir.join("rclone.conf"),
-        )?;
+        let raw_account_dir = self
+            .inner
+            .state_dir
+            .join("accounts")
+            .join(account_id.as_str());
+        let account_dir =
+            ensure_private_dir_under("account_dir", &self.inner.state_dir, &raw_account_dir)?;
+        let config_path = account_dir.join("rclone.conf");
+        reject_symlinks_under_root("account_config", &self.inner.state_dir, &config_path)?;
         if !config_path.exists() {
-            write_private_file(&config_path, b"")?;
+            write_private_file_under("account_config", &self.inner.state_dir, &config_path, b"")?;
         }
         let now = self.inner.clock.now_rfc3339();
         let record = AccountRecord {
@@ -938,6 +1007,9 @@ impl SyncManager {
                         .to_string(),
                 });
             }
+        }
+        if let Some((cause, next_step)) = guard.last_terminal_error.take() {
+            return Err(ManagerError::Storage { cause, next_step });
         }
         Ok(Arc::clone(&guard.latest_snapshot))
     }
@@ -1126,6 +1198,17 @@ impl SyncManager {
 
     fn handle_initialize(&self, cmd: InitializeCommand) -> Result<CommandAcceptance, ManagerError> {
         let mut guard = self.inner.state.lock().unwrap();
+        if guard.storage_blocked_mappings.contains(&cmd.mapping_id) {
+            return Err(ManagerError::Storage {
+                cause: format!(
+                    "Mapping `{}` is blocked because a previous terminal database commit failed.",
+                    cmd.mapping_id
+                ),
+                next_step:
+                    "Inspect SQLite storage health and restart FolderSync to reconcile unfinished runs."
+                        .to_string(),
+            });
+        }
         if let Some(blocking) =
             find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
         {
@@ -1220,6 +1303,25 @@ impl SyncManager {
 
         let effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
 
+        // Verify state-dir generation paths have no symlinks BEFORE mutating
+        // endpoints or writing any files/dirs under state_dir (HIGH #2).
+        let gen_num = guard.store.next_generation_number(&mapping.id)?;
+        let gen_id = GenerationId::new(format!("{}-gen-{gen_num}", mapping.id));
+        let raw_gen_dir = self
+            .inner
+            .state_dir
+            .join("mappings")
+            .join(mapping.id.as_str())
+            .join(format!("generation-{gen_num}"));
+        let raw_workdir_path = raw_gen_dir.join("bisync");
+        let raw_filters_file_path = raw_gen_dir.join("filters.txt");
+        reject_symlinks_under_root("workdir_path", &self.inner.state_dir, &raw_workdir_path)?;
+        reject_symlinks_under_root(
+            "filters_file",
+            &self.inner.state_dir,
+            &raw_filters_file_path,
+        )?;
+
         // Inspect endpoints, classify both sides, refuse both-populated, then establish recovery & markers (§9).
         let remote_ep = RemoteEndpoint::from_db_cols(
             &mapping.remote_endpoint_kind,
@@ -1283,22 +1385,20 @@ impl SyncManager {
 
         let engine_meta = self.inner.launcher.engine_metadata()?;
 
-        let gen_num = guard.store.next_generation_number(&mapping.id)?;
-        let gen_id = GenerationId::new(format!("{}-gen-{gen_num}", mapping.id));
-        let mappings_root = self.inner.state_dir.join("mappings");
-        let gen_dir = ensure_contained_path(
-            "generation_dir",
-            &mappings_root,
-            &mappings_root
-                .join(mapping.id.as_str())
-                .join(format!("generation-{gen_num}")),
+        let workdir_path =
+            ensure_private_dir_under("workdir_path", &self.inner.state_dir, &raw_workdir_path)?;
+        let filters_file_path = reject_symlinks_under_root(
+            "filters_file",
+            &self.inner.state_dir,
+            &raw_filters_file_path,
         )?;
-        let workdir_path = gen_dir.join("bisync");
-        let filters_file_path = gen_dir.join("filters.txt");
-        ensure_private_dir(&workdir_path)?;
-
         let filters_content = render_filters_file(&effective_filters);
-        write_private_file(&filters_file_path, filters_content.as_bytes())?;
+        write_private_file_under(
+            "filters_file",
+            &self.inner.state_dir,
+            &filters_file_path,
+            filters_content.as_bytes(),
+        )?;
 
         let config_gen = ConfigGeneration {
             path1: canonical_local,
@@ -1362,6 +1462,16 @@ impl SyncManager {
 
     fn handle_run_now(&self, mapping_id: MappingId) -> Result<CommandAcceptance, ManagerError> {
         let mut guard = self.inner.state.lock().unwrap();
+        if guard.storage_blocked_mappings.contains(&mapping_id) {
+            return Err(ManagerError::Storage {
+                cause: format!(
+                    "Mapping `{mapping_id}` is blocked because a previous terminal database commit failed."
+                ),
+                next_step:
+                    "Inspect SQLite storage health and restart FolderSync to reconcile unfinished runs."
+                        .to_string(),
+            });
+        }
         if let Some(blocking) =
             find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
         {
@@ -1506,10 +1616,10 @@ impl SyncManager {
         let transition = apply_user_action(mapping.state, UserAction::Pause);
         mapping.state = transition.state;
         mapping.updated_at = self.inner.clock.now_rfc3339();
-        guard.job_queue.retain(|j| j.mapping_id != mapping.id);
 
-        // Persist BEFORE acknowledging!
+        // Persist BEFORE mutating in-memory queue or acknowledging!
         guard.store.update_mapping_runtime(&mapping)?;
+        guard.job_queue.retain(|j| j.mapping_id != mapping.id);
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         self.inner.idle_cv.notify_all();
 
@@ -1580,8 +1690,8 @@ impl SyncManager {
                 let transition = apply_user_action(mapping.state, UserAction::StopRun);
                 mapping.state = transition.state;
                 mapping.updated_at = self.inner.clock.now_rfc3339();
-                guard.job_queue.retain(|j| j.mapping_id != mapping.id);
                 guard.store.update_mapping_runtime(&mapping)?;
+                guard.job_queue.retain(|j| j.mapping_id != mapping.id);
 
                 if transition.effect == TransitionEffect::RequestGracefulStop {
                     if let Some(active) = guard.active_run.as_mut()
@@ -1647,18 +1757,12 @@ impl SyncManager {
             mapping.state = transition.state;
             let now = self.inner.clock.now_rfc3339();
             mapping.updated_at = now.clone();
-            guard.job_queue.retain(|j| j.mapping_id != mapping.id);
 
-            let mut stopper = None;
-            let mut run_id_for_case = None;
-            if let Some(active) = guard.active_run.as_mut()
-                && active.mapping_id == mapping.id
-            {
-                active.force_stopped = true;
-                active.stop_requested = true;
-                run_id_for_case = Some(active.run_id.clone());
-                stopper = active.stopper.as_ref().map(Arc::clone);
-            }
+            let run_id_for_case = guard
+                .active_run
+                .as_ref()
+                .filter(|a| a.mapping_id == mapping.id)
+                .map(|a| a.run_id.clone());
 
             let recovery_case = if transition.effect == TransitionEffect::ForceTerminateChild {
                 let gen_workdir = mapping
@@ -1690,9 +1794,21 @@ impl SyncManager {
                 None
             };
 
+            // Commit transaction BEFORE mutating in-memory flags or queue (HIGH #7).
             guard
                 .store
                 .commit_mapping_and_recovery(&mapping, recovery_case.as_ref())?;
+
+            guard.job_queue.retain(|j| j.mapping_id != mapping.id);
+            let stopper = if let Some(active) = guard.active_run.as_mut()
+                && active.mapping_id == mapping.id
+            {
+                active.force_stopped = true;
+                active.stop_requested = true;
+                active.stopper.as_ref().map(Arc::clone)
+            } else {
+                None
+            };
 
             let ev = recovery_case.map(|case| ManagerEvent::RecoveryOpened {
                 mapping_id: mapping.id.clone(),
@@ -1934,8 +2050,8 @@ fn verify_endpoints_for_generation(
 
 /// Probes whether a recorded orphan PID is still the exact same process:
 /// - `Some(true)`: positively matches PID + start time + executable
-/// - `Some(false)`: positively exited (`NotFound`) or PID reused (start time/exe differs)
-/// - `None`: inconclusive (permission denied or missing identity metadata)
+/// - `Some(false)`: positively exited (`NotFound`) or PID reused (start time or conclusively different exe)
+/// - `None`: inconclusive (permission denied, missing metadata, `(deleted)` exe, or canonicalization failure)
 fn probe_orphan_liveness(
     inspector: &dyn ProcessInspector,
     pid: u32,
@@ -1951,12 +2067,11 @@ fn probe_orphan_liveness(
             let start_differs = run.child_start_time.is_some()
                 && live.start_time.is_some()
                 && live.start_time != run.child_start_time;
-            let exe_matches = executables_match(&run.child_executable, &live.executable);
-            let exe_differs = executables_clearly_differ(&run.child_executable, &live.executable);
+            let exe_cmp = compare_executables(&run.child_executable, &live.executable);
 
-            if start_matches && exe_matches {
+            if start_matches && exe_cmp == ExeComparison::Match {
                 Some(true)
-            } else if start_differs || exe_differs {
+            } else if start_differs || exe_cmp == ExeComparison::ClearlyDifferent {
                 Some(false)
             } else {
                 None
@@ -2017,27 +2132,35 @@ fn inspect_workdir_readonly(workdir: &Path) -> (Vec<String>, bool) {
     (files, has_lock)
 }
 
-fn executables_match(recorded: &Option<PathBuf>, live: &Option<PathBuf>) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExeComparison {
+    Match,
+    ClearlyDifferent,
+    Inconclusive,
+}
+
+/// Compares recorded and live executable paths without ever treating
+/// uncanonicalizable paths or Linux ` (deleted)` suffixes as proof of PID reuse (HIGH #6).
+fn compare_executables(recorded: &Option<PathBuf>, live: &Option<PathBuf>) -> ExeComparison {
     let (Some(rec), Some(act)) = (recorded, live) else {
-        return false;
+        return ExeComparison::Inconclusive;
     };
+    if act.to_string_lossy().ends_with(" (deleted)")
+        || rec.to_string_lossy().ends_with(" (deleted)")
+    {
+        return ExeComparison::Inconclusive;
+    }
     if rec == act {
-        return true;
+        return ExeComparison::Match;
     }
     match (fs::canonicalize(rec), fs::canonicalize(act)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+        (Ok(a), Ok(b)) if a == b => ExeComparison::Match,
+        (Ok(_), Ok(_)) => ExeComparison::ClearlyDifferent,
+        _ => ExeComparison::Inconclusive,
     }
 }
 
-fn executables_clearly_differ(recorded: &Option<PathBuf>, live: &Option<PathBuf>) -> bool {
-    let (Some(rec), Some(act)) = (recorded, live) else {
-        return false;
-    };
-    !executables_match(&Some(rec.clone()), &Some(act.clone()))
-}
-
-fn write_run_outcome_json(run: &RunRecord) {
+fn write_run_outcome_json(state_dir: &Path, run: &RunRecord) {
     let outcome_doc = serde_json::json!({
         "run_id": run.id.as_str(),
         "status": run.status,
@@ -2053,7 +2176,12 @@ fn write_run_outcome_json(run: &RunRecord) {
         "finished_at": run.finished_at,
     });
     if let Ok(bytes) = serde_json::to_vec_pretty(&outcome_doc)
-        && let Err(err) = write_private_file(&run.run_dir.join("outcome.json"), &bytes)
+        && let Err(err) = write_private_file_under(
+            "outcome_json",
+            state_dir,
+            &run.run_dir.join("outcome.json"),
+            &bytes,
+        )
     {
         eprintln!(
             "Warning: failed to write outcome.json for run `{}`: {err}",
@@ -2089,6 +2217,7 @@ fn format_ndjson_line(line: &OutputLine, timestamp: &str) -> String {
 }
 
 fn reconcile_startup_state(
+    state_dir: &Path,
     store: &mut SqliteStateStore,
     inspector: &dyn ProcessInspector,
     clock: &dyn Clock,
@@ -2151,11 +2280,9 @@ fn reconcile_startup_state(
                     let start_differs = run.child_start_time.is_some()
                         && live.start_time.is_some()
                         && live.start_time != run.child_start_time;
-                    let exe_matches = executables_match(&run.child_executable, &live.executable);
-                    let exe_differs =
-                        executables_clearly_differ(&run.child_executable, &live.executable);
+                    let exe_cmp = compare_executables(&run.child_executable, &live.executable);
 
-                    if start_matches && exe_matches {
+                    if start_matches && exe_cmp == ExeComparison::Match {
                         (
                             "reconciled_orphan_running".to_string(),
                             "orphan_running".to_string(),
@@ -2167,7 +2294,7 @@ fn reconcile_startup_state(
                                 .to_string(),
                             Some(pid),
                         )
-                    } else if start_differs || exe_differs {
+                    } else if start_differs || exe_cmp == ExeComparison::ClearlyDifferent {
                         (
                             "reconciled_pid_reused".to_string(),
                             "interrupted".to_string(),
@@ -2248,9 +2375,9 @@ fn reconcile_startup_state(
             resolution_note: None,
         };
 
-        // Commit run terminal status + mapping hold + recovery case in ONE SQLite transaction (HIGH #7).
+        // Write outcome.json BEFORE committing terminal DB state (HIGH #8), then commit atomically (HIGH #7).
+        write_run_outcome_json(state_dir, &run);
         store.commit_run_terminal(&run, updated_mapping.as_ref(), Some(&case))?;
-        write_run_outcome_json(&run);
 
         event_bus.publish_event(ManagerEvent::RecoveryOpened {
             mapping_id: run.mapping_id,
@@ -2259,6 +2386,17 @@ fn reconcile_startup_state(
             cause,
             timestamp: now.clone(),
         });
+    }
+
+    // Repair any missing outcome.json on already-committed terminal run rows (HIGH #8).
+    for run in store.list_terminal_runs()? {
+        let outcome_path = run.run_dir.join("outcome.json");
+        if matches!(
+            fs::symlink_metadata(&outcome_path),
+            Err(ref err) if err.kind() == std::io::ErrorKind::NotFound
+        ) {
+            write_run_outcome_json(state_dir, &run);
+        }
     }
 
     // Defensive check for any mapping left in Queued/Running/Stopping without an unfinished run row.
@@ -2482,6 +2620,8 @@ fn worker_loop(inner: Arc<ManagerInner>) {
 
 struct PreparedRun {
     run: RunRecord,
+    mapping: MappingRecord,
+    generation: GenerationRecord,
     plan: LaunchPlan,
     mode_label: String,
     is_init: bool,
@@ -2497,7 +2637,7 @@ fn claim_and_prepare_locked(
     guard: &mut SharedState,
     job: &QueuedJob,
 ) -> Result<Option<PreparedRun>, ManagerError> {
-    if guard.shutdown {
+    if guard.shutdown || guard.storage_blocked_mappings.contains(&job.mapping_id) {
         return Ok(None);
     }
 
@@ -2551,8 +2691,7 @@ fn claim_and_prepare_locked(
             next_step: "Reconnect account.".to_string(),
         })?;
 
-    // Immediately before EVERY launch (Run once AND init), re-verify both roots
-    // against stored generation and check access-marker contents on both sides (HIGH #4).
+    // Fast pre-claim verification (re-run again as the VERY LAST step right before spawn!).
     if let Err((event, _err)) = verify_endpoints_for_generation(&mapping, &generation) {
         mapping.state = apply_event(mapping.state, event).state;
         mapping.state.execution = Execution::Idle;
@@ -2567,11 +2706,10 @@ fn claim_and_prepare_locked(
     validate_safe_path_id("mapping_id", mapping.id.as_str())?;
     validate_safe_path_id("device_id", mapping.device_id.as_str())?;
 
-    let runs_root = inner.state_dir.join("runs");
-    let run_dir = ensure_contained_path("run_dir", &runs_root, &runs_root.join(run_id.as_str()))?;
-    ensure_private_dir(&run_dir)?;
-    let log_path = ensure_contained_path("log_path", &run_dir, &run_dir.join("output.ndjson"))?;
-    let log_file = open_private_write_file(&log_path)?;
+    let raw_run_dir = inner.state_dir.join("runs").join(run_id.as_str());
+    let run_dir = ensure_private_dir_under("run_dir", &inner.state_dir, &raw_run_dir)?;
+    let log_path = run_dir.join("output.ndjson");
+    let log_file = open_private_write_file_under("log_path", &inner.state_dir, &log_path)?;
 
     let remote_ep = RemoteEndpoint::from_db_cols(
         &mapping.remote_endpoint_kind,
@@ -2672,13 +2810,6 @@ fn claim_and_prepare_locked(
         stop_requested: false,
         force_stopped: false,
     });
-    let _ = publish_updated_snapshot(inner, guard);
-    inner.event_bus.publish_event(ManagerEvent::RunStarted {
-        mapping_id: mapping.id.clone(),
-        run_id: run_id.clone(),
-        mode: mode_label.clone(),
-        timestamp: started_at,
-    });
 
     let plan = LaunchPlan {
         run_id: run_id.as_str().to_string(),
@@ -2686,8 +2817,8 @@ fn claim_and_prepare_locked(
         path1: generation.config.path1.clone(),
         path2: remote_ep.to_path2(),
         config_path: account.config_path,
-        workdir: generation.workdir_path,
-        filters_file: generation.filters_file_path,
+        workdir: generation.workdir_path.clone(),
+        filters_file: generation.filters_file_path.clone(),
         check_filename: ACCESS_MARKER_FILENAME.to_string(),
         max_delete_percent: mapping.max_delete_percent,
         backup_dir1,
@@ -2696,6 +2827,8 @@ fn claim_and_prepare_locked(
 
     Ok(Some(PreparedRun {
         run,
+        mapping,
+        generation,
         plan,
         mode_label,
         is_init,
@@ -2736,13 +2869,278 @@ fn record_prepare_failure_locked(
         };
         if let Err(db_err) = guard.store.commit_mapping_and_recovery(&m, Some(&case)) {
             eprintln!("Error committing prepare failure recovery hold: {db_err}");
+            record_terminal_db_error_locked(guard, &job.mapping_id, db_err);
             return;
         }
         let _ = publish_updated_snapshot(inner, guard);
     }
 }
 
+fn record_terminal_db_error_locked(
+    guard: &mut SharedState,
+    mapping_id: &MappingId,
+    db_err: ManagerError,
+) {
+    guard.storage_blocked_mappings.insert(mapping_id.clone());
+    guard.last_terminal_error = Some((db_err.cause(), db_err.next_step()));
+}
+
+fn abort_before_spawn_locked(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    mut run: RunRecord,
+    is_force_stopped: bool,
+) {
+    let now = inner.clock.now_rfc3339();
+    guard.active_run = None;
+    run.status = "interrupted".to_string();
+    run.finished_at = Some(now.clone());
+    run.outcome_kind = Some(
+        if is_force_stopped {
+            "force_stopped"
+        } else {
+            "canceled_before_spawn"
+        }
+        .to_string(),
+    );
+    run.outcome_detail = Some(
+        if is_force_stopped {
+            "Synchronization was force-stopped before spawning child process."
+        } else {
+            "Synchronization was stopped before spawning child process."
+        }
+        .to_string(),
+    );
+    run.last_verified_phase = "aborted_pre_spawn".to_string();
+
+    let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
+        Ok(Some(mut mapping)) => {
+            if is_force_stopped {
+                mapping.state = apply_event(
+                    mapping.state,
+                    ObservedEvent::RunFinished(RunOutcome::Interrupted),
+                )
+                .state;
+            } else {
+                mapping.state.execution = Execution::Idle;
+            }
+            mapping.last_run_id = Some(run.id.clone());
+            mapping.last_run_outcome = Some(RunOutcome::Interrupted);
+            mapping.last_run_completed_at = Some(now.clone());
+            mapping.last_run_summary_text = Some(
+                if is_force_stopped {
+                    "Force-stopped before launch"
+                } else {
+                    "Stopped before launch"
+                }
+                .to_string(),
+            );
+            mapping.updated_at = now.clone();
+            Some(mapping)
+        }
+        Ok(None) => None,
+        Err(db_err) => {
+            eprintln!("Error loading mapping for pre-spawn abort commit: {db_err}");
+            record_terminal_db_error_locked(guard, &run.mapping_id, db_err);
+            inner.idle_cv.notify_all();
+            return;
+        }
+    };
+
+    write_run_outcome_json(&inner.state_dir, &run);
+    if let Err(db_err) = guard
+        .store
+        .commit_run_terminal(&run, updated_mapping.as_ref(), None)
+    {
+        eprintln!(
+            "Error committing pre-spawn abort for `{}`: {db_err}",
+            run.id
+        );
+        record_terminal_db_error_locked(guard, &run.mapping_id, db_err);
+        inner.idle_cv.notify_all();
+        return;
+    }
+
+    let _ = publish_updated_snapshot(inner, guard);
+    inner.event_bus.publish_event(ManagerEvent::RunFinished {
+        mapping_id: run.mapping_id,
+        run_id: run.id,
+        outcome: run
+            .outcome_kind
+            .unwrap_or_else(|| "canceled_before_spawn".to_string()),
+        timestamp: now,
+    });
+    inner.idle_cv.notify_all();
+}
+
+fn abort_endpoint_check_failed_locked(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    mut run: RunRecord,
+    event: ObservedEvent,
+    err: ManagerError,
+) {
+    let now = inner.clock.now_rfc3339();
+    guard.active_run = None;
+    let (outcome_kind, run_outcome) = match event {
+        ObservedEvent::VolumeLost => ("volume_mismatch", RunOutcome::VolumeMismatch),
+        _ => ("endpoint_mismatch", RunOutcome::EndpointMismatch),
+    };
+    run.status = "failed".to_string();
+    run.finished_at = Some(now.clone());
+    run.outcome_kind = Some(outcome_kind.to_string());
+    run.outcome_detail = Some(err.cause());
+    run.last_verified_phase = "pre_spawn_endpoint_check_failed".to_string();
+
+    let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
+        Ok(Some(mut mapping)) => {
+            mapping.state = apply_event(mapping.state, event).state;
+            mapping.state.execution = Execution::Idle;
+            mapping.last_run_id = Some(run.id.clone());
+            mapping.last_run_outcome = Some(run_outcome);
+            mapping.last_run_completed_at = Some(now.clone());
+            mapping.last_run_summary_text = Some(err.cause());
+            mapping.updated_at = now.clone();
+            Some(mapping)
+        }
+        Ok(None) => None,
+        Err(db_err) => {
+            eprintln!("Error loading mapping for pre-spawn endpoint check failure: {db_err}");
+            record_terminal_db_error_locked(guard, &run.mapping_id, db_err);
+            inner.idle_cv.notify_all();
+            return;
+        }
+    };
+
+    write_run_outcome_json(&inner.state_dir, &run);
+    if let Err(db_err) = guard
+        .store
+        .commit_run_terminal(&run, updated_mapping.as_ref(), None)
+    {
+        eprintln!(
+            "Error committing pre-spawn endpoint check failure for `{}`: {db_err}",
+            run.id
+        );
+        record_terminal_db_error_locked(guard, &run.mapping_id, db_err);
+        inner.idle_cv.notify_all();
+        return;
+    }
+
+    let _ = publish_updated_snapshot(inner, guard);
+    inner.event_bus.publish_event(ManagerEvent::RunFinished {
+        mapping_id: run.mapping_id,
+        run_id: run.id,
+        outcome: outcome_kind.to_string(),
+        timestamp: now,
+    });
+    inner.idle_cv.notify_all();
+}
+
+fn finish_with_child_identity_error(
+    inner: &ManagerInner,
+    mut run: RunRecord,
+    db_err: ManagerError,
+) {
+    let now = inner.clock.now_rfc3339();
+    let cause = format!(
+        "Failed to persist child process identity ({}); child was force-stopped immediately.",
+        db_err.cause()
+    );
+    run.status = "interrupted".to_string();
+    run.finished_at = Some(now.clone());
+    run.outcome_kind = Some("interrupted".to_string());
+    run.outcome_detail = Some(cause.clone());
+    run.last_verified_phase = "child_identity_persist_failed".to_string();
+
+    let mut guard = inner.state.lock().unwrap();
+    guard.active_run = None;
+
+    let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
+        Ok(Some(mut mapping)) => {
+            let next = apply_event(
+                mapping.state,
+                ObservedEvent::RunFinished(RunOutcome::Interrupted),
+            );
+            mapping.state = next.state;
+            mapping.last_run_id = Some(run.id.clone());
+            mapping.last_run_outcome = Some(RunOutcome::Interrupted);
+            mapping.last_run_completed_at = Some(now.clone());
+            mapping.last_run_summary_text =
+                Some("Interrupted — failed to persist child identity".to_string());
+            mapping.updated_at = now.clone();
+            Some(mapping)
+        }
+        Ok(None) => None,
+        Err(load_err) => {
+            eprintln!("Error loading mapping after child identity failure: {load_err}");
+            record_terminal_db_error_locked(&mut guard, &run.mapping_id, load_err);
+            inner.idle_cv.notify_all();
+            return;
+        }
+    };
+
+    let case = RecoveryCaseRecord {
+        id: format!("rc-{}", Uuid::new_v4()),
+        mapping_id: run.mapping_id.clone(),
+        run_id: Some(run.id.clone()),
+        status: "open".to_string(),
+        reason_kind: "child_identity_persist_failed".to_string(),
+        cause: cause.clone(),
+        next_step:
+            "Inspect SQLite storage, active processes, and the preserved work directory before clearing recovery."
+                .to_string(),
+        workdir_path: Some(run.workdir_path.clone()),
+        backup_dir1: Some(run.backup_dir1.clone()),
+        backup_dir2: Some(run.backup_dir2.clone()),
+        log_path: Some(run.log_path.clone()),
+        orphan_pid: None,
+        created_at: now.clone(),
+        resolved_at: None,
+        resolution_note: None,
+    };
+
+    write_run_outcome_json(&inner.state_dir, &run);
+    if let Err(commit_err) =
+        guard
+            .store
+            .commit_run_terminal(&run, updated_mapping.as_ref(), Some(&case))
+    {
+        eprintln!(
+            "Error committing child identity failure for `{}`: {commit_err}",
+            run.id
+        );
+        record_terminal_db_error_locked(&mut guard, &run.mapping_id, commit_err);
+        inner.idle_cv.notify_all();
+        return;
+    }
+
+    let _ = publish_updated_snapshot(inner, &mut guard);
+    inner.event_bus.publish_event(ManagerEvent::RecoveryOpened {
+        mapping_id: run.mapping_id.clone(),
+        case_id: case.id,
+        reason_kind: case.reason_kind,
+        cause,
+        timestamp: now.clone(),
+    });
+    inner.event_bus.publish_event(ManagerEvent::RunFinished {
+        mapping_id: run.mapping_id,
+        run_id: run.id,
+        outcome: "interrupted".to_string(),
+        timestamp: now,
+    });
+    inner.idle_cv.notify_all();
+}
+
 fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
+    // 1. Qualify engine and construct request OUTSIDE the state mutex.
+    let prepared_launch = match inner.launcher.prepare(&prepared.plan) {
+        Ok(p) => p,
+        Err(err) => {
+            finish_with_launch_error(inner, prepared.run, err);
+            return;
+        }
+    };
+
     let (line_tx, line_rx) = mpsc::sync_channel::<OutputLine>(1024);
     let forwarder_inner = Arc::clone(inner);
     let fwd_mapping = prepared.run.mapping_id.clone();
@@ -2767,70 +3165,104 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
         let _ = log_file.sync_all();
     });
 
-    let spawn_result = inner.launcher.launch(
-        &prepared.plan,
-        SpawnOptions {
-            limits: OutputLimits::default(),
-            line_observer: Some(line_tx),
-        },
-    );
-
-    let launched = match spawn_result {
-        Ok(l) => l,
-        Err(err) => {
+    // 2. Hold state mutex across final stop/shutdown check (HIGH #5, #9),
+    //    final root/marker check (HIGH #4), spawn, child identity commit (HIGH #8),
+    //    and stopper registration — zero gap between cancel/check and spawn!
+    let mut run = prepared.run;
+    let launched = {
+        let mut guard = inner.state.lock().unwrap();
+        let (is_force_stopped, is_stop_requested) = match guard.active_run.as_ref() {
+            Some(active) if active.run_id == run.id => (
+                active.force_stopped,
+                active.stop_requested || guard.shutdown,
+            ),
+            _ => (false, true),
+        };
+        if is_force_stopped || is_stop_requested {
+            drop(prepared_launch);
+            drop(line_tx);
+            abort_before_spawn_locked(inner, &mut guard, run, is_force_stopped);
+            drop(guard);
             let _ = forwarder.join();
-            finish_with_launch_error(inner, prepared.run, err);
             return;
         }
-    };
 
-    // Test fault-injection hook simulating an abrupt manager crash right after
-    // spawn BEFORE updating child_pid / start_time in SQLite (§14).
-    if launched.simulate_crash_before_pid_record {
-        drop(launched);
-        let _ = forwarder.join();
-        let mut guard = inner.state.lock().unwrap();
-        guard.active_run = None;
-        inner.idle_cv.notify_all();
-        return;
-    }
+        // VERY LAST step immediately before spawn: re-verify both roots and
+        // access-marker contents against the stored generation (HIGH #4).
+        if let Err((event, err)) =
+            verify_endpoints_for_generation(&prepared.mapping, &prepared.generation)
+        {
+            drop(prepared_launch);
+            drop(line_tx);
+            abort_endpoint_check_failed_locked(inner, &mut guard, run, event, *err);
+            drop(guard);
+            let _ = forwarder.join();
+            return;
+        }
 
-    // Commit child identity to SQLite FIRST before any post-spawn file work (HIGH #8).
-    let mut run = prepared.run;
-    run.child_pid = Some(launched.identity.pid);
-    run.child_start_time = launched.identity.start_time;
-    run.child_executable = Some(launched.identity.executable.clone());
-    run.engine_version = Some(launched.engine.version.clone());
-    run.engine_sha256 = Some(launched.engine.sha256.clone());
-    run.engine_platform = Some(launched.engine.platform.clone());
-    run.status = "running".to_string();
-    run.last_verified_phase = "spawned".to_string();
+        let launched = match prepared_launch.spawn(SpawnOptions {
+            limits: OutputLimits::default(),
+            line_observer: Some(line_tx),
+        }) {
+            Ok(l) => l,
+            Err(err) => {
+                drop(guard);
+                let _ = forwarder.join();
+                finish_with_launch_error(inner, run, err);
+                return;
+            }
+        };
 
-    let stopper = launched.stop_handle();
-    let (pending_force_stop, pending_graceful_stop) = {
-        let mut guard = inner.state.lock().unwrap();
-        if let Err(err) =
+        // Test fault-injection hook simulating an abrupt manager crash right after
+        // spawn BEFORE updating child_pid / start_time in SQLite (§14).
+        if launched.simulate_crash_before_pid_record {
+            guard.active_run = None;
+            inner.idle_cv.notify_all();
+            drop(guard);
+            drop(launched);
+            let _ = forwarder.join();
+            return;
+        }
+
+        let stopper = launched.stop_handle();
+        // Commit child identity to SQLite FIRST before any post-spawn file work (HIGH #8).
+        if let Err(db_err) =
             guard
                 .store
                 .update_run_child_identity(&run.id, &launched.identity, &launched.engine)
         {
-            eprintln!(
-                "Error persisting child identity for run `{}`: {err}",
-                run.id
-            );
+            guard.active_run = None;
+            drop(guard);
+            let _ = stopper.force_stop();
+            let _ = launched.wait();
+            let _ = forwarder.join();
+            finish_with_child_identity_error(inner, run, db_err);
+            return;
         }
+
+        run.child_pid = Some(launched.identity.pid);
+        run.child_start_time = launched.identity.start_time;
+        run.child_executable = Some(launched.identity.executable.clone());
+        run.engine_version = Some(launched.engine.version.clone());
+        run.engine_sha256 = Some(launched.engine.sha256.clone());
+        run.engine_platform = Some(launched.engine.platform.clone());
+        run.status = "running".to_string();
+        run.last_verified_phase = "spawned".to_string();
+
         if let Some(active) = guard.active_run.as_mut() {
             active.stopper = Some(Arc::clone(&stopper));
-            (
-                active.force_stopped,
-                active.stop_requested || guard.shutdown,
-            )
-        } else {
-            (false, guard.shutdown)
         }
+        let _ = publish_updated_snapshot(inner, &mut guard);
+        inner.event_bus.publish_event(ManagerEvent::RunStarted {
+            mapping_id: run.mapping_id.clone(),
+            run_id: run.id.clone(),
+            mode: prepared.mode_label.clone(),
+            timestamp: run.started_at.clone(),
+        });
+        launched
     };
 
-    // Only AFTER child identity is committed, write runs/<run-id>/argv.json (HIGH #8).
+    // 3. Only AFTER child identity is committed, write runs/<run-id>/argv.json (HIGH #2, #8).
     let argv_doc = serde_json::json!({
         "run_id": run.id.as_str(),
         "mode": prepared.mode_label,
@@ -2843,7 +3275,12 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
         }
     });
     if let Ok(bytes) = serde_json::to_vec_pretty(&argv_doc)
-        && let Err(err) = write_private_file(&run.run_dir.join("argv.json"), &bytes)
+        && let Err(err) = write_private_file_under(
+            "argv_json",
+            &inner.state_dir,
+            &run.run_dir.join("argv.json"),
+            &bytes,
+        )
     {
         eprintln!(
             "Warning: failed to write argv.json for run `{}`: {err}",
@@ -2851,13 +3288,7 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
         );
     }
 
-    if pending_force_stop {
-        let _ = stopper.force_stop();
-    } else if pending_graceful_stop {
-        let _ = stopper.request_stop();
-    }
-
-    // Wait for child completion without holding the manager state lock.
+    // 4. Wait for child completion without holding the manager state lock.
     let wait_res = launched.wait();
     let _ = forwarder.join();
 
@@ -2900,6 +3331,7 @@ fn finish_with_launch_error(inner: &ManagerInner, mut run: RunRecord, err: Manag
         Ok(None) => None,
         Err(db_err) => {
             eprintln!("Error loading mapping for launch failure commit: {db_err}");
+            record_terminal_db_error_locked(&mut guard, &run.mapping_id, db_err);
             inner.idle_cv.notify_all();
             return;
         }
@@ -2927,19 +3359,18 @@ fn finish_with_launch_error(inner: &ManagerInner, mut run: RunRecord, err: Manag
         None
     };
 
-    // Commit run + mapping hold + recovery case atomically in ONE SQLite transaction (HIGH #7).
+    // Write outcome.json BEFORE terminal commit (HIGH #8), then commit atomically (HIGH #7).
+    write_run_outcome_json(&inner.state_dir, &run);
     if let Err(db_err) =
         guard
             .store
             .commit_run_terminal(&run, updated_mapping.as_ref(), case.as_ref())
     {
         eprintln!("Error committing launch failure atomically: {db_err}");
+        record_terminal_db_error_locked(&mut guard, &run.mapping_id, db_err);
         inner.idle_cv.notify_all();
         return;
     }
-
-    // Write outcome.json on launch failure (HIGH #8).
-    write_run_outcome_json(&run);
 
     let _ = publish_updated_snapshot(inner, &mut guard);
     if let Some(c) = case {
@@ -3138,18 +3569,35 @@ fn finalize_completed_run(
         }
     }
 
-    // If observer channel dropped any lines under backpressure, record a valid NDJSON notice.
-    if run_out.output.observer_dropped_lines > 0
-        && let Ok(mut f) = fs::OpenOptions::new().append(true).open(&run.log_path)
-    {
+    // Rewrite disk output.ndjson atomically from the adapter's lossless retained
+    // output buffer (up to its bounds), refusing any symlinks under state_dir (HIGH #2, #8).
+    let log_ts = inner.clock.now_rfc3339();
+    let mut final_log = String::new();
+    for line in &run_out.output.lines {
+        final_log.push_str(&format_ndjson_line(line, &log_ts));
+        final_log.push('\n');
+    }
+    if run_out.output.dropped_lines > 0 || run_out.output.dropped_diagnostic_events > 0 {
         let notice = serde_json::json!({
             "stream": "manager",
-            "warning": "observer_dropped_lines",
-            "dropped": run_out.output.observer_dropped_lines,
-            "timestamp": inner.clock.now_rfc3339(),
+            "warning": "output_buffer_truncated",
+            "dropped_lines": run_out.output.dropped_lines,
+            "dropped_diagnostic_events": run_out.output.dropped_diagnostic_events,
+            "timestamp": log_ts,
         });
-        let _ = writeln!(f, "{notice}");
-        let _ = f.sync_all();
+        final_log.push_str(&notice.to_string());
+        final_log.push('\n');
+    }
+    if let Err(err) = write_private_file_atomic_under(
+        "log_path",
+        &inner.state_dir,
+        &run.log_path,
+        final_log.as_bytes(),
+    ) {
+        eprintln!(
+            "Warning: failed to finalize output.ndjson for run `{}`: {err}",
+            run.id
+        );
     }
 
     let classified = classify_run_outcome(&run_out);
@@ -3219,6 +3667,7 @@ fn finalize_completed_run(
         Ok(None) => None,
         Err(db_err) => {
             eprintln!("Error loading mapping during run finalization: {db_err}");
+            record_terminal_db_error_locked(&mut guard, &run.mapping_id, db_err);
             inner.idle_cv.notify_all();
             return;
         }
@@ -3246,19 +3695,19 @@ fn finalize_completed_run(
         None
     };
 
-    // Atomically commit run + mapping state + recovery case in ONE SQLite transaction (HIGH #7).
-    // Publish ONLY after commit succeeds.
+    // Write outcome.json BEFORE terminal commit (HIGH #8), then commit run +
+    // mapping state + recovery case atomically in ONE SQLite transaction (HIGH #7).
+    write_run_outcome_json(&inner.state_dir, &run);
     if let Err(db_err) =
         guard
             .store
             .commit_run_terminal(&run, updated_mapping.as_ref(), case.as_ref())
     {
         eprintln!("Error committing completed run `{}`: {db_err}", run.id);
+        record_terminal_db_error_locked(&mut guard, &run.mapping_id, db_err);
         inner.idle_cv.notify_all();
         return;
     }
-
-    write_run_outcome_json(&run);
 
     let _ = publish_updated_snapshot(inner, &mut guard);
     if let Some(c) = case {
