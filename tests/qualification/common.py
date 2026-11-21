@@ -21,7 +21,10 @@ MANIFEST_PATH = REPO_ROOT / "packaging" / "qualification-manifest.toml"
 
 ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 PW_CMD_STDERR_PREFIX = "--password-command stderr:"
-RCLONE_TIMESTAMP_RE = re.compile(r"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+")
+RCLONE_LOG_LEVELS = {"debug", "info", "notice", "warning", "error", "critical"}
+RCLONE_PLAIN_LOG_RE = re.compile(
+    r"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+(DEBUG|INFO|NOTICE|WARNING|ERROR|CRITICAL)\s*:\s"
+)
 
 
 def utc_now() -> str:
@@ -32,14 +35,40 @@ def strip_ansi(text: str) -> str:
     return ANSI_CSI_RE.sub("", text)
 
 
-def redact_credential_stderr(text: str) -> str:
-    """Redacts rclone `--password-command stderr:` payloads at the capture boundary.
+def _parse_rclone_json_record(raw_line: str) -> dict[str, Any] | None:
+    trimmed = raw_line.strip()
+    if not trimmed.startswith("{"):
+        return None
+    try:
+        obj = json.loads(trimmed)
+    except json.JSONDecodeError:
+        return None
+    if (
+        isinstance(obj, dict)
+        and isinstance(obj.get("level"), str)
+        and obj["level"].lower() in RCLONE_LOG_LEVELS
+        and isinstance(obj.get("msg"), str)
+    ):
+        return obj
+    return None
 
-    Mirrors `crates/rclone-adapter/src/process.rs`:
-    - Matches JSON log objects whose decoded `msg` starts with `--password-command stderr:`.
-    - Matches plaintext lines starting with `--password-command stderr:` or
-      `... ERROR : --password-command stderr:` and drops any unprefixed continuation lines
-      that immediately follow a multiline helper stderr dump.
+
+def _is_recognized_rclone_log_record(raw_line: str) -> bool:
+    if _parse_rclone_json_record(raw_line) is not None:
+        return True
+    plain = strip_ansi(raw_line)
+    return RCLONE_PLAIN_LOG_RE.match(plain) is not None
+
+
+def redact_credential_stderr(text: str) -> str:
+    """Redacts rclone `--password-command stderr:` payloads at the capture boundary (fail-closed).
+
+    - Recognizes structured JSON log records (`level` in valid rclone levels + string `msg`):
+      redacts `msg` whenever its decoded text starts with `--password-command stderr:`.
+    - In unstructured/plaintext output, once a `--password-command stderr:` marker appears,
+      redacts that line and drops EVERY following line (including blank lines, `{` lines,
+      unstructured JSON, and bare timestamps without a valid rclone level prefix) until the
+      next line that parses as a recognized rclone log record.
     - Preserves benign transfer/conflict lines whose filenames happen to contain the phrase.
     """
     if not text:
@@ -49,25 +78,20 @@ def redact_credential_stderr(text: str) -> str:
     dropping_continuation = False
 
     for raw_line in text.splitlines():
-        trimmed = raw_line.strip()
-
         if dropping_continuation:
-            if not trimmed or trimmed.startswith("{") or RCLONE_TIMESTAMP_RE.match(raw_line):
-                dropping_continuation = False
-            else:
+            if not _is_recognized_rclone_log_record(raw_line):
                 continue
+            dropping_continuation = False
 
-        if trimmed.startswith("{"):
-            try:
-                obj = json.loads(trimmed)
-            except json.JSONDecodeError:
-                obj = None
-            if isinstance(obj, dict) and isinstance(obj.get("msg"), str):
-                plain_msg = strip_ansi(obj["msg"]).lstrip()
-                if plain_msg.startswith(PW_CMD_STDERR_PREFIX):
-                    obj["msg"] = f"{PW_CMD_STDERR_PREFIX} [REDACTED]"
-                    out_lines.append(json.dumps(obj, separators=(",", ":")))
-                    continue
+        obj = _parse_rclone_json_record(raw_line)
+        if obj is not None:
+            plain_msg = strip_ansi(obj["msg"]).lstrip()
+            if plain_msg.startswith(PW_CMD_STDERR_PREFIX):
+                obj["msg"] = f"{PW_CMD_STDERR_PREFIX} [REDACTED]"
+                out_lines.append(json.dumps(obj, separators=(",", ":")))
+                continue
+            out_lines.append(raw_line)
+            continue
 
         plain_line = strip_ansi(raw_line)
         plain_stripped = plain_line.lstrip()
@@ -76,13 +100,11 @@ def redact_credential_stderr(text: str) -> str:
             dropping_continuation = True
             continue
 
-        err_marker = " ERROR : "
-        idx = plain_line.find(err_marker)
-        if idx != -1:
-            after_err = plain_line[idx + len(err_marker) :].lstrip()
-            if after_err.startswith(PW_CMD_STDERR_PREFIX):
-                prefix = plain_line[: idx + len(err_marker)]
-                out_lines.append(f"{prefix}{PW_CMD_STDERR_PREFIX} [REDACTED]")
+        m = RCLONE_PLAIN_LOG_RE.match(plain_line)
+        if m is not None:
+            after_level = plain_line[m.end() :].lstrip()
+            if after_level.startswith(PW_CMD_STDERR_PREFIX):
+                out_lines.append(f"{plain_line[: m.end()]}{PW_CMD_STDERR_PREFIX} [REDACTED]")
                 dropping_continuation = True
                 continue
 

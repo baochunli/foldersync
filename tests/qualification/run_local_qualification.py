@@ -38,6 +38,69 @@ from common import (
 MTIME_STEP_SECS = 1.15
 
 
+def is_mid_transfer_interruption_verified(
+    *,
+    signal_confirmed: bool,
+    count_before_signal: int,
+    count_after_signal: int,
+    count_after_exit: int,
+    batch_count: int,
+    cli_returncode: int,
+    readiness: str,
+    run_log_or_outcome_shows_interrupt: bool,
+) -> bool:
+    """Returns True ONLY when positive evidence proves SIGINT landed mid-transfer."""
+    return (
+        signal_confirmed
+        and 1 <= count_before_signal < batch_count
+        and count_after_signal < batch_count
+        and count_after_exit < batch_count
+        and cli_returncode != 0
+        and readiness == "RecoveryRequired"
+        and run_log_or_outcome_shows_interrupt
+    )
+
+
+def inspect_interrupted_run_evidence(state_dir: Path, run_id: str | None) -> tuple[bool, dict[str, Any]]:
+    """Checks `outcome.json` and `output.ndjson` for positive interrupted-transfer evidence."""
+    details: dict[str, Any] = {
+        "run_id": run_id,
+        "outcome_kind": None,
+        "log_has_interrupt_marker": False,
+    }
+    if not run_id:
+        return False, details
+    run_dir = state_dir / "runs" / run_id
+    outcome_file = run_dir / "outcome.json"
+    log_file = run_dir / "output.ndjson"
+
+    outcome_interrupted = False
+    if outcome_file.is_file():
+        try:
+            outcome = json.loads(outcome_file.read_text(encoding="utf-8"))
+            kind = str(outcome.get("outcome_kind") or outcome.get("kind") or outcome.get("status") or "").lower()
+            details["outcome_kind"] = kind
+            if "interrupt" in kind:
+                outcome_interrupted = True
+        except Exception:  # noqa: BLE001
+            pass
+
+    log_interrupted = False
+    if log_file.is_file():
+        try:
+            raw_log = log_file.read_text(encoding="utf-8", errors="replace").lower()
+            if (
+                "signal received: interrupt" in raw_log
+                or "graceful shutdown" in raw_log
+                or "interrupted" in raw_log
+            ):
+                log_interrupted = True
+        except Exception:  # noqa: BLE001
+            pass
+    details["log_has_interrupt_marker"] = log_interrupted
+    return (outcome_interrupted or log_interrupted), details
+
+
 def build_or_find_sync_cli(explicit: str | None) -> Path:
     if explicit:
         p = Path(explicit).resolve()
@@ -762,19 +825,26 @@ def run_interruption_scenarios(
         )
 
         # Require BOTH: (1) a live `rclone bisync` child PID AND (2) observed partial transfer
-        # progress on the destination (1 <= files_transferred < batch_count) BEFORE sending SIGINT.
+        # progress on the destination (1 <= files_transferred < batch_count) BEFORE sending SIGINT,
+        # THEN immediately re-sample AFTER os.kill() and AFTER process exit to prove the signal
+        # landed mid-transfer (not during finalization after all files had arrived).
         signaled_pid: int | None = None
         signal_confirmed = False
         transferred_before_sigint = 0
+        transferred_after_sigint = batch_count
         pb_remote_batch = pb_remote / "batch"
+
+        def count_remote_batch() -> int:
+            if not pb_remote_batch.is_dir():
+                return 0
+            try:
+                return sum(1 for _ in pb_remote_batch.iterdir())
+            except OSError:
+                return 0
+
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline and proc_b.poll() is None:
-            cur_transferred = 0
-            if pb_remote_batch.is_dir():
-                try:
-                    cur_transferred = sum(1 for _ in pb_remote_batch.iterdir())
-                except OSError:
-                    cur_transferred = 0
+            cur_transferred = count_remote_batch()
             if 1 <= cur_transferred < batch_count:
                 try:
                     pg = subprocess.run(
@@ -796,6 +866,8 @@ def run_interruption_scenarios(
                     if "bisync" in ps_out:
                         try:
                             os.kill(pid, signal.SIGINT)
+                            # Re-sample destination count immediately after sending SIGINT.
+                            transferred_after_sigint = count_remote_batch()
                             signaled_pid = pid
                             signal_confirmed = True
                             transferred_before_sigint = cur_transferred
@@ -807,13 +879,14 @@ def run_interruption_scenarios(
             time.sleep(0.005)
 
         out_b, err_b = proc_b.communicate(timeout=90)
+        transferred_after_exit = count_remote_batch()
         cmds.append(
             {
                 "client": "client-int-b",
                 "args": [
                     "run-once",
                     "pb",
-                    f"(SIGINT confirmed={signal_confirmed} pid={signaled_pid} progress={transferred_before_sigint}/{batch_count})",
+                    f"(SIGINT confirmed={signal_confirmed} pid={signaled_pid} progress={transferred_before_sigint}->{transferred_after_sigint}->{transferred_after_exit}/{batch_count})",
                 ],
                 "returncode": proc_b.returncode,
                 "stdout": redact_credential_stderr(out_b).strip()[:300],
@@ -822,15 +895,23 @@ def run_interruption_scenarios(
         )
         pb_status_after = pb_client.status_json()["mappings"][0]
         pb_runs = pb_client.sqlite_runs()
+        last_run_id = pb_status_after.get("last_run_id") or (pb_runs[-1]["id"] if pb_runs else None)
+        log_or_outcome_interrupt, interrupt_evidence = inspect_interrupted_run_evidence(
+            pb_client.state_dir, last_run_id
+        )
         pb_bisync_dir = pb_client.state_dir / "mappings" / "pb" / "generation-1" / "bisync"
         pb_filters_file = pb_client.state_dir / "mappings" / "pb" / "generation-1" / "filters.txt"
         pb_rclone_conf = pb_client.state_dir / "accounts" / "local-fixture" / "rclone.conf"
         pb_workdir_preserved = pb_bisync_dir.is_dir() and any(pb_bisync_dir.iterdir())
-        pb_hit_mid_run = (
-            signal_confirmed
-            and 1 <= transferred_before_sigint < batch_count
-            and proc_b.returncode != 0
-            and pb_status_after["readiness"] == "RecoveryRequired"
+        pb_hit_mid_run = is_mid_transfer_interruption_verified(
+            signal_confirmed=signal_confirmed,
+            count_before_signal=transferred_before_sigint,
+            count_after_signal=transferred_after_sigint,
+            count_after_exit=transferred_after_exit,
+            batch_count=batch_count,
+            cli_returncode=proc_b.returncode,
+            readiness=pb_status_after["readiness"],
+            run_log_or_outcome_shows_interrupt=log_or_outcome_interrupt,
         )
 
         # Verify sync-cli refuses automatic re-run while mapping is held in RecoveryRequired.
@@ -929,11 +1010,11 @@ def run_interruption_scenarios(
         )
         notes.append(
             f"Phase B (mid-transfer SIGINT + recovery cycle): signal_confirmed={signal_confirmed}, "
-            f"pid={signaled_pid}, progress_before_sigint={transferred_before_sigint}/{batch_count}, "
+            f"pid={signaled_pid}, progress={transferred_before_sigint}->{transferred_after_sigint}->{transferred_after_exit}/{batch_count}, "
             f"rc={proc_b.returncode}, readiness={pb_status_after['readiness']}, "
-            f"hold_enforced={pb_hold_enforced}, workdir_preserved={pb_workdir_preserved}, "
-            f"followup_recovery_cycles_ok={followup_ok}, all_{len(pb_truth_labels)}_truth_hashes_converged={all_pb_converged}, "
-            f"recorded_runs={len(pb_runs)}"
+            f"interrupt_evidence={interrupt_evidence}, hold_enforced={pb_hold_enforced}, "
+            f"workdir_preserved={pb_workdir_preserved}, followup_recovery_cycles_ok={followup_ok}, "
+            f"all_{len(pb_truth_labels)}_truth_hashes_converged={all_pb_converged}, recorded_runs={len(pb_runs)}"
         )
 
         # --- Phase C: Abrupt SIGKILL crash + startup reconciliation ---
@@ -1044,18 +1125,20 @@ def run_interruption_scenarios(
                 }
             )
 
-        if not (signal_confirmed and 1 <= transferred_before_sigint < batch_count):
+        if not pb_hit_mid_run:
             scenario_status = "NOT VERIFIED"
             passed = False
             conclusion = (
-                "NOT VERIFIED: did not observe partial transfer progress + confirmed SIGINT delivery to rclone bisync before completion."
+                "NOT VERIFIED: did not prove SIGINT landed mid-transfer "
+                f"(before={transferred_before_sigint}, after_signal={transferred_after_sigint}, "
+                f"after_exit={transferred_after_exit}/{batch_count}, log_or_outcome_interrupt={log_or_outcome_interrupt})."
             )
         elif phase_a_ok and phase_b_verified and phase_c_ok and acct_ok:
             scenario_status = "PASS"
             passed = True
             conclusion = (
-                f"supported (observed mid-transfer SIGINT at {transferred_before_sigint}/{batch_count} files, "
-                f"latched RecoveryRequired, and converged all {len(pb_truth_labels)}/{len(pb_truth_labels)} truth-set hashes across follow-up cycles)"
+                f"supported (confirmed mid-transfer SIGINT at {transferred_before_sigint}->{transferred_after_sigint}->{transferred_after_exit}/{batch_count} files "
+                f"with interrupted run log/outcome, latched RecoveryRequired, and converged all {len(pb_truth_labels)}/{len(pb_truth_labels)} truth-set hashes across follow-up cycles)"
             )
         else:
             scenario_status = "FAIL"
@@ -1064,10 +1147,10 @@ def run_interruption_scenarios(
 
         return ScenarioEvidence(
             name="interruption_at_phases",
-            description="Inject faults across phases: pre-listing missing RCLONE_TEST, observed mid-transfer SIGINT + follow-up recovery cycles over 500 truth-set files, and abrupt crash + startup reconciliation.",
+            description="Inject faults across phases: pre-listing missing RCLONE_TEST, verified mid-transfer SIGINT + follow-up recovery cycles over 500 truth-set files, and abrupt crash + startup reconciliation.",
             started_at=start,
             finished_at=utc_now(),
-            injected_failure=f"missing RCLONE_TEST before listing; confirmed SIGINT at {transferred_before_sigint}/{batch_count} files; unfinished running row on restart",
+            injected_failure=f"missing RCLONE_TEST before listing; confirmed mid-transfer SIGINT ({transferred_before_sigint}->{transferred_after_sigint}->{transferred_after_exit}/{batch_count}); unfinished running row on restart",
             passed=passed,
             status=scenario_status,
             conclusion=conclusion,
@@ -1076,7 +1159,10 @@ def run_interruption_scenarios(
                 "phase_a_ok": phase_a_ok,
                 "phase_b_signal_confirmed": signal_confirmed,
                 "phase_b_transferred_before_sigint": transferred_before_sigint,
+                "phase_b_transferred_after_sigint": transferred_after_sigint,
+                "phase_b_transferred_after_exit": transferred_after_exit,
                 "phase_b_batch_count": batch_count,
+                "phase_b_log_or_outcome_interrupt": log_or_outcome_interrupt,
                 "phase_b_hold_enforced": pb_hold_enforced,
                 "phase_b_followup_ok": followup_ok,
                 "phase_b_all_truth_converged": all_pb_converged,

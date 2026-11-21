@@ -236,25 +236,119 @@ class QualificationHarnessTests(unittest.TestCase):
                     text=True,
                 )
                 self.assertNotEqual(p_sym_ext.returncode, 0, "finder build.sh must refuse symlinked --out inside target/")
+
+                # Trailing-newline --out must be rejected up front so command substitution
+                # cannot strip the newline and turn a non-existent path into the symlink.
+                for script in (build_script, ext_script):
+                    p_nl = subprocess.run(
+                        ["bash", str(script), "--out", str(sym) + "\n"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(p_nl.returncode, 0, f"{script.name} must reject trailing-newline --out")
+                    self.assertTrue((sentinel / "keep.txt").is_file(), "trailing-newline --out must never touch symlink target")
+
+                # Pre-existing symlink at fixed entitlements leaf inside a valid --out must not be followed.
+                valid_out = target_dir / f"test-leaf-guard-{os.getpid()}"
+                valid_out.mkdir(exist_ok=True)
+                victim = outside / "victim.plist"
+                victim.write_text("UNTOUCHED", encoding="utf-8")
+                ent_link = valid_out / "FinderExtension.effective.entitlements"
+                if ent_link.is_symlink() or ent_link.exists():
+                    ent_link.unlink()
+                ent_link.symlink_to(victim)
+                try:
+                    subprocess.run(
+                        ["bash", str(ext_script), "--out", str(valid_out), "--no-sign"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(
+                        victim.read_text(encoding="utf-8"),
+                        "UNTOUCHED",
+                        "finder build.sh must never overwrite a symlinked fixed entitlements file inside --out",
+                    )
+                finally:
+                    import shutil
+                    shutil.rmtree(valid_out, ignore_errors=True)
             finally:
                 if sym.is_symlink():
                     sym.unlink()
 
     def test_redacts_credential_helper_stderr_and_blocks_pass_on_not_run(self) -> None:
-        raw_json = '{"level":"error","msg":"--password-command stderr: TOP_SECRET_PASSPHRASE","source":"config/crypt.go:199"}'
-        raw_plain = "2026/11/20 19:00:00 ERROR : --password-command stderr: ANOTHER_SECRET_123\nsecond secret line"
+        raw_json = '{"level":"error","msg":"--password-command stderr: TOP_SECRET_PASSPHRASE\\nLINE2_SECRET","source":"config/crypt.go:199"}'
+        raw_plain = "\n".join([
+            "2026/11/20 19:00:00 ERROR : --password-command stderr: ANOTHER_SECRET_123",
+            "second secret line",
+            "",
+            "SECRET_AFTER_BLANK_LINE",
+            "{",
+            "SECRET_AFTER_OPEN_BRACE",
+            '{"not_rclone":"SECRET_IN_UNSTRUCTURED_JSON"}',
+            "2026/11/20 19:00:00 SECRET_AFTER_BARE_TIMESTAMP",
+            "2026/11/20 19:00:01 INFO  : Safe post-error rclone log line",
+            '{"level":"info","msg":"Safe structured rclone line"}',
+        ])
         benign = "2026/11/20 19:00:00 INFO : Copied notes/--password-command stderr: draft.txt"
 
         red_json = common.redact_credential_stderr(raw_json)
         self.assertNotIn("TOP_SECRET_PASSPHRASE", red_json)
+        self.assertNotIn("LINE2_SECRET", red_json)
         self.assertIn("[REDACTED]", red_json)
 
         red_plain = common.redact_credential_stderr(raw_plain)
-        self.assertNotIn("ANOTHER_SECRET_123", red_plain)
-        self.assertNotIn("second secret line", red_plain)
+        for leaked in (
+            "ANOTHER_SECRET_123",
+            "second secret line",
+            "SECRET_AFTER_BLANK_LINE",
+            "SECRET_AFTER_OPEN_BRACE",
+            "SECRET_IN_UNSTRUCTURED_JSON",
+            "SECRET_AFTER_BARE_TIMESTAMP",
+        ):
+            self.assertNotIn(leaked, red_plain, f"secret continuation leaked: {leaked}")
         self.assertIn("[REDACTED]", red_plain)
+        self.assertIn("Safe post-error rclone log line", red_plain)
+        self.assertIn("Safe structured rclone line", red_plain)
 
         self.assertEqual(common.redact_credential_stderr(benign), benign)
+
+        # Verify Drive run_rclone passes --use-json-log and redacts multiline stderr in both records and exceptions.
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            fake_proc = subprocess.CompletedProcess(
+                args=["rclone"],
+                returncode=1,
+                stdout="",
+                stderr=raw_plain,
+            )
+            with mock.patch("subprocess.run", return_value=fake_proc) as mocked_run:
+                rec = run_drive_qualification.run_rclone(
+                    Path("/bin/true"),
+                    Path(tmp) / "cfg",
+                    fake_home,
+                    ["about", "qual:"],
+                    password_command="/bin/helper",
+                    check=False,
+                )
+                called_cmd = mocked_run.call_args[0][0]
+                self.assertIn("--use-json-log", called_cmd)
+                self.assertNotIn("SECRET_AFTER_BLANK_LINE", rec["stderr"])
+                self.assertNotIn("SECRET_AFTER_BARE_TIMESTAMP", rec["stderr"])
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_drive_qualification.run_rclone(
+                        Path("/bin/true"),
+                        Path(tmp) / "cfg",
+                        fake_home,
+                        ["about", "qual:"],
+                        password_command="/bin/helper",
+                        check=True,
+                    )
+                self.assertNotIn("SECRET_AFTER_BLANK_LINE", str(ctx.exception))
+                self.assertNotIn("SECRET_AFTER_OPEN_BRACE", str(ctx.exception))
+                self.assertNotIn("SECRET_AFTER_BARE_TIMESTAMP", str(ctx.exception))
 
         # Overall evidence status must NEVER be PASS when any scenario is NOT RUN or NOT VERIFIED.
         with tempfile.TemporaryDirectory() as tmp:
@@ -298,7 +392,7 @@ class QualificationHarnessTests(unittest.TestCase):
     def test_drive_harness_refuses_non_empty_or_symlinked_state_dir(self) -> None:
         script = Path(__file__).resolve().parent / "run_drive_qualification.py"
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             cfg = root / "disposable.conf"
             cfg.write_text("", encoding="utf-8")
 
@@ -344,6 +438,80 @@ class QualificationHarnessTests(unittest.TestCase):
             )
             self.assertNotEqual(p_sym.returncode, 0)
             self.assertIn("symlink", p_sym.stderr.lower())
+
+            # Symlinked ancestor two levels up (`fixture-parent/link/fresh`) must also be refused.
+            outside_target = root / "outside-target"
+            outside_target.mkdir()
+            nested_parent = root / "fixture-parent"
+            nested_parent.mkdir()
+            ancestor_link = nested_parent / "link"
+            ancestor_link.symlink_to(outside_target)
+            redirected_fresh = ancestor_link / "fresh"
+            p_anc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--remote",
+                    "qualdrive",
+                    "--state-dir",
+                    str(redirected_fresh),
+                    "--rclone-config",
+                    str(cfg),
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(p_anc.returncode, 0)
+            self.assertIn("symlink", p_anc.stderr.lower())
+            self.assertFalse((outside_target / "fresh").exists())
+
+            with self.assertRaises(ValueError):
+                run_drive_qualification.open_exclusive_state_dir_fd(redirected_fresh)
+            self.assertFalse((outside_target / "fresh").exists())
+
+    def test_interruption_mid_transfer_predicate_requires_post_signal_and_log_evidence(self) -> None:
+        import run_local_qualification as rlq
+
+        # Signal sent after destination already reached total (500/500) must NOT verify.
+        self.assertFalse(
+            rlq.is_mid_transfer_interruption_verified(
+                signal_confirmed=True,
+                count_before_signal=4,
+                count_after_signal=500,
+                count_after_exit=500,
+                batch_count=500,
+                cli_returncode=1,
+                readiness="RecoveryRequired",
+                run_log_or_outcome_shows_interrupt=True,
+            )
+        )
+        # Missing run-log/outcome interrupt evidence must NOT verify.
+        self.assertFalse(
+            rlq.is_mid_transfer_interruption_verified(
+                signal_confirmed=True,
+                count_before_signal=4,
+                count_after_signal=12,
+                count_after_exit=20,
+                batch_count=500,
+                cli_returncode=1,
+                readiness="RecoveryRequired",
+                run_log_or_outcome_shows_interrupt=False,
+            )
+        )
+        # Confirmed partial count before, after signal, after exit + interrupted run evidence verifies.
+        self.assertTrue(
+            rlq.is_mid_transfer_interruption_verified(
+                signal_confirmed=True,
+                count_before_signal=4,
+                count_after_signal=12,
+                count_after_exit=20,
+                batch_count=500,
+                cli_returncode=1,
+                readiness="RecoveryRequired",
+                run_log_or_outcome_shows_interrupt=True,
+            )
+        )
 
 
 if __name__ == "__main__":

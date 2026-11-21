@@ -76,11 +76,76 @@ PENDING_SYNC_CLI_SCENARIOS: list[tuple[str, str]] = [
 ]
 
 
+def _normalize_os_root_alias(abs_path: str) -> str:
+    """Normalizes only macOS root OS aliases (/var -> /private/var, /tmp -> /private/tmp)."""
+    for alias, target in (("/var", "/private/var"), ("/tmp", "/private/tmp")):
+        if abs_path == alias or abs_path.startswith(alias + "/"):
+            try:
+                link_dest = os.readlink(alias)
+            except OSError:
+                continue
+            if link_dest in (target.lstrip("/"), target):
+                return target + abs_path[len(alias) :]
+    return abs_path
+
+
+def _open_parent_fd_no_symlinks_from_root(abs_path: str) -> tuple[int, str, str]:
+    """Opens every ancestor component from `/` with `O_DIRECTORY | O_NOFOLLOW`.
+
+    Returns `(parent_fd, leaf_name, normalized_path)`. Refuses any symlinked
+    ancestor component anywhere from `/` down.
+    """
+    normalized = _normalize_os_root_alias(abs_path)
+    parts = [p for p in normalized.split("/") if p]
+    if not parts:
+        raise ValueError(f"Refused filesystem root as --state-dir `{abs_path}`.")
+    for p in parts:
+        if p in (".", ".."):
+            raise ValueError(f"Refused traversal component `{p}` in --state-dir `{abs_path}`.")
+
+    cur_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for comp in parts[:-1]:
+            try:
+                next_fd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+            except OSError as exc:
+                import errno as errnos
+
+                if exc.errno in (errnos.ELOOP, errnos.ENOTDIR):
+                    try:
+                        if stat.S_ISLNK(os.lstat(comp, dir_fd=cur_fd).st_mode):
+                            raise ValueError(
+                                f"Refused symlinked ancestor `{comp}` in --state-dir `{abs_path}`."
+                            ) from exc
+                    except OSError:
+                        pass
+                    if exc.errno == errnos.ELOOP:
+                        raise ValueError(
+                            f"Refused symlinked ancestor `{comp}` in --state-dir `{abs_path}`."
+                        ) from exc
+                    raise ValueError(
+                        f"Non-directory ancestor `{comp}` in --state-dir `{abs_path}`."
+                    ) from exc
+                if exc.errno == errnos.ENOENT:
+                    raise ValueError(
+                        f"Missing ancestor directory `{comp}` for --state-dir `{abs_path}`."
+                    ) from exc
+                raise ValueError(
+                    f"Cannot validate ancestor `{comp}` in --state-dir `{abs_path}`: {exc}"
+                ) from exc
+            os.close(cur_fd)
+            cur_fd = next_fd
+    except Exception:
+        os.close(cur_fd)
+        raise
+    return cur_fd, parts[-1], "/" + "/".join(parts)
+
+
 def validate_fresh_non_symlink_state_dir(raw_state_dir: str) -> Path:
-    """Requires a fresh, empty, non-symlinked --state-dir (never real app state dir)."""
+    """Requires a fresh, empty, non-symlinked --state-dir validated from `/` via O_NOFOLLOW."""
     expanded = os.path.expanduser(raw_state_dir)
-    if not expanded or "\x00" in expanded:
-        raise ValueError("Invalid --state-dir path.")
+    if not expanded or any(ord(c) < 32 or ord(c) == 127 for c in expanded):
+        raise ValueError("Invalid --state-dir path (empty or contains control characters).")
 
     path = Path(expanded)
     if is_forbidden_real_state_dir(path):
@@ -89,37 +154,52 @@ def validate_fresh_non_symlink_state_dir(raw_state_dir: str) -> Path:
         )
 
     abs_str = os.path.abspath(expanded)
-    if os.path.lexists(abs_str):
-        st = os.lstat(abs_str)
+    parent_fd, leaf, normalized = _open_parent_fd_no_symlinks_from_root(abs_str)
+    try:
+        try:
+            st = os.lstat(leaf, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return Path(normalized)
         if stat.S_ISLNK(st.st_mode):
             raise ValueError(f"Refused symlinked --state-dir `{path}`.")
         if not stat.S_ISDIR(st.st_mode):
             raise ValueError(f"Refused non-directory --state-dir `{path}`.")
-        if os.listdir(abs_str):
-            raise ValueError(
-                f"Refused non-empty --state-dir `{path}`: pass a fresh, empty directory for qualification."
-            )
-    else:
-        # Walk up to existing parent and refuse any symlinked immediate parent inside user dirs.
-        parent = os.path.dirname(abs_str)
-        if not parent or not os.path.isdir(parent):
-            raise ValueError(f"Parent directory does not exist for --state-dir `{path}`.")
-        if os.path.islink(parent):
-            raise ValueError(f"Refused symlinked parent for --state-dir `{path}`.")
+        leaf_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            if os.listdir(leaf_fd):
+                raise ValueError(
+                    f"Refused non-empty --state-dir `{path}`: pass a fresh, empty directory for qualification."
+                )
+        finally:
+            os.close(leaf_fd)
+    finally:
+        os.close(parent_fd)
 
-    return Path(abs_str)
+    return Path(normalized)
 
 
 def open_exclusive_state_dir_fd(state_dir: Path) -> int:
-    """Creates (if absent) and opens a verified fresh, empty, non-symlinked state dir fd."""
-    if not os.path.lexists(state_dir):
-        os.mkdir(state_dir, 0o700)
-    st = os.lstat(state_dir)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise ValueError(f"Refused symlinked or non-directory --state-dir `{state_dir}`.")
-    os.chmod(state_dir, 0o700)
-    fd = os.open(str(state_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    """Validates every ancestor from `/` with O_NOFOLLOW, creates/opens leaf via dir_fd,
+    applies `fchmod(0o700)` on the checked fd, and verifies the directory is empty."""
+    abs_str = os.path.abspath(os.path.expanduser(str(state_dir)))
+    parent_fd, leaf, _ = _open_parent_fd_no_symlinks_from_root(abs_str)
     try:
+        try:
+            os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError as exc:
+            raise ValueError(f"Refused symlinked or non-directory --state-dir `{state_dir}`: {exc}") from exc
+    finally:
+        os.close(parent_fd)
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValueError(f"Refused non-directory --state-dir `{state_dir}`.")
+        os.fchmod(fd, 0o700)
         if os.listdir(fd):
             raise ValueError(f"Refused non-empty --state-dir `{state_dir}`.")
     except Exception:
@@ -182,6 +262,7 @@ def run_rclone(
     cmd = [
         str(rclone_bin),
         *rclone_args,
+        "--use-json-log",
         "--config",
         str(rclone_cfg),
         "--ask-password=false",
@@ -305,7 +386,13 @@ def main() -> int:
         os.mkdir("isolated-home", 0o700, dir_fd=state_fd)
         home_fd = os.open("isolated-home", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
         try:
+            os.fchmod(home_fd, 0o700)
             os.mkdir("tmp", 0o700, dir_fd=home_fd)
+            tmp_fd = os.open("tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
+            try:
+                os.fchmod(tmp_fd, 0o700)
+            finally:
+                os.close(tmp_fd)
         finally:
             os.close(home_fd)
     finally:
