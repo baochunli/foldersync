@@ -1,12 +1,14 @@
 //! High-level account management service coordinating app-owned encrypted
-//! `accounts/<id>/rclone.conf` files, OS secret storage, per-account config
-//! mutation locks, Drive OAuth flows, explicit single-remote import, and
-//! `lsjson --dirs-only` folder-identity resolution (§7, §8, §19).
+//! `accounts/<id>/rclone.conf` files, per-state scoped OS secret storage
+//! (`<install-id>/<account-id>`), per-account config mutation locks, Drive
+//! OAuth flows, explicit single-remote import, and `lsjson --dirs-only`
+//! folder-identity resolution (§7, §8, §19).
 //!
 //! Designed as a small, self-contained API that both `sync-cli` and the
 //! `SyncManager` / UI wiring layer (`connect-t4`) can call cleanly.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,15 +17,17 @@ use rclone_adapter::{
     AccountConfigLock, AuthUrlCallback, ConfigError, DriveAuthError, DriveAuthRequest,
     DriveRemoteConfigSpec, DuplicateDirFinding, EngineIdentity, ImportRemoteSpec, LsJsonEntry,
     LsJsonError, LsJsonRequest, PasswordCommand, ProcessRunner, RealProcessRunner,
-    ResolvedRemotePath, create_drive_remote_config, find_duplicate_dir_names,
-    import_single_remote_into_encrypted_config, list_dirs_with_runner, pinned_binary_path,
-    qualify_binary, resolve_folder_path_with_runner, run_drive_auth, verify_encrypted_config,
+    ResolvedRemotePath, cleanup_account_temp_and_backup_files, create_drive_remote_config_locked,
+    find_duplicate_dir_names, import_single_remote_into_encrypted_config_locked,
+    is_global_default_rclone_config, list_dirs_with_runner, pinned_binary_path, qualify_binary,
+    resolve_folder_path_with_runner, run_drive_auth_locked, verify_encrypted_config,
     verify_expected_folder_identity_with_runner,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use sync_core::{AccountId, CloudCollection};
+use sync_core::{AccountId, CloudCollection, DeviceId};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{
     clock::{Clock, SystemClock},
@@ -32,13 +36,28 @@ use crate::{
         StateLock, ensure_private_dir_under, reject_symlinks_under_root, resolve_state_dir,
         validate_safe_path_id,
     },
-    secrets::{SecretStore, SecretStoreError, SecretString, SystemSecretStore},
-    store::{AccountRecord, SqliteStateStore},
+    secrets::{
+        SecretStore, SecretStoreError, SecretString, SystemSecretStore, scoped_credential_key,
+    },
+    store::{AccountRecord, DeviceRecord, SqliteStateStore},
 };
 
-/// Factory producing the non-secret `--password-command` argv for a given account.
+/// Reserved account identifier used exclusively by local-to-local CLI fixtures.
+/// `add_drive_account` and `import_account` refuse this ID so fixture commands
+/// cannot collide with or overwrite real accounts.
+pub const RESERVED_LOCAL_FIXTURE_ACCOUNT_ID: &str = "local-fixture";
+
+/// Factory producing the non-secret `--password-command` argv for a given
+/// scoped credential key (`<install-id>/<account-id>`).
 pub type PasswordCommandFactory =
-    Arc<dyn Fn(&AccountId) -> Result<PasswordCommand, AccountError> + Send + Sync>;
+    Arc<dyn Fn(&str) -> Result<PasswordCommand, AccountError> + Send + Sync>;
+
+fn format_matching_ids(ids: &[Option<String>]) -> String {
+    ids.iter()
+        .map(|id| id.as_deref().unwrap_or("(no ID)"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Errors returned by [`AccountService`], carrying actionable `cause()` and `next_step()`.
 #[derive(Debug, Error)]
@@ -58,8 +77,9 @@ pub enum AccountError {
     )]
     EncryptedSourceUnsupported { path: PathBuf },
     #[error(
-        "Ambiguous duplicate cloud folder `{component}` at `{path}` ({} matching folders).",
-        matching_ids.len()
+        "Ambiguous duplicate cloud folder `{component}` at `{path}` ({} matching folders; IDs: {}).",
+        matching_ids.len(),
+        format_matching_ids(matching_ids)
     )]
     AmbiguousDuplicate {
         path: String,
@@ -140,7 +160,8 @@ impl AccountError {
                 "Verify the folder exists under the account's shared parent folder.".to_string()
             }
             Self::AlreadyExists { .. } => {
-                "Choose a different account ID or reconnect the existing account.".to_string()
+                "Choose a different account ID or run `sync-cli account reconnect` for the existing account."
+                    .to_string()
             }
             Self::NotFound { .. } => {
                 "Run `sync-cli account list --state-dir <dir>` to inspect configured accounts."
@@ -159,15 +180,18 @@ impl From<SecretStoreError> for AccountError {
                 next_step: "Unlock your macOS login Keychain and retry the account operation."
                     .to_string(),
             },
+            SecretStoreError::AlreadyExists { account_id } => Self::AlreadyExists {
+                account_id: AccountId::new(account_id),
+            },
             SecretStoreError::NotFound { account_id } => Self::AuthenticationRequired {
                 cause: format!(
-                    "No configuration passphrase was found in the credential store for account `{account_id}`."
+                    "No configuration passphrase was found in the credential store for `{account_id}`."
                 ),
                 next_step: "Reconnect the account to restore its credential store entry."
                     .to_string(),
             },
             SecretStoreError::InvalidAccountId(id) => Self::InvalidInput {
-                cause: format!("Invalid account identifier `{id}`."),
+                cause: format!("Invalid credential identifier `{id}`."),
                 next_step:
                     "Use an ASCII alphanumeric identifier containing only letters, digits, `-`, or `_`."
                         .to_string(),
@@ -209,8 +233,17 @@ impl From<DriveAuthError> for AccountError {
         match err {
             DriveAuthError::AuthenticationRequired { reason } => Self::AuthenticationRequired {
                 cause: format!("Google Drive authorization or credential store failed: {reason}."),
-                next_step: "Unlock your macOS Keychain and complete Google Drive authorization in your browser."
-                    .to_string(),
+                next_step:
+                    "Unlock your macOS Keychain and complete Google Drive authorization in your browser."
+                        .to_string(),
+            },
+            DriveAuthError::TokenNotSaved { remote } => Self::AuthenticationRequired {
+                cause: format!(
+                    "Google Drive authorization for remote `{remote}:` exited without saving an OAuth token in the encrypted configuration."
+                ),
+                next_step:
+                    "Run `sync-cli account reconnect --account <id> --state-dir <dir>` (or re-run `account add-drive`) to complete authorization."
+                        .to_string(),
             },
             DriveAuthError::Config(cfg) => Self::from(cfg),
             other => Self::Engine {
@@ -321,7 +354,7 @@ pub struct AddDriveAccountRequest {
     pub run_oauth_flow: bool,
 }
 
-/// Result returned by [`AccountService::add_drive_account`].
+/// Result returned by [`AccountService::add_drive_account`] or [`AccountService::reconnect_drive_account`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveAccountResult {
     pub account: AccountRecord,
@@ -336,9 +369,10 @@ pub struct ImportAccountRequest {
     pub source_config_path: PathBuf,
     pub source_remote_name: String,
     pub target_remote_name: String,
-    /// Optional shared parent folder ID (or local parent directory for local-backend fixtures).
+    /// Shared parent folder ID (required for Drive imports if not already set in
+    /// the source section; overrides source `root_folder_id` when supplied).
     pub root_folder_id: Option<String>,
-    /// Must be `true` to allow reading the user's global default rclone config.
+    /// Must be `true` to allow reading any default rclone config location.
     pub allow_global_default_source: bool,
 }
 
@@ -351,8 +385,9 @@ pub struct AccountCheckReport {
     pub duplicate_directories: Vec<DuplicateDirFinding>,
 }
 
-/// Account management service for encrypted rclone configs, credentials, Drive
-/// OAuth flows, explicit single-remote import, and folder-identity resolution.
+/// Account management service for encrypted rclone configs, per-state scoped
+/// credentials, Drive OAuth flows, explicit single-remote import, and
+/// folder-identity resolution.
 pub struct AccountService {
     state_dir: PathBuf,
     secret_store: Arc<dyn SecretStore>,
@@ -365,10 +400,12 @@ pub struct AccountService {
 }
 
 impl AccountService {
-    /// Opens an [`AccountService`] bound to `config.state_dir`.
+    /// Opens an [`AccountService`] bound to `config.state_dir` and cleans up
+    /// any leftover setup temp files or rclone plaintext backup files in
+    /// existing account directories under `state_dir/accounts/`.
     pub fn new(config: AccountServiceConfig) -> Result<Self, AccountError> {
         let state_dir = resolve_state_dir(Some(&config.state_dir))?;
-        Ok(Self {
+        let svc = Self {
             state_dir,
             secret_store: config.secret_store,
             process_runner: config.process_runner,
@@ -377,11 +414,14 @@ impl AccountService {
             credential_helper_binary: config.credential_helper_binary,
             password_command_factory: config.password_command_factory,
             acquire_state_lock: config.acquire_state_lock,
-        })
+        };
+        svc.cleanup_stale_account_artifacts();
+        Ok(svc)
     }
 
     /// Convenience constructor for callers (such as `SyncManager`) that already
-    /// hold the exclusive `StateLock` on `state_dir`.
+    /// hold the exclusive `StateLock` on `state_dir`. Per-account config locks
+    /// are still always acquired on every operation.
     pub fn for_locked_manager(mut config: AccountServiceConfig) -> Result<Self, AccountError> {
         config.acquire_state_lock = false;
         Self::new(config)
@@ -389,6 +429,34 @@ impl AccountService {
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Best-effort startup cleanup of any leftover setup temp files and rclone
+    /// plaintext backups across `<state_dir>/accounts/*`, acquiring each
+    /// account's `config.lock` and refusing symlinks.
+    pub fn cleanup_stale_account_artifacts(&self) {
+        let accounts_root = self.state_dir.join("accounts");
+        let Ok(meta) = fs::symlink_metadata(&accounts_root) else {
+            return;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&accounts_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let acct_dir = entry.path();
+            if let Ok(emeta) = fs::symlink_metadata(&acct_dir)
+                && !emeta.file_type().is_symlink()
+                && emeta.is_dir()
+            {
+                let lock_path = acct_dir.join("config.lock");
+                if let Ok(_lock) = AccountConfigLock::acquire(&lock_path) {
+                    let _ = cleanup_account_temp_and_backup_files(&acct_dir);
+                }
+            }
+        }
     }
 
     fn maybe_lock_state(&self) -> Result<Option<StateLock>, AccountError> {
@@ -404,26 +472,63 @@ impl AccountService {
         Ok(SqliteStateStore::open(&db_path)?)
     }
 
+    fn installation_id(&self, store: &SqliteStateStore) -> Result<String, AccountError> {
+        let default_device = DeviceRecord {
+            id: DeviceId::new(format!("device-{}", Uuid::new_v4())),
+            name: "foldersync-installation".to_string(),
+            created_at: self.now_rfc3339(),
+        };
+        let device = store.ensure_device(&default_device)?;
+        Ok(device.id.as_str().to_string())
+    }
+
+    fn credential_key_for(
+        &self,
+        store: &SqliteStateStore,
+        id: &AccountId,
+    ) -> Result<String, AccountError> {
+        let install_id = self.installation_id(store)?;
+        Ok(scoped_credential_key(&install_id, id.as_str())?)
+    }
+
     fn now_rfc3339(&self) -> String {
         self.clock.now_rfc3339()
     }
 
-    fn qualify_engine(&self) -> Result<EngineIdentity, AccountError> {
-        let path = match &self.rclone_binary_override {
-            Some(p) => p.clone(),
+    fn resolve_rclone_path(&self) -> Result<PathBuf, AccountError> {
+        match &self.rclone_binary_override {
+            Some(p) => Ok(p.clone()),
             None => pinned_binary_path().ok_or_else(|| AccountError::Engine {
                 cause: "Pinned rclone binary is not installed.".to_string(),
                 next_step:
                     "Run scripts/fetch-rclone.sh (or set FOLDERSYNC_RCLONE to the verified binary)."
                         .to_string(),
-            })?,
-        };
+            }),
+        }
+    }
+
+    fn qualify_engine(&self) -> Result<EngineIdentity, AccountError> {
+        let path = self.resolve_rclone_path()?;
         qualify_binary(&path).map_err(|err| AccountError::Engine {
             cause: err.to_string(),
             next_step:
                 "Verify the bundled rclone executable against packaging/qualification-manifest.toml."
                     .to_string(),
         })
+    }
+
+    fn reject_reserved_account_id(id: &AccountId) -> Result<(), AccountError> {
+        if id.as_str() == RESERVED_LOCAL_FIXTURE_ACCOUNT_ID {
+            return Err(AccountError::InvalidInput {
+                cause: format!(
+                    "Account ID `{RESERVED_LOCAL_FIXTURE_ACCOUNT_ID}` is reserved for local-to-local fixture mappings."
+                ),
+                next_step:
+                    "Choose a different account ID (for example, `household-a` or `imported-1`)."
+                        .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Returns the validated private directory `<state_dir>/accounts/<id>`,
@@ -468,11 +573,18 @@ impl AccountService {
         Ok(AccountConfigLock::acquire(&lock_path)?)
     }
 
-    /// Builds the validated non-secret `--password-command` (`sync-cli credential-helper --account <id>`).
+    /// Builds the validated non-secret `--password-command`
+    /// (`sync-cli credential-helper --account <install-id>/<account-id>`).
     pub fn password_command_for(&self, id: &AccountId) -> Result<PasswordCommand, AccountError> {
         validate_safe_path_id("account_id", id.as_str())?;
+        let store = self.open_store()?;
+        let cred_key = self.credential_key_for(&store, id)?;
+        self.password_command_for_key(&cred_key)
+    }
+
+    fn password_command_for_key(&self, cred_key: &str) -> Result<PasswordCommand, AccountError> {
         if let Some(factory) = &self.password_command_factory {
-            return factory(id);
+            return factory(cred_key);
         }
         let helper_bin = match &self.credential_helper_binary {
             Some(p) => p.clone(),
@@ -489,7 +601,7 @@ impl AccountService {
             vec![
                 "credential-helper".to_string(),
                 "--account".to_string(),
-                id.as_str().to_string(),
+                cred_key.to_string(),
             ],
         )
         .map_err(|err| AccountError::InvalidInput {
@@ -502,52 +614,22 @@ impl AccountService {
 
     /// Creates a new app-owned encrypted Google Drive account config (`0600`)
     /// rooted at `req.root_folder_id` with the user's own OAuth client credentials,
-    /// stores the config passphrase in [`SecretStore`], persists the account row
-    /// in SQLite, and optionally runs the pinned rclone browser OAuth flow.
+    /// stores the config passphrase in [`SecretStore`] under `<install-id>/<account-id>`
+    /// (create-only), persists the account row in SQLite, and optionally runs the
+    /// pinned rclone browser OAuth flow (verifying a saved token before marking `ready`).
+    ///
+    /// If a prior Drive registration for the same ID, remote name, and root folder ID
+    /// ended in a retryable non-ready state (`pending` or `authentication_required`),
+    /// re-running `add_drive_account` resumes OAuth against the existing encrypted config.
     pub fn add_drive_account(
         &self,
         req: AddDriveAccountRequest,
         on_auth_url: Option<AuthUrlCallback>,
     ) -> Result<DriveAccountResult, AccountError> {
         validate_safe_path_id("account_id", req.id.as_str())?;
-        let _state_lock = self.maybe_lock_state()?;
-        let store = self.open_store()?;
+        Self::reject_reserved_account_id(&req.id)?;
 
-        if store.get_account(&req.id)?.is_some() {
-            return Err(AccountError::AlreadyExists {
-                account_id: req.id.clone(),
-            });
-        }
-
-        let account_dir = self.account_dir(&req.id)?;
-        let config_path = self.account_config_path(&req.id)?;
-        let lock_path = self.account_lock_path(&req.id)?;
-
-        // Validate inputs BEFORE creating directories or touching SecretStore.
-        if req.client_id.trim().is_empty()
-            || req.client_secret.is_empty()
-            || req.root_folder_id.trim().is_empty()
-        {
-            return Err(AccountError::InvalidInput {
-                cause: "Google Drive account requires non-empty client_id, client_secret, and root_folder_id.".to_string(),
-                next_step: "Provide your OAuth client ID, client secret, and shared parent folder ID.".to_string(),
-            });
-        }
-
-        let engine = self.qualify_engine()?;
-        ensure_private_dir_under("account_dir", &self.state_dir, &account_dir)?;
-
-        // Store a fresh 256-bit passphrase in SecretStore BEFORE invoking rclone.
-        let passphrase = SecretString::generate_random_passphrase()?;
-        self.secret_store.set_secret(req.id.as_str(), &passphrase)?;
-        let pw_cmd = match self.password_command_for(&req.id) {
-            Ok(cmd) => cmd,
-            Err(err) => {
-                let _ = self.secret_store.delete_secret(req.id.as_str());
-                return Err(err);
-            }
-        };
-
+        // Validate inputs BEFORE creating directories or touching SQLite/SecretStore.
         let remote_name = if req.remote_name.trim().is_empty() {
             "household".to_string()
         } else {
@@ -558,23 +640,112 @@ impl AccountService {
         } else {
             req.scope.trim().to_string()
         };
+        let root_folder_id = req.root_folder_id.trim().to_string();
+        if req.client_id.trim().is_empty()
+            || req.client_secret.is_empty()
+            || root_folder_id.is_empty()
+        {
+            return Err(AccountError::InvalidInput {
+                cause: "Google Drive account requires non-empty client_id, client_secret, and root_folder_id.".to_string(),
+                next_step: "Provide your OAuth client ID, client secret, and shared parent folder ID.".to_string(),
+            });
+        }
+
+        let _state_lock = self.maybe_lock_state()?;
+        // Hold ONE per-account lock across existence checks, credential registration,
+        // config encryption/publication, DB persistence, and OAuth authorization.
+        let acct_lock = self.acquire_account_lock(&req.id)?;
+        let account_dir = self.account_dir(&req.id)?;
+        let config_path = self.account_config_path(&req.id)?;
+        let lock_path = self.account_lock_path(&req.id)?;
+
+        let store = self.open_store()?;
+        let cred_key = self.credential_key_for(&store, &req.id)?;
+
+        if let Some(mut existing) = store.get_account(&req.id)? {
+            let can_resume = existing.kind == "drive"
+                && existing.auth_status != "ready"
+                && existing.remote_name == remote_name
+                && existing.remote_root_folder_id == root_folder_id
+                && config_path.is_file()
+                && req.run_oauth_flow;
+            if !can_resume {
+                return Err(AccountError::AlreadyExists {
+                    account_id: req.id.clone(),
+                });
+            }
+
+            let engine = self.qualify_engine()?;
+            let pw_cmd = self.password_command_for_key(&cred_key)?;
+            let auth_req = DriveAuthRequest::new(
+                engine,
+                config_path,
+                lock_path,
+                existing.remote_name.clone(),
+                pw_cmd,
+            )?;
+            return match run_drive_auth_locked(
+                &auth_req,
+                &acct_lock,
+                self.process_runner.as_ref(),
+                on_auth_url,
+            ) {
+                Ok(outcome) => {
+                    existing.auth_status = "ready".to_string();
+                    existing.updated_at = self.now_rfc3339();
+                    store.upsert_account(&existing)?;
+                    Ok(DriveAccountResult {
+                        account: existing,
+                        auth_url: outcome.auth_url,
+                    })
+                }
+                Err(err) => {
+                    existing.auth_status = "authentication_required".to_string();
+                    existing.updated_at = self.now_rfc3339();
+                    store.upsert_account(&existing)?;
+                    Err(err.into())
+                }
+            };
+        }
+
+        let engine = self.qualify_engine()?;
+
+        // Create-only credential registration; track ownership so cleanup NEVER
+        // deletes a pre-existing credential owned by another account or state.
+        let passphrase = SecretString::generate_random_passphrase()?;
+        self.secret_store.create_secret(&cred_key, &passphrase)?;
+        let created_credential = true;
+
+        let pw_cmd = match self.password_command_for_key(&cred_key) {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                if created_credential {
+                    let _ = self.secret_store.delete_secret(&cred_key);
+                }
+                return Err(err);
+            }
+        };
+
         let drive_spec = DriveRemoteConfigSpec {
             remote_name: remote_name.clone(),
             client_id: req.client_id.clone(),
             client_secret: req.client_secret.expose().to_string(),
             scope,
-            root_folder_id: req.root_folder_id.trim().to_string(),
+            root_folder_id: root_folder_id.clone(),
         };
 
-        if let Err(err) = create_drive_remote_config(
+        if let Err(err) = create_drive_remote_config_locked(
             &engine,
             self.process_runner.as_ref(),
             &config_path,
-            &lock_path,
+            &acct_lock,
             &pw_cmd,
             &drive_spec,
         ) {
-            let _ = self.secret_store.delete_secret(req.id.as_str());
+            if created_credential {
+                let _ = self.secret_store.delete_secret(&cred_key);
+            }
+            let _ = cleanup_account_temp_and_backup_files(&account_dir);
             return Err(err.into());
         }
 
@@ -588,19 +759,30 @@ impl AccountService {
             },
             kind: "drive".to_string(),
             remote_name: remote_name.clone(),
-            remote_root_folder_id: req.root_folder_id.trim().to_string(),
+            remote_root_folder_id: root_folder_id,
             config_path: config_path.clone(),
             auth_status: "pending".to_string(),
             created_at: now.clone(),
             updated_at: now,
         };
-        store.upsert_account(&record)?;
+        if let Err(err) = store.upsert_account(&record) {
+            let _ = fs::remove_file(&config_path);
+            if created_credential {
+                let _ = self.secret_store.delete_secret(&cred_key);
+            }
+            return Err(err.into());
+        }
 
         let mut auth_url = None;
         if req.run_oauth_flow {
             let auth_req =
                 DriveAuthRequest::new(engine, config_path, lock_path, remote_name, pw_cmd)?;
-            match run_drive_auth(&auth_req, self.process_runner.as_ref(), on_auth_url) {
+            match run_drive_auth_locked(
+                &auth_req,
+                &acct_lock,
+                self.process_runner.as_ref(),
+                on_auth_url,
+            ) {
                 Ok(outcome) => {
                     auth_url = outcome.auth_url;
                     record.auth_status = "ready".to_string();
@@ -622,19 +804,89 @@ impl AccountService {
         })
     }
 
+    /// Resumes or refreshes Google Drive OAuth authorization for an existing
+    /// Drive account (for example, after an interrupted first attempt or token
+    /// expiry), verifying that a token was saved before marking `ready`.
+    pub fn reconnect_drive_account(
+        &self,
+        id: &AccountId,
+        on_auth_url: Option<AuthUrlCallback>,
+    ) -> Result<DriveAccountResult, AccountError> {
+        validate_safe_path_id("account_id", id.as_str())?;
+        let _state_lock = self.maybe_lock_state()?;
+        let acct_lock = self.acquire_account_lock(id)?;
+        let store = self.open_store()?;
+        let mut account = self.load_account_for_op(&store, id)?;
+
+        if account.kind != "drive" {
+            return Err(AccountError::InvalidInput {
+                cause: format!(
+                    "Account `{}` has kind `{}` and does not support Drive OAuth reconnect.",
+                    account.id, account.kind
+                ),
+                next_step: "Only Google Drive accounts use `account reconnect`.".to_string(),
+            });
+        }
+
+        let config_path =
+            reject_symlinks_under_root("account_config", &self.state_dir, &account.config_path)?;
+        let lock_path = self.account_lock_path(&account.id)?;
+        let cred_key = self.credential_key_for(&store, &account.id)?;
+
+        // Fail fast if credential store is locked.
+        if let Err(err) = self.secret_store.get_secret(&cred_key) {
+            let acct_err = AccountError::from(err);
+            if matches!(acct_err, AccountError::AuthenticationRequired { .. }) {
+                account.auth_status = "authentication_required".to_string();
+                account.updated_at = self.now_rfc3339();
+                store.upsert_account(&account)?;
+            }
+            return Err(acct_err);
+        }
+
+        let engine = self.qualify_engine()?;
+        let pw_cmd = self.password_command_for_key(&cred_key)?;
+        let auth_req = DriveAuthRequest::new(
+            engine,
+            config_path,
+            lock_path,
+            account.remote_name.clone(),
+            pw_cmd,
+        )?;
+        match run_drive_auth_locked(
+            &auth_req,
+            &acct_lock,
+            self.process_runner.as_ref(),
+            on_auth_url,
+        ) {
+            Ok(outcome) => {
+                account.auth_status = "ready".to_string();
+                account.updated_at = self.now_rfc3339();
+                store.upsert_account(&account)?;
+                Ok(DriveAccountResult {
+                    account,
+                    auth_url: outcome.auth_url,
+                })
+            }
+            Err(err) => {
+                account.auth_status = "authentication_required".to_string();
+                account.updated_at = self.now_rfc3339();
+                store.upsert_account(&account)?;
+                Err(err.into())
+            }
+        }
+    }
+
     /// Explicitly imports ONE named remote from a user-chosen rclone config into
     /// a newly encrypted app-owned `accounts/<id>/rclone.conf` without mutating
     /// the source file (§8).
+    ///
+    /// For Drive imports, binds `root_folder_id` to the requested shared-parent
+    /// ID, strips `shared_with_me`, and verifies the effective root by listing
+    /// it via `lsjson --dirs-only` before recording the account in SQLite.
     pub fn import_account(&self, req: ImportAccountRequest) -> Result<AccountRecord, AccountError> {
         validate_safe_path_id("account_id", req.id.as_str())?;
-        let _state_lock = self.maybe_lock_state()?;
-        let store = self.open_store()?;
-
-        if store.get_account(&req.id)?.is_some() {
-            return Err(AccountError::AlreadyExists {
-                account_id: req.id.clone(),
-            });
-        }
+        Self::reject_reserved_account_id(&req.id)?;
 
         let source_abs = if req.source_config_path.is_absolute() {
             req.source_config_path.clone()
@@ -647,25 +899,54 @@ impl AccountService {
                 .join(&req.source_config_path)
         };
 
-        // Refuse user's global default rclone config BEFORE touching directories, rclone, or SecretStore.
+        // Refuse default rclone configs (including rclone's executable dir) BEFORE
+        // creating directories, opening SQLite, or touching SecretStore.
+        let exe_dir = self
+            .rclone_binary_override
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                pinned_binary_path()
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            });
         if !req.allow_global_default_source
-            && rclone_adapter::is_global_default_rclone_config(&source_abs, None, None)
+            && is_global_default_rclone_config(&source_abs, None, None, exe_dir.as_deref())
         {
             return Err(AccountError::GlobalDefaultConfigRefused { path: source_abs });
         }
 
-        let engine = self.qualify_engine()?;
+        let _state_lock = self.maybe_lock_state()?;
+        // Hold ONE per-account lock across existence checks, credential registration,
+        // config encryption/publication, root verification, and DB insert.
+        let acct_lock = self.acquire_account_lock(&req.id)?;
         let account_dir = self.account_dir(&req.id)?;
-        ensure_private_dir_under("account_dir", &self.state_dir, &account_dir)?;
         let target_config_path = self.account_config_path(&req.id)?;
         let lock_path = self.account_lock_path(&req.id)?;
 
+        let store = self.open_store()?;
+        if store.get_account(&req.id)?.is_some() {
+            return Err(AccountError::AlreadyExists {
+                account_id: req.id.clone(),
+            });
+        }
+
+        let engine = self.qualify_engine()?;
+        let cred_key = self.credential_key_for(&store, &req.id)?;
+
+        // Create-only credential registration.
         let passphrase = SecretString::generate_random_passphrase()?;
-        self.secret_store.set_secret(req.id.as_str(), &passphrase)?;
-        let pw_cmd = match self.password_command_for(&req.id) {
+        self.secret_store.create_secret(&cred_key, &passphrase)?;
+        let created_credential = true;
+
+        let pw_cmd = match self.password_command_for_key(&cred_key) {
             Ok(cmd) => cmd,
             Err(err) => {
-                let _ = self.secret_store.delete_secret(req.id.as_str());
+                if created_credential {
+                    let _ = self.secret_store.delete_secret(&cred_key);
+                }
                 return Err(err);
             }
         };
@@ -676,7 +957,7 @@ impl AccountService {
             req.target_remote_name.trim().to_string()
         };
 
-        let imported = match import_single_remote_into_encrypted_config(
+        let imported = match import_single_remote_into_encrypted_config_locked(
             &engine,
             self.process_runner.as_ref(),
             &ImportRemoteSpec {
@@ -685,26 +966,43 @@ impl AccountService {
                 target_remote_name: target_remote,
                 target_config_path: target_config_path.clone(),
                 lock_path,
-                password_command: pw_cmd,
+                password_command: pw_cmd.clone(),
+                override_root_folder_id: req.root_folder_id.clone(),
                 allow_global_default_source: req.allow_global_default_source,
             },
+            &acct_lock,
         ) {
             Ok(info) => info,
             Err(err) => {
-                let _ = self.secret_store.delete_secret(req.id.as_str());
+                if created_credential {
+                    let _ = self.secret_store.delete_secret(&cred_key);
+                }
+                let _ = cleanup_account_temp_and_backup_files(&account_dir);
                 return Err(err.into());
             }
         };
 
-        let root_folder_id = req
-            .root_folder_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .or(imported.root_folder_id)
-            .unwrap_or_default();
+        // Finding 4: For Drive imports, verify the effective shared-parent root
+        // by listing it via `lsjson --dirs-only` BEFORE recording in SQLite.
+        if imported.remote_type.eq_ignore_ascii_case("drive") {
+            let ls_req = LsJsonRequest::new(
+                engine,
+                target_config_path.clone(),
+                imported.target_remote_name.clone(),
+                true,
+                Some(pw_cmd),
+            )?;
+            if let Err(err) = list_dirs_with_runner(&ls_req, "", self.process_runner.as_ref()) {
+                let _ = fs::remove_file(&target_config_path);
+                let _ = cleanup_account_temp_and_backup_files(&account_dir);
+                if created_credential {
+                    let _ = self.secret_store.delete_secret(&cred_key);
+                }
+                return Err(err.into());
+            }
+        }
 
+        let root_folder_id = imported.root_folder_id.unwrap_or_default();
         let now = self.now_rfc3339();
         let record = AccountRecord {
             id: req.id.clone(),
@@ -716,23 +1014,30 @@ impl AccountService {
             kind: imported.remote_type,
             remote_name: imported.target_remote_name,
             remote_root_folder_id: root_folder_id,
-            config_path: target_config_path,
+            config_path: target_config_path.clone(),
             auth_status: "ready".to_string(),
             created_at: now.clone(),
             updated_at: now,
         };
-        store.upsert_account(&record)?;
+        if let Err(err) = store.upsert_account(&record) {
+            let _ = fs::remove_file(&target_config_path);
+            if created_credential {
+                let _ = self.secret_store.delete_secret(&cred_key);
+            }
+            return Err(err.into());
+        }
         Ok(record)
     }
 
     /// Lists all persisted accounts ordered by creation time and ID.
     pub fn list_accounts(&self) -> Result<Vec<AccountRecord>, AccountError> {
         let _state_lock = self.maybe_lock_state()?;
-        // Ensure migrations and DB permissions are initialized first.
+        // Ensure symlink checks, migrations, and DB permissions are enforced first.
         let store = self.open_store()?;
         let db_path = store.path().to_path_buf();
         drop(store);
 
+        reject_symlinks_under_root("state_sqlite", &self.state_dir, &db_path)?;
         let conn = Connection::open(&db_path).map_err(|err| ManagerError::Storage {
             cause: format!("Failed to open SQLite DB `{}`: {err}.", db_path.display()),
             next_step: "Verify the FolderSync state directory is readable.".to_string(),
@@ -795,19 +1100,23 @@ impl AccountService {
     }
 
     /// Verifies the account's encrypted config and lists immediate child
-    /// directories of its shared parent folder via `rclone lsjson --dirs-only`.
+    /// directories of its shared parent folder via `rclone lsjson --dirs-only`
+    /// while holding the per-account config lock (so token refreshes serialize).
     pub fn check_account(&self, id: &AccountId) -> Result<AccountCheckReport, AccountError> {
+        validate_safe_path_id("account_id", id.as_str())?;
         let _state_lock = self.maybe_lock_state()?;
+        let _acct_lock = self.acquire_account_lock(id)?;
         let store = self.open_store()?;
         let mut account = self.load_account_for_op(&store, id)?;
 
         let config_path =
             reject_symlinks_under_root("account_config", &self.state_dir, &account.config_path)?;
+        let cred_key = self.credential_key_for(&store, &account.id)?;
 
         // Verify credential store is unlocked BEFORE building password-command
         // or qualifying rclone so a locked Keychain immediately records
         // `authentication_required` and fails without any hidden prompt.
-        if let Err(err) = self.secret_store.get_secret(account.id.as_str()) {
+        if let Err(err) = self.secret_store.get_secret(&cred_key) {
             let acct_err = AccountError::from(err);
             if matches!(acct_err, AccountError::AuthenticationRequired { .. }) {
                 account.auth_status = "authentication_required".to_string();
@@ -818,7 +1127,7 @@ impl AccountService {
         }
 
         let engine = self.qualify_engine()?;
-        let pw_cmd = self.password_command_for(&account.id)?;
+        let pw_cmd = self.password_command_for_key(&cred_key)?;
 
         if let Err(err) =
             verify_encrypted_config(&engine, self.process_runner.as_ref(), &config_path, &pw_cmd)
@@ -873,24 +1182,27 @@ impl AccountService {
     }
 
     /// Resolves every component of `relative_path` (e.g. `Data/Research`) under
-    /// the account's remote via `rclone lsjson --dirs-only`, rejecting ambiguous
-    /// duplicate folder names (§7).
+    /// the account's remote via `rclone lsjson --dirs-only` while holding the
+    /// per-account config lock, rejecting ambiguous duplicate folder names (§7).
     pub fn resolve_remote_path(
         &self,
         id: &AccountId,
         relative_path: &str,
     ) -> Result<ResolvedRemotePath, AccountError> {
+        validate_safe_path_id("account_id", id.as_str())?;
         let _state_lock = self.maybe_lock_state()?;
+        let _acct_lock = self.acquire_account_lock(id)?;
         let store = self.open_store()?;
         let account = self.load_account_for_op(&store, id)?;
         let config_path =
             reject_symlinks_under_root("account_config", &self.state_dir, &account.config_path)?;
+        let cred_key = self.credential_key_for(&store, &account.id)?;
 
         // Fast fail with AuthenticationRequired if credential store is locked.
-        self.secret_store.get_secret(account.id.as_str())?;
+        self.secret_store.get_secret(&cred_key)?;
 
         let engine = self.qualify_engine()?;
-        let pw_cmd = self.password_command_for(&account.id)?;
+        let pw_cmd = self.password_command_for_key(&cred_key)?;
 
         let is_drive = account.kind == "drive";
         let ls_req = LsJsonRequest::new(
@@ -968,22 +1280,27 @@ impl AccountService {
         )?)
     }
 
-    /// Pre-run cloud folder identity check (§7): resolves `collection.display_path`
-    /// via `lsjson --dirs-only`, rejects duplicates, and confirms that both
-    /// `collection.folder_id` and `collection.ancestor_ids` still match.
+    /// Pre-run cloud folder identity check (§7): acquires the per-account config
+    /// lock, resolves `collection.display_path` via `lsjson --dirs-only`,
+    /// rejects duplicates, and confirms that both `collection.folder_id` and
+    /// `collection.ancestor_ids` still match.
     pub fn verify_collection_identity(
         &self,
         id: &AccountId,
         collection: &CloudCollection,
     ) -> Result<ResolvedRemotePath, AccountError> {
+        validate_safe_path_id("account_id", id.as_str())?;
         let _state_lock = self.maybe_lock_state()?;
+        let _acct_lock = self.acquire_account_lock(id)?;
         let store = self.open_store()?;
         let account = self.load_account_for_op(&store, id)?;
         let config_path =
             reject_symlinks_under_root("account_config", &self.state_dir, &account.config_path)?;
+        let cred_key = self.credential_key_for(&store, &account.id)?;
+        self.secret_store.get_secret(&cred_key)?;
+
         let engine = self.qualify_engine()?;
-        let pw_cmd = self.password_command_for(&account.id)?;
-        self.secret_store.get_secret(account.id.as_str())?;
+        let pw_cmd = self.password_command_for_key(&cred_key)?;
 
         let ls_req = LsJsonRequest::new(
             engine,
@@ -1011,7 +1328,6 @@ impl AccountService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -1026,25 +1342,36 @@ mod tests {
     fn make_helper_factory(tmp: &Path, store: Arc<InMemorySecretStore>) -> PasswordCommandFactory {
         let helper_dir = tmp.join("test-helper");
         fs::create_dir_all(&helper_dir).unwrap();
-        Arc::new(move |account_id: &AccountId| {
-            let secret = store
-                .get_secret(account_id.as_str())
-                .map_err(AccountError::from)?;
-            let secret_file = helper_dir.join(format!("{}.secret", account_id.as_str()));
+        Arc::new(move |cred_key: &str| {
+            let secret = store.get_secret(cred_key).map_err(AccountError::from)?;
+            let safe_name = cred_key.replace('/', "__");
+            let secret_file = helper_dir.join(format!("{safe_name}.secret"));
             fs::write(&secret_file, secret.expose().as_bytes()).unwrap();
             fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
 
-            let script_path = helper_dir.join(format!("cred-helper-{}", account_id.as_str()));
+            let script_path = helper_dir.join(format!("cred-helper-{safe_name}"));
             let script = format!("#!/bin/sh\ncat \"{}\"\n", secret_file.display());
             fs::write(&script_path, script.as_bytes()).unwrap();
             fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
 
             Ok(PasswordCommand::new(
                 script_path,
-                vec!["--account".to_string(), account_id.as_str().to_string()],
+                vec!["--account".to_string(), cred_key.to_string()],
             )
             .unwrap())
         })
+    }
+
+    #[test]
+    fn duplicate_error_renders_matching_folder_ids() {
+        let err = AccountError::AmbiguousDuplicate {
+            path: "Data/Research".to_string(),
+            component: "Research".to_string(),
+            matching_ids: vec![Some("1ResA".to_string()), Some("1ResB".to_string())],
+        };
+        let rendered = err.cause();
+        assert!(rendered.contains("1ResA"), "got: {rendered}");
+        assert!(rendered.contains("1ResB"), "got: {rendered}");
     }
 
     #[test]
@@ -1087,7 +1414,7 @@ mod tests {
         assert_eq!(imported.id.as_str(), "local-1");
         assert_eq!(imported.kind, "local");
         assert_eq!(imported.remote_name, "household");
-        assert!(secret_store.contains("local-1"));
+        assert_eq!(secret_store.len(), 1);
         assert_eq!(fs::read(&source_cfg).unwrap(), source_bytes);
 
         let listed = svc.list_accounts().unwrap();
@@ -1125,10 +1452,6 @@ mod tests {
         };
         let tmp = TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
-        let secret_store = Arc::new(InMemorySecretStore::new());
-        secret_store
-            .set_secret("drive-1", &SecretString::new("passphrase-123"))
-            .unwrap();
 
         let acct_dir = state_dir.join("accounts/drive-1");
         fs::create_dir_all(&acct_dir).unwrap();
@@ -1142,6 +1465,13 @@ mod tests {
         fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let store = SqliteStateStore::open(&state_dir.join("state.sqlite")).unwrap();
+        let dev = store
+            .ensure_device(&DeviceRecord {
+                id: DeviceId::new("device-test-1"),
+                name: "test".to_string(),
+                created_at: "2026-11-20T00:00:00Z".to_string(),
+            })
+            .unwrap();
         store
             .upsert_account(&AccountRecord {
                 id: AccountId::new("drive-1"),
@@ -1156,6 +1486,12 @@ mod tests {
             })
             .unwrap();
         drop(store);
+
+        let secret_store = Arc::new(InMemorySecretStore::new());
+        let cred_key = scoped_credential_key(dev.id.as_str(), "drive-1").unwrap();
+        secret_store
+            .create_secret(&cred_key, &SecretString::new("passphrase-123"))
+            .unwrap();
 
         let runner = Arc::new(FakeProcessRunner::new());
         // Pass 1: matching IDs -> Ok
@@ -1197,10 +1533,10 @@ mod tests {
         cfg.secret_store = Arc::clone(&secret_store) as Arc<dyn SecretStore>;
         cfg.process_runner = Arc::clone(&runner) as Arc<dyn ProcessRunner>;
         cfg.rclone_binary_override = Some(rclone_path);
-        cfg.password_command_factory = Some(Arc::new(|id: &AccountId| {
+        cfg.password_command_factory = Some(Arc::new(|key: &str| {
             Ok(PasswordCommand::new(
                 "/usr/local/bin/foldersync-cred-helper",
-                vec!["--account".to_string(), id.as_str().to_string()],
+                vec!["--account".to_string(), key.to_string()],
             )
             .unwrap())
         }));

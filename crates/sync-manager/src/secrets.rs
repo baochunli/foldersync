@@ -94,9 +94,11 @@ fn fill_random_bytes(buf: &mut [u8]) -> Result<(), SecretStoreError> {
 /// Errors returned by [`SecretStore`] implementations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SecretStoreError {
-    #[error("invalid account identifier `{0}` for credential lookup")]
+    #[error("invalid credential key `{0}` for credential lookup")]
     InvalidAccountId(String),
-    #[error("no credential stored for account `{account_id}`")]
+    #[error("credential already exists for `{account_id}`")]
+    AlreadyExists { account_id: String },
+    #[error("no credential stored for `{account_id}`")]
     NotFound { account_id: String },
     #[error("authentication required: credential store is locked or unavailable ({reason})")]
     AuthenticationRequired { reason: String },
@@ -104,9 +106,36 @@ pub enum SecretStoreError {
     Backend { reason: String },
 }
 
-fn validate_secret_account_id(account_id: &str) -> Result<(), SecretStoreError> {
+/// Validates a Keychain credential key: either `<install-id>/<account-id>`
+/// (each component a single safe identifier `[A-Za-z0-9_-]`) or a single safe
+/// identifier. Rejects traversal (`..`), empty segments, or multiple slashes.
+pub fn validate_credential_key(key: &str) -> Result<(), SecretStoreError> {
+    let mut parts = key.split('/');
+    let Some(first) = parts.next() else {
+        return Err(SecretStoreError::InvalidAccountId(key.to_string()));
+    };
+    validate_safe_path_id("credential_key", first)
+        .map_err(|_| SecretStoreError::InvalidAccountId(key.to_string()))?;
+    if let Some(second) = parts.next() {
+        validate_safe_path_id("account_id", second)
+            .map_err(|_| SecretStoreError::InvalidAccountId(key.to_string()))?;
+        if parts.next().is_some() {
+            return Err(SecretStoreError::InvalidAccountId(key.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// Formats the per-state scoped Keychain credential key `<install-id>/<account-id>`.
+pub fn scoped_credential_key(
+    install_id: &str,
+    account_id: &str,
+) -> Result<String, SecretStoreError> {
+    validate_safe_path_id("install_id", install_id)
+        .map_err(|_| SecretStoreError::InvalidAccountId(install_id.to_string()))?;
     validate_safe_path_id("account_id", account_id)
-        .map_err(|_| SecretStoreError::InvalidAccountId(account_id.to_string()))
+        .map_err(|_| SecretStoreError::InvalidAccountId(account_id.to_string()))?;
+    Ok(format!("{install_id}/{account_id}"))
 }
 
 /// Injectable secret storage boundary for account rclone-config passphrases (§8).
@@ -114,9 +143,12 @@ fn validate_secret_account_id(account_id: &str) -> Result<(), SecretStoreError> 
 /// Production code uses [`SystemSecretStore`] (macOS Keychain generic password
 /// under service `dev.foldersync`); tests always inject [`InMemorySecretStore`].
 pub trait SecretStore: Send + Sync {
-    fn get_secret(&self, account_id: &str) -> Result<SecretString, SecretStoreError>;
-    fn set_secret(&self, account_id: &str, secret: &SecretString) -> Result<(), SecretStoreError>;
-    fn delete_secret(&self, account_id: &str) -> Result<(), SecretStoreError>;
+    fn get_secret(&self, key: &str) -> Result<SecretString, SecretStoreError>;
+    /// Create-only credential registration: fails with
+    /// [`SecretStoreError::AlreadyExists`] if an item for `key` already exists.
+    fn create_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError>;
+    fn set_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError>;
+    fn delete_secret(&self, key: &str) -> Result<(), SecretStoreError>;
 }
 
 /// Pure in-memory fake [`SecretStore`] for tests (never touches OS Keychain or disk).
@@ -149,8 +181,16 @@ impl InMemorySecretStore {
         self.state.lock().unwrap().unavailable = unavailable;
     }
 
-    pub fn contains(&self, account_id: &str) -> bool {
-        self.state.lock().unwrap().entries.contains_key(account_id)
+    pub fn contains(&self, key: &str) -> bool {
+        self.state.lock().unwrap().entries.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.lock().unwrap().entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.state.lock().unwrap().entries.is_empty()
     }
 
     fn check_available(state: &InMemoryStoreState) -> Result<(), SecretStoreError> {
@@ -169,21 +209,21 @@ impl InMemorySecretStore {
 }
 
 impl SecretStore for InMemorySecretStore {
-    fn get_secret(&self, account_id: &str) -> Result<SecretString, SecretStoreError> {
-        validate_secret_account_id(account_id)?;
+    fn get_secret(&self, key: &str) -> Result<SecretString, SecretStoreError> {
+        validate_credential_key(key)?;
         let state = self.state.lock().unwrap();
         Self::check_available(&state)?;
         state
             .entries
-            .get(account_id)
+            .get(key)
             .cloned()
             .ok_or_else(|| SecretStoreError::NotFound {
-                account_id: account_id.to_string(),
+                account_id: key.to_string(),
             })
     }
 
-    fn set_secret(&self, account_id: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
-        validate_secret_account_id(account_id)?;
+    fn create_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
+        validate_credential_key(key)?;
         if secret.is_empty() {
             return Err(SecretStoreError::Backend {
                 reason: "secret passphrase must not be empty".to_string(),
@@ -191,29 +231,47 @@ impl SecretStore for InMemorySecretStore {
         }
         let mut state = self.state.lock().unwrap();
         Self::check_available(&state)?;
-        state.entries.insert(account_id.to_string(), secret.clone());
+        if state.entries.contains_key(key) {
+            return Err(SecretStoreError::AlreadyExists {
+                account_id: key.to_string(),
+            });
+        }
+        state.entries.insert(key.to_string(), secret.clone());
         Ok(())
     }
 
-    fn delete_secret(&self, account_id: &str) -> Result<(), SecretStoreError> {
-        validate_secret_account_id(account_id)?;
+    fn set_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
+        validate_credential_key(key)?;
+        if secret.is_empty() {
+            return Err(SecretStoreError::Backend {
+                reason: "secret passphrase must not be empty".to_string(),
+            });
+        }
         let mut state = self.state.lock().unwrap();
         Self::check_available(&state)?;
-        state.entries.remove(account_id);
+        state.entries.insert(key.to_string(), secret.clone());
+        Ok(())
+    }
+
+    fn delete_secret(&self, key: &str) -> Result<(), SecretStoreError> {
+        validate_credential_key(key)?;
+        let mut state = self.state.lock().unwrap();
+        Self::check_available(&state)?;
+        state.entries.remove(key);
         Ok(())
     }
 }
 
-/// Executes the `sync-cli credential-helper --account <id>` operation against an
+/// Executes the `sync-cli credential-helper --account <key>` operation against an
 /// injected [`SecretStore`], writing ONLY the password bytes + newline to `out`.
 ///
 /// Never reads stdin and never emits secret material in errors.
 pub fn run_credential_helper(
     store: &dyn SecretStore,
-    account_id: &str,
+    key: &str,
     out: &mut dyn Write,
 ) -> Result<(), SecretStoreError> {
-    let secret = store.get_secret(account_id)?;
+    let secret = store.get_secret(key)?;
     out.write_all(secret.expose().as_bytes())
         .and_then(|()| out.write_all(b"\n"))
         .and_then(|()| out.flush())
@@ -223,7 +281,7 @@ pub fn run_credential_helper(
 }
 
 /// Real macOS Keychain backend (`Security.framework` generic password under
-/// service `dev.foldersync` and account `<account_id>`).
+/// service `dev.foldersync` and account `<install-id>/<account-id>`).
 ///
 /// Always sets `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail` so a
 /// locked Keychain fails immediately with [`SecretStoreError::AuthenticationRequired`]
@@ -239,7 +297,7 @@ mod macos_keychain {
 
     use super::{
         KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore, SecretStoreError, SecretString,
-        validate_secret_account_id,
+        validate_credential_key,
     };
 
     type CFAllocatorRef = *const c_void;
@@ -371,10 +429,13 @@ mod macos_keychain {
         OwnedCF::new(ptr)
     }
 
-    fn map_os_status(status: OSStatus, account_id: &str) -> SecretStoreError {
+    fn map_os_status(status: OSStatus, key: &str) -> SecretStoreError {
         match status {
+            ERR_SEC_DUPLICATE_ITEM => SecretStoreError::AlreadyExists {
+                account_id: key.to_string(),
+            },
             ERR_SEC_ITEM_NOT_FOUND => SecretStoreError::NotFound {
-                account_id: account_id.to_string(),
+                account_id: key.to_string(),
             },
             ERR_SEC_INTERACTION_NOT_ALLOWED => SecretStoreError::AuthenticationRequired {
                 reason: "macOS Keychain is locked or non-interactive access was denied (errSecInteractionNotAllowed)".to_string(),
@@ -398,10 +459,10 @@ mod macos_keychain {
     }
 
     impl SecretStore for KeychainSecretStore {
-        fn get_secret(&self, account_id: &str) -> Result<SecretString, SecretStoreError> {
-            validate_secret_account_id(account_id)?;
+        fn get_secret(&self, key: &str) -> Result<SecretString, SecretStoreError> {
+            validate_credential_key(key)?;
             let service_cf = cf_string(KEYCHAIN_SERVICE)?;
-            let account_cf = cf_string(account_id)?;
+            let account_cf = cf_string(key)?;
 
             let query = unsafe {
                 cf_dict(&[
@@ -417,7 +478,7 @@ mod macos_keychain {
             let mut result: CFTypeRef = ptr::null();
             let status = unsafe { SecItemCopyMatching(query.as_ptr(), &mut result) };
             if status != ERR_SEC_SUCCESS {
-                return Err(map_os_status(status, account_id));
+                return Err(map_os_status(status, key));
             }
             let data_cf = OwnedCF::new(result)?;
             let len = unsafe { CFDataGetLength(data_cf.as_ptr()) };
@@ -445,19 +506,15 @@ mod macos_keychain {
             Ok(SecretString::new(text))
         }
 
-        fn set_secret(
-            &self,
-            account_id: &str,
-            secret: &SecretString,
-        ) -> Result<(), SecretStoreError> {
-            validate_secret_account_id(account_id)?;
+        fn create_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
+            validate_credential_key(key)?;
             if secret.is_empty() {
                 return Err(SecretStoreError::Backend {
                     reason: "secret passphrase must not be empty".to_string(),
                 });
             }
             let service_cf = cf_string(KEYCHAIN_SERVICE)?;
-            let account_cf = cf_string(account_id)?;
+            let account_cf = cf_string(key)?;
             let value_cf = cf_data(secret.expose().as_bytes())?;
 
             let add_attrs = unsafe {
@@ -471,31 +528,43 @@ mod macos_keychain {
             };
             let status = unsafe { SecItemAdd(add_attrs.as_ptr(), ptr::null_mut()) };
             if status == ERR_SEC_SUCCESS {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(map_os_status(status, key))
             }
-            if status == ERR_SEC_DUPLICATE_ITEM {
-                let query = unsafe {
-                    cf_dict(&[
-                        (kSecClass, kSecClassGenericPassword),
-                        (kSecAttrService, service_cf.as_ptr()),
-                        (kSecAttrAccount, account_cf.as_ptr()),
-                        (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
-                    ])?
-                };
-                let update = unsafe { cf_dict(&[(kSecValueData, value_cf.as_ptr())])? };
-                let update_status = unsafe { SecItemUpdate(query.as_ptr(), update.as_ptr()) };
-                if update_status == ERR_SEC_SUCCESS {
-                    return Ok(());
-                }
-                return Err(map_os_status(update_status, account_id));
-            }
-            Err(map_os_status(status, account_id))
         }
 
-        fn delete_secret(&self, account_id: &str) -> Result<(), SecretStoreError> {
-            validate_secret_account_id(account_id)?;
+        fn set_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
+            match self.create_secret(key, secret) {
+                Ok(()) => Ok(()),
+                Err(SecretStoreError::AlreadyExists { .. }) => {
+                    let service_cf = cf_string(KEYCHAIN_SERVICE)?;
+                    let account_cf = cf_string(key)?;
+                    let value_cf = cf_data(secret.expose().as_bytes())?;
+                    let query = unsafe {
+                        cf_dict(&[
+                            (kSecClass, kSecClassGenericPassword),
+                            (kSecAttrService, service_cf.as_ptr()),
+                            (kSecAttrAccount, account_cf.as_ptr()),
+                            (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
+                        ])?
+                    };
+                    let update = unsafe { cf_dict(&[(kSecValueData, value_cf.as_ptr())])? };
+                    let update_status = unsafe { SecItemUpdate(query.as_ptr(), update.as_ptr()) };
+                    if update_status == ERR_SEC_SUCCESS {
+                        Ok(())
+                    } else {
+                        Err(map_os_status(update_status, key))
+                    }
+                }
+                Err(other) => Err(other),
+            }
+        }
+
+        fn delete_secret(&self, key: &str) -> Result<(), SecretStoreError> {
+            validate_credential_key(key)?;
             let service_cf = cf_string(KEYCHAIN_SERVICE)?;
-            let account_cf = cf_string(account_id)?;
+            let account_cf = cf_string(key)?;
 
             let query = unsafe {
                 cf_dict(&[
@@ -509,7 +578,7 @@ mod macos_keychain {
             if status == ERR_SEC_SUCCESS || status == ERR_SEC_ITEM_NOT_FOUND {
                 Ok(())
             } else {
-                Err(map_os_status(status, account_id))
+                Err(map_os_status(status, key))
             }
         }
     }
@@ -521,43 +590,58 @@ mod macos_keychain {
 pub struct SystemSecretStore;
 
 impl SecretStore for SystemSecretStore {
-    fn get_secret(&self, account_id: &str) -> Result<SecretString, SecretStoreError> {
+    fn get_secret(&self, key: &str) -> Result<SecretString, SecretStoreError> {
         #[cfg(target_os = "macos")]
         {
-            KeychainSecretStore.get_secret(account_id)
+            KeychainSecretStore.get_secret(key)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            validate_secret_account_id(account_id)?;
+            validate_credential_key(key)?;
             Err(SecretStoreError::AuthenticationRequired {
                 reason: "OS secret store backend is not qualified on this platform yet".to_string(),
             })
         }
     }
 
-    fn set_secret(&self, account_id: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
+    fn create_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
         #[cfg(target_os = "macos")]
         {
-            KeychainSecretStore.set_secret(account_id, secret)
+            KeychainSecretStore.create_secret(key, secret)
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = secret;
-            validate_secret_account_id(account_id)?;
+            validate_credential_key(key)?;
             Err(SecretStoreError::AuthenticationRequired {
                 reason: "OS secret store backend is not qualified on this platform yet".to_string(),
             })
         }
     }
 
-    fn delete_secret(&self, account_id: &str) -> Result<(), SecretStoreError> {
+    fn set_secret(&self, key: &str, secret: &SecretString) -> Result<(), SecretStoreError> {
         #[cfg(target_os = "macos")]
         {
-            KeychainSecretStore.delete_secret(account_id)
+            KeychainSecretStore.set_secret(key, secret)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            validate_secret_account_id(account_id)?;
+            let _ = secret;
+            validate_credential_key(key)?;
+            Err(SecretStoreError::AuthenticationRequired {
+                reason: "OS secret store backend is not qualified on this platform yet".to_string(),
+            })
+        }
+    }
+
+    fn delete_secret(&self, key: &str) -> Result<(), SecretStoreError> {
+        #[cfg(target_os = "macos")]
+        {
+            KeychainSecretStore.delete_secret(key)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            validate_credential_key(key)?;
             Err(SecretStoreError::AuthenticationRequired {
                 reason: "OS secret store backend is not qualified on this platform yet".to_string(),
             })
@@ -585,18 +669,24 @@ mod tests {
     #[test]
     fn credential_helper_reads_in_memory_fake_and_surfaces_authentication_required_when_locked() {
         let store = InMemorySecretStore::new();
+        let key = scoped_credential_key("device-abc", "acc-1").unwrap();
         store
-            .set_secret("acc-1", &SecretString::new("pw-alpha-999"))
+            .create_secret(&key, &SecretString::new("pw-alpha-999"))
             .unwrap();
+        // create_secret is strictly create-only.
+        assert!(matches!(
+            store.create_secret(&key, &SecretString::new("pw-overwrite")),
+            Err(SecretStoreError::AlreadyExists { .. })
+        ));
 
         let mut stdout = Vec::new();
-        run_credential_helper(&store, "acc-1", &mut stdout).unwrap();
+        run_credential_helper(&store, &key, &mut stdout).unwrap();
         assert_eq!(String::from_utf8(stdout).unwrap(), "pw-alpha-999\n");
 
         // Locked store -> AuthenticationRequired, never prints anything.
         store.set_locked(true);
         let mut locked_out = Vec::new();
-        let err = run_credential_helper(&store, "acc-1", &mut locked_out).unwrap_err();
+        let err = run_credential_helper(&store, &key, &mut locked_out).unwrap_err();
         assert!(matches!(
             err,
             SecretStoreError::AuthenticationRequired { .. }
@@ -607,18 +697,22 @@ mod tests {
         store.set_locked(false);
         store.set_unavailable(true);
         let mut unavail_out = Vec::new();
-        let err2 = run_credential_helper(&store, "acc-1", &mut unavail_out).unwrap_err();
+        let err2 = run_credential_helper(&store, &key, &mut unavail_out).unwrap_err();
         assert!(matches!(
             err2,
             SecretStoreError::AuthenticationRequired { .. }
         ));
         assert!(unavail_out.is_empty());
 
-        // Reject unsafe account IDs.
+        // Reject unsafe keys (traversal, extra slashes).
         store.set_unavailable(false);
         let mut bad_out = Vec::new();
         assert!(matches!(
             run_credential_helper(&store, "../escape", &mut bad_out),
+            Err(SecretStoreError::InvalidAccountId(_))
+        ));
+        assert!(matches!(
+            run_credential_helper(&store, "a/b/c", &mut bad_out),
             Err(SecretStoreError::InvalidAccountId(_))
         ));
     }
@@ -628,14 +722,19 @@ mod tests {
     #[ignore = "touches real macOS Keychain; run manually during owner qualification"]
     fn keychain_generic_password_roundtrip_manual_only() {
         let store = KeychainSecretStore;
-        let account = "foldersync-manual-qual-test";
+        let key = scoped_credential_key("manual-qual", "foldersync-test").unwrap();
         let secret = SecretString::new("manual-qual-passphrase");
-        store.set_secret(account, &secret).unwrap();
-        let got = store.get_secret(account).unwrap();
-        assert_eq!(got.expose(), secret.expose());
-        store.delete_secret(account).unwrap();
+        let _ = store.delete_secret(&key);
+        store.create_secret(&key, &secret).unwrap();
         assert!(matches!(
-            store.get_secret(account),
+            store.create_secret(&key, &secret),
+            Err(SecretStoreError::AlreadyExists { .. })
+        ));
+        let got = store.get_secret(&key).unwrap();
+        assert_eq!(got.expose(), secret.expose());
+        store.delete_secret(&key).unwrap();
+        assert!(matches!(
+            store.get_secret(&key),
             Err(SecretStoreError::NotFound { .. })
         ));
     }

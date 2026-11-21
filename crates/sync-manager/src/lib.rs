@@ -17,6 +17,7 @@ pub mod store;
 pub use accounts::{
     AccountCheckReport, AccountError, AccountService, AccountServiceConfig, AddDriveAccountRequest,
     DriveAccountResult, ImportAccountRequest, PasswordCommandFactory,
+    RESERVED_LOCAL_FIXTURE_ACCOUNT_ID,
 };
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::ManagerError;
@@ -41,7 +42,7 @@ pub use platform::{
 pub use secrets::KeychainSecretStore;
 pub use secrets::{
     InMemorySecretStore, KEYCHAIN_SERVICE, SecretStore, SecretStoreError, SecretString,
-    SystemSecretStore, run_credential_helper,
+    SystemSecretStore, run_credential_helper, scoped_credential_key, validate_credential_key,
 };
 pub use snapshot::{ManagerEvent, MappingCounters, MappingStatusSnapshot, StatusSnapshot};
 pub use store::{

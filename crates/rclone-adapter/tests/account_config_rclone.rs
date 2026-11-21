@@ -197,6 +197,7 @@ client_secret = super-secret-do-not-import
             target_config_path: target_config.clone(),
             lock_path,
             password_command: pw_cmd.clone(),
+            override_root_folder_id: None,
             allow_global_default_source: false,
         },
     )
@@ -259,7 +260,7 @@ client_secret = super-secret-do-not-import
 }
 
 #[test]
-fn refuses_global_default_config_unless_explicitly_allowed() {
+fn refuses_global_default_config_including_rclone_exe_dir_unless_explicitly_allowed() {
     let Some(rclone_path) = pinned_binary_path() else {
         eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
         return;
@@ -284,16 +285,136 @@ fn refuses_global_default_config_unless_explicitly_allowed() {
             target_remote_name: "demo".to_string(),
             target_config_path: ws.path("state/accounts/a1/rclone.conf"),
             lock_path: ws.path("state/accounts/a1/config.lock"),
-            password_command: pw_cmd,
+            password_command: pw_cmd.clone(),
+            override_root_folder_id: None,
             allow_global_default_source: false,
         },
         Some(&fake_home),
+        None,
         None,
     )
     .unwrap_err();
     assert!(matches!(
         err,
         ConfigError::GlobalDefaultConfigRefused { .. }
+    ));
+
+    // Finding 5: synthetic executable directory `rclone.conf` must also be refused by default.
+    let synth_exe_dir = ws.path("synthetic-rclone-dir");
+    let exe_dir_cfg = synth_exe_dir.join("rclone.conf");
+    fs::create_dir_all(&synth_exe_dir).unwrap();
+    fs::write(&exe_dir_cfg, "[portable]\ntype = local\n").unwrap();
+
+    let err_exe = rclone_adapter::config::import_single_remote_with_home_override(
+        &engine,
+        &RealProcessRunner,
+        &ImportRemoteSpec {
+            source_config_path: exe_dir_cfg,
+            source_remote_name: "portable".to_string(),
+            target_remote_name: "portable".to_string(),
+            target_config_path: ws.path("state/accounts/a2/rclone.conf"),
+            lock_path: ws.path("state/accounts/a2/config.lock"),
+            password_command: pw_cmd,
+            override_root_folder_id: None,
+            allow_global_default_source: false,
+        },
+        Some(&fake_home),
+        None,
+        Some(&synth_exe_dir),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err_exe,
+        ConfigError::GlobalDefaultConfigRefused { .. }
+    ));
+}
+
+#[test]
+fn drive_import_overrides_root_folder_id_strips_shared_with_me_and_rejects_missing_root() {
+    let Some(rclone_path) = pinned_binary_path() else {
+        eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+        return;
+    };
+    let engine = qualify_binary(&rclone_path).unwrap();
+    let ws = TempWorkspace::new("drive-import-root");
+    let src_cfg = ws.path("chosen/source.conf");
+    fs::create_dir_all(src_cfg.parent().unwrap()).unwrap();
+    let src_bytes = b"\
+[my_drive]
+type = drive
+client_id = cid
+client_secret = csec
+root_folder_id = OldWrongRoot
+shared_with_me = true
+token = {\"access_token\":\"tok\",\"refresh_token\":\"ref\"}
+
+[no_root_drive]
+type = drive
+client_id = cid
+client_secret = csec
+shared_with_me = true
+";
+    fs::write(&src_cfg, src_bytes).unwrap();
+
+    let helper_dir = ws.path("helper");
+    fs::create_dir_all(&helper_dir).unwrap();
+    let pw_cmd = make_test_password_helper(&helper_dir, "drive-import-pw");
+
+    // 1. Importing `my_drive` with requested shared-parent ID overrides root_folder_id and strips shared_with_me.
+    let target_cfg = ws.path("state/accounts/d1/rclone.conf");
+    let imported = import_single_remote_into_encrypted_config(
+        &engine,
+        &RealProcessRunner,
+        &ImportRemoteSpec {
+            source_config_path: src_cfg.clone(),
+            source_remote_name: "my_drive".to_string(),
+            target_remote_name: "household".to_string(),
+            target_config_path: target_cfg.clone(),
+            lock_path: ws.path("state/accounts/d1/config.lock"),
+            password_command: pw_cmd.clone(),
+            override_root_folder_id: Some("0ARequestedSharedParent".to_string()),
+            allow_global_default_source: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        imported.root_folder_id.as_deref(),
+        Some("0ARequestedSharedParent")
+    );
+    assert_eq!(fs::read(&src_cfg).unwrap(), src_bytes);
+
+    let summaries =
+        list_encrypted_config_remotes(&engine, &RealProcessRunner, &target_cfg, &pw_cmd).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0].root_folder_id.as_deref(),
+        Some("0ARequestedSharedParent")
+    );
+    assert!(!summaries[0].shared_with_me);
+    assert!(summaries[0].has_token);
+
+    // 2. Importing a Drive remote with NO root_folder_id anywhere must be rejected.
+    let err = import_single_remote_into_encrypted_config(
+        &engine,
+        &RealProcessRunner,
+        &ImportRemoteSpec {
+            source_config_path: src_cfg,
+            source_remote_name: "no_root_drive".to_string(),
+            target_remote_name: "household".to_string(),
+            target_config_path: ws.path("state/accounts/d2/rclone.conf"),
+            lock_path: ws.path("state/accounts/d2/config.lock"),
+            password_command: pw_cmd,
+            override_root_folder_id: None,
+            allow_global_default_source: false,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::InvalidInput {
+            field: "root_folder_id",
+            ..
+        }
     ));
 }
 

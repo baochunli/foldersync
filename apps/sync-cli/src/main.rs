@@ -12,12 +12,12 @@ use sync_core::{AccountId, MappingId, Readiness, RunId, RunOutcome};
 use sync_manager::{
     AccountError, AccountService, AccountServiceConfig, AddDriveAccountRequest, AddMappingCommand,
     ImportAccountRequest, InitializeCommand, ManagerConfig, ManagerError, MappingStatusSnapshot,
-    PasswordCommandFactory, SecretStore, SecretStoreError, SecretString, SyncManager,
-    SystemSecretStore, run_credential_helper,
+    PasswordCommandFactory, RESERVED_LOCAL_FIXTURE_ACCOUNT_ID, SecretStore, SecretStoreError,
+    SecretString, SyncManager, SystemSecretStore, run_credential_helper,
 };
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
-const LOCAL_FIXTURE_ACCOUNT_ID: &str = "local-fixture";
+const LOCAL_FIXTURE_ACCOUNT_ID: &str = RESERVED_LOCAL_FIXTURE_ACCOUNT_ID;
 const EXIT_AUTH_REQUIRED: u8 = 3;
 
 struct CliRuntime {
@@ -240,6 +240,8 @@ Commands:
     [--root-folder-id <id>]
     [--allow-global-config]
   account list --state-dir <dir> [--json]      List configured accounts
+  account reconnect --state-dir <dir> [opts]   Resume or refresh Drive OAuth for an account
+    --account <id> (or positional <id>)
   account check --state-dir <dir> [opts]       Verify encrypted config and lsjson parent root
     --account <id> (or positional <id>) [--json]
   remote resolve <path> --state-dir <dir>      Resolve cloud folder component IDs via lsjson
@@ -331,6 +333,9 @@ fn cmd_credential_helper(
         SecretStoreError::NotFound { account_id } => {
             CliError::Failed(format!("No credential stored for account `{account_id}`."))
         }
+        SecretStoreError::AlreadyExists { account_id } => CliError::Failed(format!(
+            "Credential already exists for account `{account_id}`."
+        )),
         SecretStoreError::Backend { reason } => CliError::Failed(reason),
     })
 }
@@ -339,11 +344,12 @@ fn cmd_account(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<
     let (sub, rest) = split_subcommand(args)?;
     match sub.as_str() {
         "add-drive" => cmd_account_add_drive(rt, &rest, out),
+        "reconnect" => cmd_account_reconnect(rt, &rest, out),
         "import" => cmd_account_import(rt, &rest, out),
         "list" => cmd_account_list(rt, &rest, out),
         "check" => cmd_account_check(rt, &rest, out),
         other => Err(CliError::Usage(format!(
-            "Unknown account subcommand `{other}` (expected add-drive, import, list, or check)."
+            "Unknown account subcommand `{other}` (expected add-drive, reconnect, import, list, or check)."
         ))),
     }
 }
@@ -476,6 +482,76 @@ fn cmd_account_add_drive(
     writeln!(
         out,
         "Added Drive account `{}` (remote `{}:`, root `{}`): auth_status={}.",
+        result.account.id,
+        result.account.remote_name,
+        result.account.remote_root_folder_id,
+        result.account.auth_status
+    )?;
+    Ok(())
+}
+
+fn cmd_account_reconnect(
+    rt: &CliRuntime,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let mut state_dir = None;
+    let mut account_id: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(take_value(args, &mut i, "--state-dir")?))
+            }
+            "--account" => {
+                account_id = Some(take_value(args, &mut i, "--account")?.to_string());
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::Usage(format!("Unknown argument `{other}`.")));
+            }
+            positional => {
+                if account_id.is_some() {
+                    return Err(CliError::Usage(format!(
+                        "Unexpected extra argument `{positional}`."
+                    )));
+                }
+                account_id = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let svc = rt.account_service(state_dir)?;
+    let account_id = account_id
+        .ok_or_else(|| CliError::Usage("Missing required --account <id>.".to_string()))?;
+
+    let captured_urls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let captured_cb = Arc::clone(&captured_urls);
+    let echo_stdout = rt.echo_auth_url_to_process_stdout;
+    let result = svc.reconnect_drive_account(
+        &AccountId::new(account_id),
+        Some(Box::new(move |url| {
+            if echo_stdout {
+                let _ = writeln!(
+                    io::stdout(),
+                    "Open this URL in your browser to authorize Google Drive:\n{url}"
+                );
+                let _ = io::stdout().flush();
+            }
+            captured_cb.lock().unwrap().push(url.to_string());
+        })),
+    )?;
+
+    let surfaced_url = result
+        .auth_url
+        .clone()
+        .or_else(|| captured_urls.lock().ok().and_then(|v| v.first().cloned()));
+    if let Some(url) = surfaced_url {
+        writeln!(out, "Authorization URL: {url}")?;
+    }
+    writeln!(
+        out,
+        "Reconnected Drive account `{}` (remote `{}:`, root `{}`): auth_status={}.",
         result.account.id,
         result.account.remote_name,
         result.account.remote_root_folder_id,
@@ -845,6 +921,19 @@ fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError>
     let collection_path = collection.unwrap_or_else(|| format!("Data/{id}"));
 
     let mgr = open_manager(state_dir, finder_dir)?;
+    // Finding 8: Refuse to overwrite an existing non-fixture account with the
+    // reserved `local-fixture` ID.
+    let acct_svc =
+        AccountService::for_locked_manager(AccountServiceConfig::with_state_dir(mgr.state_dir()))?;
+    if let Some(existing) = acct_svc.get_account(&AccountId::new(LOCAL_FIXTURE_ACCOUNT_ID))?
+        && existing.kind != "local_fixture"
+    {
+        mgr.shutdown()?;
+        return Err(CliError::Failed(format!(
+            "Refused to overwrite existing non-fixture account `{LOCAL_FIXTURE_ACCOUNT_ID}` (kind={}).",
+            existing.kind
+        )));
+    }
     mgr.register_local_fixture_account(LOCAL_FIXTURE_ACCOUNT_ID, "Local Fixture")?;
     let mut cmd = AddMappingCommand::local_fixture(
         id.clone(),
@@ -1113,7 +1202,7 @@ mod tests {
     fn credential_helper_uses_fake_store_and_exits_3_when_locked() {
         let store = Arc::new(InMemorySecretStore::new());
         store
-            .set_secret("drive-1", &SecretString::new("fake-secret-42"))
+            .create_secret("inst-1/drive-1", &SecretString::new("fake-secret-42"))
             .unwrap();
         let rt = CliRuntime {
             secret_store: Arc::clone(&store) as Arc<dyn SecretStore>,
@@ -1123,14 +1212,15 @@ mod tests {
             echo_auth_url_to_process_stdout: false,
         };
 
-        let (code, stdout, stderr) = run_args(&rt, &["credential-helper", "--account", "drive-1"]);
+        let (code, stdout, stderr) =
+            run_args(&rt, &["credential-helper", "--account", "inst-1/drive-1"]);
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(stdout, "fake-secret-42\n");
         assert!(stderr.is_empty());
 
         store.set_locked(true);
         let (code2, stdout2, stderr2) =
-            run_args(&rt, &["credential-helper", "--account", "drive-1"]);
+            run_args(&rt, &["credential-helper", "--account", "inst-1/drive-1"]);
         assert_eq!(code2, ExitCode::from(EXIT_AUTH_REQUIRED));
         assert!(stdout2.is_empty());
         assert!(stderr2.contains("authentication_required"));
@@ -1158,18 +1248,19 @@ mod tests {
         let helper_dir = tmp.path().join("helpers");
         fs::create_dir_all(&helper_dir).unwrap();
         let store_for_cb = Arc::clone(&store);
-        let factory: PasswordCommandFactory = Arc::new(move |id: &AccountId| {
+        let factory: PasswordCommandFactory = Arc::new(move |cred_key: &str| {
             let secret = store_for_cb
-                .get_secret(id.as_str())
+                .get_secret(cred_key)
                 .map_err(AccountError::from)?;
-            let sec_file = helper_dir.join(format!("{}.sec", id.as_str()));
+            let safe = cred_key.replace('/', "__");
+            let sec_file = helper_dir.join(format!("{safe}.sec"));
             fs::write(&sec_file, secret.expose().as_bytes()).unwrap();
             fs::set_permissions(&sec_file, fs::Permissions::from_mode(0o600)).unwrap();
-            let bin = helper_dir.join(format!("helper-{}", id.as_str()));
+            let bin = helper_dir.join(format!("helper-{safe}"));
             fs::write(&bin, format!("#!/bin/sh\ncat \"{}\"\n", sec_file.display())).unwrap();
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
             Ok(
-                PasswordCommand::new(bin, vec!["--account".to_string(), id.as_str().to_string()])
+                PasswordCommand::new(bin, vec!["--account".to_string(), cred_key.to_string()])
                     .unwrap(),
             )
         });
@@ -1249,14 +1340,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cli_account_add_drive_encrypts_config_prints_auth_url_and_never_leaks_secrets() {
+    fn cli_account_add_drive_requires_saved_token_and_reconnect_resumes_without_leaking_secrets() {
         use rclone_adapter::{ProcessError, ProcessSpec, RunHandle, SpawnOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         /// Runs real pinned rclone for local config encryption/check commands,
-        /// and serves a recorded fixture for `config reconnect` so no Google
-        /// network call or browser launch ever occurs.
+        /// serves recorded fixtures for `config reconnect` so no Google network
+        /// call or browser launch ever occurs, and simulates a saved OAuth token
+        /// in `config dump` once `simulate_saved_token` is enabled.
         struct HybridDriveAuthRunner {
             fake_reconnect: FakeProcessRunner,
+            simulate_saved_token: AtomicBool,
             recorded_argvs: std::sync::Mutex<Vec<Vec<String>>>,
         }
 
@@ -1273,9 +1367,22 @@ mod tests {
                     .collect();
                 let is_reconnect = argv.first().map(String::as_str) == Some("config")
                     && argv.get(1).map(String::as_str) == Some("reconnect");
+                let is_dump = argv.first().map(String::as_str) == Some("config")
+                    && argv.get(1).map(String::as_str) == Some("dump");
                 self.recorded_argvs.lock().unwrap().push(argv);
                 if is_reconnect {
                     self.fake_reconnect.spawn(spec, options)
+                } else if is_dump && self.simulate_saved_token.load(Ordering::SeqCst) {
+                    let fake_dump = FakeProcessRunner::new();
+                    fake_dump.push_run(FakeRunScript {
+                        lines: vec![OutputLine {
+                            stream: StreamKind::Stdout,
+                            text: r#"{"household":{"type":"drive","scope":"drive","root_folder_id":"0AParentId","token":"{\"access_token\":\"ya29.fake-access-token\",\"refresh_token\":\"1//fake-refresh-token\"}"}}"#.to_string(),
+                            truncated: false,
+                        }],
+                        ..Default::default()
+                    });
+                    fake_dump.spawn(spec, options)
                 } else {
                     RealProcessRunner.spawn(spec, options)
                 }
@@ -1297,23 +1404,37 @@ mod tests {
         let helper_dir = tmp.path().join("helpers");
         fs::create_dir_all(&helper_dir).unwrap();
         let store_for_cb = Arc::clone(&store);
-        let factory: PasswordCommandFactory = Arc::new(move |id: &AccountId| {
+        let captured_key = Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_key_cb = Arc::clone(&captured_key);
+        let factory: PasswordCommandFactory = Arc::new(move |cred_key: &str| {
+            *captured_key_cb.lock().unwrap() = Some(cred_key.to_string());
             let secret = store_for_cb
-                .get_secret(id.as_str())
+                .get_secret(cred_key)
                 .map_err(AccountError::from)?;
-            let sec_file = helper_dir.join(format!("{}.sec", id.as_str()));
+            let safe = cred_key.replace('/', "__");
+            let sec_file = helper_dir.join(format!("{safe}.sec"));
             fs::write(&sec_file, secret.expose().as_bytes()).unwrap();
             fs::set_permissions(&sec_file, fs::Permissions::from_mode(0o600)).unwrap();
-            let bin = helper_dir.join(format!("helper-{}", id.as_str()));
+            let bin = helper_dir.join(format!("helper-{safe}"));
             fs::write(&bin, format!("#!/bin/sh\ncat \"{}\"\n", sec_file.display())).unwrap();
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
             Ok(
-                PasswordCommand::new(bin, vec!["--account".to_string(), id.as_str().to_string()])
+                PasswordCommand::new(bin, vec!["--account".to_string(), cred_key.to_string()])
                     .unwrap(),
             )
         });
 
         let fake_reconnect = FakeProcessRunner::new();
+        // Attempt 1: `config reconnect` exits 0 without writing any token.
+        fake_reconnect.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stderr,
+                text: "NOTICE: If your browser doesn't open automatically go to the following link: http://127.0.0.1:53682/auth?state=cliAttempt1".to_string(),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        // Attempt 2 (`account reconnect`): succeeds and token is present in dump.
         fake_reconnect.push_run(FakeRunScript {
             lines: vec![
                 OutputLine {
@@ -1331,6 +1452,7 @@ mod tests {
         });
         let runner = Arc::new(HybridDriveAuthRunner {
             fake_reconnect,
+            simulate_saved_token: AtomicBool::new(false),
             recorded_argvs: std::sync::Mutex::new(Vec::new()),
         });
 
@@ -1342,13 +1464,14 @@ mod tests {
             echo_auth_url_to_process_stdout: false,
         };
 
-        let (code, stdout, stderr) = run_args(
+        let sd = state_dir.to_str().unwrap();
+        let (code1, stdout1, stderr1) = run_args(
             &rt,
             &[
                 "account",
                 "add-drive",
                 "--state-dir",
-                state_dir.to_str().unwrap(),
+                sd,
                 "--id",
                 "drive-1",
                 "--root-folder-id",
@@ -1359,6 +1482,34 @@ mod tests {
                 secret_file.to_str().unwrap(),
             ],
         );
+        assert_eq!(
+            code1,
+            ExitCode::from(EXIT_AUTH_REQUIRED),
+            "CLI must not mark account ready when reconnect exits 0 without a saved token; stdout={stdout1} stderr={stderr1}"
+        );
+        assert!(stderr1.contains("authentication_required"));
+
+        let (list_code, list_json, list_err) =
+            run_args(&rt, &["account", "list", "--state-dir", sd, "--json"]);
+        assert_eq!(list_code, ExitCode::SUCCESS, "stderr={list_err}");
+        let parsed: serde_json::Value = serde_json::from_str(&list_json).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["id"], "drive-1");
+        assert_eq!(parsed[0]["auth_status"], "authentication_required");
+
+        // Now complete authorization via `account reconnect` with a saved token.
+        runner.simulate_saved_token.store(true, Ordering::SeqCst);
+        let (code, stdout, stderr) = run_args(
+            &rt,
+            &[
+                "account",
+                "reconnect",
+                "--state-dir",
+                sd,
+                "--account",
+                "drive-1",
+            ],
+        );
         assert_eq!(code, ExitCode::SUCCESS, "stderr={stderr}");
         assert!(
             stdout.contains("Authorization URL: http://127.0.0.1:53682/auth?state=cliAddDriveTest"),
@@ -1366,9 +1517,25 @@ mod tests {
         );
         assert!(stdout.contains("auth_status=ready"));
 
-        let stored_passphrase = store.get_secret("drive-1").unwrap();
-        // Neither OAuth secret nor config passphrase may appear in stdout, stderr, argv, or plaintext config.
-        for secret in [oauth_secret, stored_passphrase.expose()] {
+        let cred_key = captured_key
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("scoped credential key recorded");
+        assert!(
+            cred_key.contains("/drive-1"),
+            "expected per-state install-id scoped key, got {cred_key}"
+        );
+        let stored_passphrase = store.get_secret(&cred_key).unwrap();
+        // Neither OAuth secret, config passphrase, nor OAuth token may appear in stdout, stderr, argv, or plaintext config.
+        for secret in [
+            oauth_secret,
+            stored_passphrase.expose(),
+            "ya29.fake-access-token",
+            "1//fake-refresh-token",
+        ] {
+            assert!(!stdout1.contains(secret));
+            assert!(!stderr1.contains(secret));
             assert!(!stdout.contains(secret));
             assert!(!stderr.contains(secret));
             for argv in runner.recorded_argvs.lock().unwrap().iter() {

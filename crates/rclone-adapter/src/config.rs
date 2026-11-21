@@ -9,7 +9,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(unix)]
@@ -33,6 +36,8 @@ use crate::{
 /// Header written by rclone at the top of an encrypted configuration file.
 pub const RCLONE_ENCRYPT_HEADER: &str = "RCLONE_ENCRYPT_V0:";
 
+static SETUP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Non-secret summary of a remote stored in an app-owned rclone config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConfigSummary {
@@ -40,6 +45,8 @@ pub struct RemoteConfigSummary {
     pub remote_type: String,
     pub root_folder_id: Option<String>,
     pub shared_with_me: bool,
+    /// Boolean presence check for a saved OAuth token (never exposes the token).
+    pub has_token: bool,
 }
 
 /// Specification for creating a Google Drive remote inside an app-owned
@@ -75,9 +82,13 @@ pub struct ImportRemoteSpec {
     pub target_config_path: PathBuf,
     pub lock_path: PathBuf,
     pub password_command: PasswordCommand,
-    /// Must be `true` to allow importing from the user's global default rclone
-    /// config (`~/.config/rclone/rclone.conf`, `$XDG_CONFIG_HOME/rclone/rclone.conf`,
-    /// or `~/.rclone.conf`). Defaults to `false`.
+    /// For Google Drive imports, overrides `root_folder_id` in the copied
+    /// section to the requested shared parent folder ID (and `shared_with_me`
+    /// is always removed).
+    pub override_root_folder_id: Option<String>,
+    /// Must be `true` to allow importing from any of rclone's default config
+    /// locations (`<rclone-exe-dir>/rclone.conf`, `$XDG_CONFIG_HOME/rclone/rclone.conf`,
+    /// `$HOME/.config/rclone/rclone.conf`, or `$HOME/.rclone.conf`).
     pub allow_global_default_source: bool,
 }
 
@@ -194,13 +205,15 @@ fn resolve_canonical_or_lexical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
 }
 
-/// Checks whether `candidate` matches rclone's default global configuration paths
-/// (`$XDG_CONFIG_HOME/rclone/rclone.conf`, `$HOME/.config/rclone/rclone.conf`,
+/// Checks whether `candidate` matches any of rclone v1.76.0's default global
+/// configuration locations (`<rclone-exe-dir>/rclone.conf`,
+/// `$XDG_CONFIG_HOME/rclone/rclone.conf`, `$HOME/.config/rclone/rclone.conf`,
 /// or `$HOME/.rclone.conf`), comparing both lexical and canonicalized paths.
 pub fn is_global_default_rclone_config(
     candidate: &Path,
     home_override: Option<&Path>,
     xdg_config_home_override: Option<&Path>,
+    rclone_exe_dir_override: Option<&Path>,
 ) -> bool {
     let cand_lex = lexical_normalize(candidate);
     let cand_can = resolve_canonical_or_lexical(candidate);
@@ -217,6 +230,9 @@ pub fn is_global_default_rclone_config(
             .map(PathBuf::from)
     });
 
+    if let Some(exe_dir) = rclone_exe_dir_override {
+        defaults.push(exe_dir.join("rclone.conf"));
+    }
     if let Some(xdg_dir) = xdg {
         defaults.push(xdg_dir.join("rclone").join("rclone.conf"));
     }
@@ -256,23 +272,47 @@ fn ensure_private_dir_no_symlink(dir: &Path) -> Result<(), ConfigError> {
             });
         }
     } else {
-        #[cfg(unix)]
-        {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|source| ConfigError::Io {
+        let create_res = {
+            #[cfg(unix)]
+            {
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(dir)
+            }
+        };
+        match create_res {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = fs::symlink_metadata(dir).map_err(|source| ConfigError::Io {
                     path: dir.to_path_buf(),
                     source,
                 })?;
-        }
-        #[cfg(not(unix))]
-        {
-            fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
-                path: dir.to_path_buf(),
-                source,
-            })?;
+                if meta.file_type().is_symlink() {
+                    return Err(ConfigError::SymlinkRefused {
+                        path: dir.to_path_buf(),
+                    });
+                }
+                if !meta.is_dir() {
+                    return Err(ConfigError::Io {
+                        path: dir.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "expected a directory",
+                        ),
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+            }
         }
     }
 
@@ -313,8 +353,9 @@ fn in_process_lock_table() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
 }
 
 /// Exclusive per-account configuration lock serializing all config mutations
-/// (config creation, import, encryption, OAuth authorization, token refresh)
-/// across both threads and processes (§8).
+/// (existence checks, credential registration, config creation, import,
+/// encryption, OAuth authorization, and refresh-capable listings) across both
+/// threads and processes (§8).
 pub struct AccountConfigLock {
     file: File,
     lock_path: PathBuf,
@@ -429,10 +470,19 @@ impl Drop for AccountConfigLock {
 }
 
 /// Parsed single remote section from an unencrypted rclone INI config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ParsedIniSection {
     pub remote_name: String,
     pub entries: Vec<(String, String)>,
+}
+
+impl fmt::Debug for ParsedIniSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParsedIniSection")
+            .field("remote_name", &self.remote_name)
+            .field("option_count", &self.entries.len())
+            .finish()
+    }
 }
 
 impl ParsedIniSection {
@@ -536,72 +586,118 @@ fn render_single_section_ini(remote_name: &str, entries: &[(String, String)]) ->
     out
 }
 
-fn create_private_config_file_new(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
-    if !path.is_absolute() {
-        return Err(ConfigError::InvalidInput {
-            field: "config_path",
-            reason: "must be an absolute path",
-        });
+fn is_leftover_temp_or_backup_name(name: &str) -> bool {
+    if name == "rclone.conf" || name == "config.lock" {
+        return false;
     }
-    let parent = path.parent().ok_or(ConfigError::InvalidInput {
-        field: "config_path",
-        reason: "must have a parent directory",
-    })?;
-    ensure_private_dir_no_symlink(parent)?;
+    name.starts_with(".rclone.conf.setup.")
+        || name.starts_with(".rclone.conf.tmp.")
+        || name.starts_with("rclone.conf.")
+        || name.starts_with("rclone-config")
+        || name.ends_with(".bak")
+        || name.ends_with(".tmp")
+        || name.ends_with('~')
+}
 
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(ConfigError::SymlinkRefused {
-                path: path.to_path_buf(),
+/// Scrubs and removes any leftover setup temp files (`.rclone.conf.setup.*`) and
+/// rclone backup/temp files (`rclone.conf.*`, `*.bak`, `rclone-config*`, etc.)
+/// inside `account_dir`, never touching `rclone.conf`, `config.lock`, or symlinks.
+pub fn cleanup_account_temp_and_backup_files(account_dir: &Path) -> Result<usize, ConfigError> {
+    let meta = match fs::symlink_metadata(account_dir) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: account_dir.to_path_buf(),
+                source,
             });
         }
-        return Err(ConfigError::ConfigAlreadyExists {
-            path: path.to_path_buf(),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(ConfigError::SymlinkRefused {
+            path: account_dir.to_path_buf(),
         });
     }
-
-    let mut opts = OpenOptions::new();
-    opts.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        opts.mode(0o600);
-        opts.custom_flags(libc::O_NOFOLLOW);
+    if !meta.is_dir() {
+        return Ok(0);
     }
-    let mut file = opts.open(path).map_err(|source| {
-        #[cfg(unix)]
-        if source.raw_os_error() == Some(libc::ELOOP) {
-            return ConfigError::SymlinkRefused {
-                path: path.to_path_buf(),
-            };
-        }
-        if source.kind() == std::io::ErrorKind::AlreadyExists {
-            return ConfigError::ConfigAlreadyExists {
-                path: path.to_path_buf(),
-            };
-        }
-        ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        }
+
+    let entries = fs::read_dir(account_dir).map_err(|source| ConfigError::Io {
+        path: account_dir.to_path_buf(),
+        source,
     })?;
-
-    let write_res = (|| -> Result<(), ConfigError> {
-        file.write_all(content).map_err(|source| ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        file.sync_all().map_err(|source| ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        enforce_private_config_permissions(path)?;
-        Ok(())
-    })();
-
-    if write_res.is_err() {
-        scrub_and_remove_file(path);
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_leftover_temp_or_backup_name(name) {
+            continue;
+        }
+        if let Ok(emeta) = fs::symlink_metadata(&path)
+            && !emeta.file_type().is_symlink()
+            && emeta.is_file()
+        {
+            scrub_and_remove_file(&path);
+            removed += 1;
+        }
     }
-    write_res
+    Ok(removed)
+}
+
+fn create_exclusive_setup_temp(account_dir: &Path, content: &[u8]) -> Result<PathBuf, ConfigError> {
+    ensure_private_dir_no_symlink(account_dir)?;
+    for _ in 0..64 {
+        let seq = SETUP_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = account_dir.join(format!(".rclone.conf.setup.{}.{seq}", std::process::id()));
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        match opts.open(&tmp_path) {
+            Ok(mut file) => {
+                let write_res = (|| -> Result<(), ConfigError> {
+                    file.write_all(content).map_err(|source| ConfigError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?;
+                    file.sync_all().map_err(|source| ConfigError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?;
+                    enforce_private_config_permissions(&tmp_path)?;
+                    Ok(())
+                })();
+                if let Err(err) = write_res {
+                    scrub_and_remove_file(&tmp_path);
+                    return Err(err);
+                }
+                return Ok(tmp_path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: tmp_path,
+                    source,
+                });
+            }
+        }
+    }
+    Err(ConfigError::Io {
+        path: account_dir.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted temporary setup config filenames",
+        ),
+    })
 }
 
 fn scrub_and_remove_file(path: &Path) {
@@ -657,55 +753,122 @@ fn run_verified_rclone_config_cmd(
     Ok(run_out)
 }
 
-fn encrypt_and_verify_config_locked(
+/// Builds the config in an exclusive `0600` temp file inside the account dir,
+/// encrypts it in place via pinned rclone `config encryption set`, verifies
+/// `RCLONE_ENCRYPT_V0:` and `config encryption check`, and ONLY THEN atomically
+/// publishes it to `config_path`. Always cleans up setup temp and engine backup
+/// files on both failure and success.
+fn create_and_publish_encrypted_config_locked(
     engine: &EngineIdentity,
     manifest: &QualificationManifest,
     runner: &dyn ProcessRunner,
     config_path: &Path,
+    _lock: &AccountConfigLock,
     password_command: &PasswordCommand,
+    ini_bytes: &[u8],
 ) -> Result<(), ConfigError> {
+    if !config_path.is_absolute() {
+        return Err(ConfigError::InvalidInput {
+            field: "config_path",
+            reason: "must be an absolute path",
+        });
+    }
     let account_dir = config_path.parent().ok_or(ConfigError::InvalidInput {
         field: "config_path",
         reason: "must have a parent directory",
     })?;
+    ensure_private_dir_no_symlink(account_dir)?;
 
+    if let Ok(meta) = fs::symlink_metadata(config_path) {
+        if meta.file_type().is_symlink() {
+            return Err(ConfigError::SymlinkRefused {
+                path: config_path.to_path_buf(),
+            });
+        }
+        return Err(ConfigError::ConfigAlreadyExists {
+            path: config_path.to_path_buf(),
+        });
+    }
+
+    let tmp_path = create_exclusive_setup_temp(account_dir, ini_bytes)?;
     let enc_args = vec![
         OsString::from("config"),
         OsString::from("encryption"),
         OsString::from("set"),
         OsString::from("--config"),
-        config_path.as_os_str().to_os_string(),
+        tmp_path.as_os_str().to_os_string(),
         OsString::from("--password-command"),
         OsString::from(password_command.to_rclone_space_sep_list()),
         OsString::from("--ask-password=false"),
     ];
 
-    if let Err(err) = run_verified_rclone_config_cmd(
-        engine,
-        manifest,
-        runner,
-        "config encryption set",
-        enc_args,
-        account_dir,
-    ) {
-        scrub_and_remove_file(config_path);
-        return Err(err);
-    }
+    let setup_res = (|| -> Result<(), ConfigError> {
+        run_verified_rclone_config_cmd(
+            engine,
+            manifest,
+            runner,
+            "config encryption set",
+            enc_args,
+            account_dir,
+        )?;
 
-    enforce_private_config_permissions(config_path)?;
-    let on_disk = fs::read_to_string(config_path).map_err(|source| ConfigError::Io {
-        path: config_path.to_path_buf(),
-        source,
-    })?;
-    if !is_encrypted_config_content(&on_disk) {
-        scrub_and_remove_file(config_path);
-        return Err(ConfigError::NotEncrypted {
-            path: config_path.to_path_buf(),
-        });
-    }
+        enforce_private_config_permissions(&tmp_path)?;
+        let on_disk = fs::read_to_string(&tmp_path).map_err(|source| ConfigError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        if !is_encrypted_config_content(&on_disk) {
+            return Err(ConfigError::NotEncrypted {
+                path: tmp_path.clone(),
+            });
+        }
 
-    verify_encrypted_config_with_manifest(engine, manifest, runner, config_path, password_command)?;
-    Ok(())
+        verify_encrypted_config_with_manifest(
+            engine,
+            manifest,
+            runner,
+            &tmp_path,
+            password_command,
+        )?;
+
+        // Refuse to overwrite if final config path appeared or became a symlink.
+        if let Ok(meta) = fs::symlink_metadata(config_path) {
+            if meta.file_type().is_symlink() {
+                return Err(ConfigError::SymlinkRefused {
+                    path: config_path.to_path_buf(),
+                });
+            }
+            return Err(ConfigError::ConfigAlreadyExists {
+                path: config_path.to_path_buf(),
+            });
+        }
+
+        // Publish exclusively via hard_link + unlink (never silently overwrites).
+        match fs::hard_link(&tmp_path, config_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&tmp_path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ConfigError::ConfigAlreadyExists {
+                    path: config_path.to_path_buf(),
+                });
+            }
+            Err(_) => {
+                fs::rename(&tmp_path, config_path).map_err(|source| ConfigError::Io {
+                    path: config_path.to_path_buf(),
+                    source,
+                })?;
+            }
+        }
+        enforce_private_config_permissions(config_path)?;
+        Ok(())
+    })();
+
+    if setup_res.is_err() {
+        scrub_and_remove_file(&tmp_path);
+    }
+    let _ = cleanup_account_temp_and_backup_files(account_dir);
+    setup_res
 }
 
 /// Initializes a new empty app-owned encrypted rclone config (`0600`) through
@@ -717,10 +880,28 @@ pub fn init_encrypted_config(
     lock_path: &Path,
     password_command: &PasswordCommand,
 ) -> Result<(), ConfigError> {
+    let lock = AccountConfigLock::acquire(lock_path)?;
+    init_encrypted_config_locked(engine, runner, config_path, &lock, password_command)
+}
+
+/// Caller-locked variant of [`init_encrypted_config`].
+pub fn init_encrypted_config_locked(
+    engine: &EngineIdentity,
+    runner: &dyn ProcessRunner,
+    config_path: &Path,
+    lock: &AccountConfigLock,
+    password_command: &PasswordCommand,
+) -> Result<(), ConfigError> {
     let manifest = QualificationManifest::embedded()?;
-    let _lock = AccountConfigLock::acquire(lock_path)?;
-    create_private_config_file_new(config_path, b"")?;
-    encrypt_and_verify_config_locked(engine, &manifest, runner, config_path, password_command)
+    create_and_publish_encrypted_config_locked(
+        engine,
+        &manifest,
+        runner,
+        config_path,
+        lock,
+        password_command,
+        b"",
+    )
 }
 
 /// Verifies an existing app-owned rclone config is `0600`, not a symlink,
@@ -790,24 +971,39 @@ pub fn create_drive_remote_config(
     password_command: &PasswordCommand,
     spec: &DriveRemoteConfigSpec,
 ) -> Result<(), ConfigError> {
+    let lock = AccountConfigLock::acquire(lock_path)?;
+    create_drive_remote_config_locked(engine, runner, config_path, &lock, password_command, spec)
+}
+
+/// Caller-locked variant of [`create_drive_remote_config`] so callers can hold
+/// one [`AccountConfigLock`] across existence checks, credential registration,
+/// config publication, and OAuth authorization.
+pub fn create_drive_remote_config_locked(
+    engine: &EngineIdentity,
+    runner: &dyn ProcessRunner,
+    config_path: &Path,
+    lock: &AccountConfigLock,
+    password_command: &PasswordCommand,
+    spec: &DriveRemoteConfigSpec,
+) -> Result<(), ConfigError> {
     let manifest = QualificationManifest::embedded()?;
-    create_drive_remote_config_with_manifest(
+    create_drive_remote_config_with_manifest_locked(
         engine,
         &manifest,
         runner,
         config_path,
-        lock_path,
+        lock,
         password_command,
         spec,
     )
 }
 
-pub(crate) fn create_drive_remote_config_with_manifest(
+pub(crate) fn create_drive_remote_config_with_manifest_locked(
     engine: &EngineIdentity,
     manifest: &QualificationManifest,
     runner: &dyn ProcessRunner,
     config_path: &Path,
-    lock_path: &Path,
+    lock: &AccountConfigLock,
     password_command: &PasswordCommand,
     spec: &DriveRemoteConfigSpec,
 ) -> Result<(), ConfigError> {
@@ -845,8 +1041,6 @@ pub(crate) fn create_drive_remote_config_with_manifest(
         });
     }
 
-    let _lock = AccountConfigLock::acquire(lock_path)?;
-
     // Explicitly do NOT set `shared_with_me` (§7: root directly at the shared parent ID).
     let entries = vec![
         ("type".to_string(), "drive".to_string()),
@@ -862,8 +1056,15 @@ pub(crate) fn create_drive_remote_config_with_manifest(
         ),
     ];
     let ini = render_single_section_ini(&spec.remote_name, &entries);
-    create_private_config_file_new(config_path, ini.as_bytes())?;
-    encrypt_and_verify_config_locked(engine, manifest, runner, config_path, password_command)
+    create_and_publish_encrypted_config_locked(
+        engine,
+        manifest,
+        runner,
+        config_path,
+        lock,
+        password_command,
+        ini.as_bytes(),
+    )
 }
 
 /// Explicitly imports ONE named remote section from a user-chosen rclone config
@@ -873,36 +1074,55 @@ pub fn import_single_remote_into_encrypted_config(
     runner: &dyn ProcessRunner,
     spec: &ImportRemoteSpec,
 ) -> Result<ImportedRemoteInfo, ConfigError> {
-    import_single_remote_with_home_override(engine, runner, spec, None, None)
+    let lock = AccountConfigLock::acquire(&spec.lock_path)?;
+    import_single_remote_into_encrypted_config_locked(engine, runner, spec, &lock)
 }
 
-/// Variant accepting explicit `HOME` / `XDG_CONFIG_HOME` overrides for deterministic
-/// global-default path refusal tests without mutating process env.
+/// Caller-locked variant of [`import_single_remote_into_encrypted_config`].
+pub fn import_single_remote_into_encrypted_config_locked(
+    engine: &EngineIdentity,
+    runner: &dyn ProcessRunner,
+    spec: &ImportRemoteSpec,
+    lock: &AccountConfigLock,
+) -> Result<ImportedRemoteInfo, ConfigError> {
+    let manifest = QualificationManifest::embedded()?;
+    import_single_remote_internal_locked(engine, &manifest, runner, spec, lock, None, None, None)
+}
+
+/// Variant accepting explicit `HOME` / `XDG_CONFIG_HOME` / executable-directory
+/// overrides for deterministic default-config path refusal tests without mutating env.
 pub fn import_single_remote_with_home_override(
     engine: &EngineIdentity,
     runner: &dyn ProcessRunner,
     spec: &ImportRemoteSpec,
     home_override: Option<&Path>,
     xdg_config_home_override: Option<&Path>,
+    rclone_exe_dir_override: Option<&Path>,
 ) -> Result<ImportedRemoteInfo, ConfigError> {
     let manifest = QualificationManifest::embedded()?;
-    import_single_remote_internal(
+    let lock = AccountConfigLock::acquire(&spec.lock_path)?;
+    import_single_remote_internal_locked(
         engine,
         &manifest,
         runner,
         spec,
+        &lock,
         home_override,
         xdg_config_home_override,
+        rclone_exe_dir_override,
     )
 }
 
-pub(crate) fn import_single_remote_internal(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn import_single_remote_internal_locked(
     engine: &EngineIdentity,
     manifest: &QualificationManifest,
     runner: &dyn ProcessRunner,
     spec: &ImportRemoteSpec,
+    lock: &AccountConfigLock,
     home_override: Option<&Path>,
     xdg_config_home_override: Option<&Path>,
+    rclone_exe_dir_override: Option<&Path>,
 ) -> Result<ImportedRemoteInfo, ConfigError> {
     validate_remote_name_str(&spec.source_remote_name)?;
     validate_remote_name_str(&spec.target_remote_name)?;
@@ -913,11 +1133,13 @@ pub(crate) fn import_single_remote_internal(
             reason: "must be an absolute path",
         });
     }
+    let exe_dir = rclone_exe_dir_override.or_else(|| engine.path().parent());
     if !spec.allow_global_default_source
         && is_global_default_rclone_config(
             &spec.source_config_path,
             home_override,
             xdg_config_home_override,
+            exe_dir,
         )
     {
         return Err(ConfigError::GlobalDefaultConfigRefused {
@@ -931,7 +1153,7 @@ pub(crate) fn import_single_remote_internal(
             path: spec.source_config_path.clone(),
             source,
         })?;
-    let parsed = extract_single_remote_section(
+    let mut parsed = extract_single_remote_section(
         &spec.source_config_path,
         &source_text,
         &spec.source_remote_name,
@@ -940,35 +1162,104 @@ pub(crate) fn import_single_remote_internal(
         .remote_type()
         .expect("validated non-empty type")
         .to_string();
-    let root_folder_id = parsed
-        .option("root_folder_id")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
 
-    let _lock = AccountConfigLock::acquire(&spec.lock_path)?;
+    let effective_root_folder_id = if remote_type.eq_ignore_ascii_case("drive") {
+        // §7: Never retain `shared_with_me`; always bind Drive remotes directly
+        // to the actual shared parent folder ID.
+        parsed
+            .entries
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("shared_with_me"));
+
+        let chosen_root = spec
+            .override_root_folder_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                parsed
+                    .option("root_folder_id")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+            .map(ToOwned::to_owned)
+            .ok_or(ConfigError::InvalidInput {
+                field: "root_folder_id",
+                reason: "Drive import requires a shared parent root_folder_id (either in the source remote or via --root-folder-id)",
+            })?;
+
+        if contains_control_breaks(&chosen_root) || chosen_root.chars().any(char::is_whitespace) {
+            return Err(ConfigError::InvalidInput {
+                field: "root_folder_id",
+                reason: "must be a non-empty Drive folder ID without whitespace or control characters",
+            });
+        }
+
+        parsed
+            .entries
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("root_folder_id"));
+        parsed
+            .entries
+            .push(("root_folder_id".to_string(), chosen_root.clone()));
+        Some(chosen_root)
+    } else {
+        spec.override_root_folder_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                parsed
+                    .option("root_folder_id")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+    };
+
     let single_ini = render_single_section_ini(&spec.target_remote_name, &parsed.entries);
-    create_private_config_file_new(&spec.target_config_path, single_ini.as_bytes())?;
-    encrypt_and_verify_config_locked(
+    create_and_publish_encrypted_config_locked(
         engine,
         manifest,
         runner,
         &spec.target_config_path,
+        lock,
         &spec.password_command,
+        single_ini.as_bytes(),
     )?;
 
     Ok(ImportedRemoteInfo {
         source_remote_name: spec.source_remote_name.clone(),
         target_remote_name: spec.target_remote_name.clone(),
         remote_type,
-        root_folder_id,
+        root_folder_id: effective_root_folder_id,
         target_config_path: spec.target_config_path.clone(),
     })
 }
 
+fn json_value_has_oauth_token(val: Option<&serde_json::Value>) -> bool {
+    let Some(raw) = val.and_then(|v| v.as_str()).map(str::trim) else {
+        return false;
+    };
+    if raw.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(obj) = parsed.as_object() else {
+        return false;
+    };
+    let has_non_empty = |k: &str| {
+        obj.get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    has_non_empty("access_token") || has_non_empty("refresh_token")
+}
+
 /// Reads non-secret metadata (`remote_name`, `type`, `root_folder_id`,
-/// `shared_with_me`) for all remotes inside an encrypted app-owned config via
-/// `rclone config dump`. Never returns secrets or tokens.
+/// `shared_with_me`, `has_token`) for all remotes inside an encrypted app-owned
+/// config via `rclone config dump`. Never returns or logs secrets or tokens.
 pub fn list_encrypted_config_remotes(
     engine: &EngineIdentity,
     runner: &dyn ProcessRunner,
@@ -976,13 +1267,23 @@ pub fn list_encrypted_config_remotes(
     password_command: &PasswordCommand,
 ) -> Result<Vec<RemoteConfigSummary>, ConfigError> {
     let manifest = QualificationManifest::embedded()?;
-    verify_encrypted_config_with_manifest(
+    list_encrypted_config_remotes_with_manifest(
         engine,
         &manifest,
         runner,
         config_path,
         password_command,
-    )?;
+    )
+}
+
+pub(crate) fn list_encrypted_config_remotes_with_manifest(
+    engine: &EngineIdentity,
+    manifest: &QualificationManifest,
+    runner: &dyn ProcessRunner,
+    config_path: &Path,
+    password_command: &PasswordCommand,
+) -> Result<Vec<RemoteConfigSummary>, ConfigError> {
+    verify_encrypted_config_with_manifest(engine, manifest, runner, config_path, password_command)?;
     let account_dir = config_path.parent().ok_or(ConfigError::InvalidInput {
         field: "config_path",
         reason: "must have a parent directory",
@@ -996,14 +1297,8 @@ pub fn list_encrypted_config_remotes(
         OsString::from(password_command.to_rclone_space_sep_list()),
         OsString::from("--ask-password=false"),
     ];
-    let run_out = run_verified_rclone_config_cmd(
-        engine,
-        &manifest,
-        runner,
-        "config dump",
-        args,
-        account_dir,
-    )?;
+    let run_out =
+        run_verified_rclone_config_cmd(engine, manifest, runner, "config dump", args, account_dir)?;
     let dumped: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
         serde_json::from_str(&run_out.output.stdout_text()).map_err(|err| {
             ConfigError::RcloneCommandFailed {
@@ -1032,14 +1327,57 @@ pub fn list_encrypted_config_remotes(
                 .get("shared_with_me")
                 .and_then(|v| v.as_str())
                 .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            let has_token = json_value_has_oauth_token(opts.get("token"));
             RemoteConfigSummary {
                 remote_name,
                 remote_type,
                 root_folder_id,
                 shared_with_me,
+                has_token,
             }
         })
         .collect())
+}
+
+/// Checks (boolean presence only; never logs or returns the token) whether
+/// `remote_name` inside `config_path` has a saved OAuth token.
+pub fn encrypted_remote_has_token(
+    engine: &EngineIdentity,
+    runner: &dyn ProcessRunner,
+    config_path: &Path,
+    remote_name: &str,
+    password_command: &PasswordCommand,
+) -> Result<bool, ConfigError> {
+    let manifest = QualificationManifest::embedded()?;
+    encrypted_remote_has_token_with_manifest(
+        engine,
+        &manifest,
+        runner,
+        config_path,
+        remote_name,
+        password_command,
+    )
+}
+
+pub(crate) fn encrypted_remote_has_token_with_manifest(
+    engine: &EngineIdentity,
+    manifest: &QualificationManifest,
+    runner: &dyn ProcessRunner,
+    config_path: &Path,
+    remote_name: &str,
+    password_command: &PasswordCommand,
+) -> Result<bool, ConfigError> {
+    let remotes = list_encrypted_config_remotes_with_manifest(
+        engine,
+        manifest,
+        runner,
+        config_path,
+        password_command,
+    )?;
+    Ok(remotes
+        .into_iter()
+        .find(|r| r.remote_name == remote_name)
+        .is_some_and(|r| r.has_token))
 }
 
 #[cfg(test)]
@@ -1099,29 +1437,50 @@ client_secret = top-secret
     }
 
     #[test]
-    fn global_default_config_detection_catches_xdg_dotconfig_and_legacy_dotfile() {
+    fn global_default_config_detection_catches_exe_dir_xdg_dotconfig_and_legacy_dotfile() {
         let tmp = unique_tmp("global-detect");
         let home = tmp.join("home");
         let xdg = tmp.join("xdg");
+        let exe_dir = tmp.join("portable-rclone-bin");
         fs::create_dir_all(home.join(".config/rclone")).unwrap();
         fs::create_dir_all(xdg.join("rclone")).unwrap();
+        fs::create_dir_all(&exe_dir).unwrap();
 
         let p1 = home.join(".config/rclone/rclone.conf");
         let p2 = xdg.join("rclone/rclone.conf");
         let p3 = home.join(".rclone.conf");
+        let p4 = exe_dir.join("rclone.conf");
         let p_other = tmp.join("custom/my.conf");
 
-        assert!(is_global_default_rclone_config(&p1, Some(&home), None));
+        assert!(is_global_default_rclone_config(
+            &p1,
+            Some(&home),
+            None,
+            Some(&exe_dir)
+        ));
         assert!(is_global_default_rclone_config(
             &p2,
             Some(&home),
-            Some(&xdg)
+            Some(&xdg),
+            Some(&exe_dir)
         ));
-        assert!(is_global_default_rclone_config(&p3, Some(&home), None));
+        assert!(is_global_default_rclone_config(
+            &p3,
+            Some(&home),
+            None,
+            Some(&exe_dir)
+        ));
+        assert!(is_global_default_rclone_config(
+            &p4,
+            Some(&home),
+            Some(&xdg),
+            Some(&exe_dir)
+        ));
         assert!(!is_global_default_rclone_config(
             &p_other,
             Some(&home),
-            Some(&xdg)
+            Some(&xdg),
+            Some(&exe_dir)
         ));
 
         let _ = fs::remove_dir_all(&tmp);
@@ -1129,7 +1488,7 @@ client_secret = top-secret
 
     #[cfg(unix)]
     #[test]
-    fn failed_encryption_scrubs_unencrypted_file_and_classifies_locked_store() {
+    fn failed_encryption_never_publishes_final_config_and_cleans_temp_and_backup_files() {
         let tmp = unique_tmp("enc-fail-scrub");
         let fake_bin = tmp.join("rclone");
         fs::write(&fake_bin, b"fake rclone binary").unwrap();
@@ -1153,6 +1512,12 @@ client_secret = top-secret
         });
         let engine = qualify_binary_with_runner(&fake_bin, &manifest, &qual_runner).unwrap();
 
+        let acct_dir = tmp.join("accounts/a1");
+        fs::create_dir_all(&acct_dir).unwrap();
+        // Simulate a stale plaintext backup file from a prior interrupted engine save.
+        let simulated_bak = acct_dir.join("rclone.conf.123456789");
+        fs::write(&simulated_bak, b"[household]\nclient_secret = stale\n").unwrap();
+
         let runner = FakeProcessRunner::new();
         runner.push_run(FakeRunScript {
             lines: vec![OutputLine {
@@ -1167,8 +1532,9 @@ client_secret = top-secret
             ..Default::default()
         });
 
-        let cfg = tmp.join("accounts/a1/rclone.conf");
-        let lock = tmp.join("accounts/a1/config.lock");
+        let cfg = acct_dir.join("rclone.conf");
+        let lock_path = acct_dir.join("config.lock");
+        let lock = AccountConfigLock::acquire(&lock_path).unwrap();
         let pw = PasswordCommand::new(
             tmp.join("bin/sync-cli"),
             vec![
@@ -1186,15 +1552,25 @@ client_secret = top-secret
             root_folder_id: "root-id-1".to_string(),
         };
 
-        let err = create_drive_remote_config_with_manifest(
+        let err = create_drive_remote_config_with_manifest_locked(
             &engine, &manifest, &runner, &cfg, &lock, &pw, &spec,
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::AuthenticationRequired { .. }));
         assert!(
             !cfg.exists(),
-            "unencrypted config must be scrubbed and deleted when encryption fails"
+            "final rclone.conf must never be published when encryption fails"
         );
+        assert!(
+            !simulated_bak.exists(),
+            "rclone backup file must be removed on failure cleanup"
+        );
+        // No `.rclone.conf.setup.*` leftover should remain in account dir.
+        let remaining: Vec<String> = fs::read_dir(&acct_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining, vec!["config.lock".to_string()]);
 
         let spawned = runner.spawned_specs();
         assert_eq!(spawned.len(), 1);
@@ -1203,6 +1579,13 @@ client_secret = top-secret
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        // Verify rclone operated on the temp file, NOT final rclone.conf.
+        let cfg_arg_pos = argv.iter().position(|a| a == "--config").unwrap();
+        assert!(
+            argv[cfg_arg_pos + 1].contains(".rclone.conf.setup."),
+            "encryption must run against exclusive setup temp file, got {}",
+            argv[cfg_arg_pos + 1]
+        );
         assert!(!argv.iter().any(|a| a.contains("secret-never-in-argv")));
         assert!(format!("{spec:?}").contains("[REDACTED]"));
         assert!(!format!("{spec:?}").contains("secret-never-in-argv"));

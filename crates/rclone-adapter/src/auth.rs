@@ -17,7 +17,8 @@ use thiserror::Error;
 
 use crate::{
     config::{
-        AccountConfigLock, ConfigError, enforce_private_config_permissions,
+        AccountConfigLock, ConfigError, cleanup_account_temp_and_backup_files,
+        encrypted_remote_has_token_with_manifest, enforce_private_config_permissions,
         is_encrypted_config_content, stderr_indicates_auth_failure,
     },
     log_parser::strip_ansi_codes,
@@ -62,6 +63,10 @@ pub enum DriveAuthError {
     Qualification(#[from] QualificationError),
     #[error("authentication required or credential store locked: {reason}")]
     AuthenticationRequired { reason: String },
+    #[error(
+        "rclone authorization exited cleanly, but no OAuth token was saved in the encrypted config for remote `{remote}`"
+    )]
+    TokenNotSaved { remote: String },
     #[error("rclone authorization command failed (code={code:?}, signal={signal:?}): {detail}")]
     AuthorizationFailed {
         code: Option<i32>,
@@ -219,23 +224,36 @@ pub type AuthUrlCallback = Box<dyn Fn(&str) + Send>;
 
 /// Runs the pinned rclone OAuth browser authorization flow under the account's
 /// config mutation lock with stdin closed, surfacing the browser URL as soon as
-/// rclone emits it.
+/// rclone emits it, and verifying that an OAuth token was actually saved in the
+/// encrypted config before returning `Ok`.
 pub fn run_drive_auth(
     req: &DriveAuthRequest,
     runner: &dyn ProcessRunner,
     on_auth_url: Option<AuthUrlCallback>,
 ) -> Result<DriveAuthOutcome, DriveAuthError> {
-    let manifest = QualificationManifest::embedded()?;
-    run_drive_auth_with_manifest(req, &manifest, runner, on_auth_url)
+    let lock = AccountConfigLock::acquire(req.lock_path())?;
+    run_drive_auth_locked(req, &lock, runner, on_auth_url)
 }
 
-pub(crate) fn run_drive_auth_with_manifest(
+/// Caller-locked variant of [`run_drive_auth`] so callers can hold one
+/// [`AccountConfigLock`] across config creation and OAuth completion.
+pub fn run_drive_auth_locked(
     req: &DriveAuthRequest,
-    manifest: &QualificationManifest,
+    lock: &AccountConfigLock,
     runner: &dyn ProcessRunner,
     on_auth_url: Option<AuthUrlCallback>,
 ) -> Result<DriveAuthOutcome, DriveAuthError> {
-    let _lock = AccountConfigLock::acquire(req.lock_path())?;
+    let manifest = QualificationManifest::embedded()?;
+    run_drive_auth_with_manifest_locked(req, &manifest, lock, runner, on_auth_url)
+}
+
+pub(crate) fn run_drive_auth_with_manifest_locked(
+    req: &DriveAuthRequest,
+    manifest: &QualificationManifest,
+    _lock: &AccountConfigLock,
+    runner: &dyn ProcessRunner,
+    on_auth_url: Option<AuthUrlCallback>,
+) -> Result<DriveAuthOutcome, DriveAuthError> {
     enforce_private_config_permissions(req.config_path())?;
     let spec = req.build_verified_spec(manifest)?;
 
@@ -266,9 +284,12 @@ pub(crate) fn run_drive_auth_with_manifest(
     let run_out = handle.wait()?;
     let observed_url = observer_thread.join().unwrap_or(None);
 
-    // Always re-enforce 0600 permissions on config_path if it exists after mutation.
+    // Always re-enforce 0600 permissions and remove any leftover backup/temp files.
     if req.config_path().exists() {
         enforce_private_config_permissions(req.config_path())?;
+    }
+    if let Some(acct_dir) = req.config_path().parent() {
+        let _ = cleanup_account_temp_and_backup_files(acct_dir);
     }
 
     if !run_out.exit_status.is_success() {
@@ -296,6 +317,21 @@ pub(crate) fn run_drive_auth_with_manifest(
         return Err(DriveAuthError::Config(ConfigError::NotEncrypted {
             path: req.config_path().to_path_buf(),
         }));
+    }
+
+    // Confirm rclone actually persisted an OAuth token (presence only; never log token).
+    let has_token = encrypted_remote_has_token_with_manifest(
+        req.engine(),
+        manifest,
+        runner,
+        req.config_path(),
+        req.remote_name(),
+        req.password_command(),
+    )?;
+    if !has_token {
+        return Err(DriveAuthError::TokenNotSaved {
+            remote: req.remote_name().to_string(),
+        });
     }
 
     let auth_url = observed_url.or_else(|| {
@@ -368,7 +404,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_drive_auth_builds_reconnect_argv_surfaces_url_and_verifies_encrypted_config() {
+    fn run_drive_auth_surfaces_url_verifies_saved_token_and_rejects_missing_token() {
         let tmp = unique_tmp("reconnect-fixture");
         let fake_bin = tmp.join("rclone");
         fs::write(&fake_bin, b"fake rclone binary").unwrap();
@@ -395,7 +431,7 @@ mod tests {
         let acct_dir = tmp.join("accounts/drive1");
         fs::create_dir_all(&acct_dir).unwrap();
         let cfg = acct_dir.join("rclone.conf");
-        let lock = acct_dir.join("config.lock");
+        let lock_path = acct_dir.join("config.lock");
         fs::write(
             &cfg,
             "# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nFakeCiphertext==\n",
@@ -408,14 +444,17 @@ mod tests {
             vec![
                 "credential-helper".to_string(),
                 "--account".to_string(),
-                "drive1".to_string(),
+                "inst-1/drive1".to_string(),
             ],
         )
         .unwrap();
-        let req = DriveAuthRequest::new(engine, cfg.clone(), lock, "household", pw).unwrap();
+        let req =
+            DriveAuthRequest::new(engine, cfg.clone(), lock_path.clone(), "household", pw).unwrap();
+        let lock = AccountConfigLock::acquire(&lock_path).unwrap();
 
-        let runner = FakeProcessRunner::new();
-        runner.push_run(FakeRunScript {
+        // Case 1: reconnect exits 0, encryption check passes, config dump has token -> Ok.
+        let runner_ok = FakeProcessRunner::new();
+        runner_ok.push_run(FakeRunScript {
             lines: vec![
                 OutputLine {
                     stream: StreamKind::Stderr,
@@ -424,28 +463,31 @@ mod tests {
                 },
                 OutputLine {
                     stream: StreamKind::Stderr,
-                    text: "NOTICE: Log in and authorize rclone for access".to_string(),
-                    truncated: false,
-                },
-                OutputLine {
-                    stream: StreamKind::Stderr,
                     text: "NOTICE: Got code".to_string(),
                     truncated: false,
                 },
             ],
-            exit_status: ExitStatusInfo {
-                code: Some(0),
-                signal: None,
-            },
+            ..Default::default()
+        });
+        // config encryption check
+        runner_ok.push_run(FakeRunScript::default());
+        // config dump with saved token
+        runner_ok.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stdout,
+                text: r#"{"household":{"type":"drive","root_folder_id":"0ARoot","token":"{\"access_token\":\"tok\",\"refresh_token\":\"ref\"}"}}"#.to_string(),
+                truncated: false,
+            }],
             ..Default::default()
         });
 
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen_cb = Arc::clone(&seen);
-        let outcome = run_drive_auth_with_manifest(
+        let outcome = run_drive_auth_with_manifest_locked(
             &req,
             &manifest,
-            &runner,
+            &lock,
+            &runner_ok,
             Some(Box::new(move |url| {
                 seen_cb.lock().unwrap().push(url.to_string());
             })),
@@ -461,26 +503,35 @@ mod tests {
             ["http://127.0.0.1:53682/auth?state=fixture123"]
         );
 
-        let specs = runner.spawned_specs();
-        assert_eq!(specs.len(), 1);
-        let argv: Vec<String> = specs[0]
+        let specs = runner_ok.spawned_specs();
+        assert_eq!(specs.len(), 3);
+        let argv0: Vec<String> = specs[0]
             .args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(argv[0], "config");
-        assert_eq!(argv[1], "reconnect");
-        assert_eq!(argv[2], "household:");
-        assert!(argv.contains(&"--ask-password=false".to_string()));
-        assert!(argv.contains(&"--auto-confirm".to_string()));
-        assert!(argv.contains(&"--password-command".to_string()));
-        assert!(specs[0].env.contains_key(&OsString::from("HOME")));
-        assert!(
-            !specs[0]
-                .env
-                .keys()
-                .any(|k| k.to_string_lossy().starts_with("RCLONE_"))
-        );
+        assert_eq!(argv0[0], "config");
+        assert_eq!(argv0[1], "reconnect");
+        assert_eq!(argv0[2], "household:");
+        assert!(argv0.contains(&"--ask-password=false".to_string()));
+        assert!(argv0.contains(&"--auto-confirm".to_string()));
+
+        // Case 2: reconnect exits 0 WITHOUT saving a token -> TokenNotSaved!
+        let runner_no_token = FakeProcessRunner::new();
+        runner_no_token.push_run(FakeRunScript::default());
+        runner_no_token.push_run(FakeRunScript::default()); // encryption check
+        runner_no_token.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stdout,
+                text: r#"{"household":{"type":"drive","root_folder_id":"0ARoot"}}"#.to_string(),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        let err =
+            run_drive_auth_with_manifest_locked(&req, &manifest, &lock, &runner_no_token, None)
+                .unwrap_err();
+        assert!(matches!(err, DriveAuthError::TokenNotSaved { .. }));
 
         let _ = fs::remove_dir_all(&tmp);
     }

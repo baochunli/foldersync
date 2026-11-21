@@ -14,13 +14,16 @@ use std::{env, path::PathBuf};
 
 pub use auth::{
     AuthUrlCallback, DriveAuthError, DriveAuthOutcome, DriveAuthRequest, extract_auth_url,
-    run_drive_auth,
+    run_drive_auth, run_drive_auth_locked,
 };
 pub use config::{
     AccountConfigLock, ConfigError, DriveRemoteConfigSpec, ImportRemoteSpec, ImportedRemoteInfo,
-    ParsedIniSection, RCLONE_ENCRYPT_HEADER, RemoteConfigSummary, create_drive_remote_config,
+    ParsedIniSection, RCLONE_ENCRYPT_HEADER, RemoteConfigSummary,
+    cleanup_account_temp_and_backup_files, create_drive_remote_config,
+    create_drive_remote_config_locked, encrypted_remote_has_token,
     enforce_private_config_permissions, extract_single_remote_section,
-    import_single_remote_into_encrypted_config, init_encrypted_config, is_encrypted_config_content,
+    import_single_remote_into_encrypted_config, import_single_remote_into_encrypted_config_locked,
+    init_encrypted_config, init_encrypted_config_locked, is_encrypted_config_content,
     is_global_default_rclone_config, list_encrypted_config_remotes, verify_encrypted_config,
 };
 pub use log_parser::{

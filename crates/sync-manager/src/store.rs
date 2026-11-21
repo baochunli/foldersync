@@ -14,7 +14,7 @@ use sync_core::{
 
 use crate::{
     error::ManagerError,
-    platform::{ensure_private_dir, set_private_file_permissions},
+    platform::{ensure_private_dir, reject_symlinks_under_root, set_private_file_permissions},
 };
 
 /// Current highest SQLite schema migration version supported by this build.
@@ -366,11 +366,75 @@ pub struct SqliteStateStore {
 }
 
 impl SqliteStateStore {
-    /// Opens or creates `db_path`, enforces `0600` private permissions, and runs
-    /// forward-only migrations.
+    /// Opens or creates `db_path`, refuses symlinks (`O_NOFOLLOW`), enforces
+    /// `0600` private permissions, and runs forward-only migrations.
     pub fn open(db_path: &Path) -> Result<Self, ManagerError> {
         if let Some(parent) = db_path.parent() {
+            if let Ok(meta) = std::fs::symlink_metadata(parent)
+                && meta.file_type().is_symlink()
+            {
+                return Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Refused to follow symbolic link at database directory `{}`.",
+                        parent.display()
+                    ),
+                    next_step: "Keep state.sqlite inside a real private state directory."
+                        .to_string(),
+                });
+            }
             ensure_private_dir(parent)?;
+            let checked = reject_symlinks_under_root("state_sqlite", parent, db_path)?;
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = PathBuf::from(format!("{}{suffix}", checked.display()));
+                reject_symlinks_under_root("state_sqlite_sidecar", parent, &sidecar)?;
+            }
+        }
+
+        // Pre-open/create with O_NOFOLLOW before SQLite touches the path so
+        // symlinks cannot be followed to an outside target.
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                opts.mode(0o600);
+                opts.custom_flags(libc::O_NOFOLLOW);
+                let file = opts.open(db_path).map_err(|err| {
+                    if err.raw_os_error() == Some(libc::ELOOP) {
+                        return ManagerError::PreflightRejected {
+                            cause: format!(
+                                "Refused to follow symbolic link at SQLite DB `{}`.",
+                                db_path.display()
+                            ),
+                            next_step:
+                                "Remove the unexpected symbolic link inside the state directory."
+                                    .to_string(),
+                        };
+                    }
+                    storage_err(
+                        &format!("Failed to open SQLite DB `{}`", db_path.display()),
+                        err,
+                    )
+                })?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|err| ManagerError::Io {
+                        cause: format!(
+                            "Failed to set private 0600 permissions on `{}`: {err}.",
+                            db_path.display()
+                        ),
+                        next_step: "Verify ownership inside the state directory.".to_string(),
+                    })?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = opts.open(db_path).map_err(|err| {
+                    storage_err(
+                        &format!("Failed to open SQLite DB `{}`", db_path.display()),
+                        err,
+                    )
+                })?;
+            }
         }
 
         let conn = Connection::open(db_path).map_err(|e| {
