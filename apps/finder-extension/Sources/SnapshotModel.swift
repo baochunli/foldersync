@@ -1,7 +1,13 @@
+import Darwin
 import Foundation
 
 public let snapshotSchemaVersion = 1
 public let defaultStaleAfterSeconds = 300
+public let productionHostBundleIdentifier = "dev.foldersync.app"
+public let productionExtensionBundleIdentifier = "dev.foldersync.app.finder-extension"
+public let defaultSharedHomeRelativePath = "Library/Application Support/FolderSync/finder"
+public let darwinSnapshotUpdatedNotification = "dev.foldersync.finder.snapshot-updated"
+public let darwinActionRequestedNotification = "dev.foldersync.finder.action-requested"
 
 public enum MappingState: String, Codable, Equatable {
     case synced
@@ -148,6 +154,9 @@ public enum ActionKind: String, Codable, Equatable {
 
 public enum ActionValidationError: Error, Equatable {
     case invalidActionRequest
+    case unsafeIdentifier
+    case symlinkRefused
+    case ioFailure(Int32)
 }
 
 public struct ActionRequest: Codable, Equatable {
@@ -220,11 +229,108 @@ public struct ActionRequest: Codable, Equatable {
 }
 
 public enum SnapshotEvaluator {
-    /// Disposable default shared directory used by both the spike extension and
-    /// throwaway mock host when `FolderSyncSharedDir` is not set in Info.plist.
+    /// Returns the real user home directory even when invoked inside a macOS App Sandbox
+    /// container (where `NSHomeDirectory()` points to `~/Library/Containers/<id>/Data`).
+    public static func realUserHomeDirectoryURL() -> URL {
+        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
+            let path = String(cString: dir)
+            if !path.isEmpty {
+                return URL(fileURLWithPath: path, isDirectory: true)
+            }
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    /// Resolves the Finder handoff directory (`<state dir>/finder`):
+    /// 1. Explicit `FolderSyncSharedDir` absolute override (used in isolated dev/temp runs).
+    /// 2. `FolderSyncSharedHomeRelativeDir` (defaults to `Library/Application Support/FolderSync/finder`)
+    ///    resolved against the real user home directory (matching the temporary file exception).
+    public static func resolveSharedDirectoryURL(
+        configuredAbsolutePath: String?,
+        configuredHomeRelativePath: String?,
+        realHomeDirectory: URL? = nil
+    ) -> URL {
+        if let abs = configuredAbsolutePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !abs.isEmpty {
+            return URL(fileURLWithPath: abs, isDirectory: true)
+        }
+
+        let home = realHomeDirectory ?? realUserHomeDirectoryURL()
+        let rawRel = configuredHomeRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmedRel = rawRel.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let components = trimmedRel.split(separator: "/")
+        let relIsSafe = !components.isEmpty
+            && !components.contains("..")
+            && !components.contains(".")
+            && !trimmedRel.contains("\0")
+        let effectiveRel = relIsSafe ? trimmedRel : defaultSharedHomeRelativePath
+        return home.appendingPathComponent(effectiveRel, isDirectory: true)
+    }
+
+    /// Disposable default shared directory used by the throwaway mock host when
+    /// `FolderSyncSharedDir` is not set in Info.plist.
     public static func defaultSpikeSharedDirectoryURL() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("foldersync-finder-spike-shared", isDirectory: true)
+    }
+
+    /// Validates an identifier used as a single path component (`[A-Za-z0-9][A-Za-z0-9_-]{0,127}`).
+    public static func isSafePathComponentId(_ value: String) -> Bool {
+        guard !value.isEmpty && value.count <= 128 else {
+            return false
+        }
+        var scalars = value.unicodeScalars.makeIterator()
+        guard let first = scalars.next() else {
+            return false
+        }
+        let isAlnum: (UnicodeScalar) -> Bool = { s in
+            (s >= "a" && s <= "z") || (s >= "A" && s <= "Z") || (s >= "0" && s <= "9")
+        }
+        guard isAlnum(first) else {
+            return false
+        }
+        while let s = scalars.next() {
+            if !(isAlnum(s) || s == "-" || s == "_") {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Returns true if `url` exists as a symbolic link (`lstat`, without following links).
+    public static func isSymbolicLink(at url: URL) -> Bool {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else {
+            return false
+        }
+        return (st.st_mode & S_IFMT) == S_IFLNK
+    }
+
+    /// Reads and validates `status.json` while refusing symlinks (`O_NOFOLLOW` + `lstat`).
+    public static func readSnapshotData(at fileURL: URL) -> SnapshotReadResult {
+        if isSymbolicLink(at: fileURL.deletingLastPathComponent()) || isSymbolicLink(at: fileURL) {
+            return .failed(reason: "Status unavailable (symlink refused)")
+        }
+        let fd = Darwin.open(fileURL.path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else {
+            if errno == ELOOP {
+                return .failed(reason: "Status unavailable (symlink refused)")
+            }
+            return .failed(reason: "Status unavailable")
+        }
+        defer { Darwin.close(fd) }
+
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
+            return .failed(reason: "Status unavailable")
+        }
+
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        let data = handle.readDataToEndOfFile()
+        guard let decoded = decode(data: data) else {
+            return .failed(reason: "Status unavailable (invalid snapshot)")
+        }
+        return .valid(decoded)
     }
 
     public static func formatISO8601(_ date: Date) -> String {
@@ -391,20 +497,73 @@ public enum SnapshotEvaluator {
         guard request.isValid else {
             throw ActionValidationError.invalidActionRequest
         }
+        guard isSafePathComponentId(request.id) else {
+            throw ActionValidationError.unsafeIdentifier
+        }
         let fm = FileManager.default
-        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let parentDir = directory.deletingLastPathComponent()
+        if isSymbolicLink(at: parentDir) || isSymbolicLink(at: directory) {
+            throw ActionValidationError.symlinkRefused
+        }
+        try fm.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        if isSymbolicLink(at: directory) {
+            throw ActionValidationError.symlinkRefused
+        }
+
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(request)
 
-        let safeId = request.id.replacingOccurrences(of: "/", with: "_")
-        let finalURL = directory.appendingPathComponent("action-\(safeId).json")
-        let tmpURL = directory.appendingPathComponent(".action-\(safeId).tmp")
-        try data.write(to: tmpURL, options: .atomic)
-        if fm.fileExists(atPath: finalURL.path) {
-            try fm.removeItem(at: finalURL)
+        let finalURL = directory.appendingPathComponent("action-\(request.id).json")
+        let tmpURL = directory.appendingPathComponent(".action-\(request.id).tmp")
+        if isSymbolicLink(at: finalURL) || isSymbolicLink(at: tmpURL) {
+            throw ActionValidationError.symlinkRefused
         }
-        try fm.moveItem(at: tmpURL, to: finalURL)
+
+        let fd = Darwin.open(tmpURL.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else {
+            if errno == ELOOP {
+                throw ActionValidationError.symlinkRefused
+            }
+            throw ActionValidationError.ioFailure(errno)
+        }
+        var writeFailed = false
+        defer {
+            Darwin.close(fd)
+            if writeFailed {
+                try? fm.removeItem(at: tmpURL)
+            }
+        }
+        try data.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return }
+            var offset = 0
+            while offset < rawBuf.count {
+                let written = Darwin.write(fd, base.advanced(by: offset), rawBuf.count - offset)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    writeFailed = true
+                    throw ActionValidationError.ioFailure(errno)
+                }
+                offset += written
+            }
+        }
+        if fsync(fd) != 0 {
+            writeFailed = true
+            throw ActionValidationError.ioFailure(errno)
+        }
+
+        if isSymbolicLink(at: finalURL) {
+            writeFailed = true
+            throw ActionValidationError.symlinkRefused
+        }
+        if Darwin.rename(tmpURL.path, finalURL.path) != 0 {
+            writeFailed = true
+            throw ActionValidationError.ioFailure(errno)
+        }
         return finalURL
     }
 }

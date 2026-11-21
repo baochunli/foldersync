@@ -300,6 +300,135 @@ do {
     }
 }
 
+// 7. Production bundle IDs, Darwin notification names, and <state dir>/finder resolution
+do {
+    expect(productionHostBundleIdentifier == "dev.foldersync.app", "production host bundle ID must be dev.foldersync.app")
+    expect(productionExtensionBundleIdentifier == "dev.foldersync.app.finder-extension", "production extension bundle ID must be dev.foldersync.app.finder-extension")
+    expect(darwinSnapshotUpdatedNotification == "dev.foldersync.finder.snapshot-updated", "snapshot Darwin notification must match ADR 0002")
+    expect(darwinActionRequestedNotification == "dev.foldersync.finder.action-requested", "action Darwin notification must match ADR 0002")
+
+    let fakeHome = URL(fileURLWithPath: "/tmp/foldersync-fake-home", isDirectory: true)
+    let defaultResolved = SnapshotEvaluator.resolveSharedDirectoryURL(
+        configuredAbsolutePath: nil,
+        configuredHomeRelativePath: nil,
+        realHomeDirectory: fakeHome
+    )
+    expect(
+        defaultResolved.path == "/tmp/foldersync-fake-home/Library/Application Support/FolderSync/finder",
+        "default shared dir must resolve to <home>/Library/Application Support/FolderSync/finder, got \(defaultResolved.path)"
+    )
+
+    let leadingSlashResolved = SnapshotEvaluator.resolveSharedDirectoryURL(
+        configuredAbsolutePath: "   ",
+        configuredHomeRelativePath: "/Library/Application Support/FolderSync/finder/",
+        realHomeDirectory: fakeHome
+    )
+    expect(
+        leadingSlashResolved.path == "/tmp/foldersync-fake-home/Library/Application Support/FolderSync/finder",
+        "leading/trailing slashes in home-relative path must normalize cleanly"
+    )
+
+    let traversalFallback = SnapshotEvaluator.resolveSharedDirectoryURL(
+        configuredAbsolutePath: nil,
+        configuredHomeRelativePath: "../../etc/passwd",
+        realHomeDirectory: fakeHome
+    )
+    expect(
+        traversalFallback.path == "/tmp/foldersync-fake-home/Library/Application Support/FolderSync/finder",
+        "traversal in home-relative path must fall back to safe default"
+    )
+
+    let absOverride = SnapshotEvaluator.resolveSharedDirectoryURL(
+        configuredAbsolutePath: "/tmp/custom-finder-handoff",
+        configuredHomeRelativePath: "Library/Application Support/FolderSync/finder",
+        realHomeDirectory: fakeHome
+    )
+    expect(
+        absOverride.path == "/tmp/custom-finder-handoff",
+        "explicit FolderSyncSharedDir must override home-relative path"
+    )
+}
+
+// 8. Symlink refusal on snapshot reads and action writes, plus safe action ID enforcement
+do {
+    let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("fs-sec-\(UUID().uuidString)")
+    let finderDir = tempRoot.appendingPathComponent("finder", isDirectory: true)
+    let outsideDir = tempRoot.appendingPathComponent("outside", isDirectory: true)
+    try! FileManager.default.createDirectory(at: finderDir, withIntermediateDirectories: true)
+    try! FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+    // Valid status.json reads cleanly via readSnapshotData
+    let validStatus = """
+    {"version":1,"generated_at":"2026-11-20T18:00:00Z","stale_after_seconds":300,"mappings":[]}
+    """
+    let statusFile = finderDir.appendingPathComponent("status.json")
+    try! Data(validStatus.utf8).write(to: statusFile)
+    if case .valid(let decoded) = SnapshotEvaluator.readSnapshotData(at: statusFile) {
+        expect(decoded.version == 1, "regular status.json should read cleanly")
+    } else {
+        failed += 1
+        fputs("FAIL: regular status.json should decode cleanly via readSnapshotData\n", stderr)
+    }
+
+    // Symlinked status.json must be refused
+    let outsideStatus = outsideDir.appendingPathComponent("real-status.json")
+    try! Data(validStatus.utf8).write(to: outsideStatus)
+    try! FileManager.default.removeItem(at: statusFile)
+    try! FileManager.default.createSymbolicLink(at: statusFile, withDestinationURL: outsideStatus)
+    if case .failed(let reason) = SnapshotEvaluator.readSnapshotData(at: statusFile) {
+        expect(reason.contains("symlink"), "symlinked status.json must be refused with symlink reason, got \(reason)")
+    } else {
+        failed += 1
+        fputs("FAIL: symlinked status.json must be refused\n", stderr)
+    }
+
+    // Unsafe action IDs (path traversal / slashes) must be rejected by writeActionRequest
+    let actionsDir = finderDir.appendingPathComponent("actions", isDirectory: true)
+    for badId in ["../escape", "nested/id", "", "-leading-dash", "has space"] {
+        expect(!SnapshotEvaluator.isSafePathComponentId(badId), "unsafe id '\(badId)' must fail isSafePathComponentId")
+        if let badReq = ActionRequest(
+            version: 1,
+            id: badId,
+            requestedAt: "2026-11-20T18:01:00Z",
+            action: .openApp,
+            mappingId: nil
+        ) {
+            do {
+                _ = try SnapshotEvaluator.writeActionRequest(badReq, toDirectory: actionsDir)
+                failed += 1
+                fputs("FAIL: writeActionRequest must reject unsafe id '\(badId)'\n", stderr)
+            } catch ActionValidationError.unsafeIdentifier {
+                passed += 1
+            } catch {
+                failed += 1
+                fputs("FAIL: expected unsafeIdentifier for '\(badId)', got \(error)\n", stderr)
+            }
+        }
+    }
+
+    // Symlinked actions directory must be refused by writeActionRequest
+    let symlinkActions = finderDir.appendingPathComponent("actions-link", isDirectory: true)
+    try! FileManager.default.createSymbolicLink(at: symlinkActions, withDestinationURL: outsideDir)
+    let goodReq = ActionRequest(
+        version: 1,
+        id: "safe-action-1",
+        requestedAt: "2026-11-20T18:01:00Z",
+        action: .openApp,
+        mappingId: nil
+    )!
+    do {
+        _ = try SnapshotEvaluator.writeActionRequest(goodReq, toDirectory: symlinkActions)
+        failed += 1
+        fputs("FAIL: writeActionRequest must refuse symlinked actions directory\n", stderr)
+    } catch ActionValidationError.symlinkRefused {
+        passed += 1
+    } catch {
+        failed += 1
+        fputs("FAIL: expected symlinkRefused for symlinked actions dir, got \(error)\n", stderr)
+    }
+}
+
 print("SnapshotModelTests: \(passed) passed, \(failed) failed")
 if failed > 0 {
     exit(1)

@@ -23,12 +23,10 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     override init() {
         let info = Bundle.main.infoDictionary ?? [:]
-        let configuredSharedDir = (info["FolderSyncSharedDir"] as? String) ?? ""
-        if configuredSharedDir.isEmpty {
-            self.sharedDirectoryURL = SnapshotEvaluator.defaultSpikeSharedDirectoryURL()
-        } else {
-            self.sharedDirectoryURL = URL(fileURLWithPath: configuredSharedDir, isDirectory: true)
-        }
+        self.sharedDirectoryURL = SnapshotEvaluator.resolveSharedDirectoryURL(
+            configuredAbsolutePath: info["FolderSyncSharedDir"] as? String,
+            configuredHomeRelativePath: info["FolderSyncSharedHomeRelativeDir"] as? String
+        )
 
         self.snapshotFileURL = self.sharedDirectoryURL.appendingPathComponent("status.json")
         self.actionsDirectoryURL = self.sharedDirectoryURL.appendingPathComponent("actions", isDirectory: true)
@@ -41,10 +39,10 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
         self.snapshotUpdatedNotification =
             (info["FolderSyncDarwinSnapshotNotification"] as? String)
-            ?? "dev.foldersync.finder.snapshot-updated"
+            ?? darwinSnapshotUpdatedNotification
         self.actionRequestedNotification =
             (info["FolderSyncDarwinActionNotification"] as? String)
-            ?? "dev.foldersync.finder.action-requested"
+            ?? darwinActionRequestedNotification
 
         super.init()
 
@@ -68,7 +66,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     private static func derivedHostBundleIdentifier() -> String {
         guard let extId = Bundle.main.bundleIdentifier else {
-            return "dev.foldersync.spike.host"
+            return productionHostBundleIdentifier
         }
         let parts = extId.split(separator: ".")
         if parts.count > 1 {
@@ -122,18 +120,11 @@ final class FolderSyncFinderExtension: FIFinderSync {
     }
 
     private func readSnapshotFromDisk() -> SnapshotReadResult {
-        let data: Data
-        do {
-            data = try Data(contentsOf: snapshotFileURL)
-        } catch {
-            logger.notice("Snapshot unreadable at \(self.snapshotFileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            return .failed(reason: "Status unavailable")
+        let result = SnapshotEvaluator.readSnapshotData(at: snapshotFileURL)
+        if case .failed(let reason) = result {
+            logger.notice("Snapshot read failed at \(self.snapshotFileURL.path, privacy: .public): \(reason, privacy: .public)")
         }
-        guard let decoded = SnapshotEvaluator.decode(data: data) else {
-            logger.warning("Snapshot JSON invalid or unsupported version at \(self.snapshotFileURL.path, privacy: .public)")
-            return .failed(reason: "Status unavailable (invalid snapshot)")
-        }
-        return .valid(decoded)
+        return result
     }
 
     private func evaluateCurrentState() -> SnapshotEvaluation {
