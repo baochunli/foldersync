@@ -17,8 +17,8 @@ use std::{
 
 use rclone_adapter::{
     BackupDir2, BisyncMarker, BisyncRequest, EngineIdentity, InitPreference, LaunchError, LogEvent,
-    Outcome, Path2, QualificationError, RealProcessRunner, RunMode, SpawnOptions,
-    classify_run_outcome, pinned_binary_path, qualify_binary, sha256_file,
+    Outcome, Path2, ProcessError, RealProcessRunner, RunMode, SpawnOptions, classify_run_outcome,
+    pinned_binary_path, qualify_binary, sha256_file,
 };
 use sha2::{Digest, Sha256};
 
@@ -791,9 +791,9 @@ fn refuses_launch_when_pinned_binary_is_replaced_after_qualification() {
     assert!(
         matches!(
             err,
-            LaunchError::Qualification(QualificationError::Sha256Mismatch { .. })
+            LaunchError::Process(ProcessError::BinaryIntegrityMismatch { .. })
         ),
-        "expected Sha256Mismatch at launch boundary, got {err:?}"
+        "expected the process runner to refuse the replacement before spawn, got {err:?}"
     );
 }
 

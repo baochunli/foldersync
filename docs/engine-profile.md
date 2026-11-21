@@ -30,9 +30,9 @@ Both paths check SHA-256 before running
 `<binary> version --config <throwaway-temp-config> --ask-password=false` with
 closed stdin, a cleared environment, and an isolated `HOME`. The version must
 equal `1.76.0`. The immutable `EngineIdentity` records the resolved path, host
-platform, version, and verified digest. The adapter re-hashes the executable at
-each launch boundary, including immediately before spawning with
-`RealProcessRunner`. The startup digest is retained across launches.
+platform, version, and verified digest. The adapter checks that digest once
+per bisync launch, immediately before spawning with `RealProcessRunner`.
+The qualified digest is retained across launches.
 
 `rclone selfupdate` and `rclone` on `PATH` are never used.
 

@@ -16,8 +16,7 @@ use crate::{
         ProcessError, ProcessRunner, ProcessSpec, RunHandle, SpawnOptions, minimal_isolated_env,
     },
     qualification::{
-        EngineIdentity, QualificationError, QualificationManifest,
-        verify_binary_integrity_with_manifest,
+        EngineIdentity, QualificationError, QualificationManifest, verify_executable_metadata,
     },
 };
 
@@ -466,13 +465,8 @@ impl BisyncRequest {
         args
     }
 
-    /// Re-verifies the qualified binary's SHA-256 on disk against `manifest`
-    /// and builds an isolated [`ProcessSpec`] pinned to that digest.
-    fn build_verified_spec(
-        &self,
-        manifest: &QualificationManifest,
-    ) -> Result<ProcessSpec, QualificationError> {
-        verify_binary_integrity_with_manifest(&self.engine, manifest)?;
+    fn build_process_spec(&self) -> Result<ProcessSpec, QualificationError> {
+        verify_executable_metadata(&self.engine)?;
         Ok(ProcessSpec {
             program: self.engine.path().to_path_buf(),
             args: self.to_args(),
@@ -482,37 +476,14 @@ impl BisyncRequest {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn to_verified_process_spec_with_manifest(
-        &self,
-        manifest: &QualificationManifest,
-    ) -> Result<ProcessSpec, QualificationError> {
-        self.build_verified_spec(manifest)
-    }
-
-    /// Re-hashes the binary on disk at the launch boundary against the checked-in
-    /// qualification manifest and spawns the process with a cleared, allowlisted
-    /// environment (where [`crate::RealProcessRunner`] also re-hashes immediately
-    /// before `exec`).
+    /// Spawns with a cleared, allowlisted environment. [`crate::RealProcessRunner`]
+    /// checks the qualified digest immediately before spawning the executable.
     pub fn spawn(
         &self,
         runner: &dyn ProcessRunner,
         options: SpawnOptions,
     ) -> Result<RunHandle, LaunchError> {
-        let manifest = QualificationManifest::embedded()?;
-        let spec = self.build_verified_spec(&manifest)?;
-        Ok(runner.spawn(&spec, options)?)
-    }
-
-    /// Test-only launch boundary variant accepting a synthetic manifest.
-    #[cfg(test)]
-    pub(crate) fn spawn_with_manifest(
-        &self,
-        runner: &dyn ProcessRunner,
-        options: SpawnOptions,
-        manifest: &QualificationManifest,
-    ) -> Result<RunHandle, LaunchError> {
-        let spec = self.build_verified_spec(manifest)?;
+        let spec = self.build_process_spec()?;
         Ok(runner.spawn(&spec, options)?)
     }
 }
@@ -1504,23 +1475,18 @@ mod tests {
 
         // Replace binary on disk AFTER qualification and request creation.
         fs::write(&bin, b"tampered after qualification").unwrap();
-        let launch_runner = FakeProcessRunner::new();
         let err = req
-            .spawn_with_manifest(&launch_runner, SpawnOptions::default(), &manifest)
+            .spawn(&crate::process::RealProcessRunner, SpawnOptions::default())
             .unwrap_err();
         assert!(matches!(
             err,
-            LaunchError::Qualification(QualificationError::Sha256Mismatch { .. })
+            LaunchError::Process(ProcessError::BinaryIntegrityMismatch { .. })
         ));
-        assert!(
-            launch_runner.spawned_specs().is_empty(),
-            "replaced binary must never be launched"
-        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn real_runner_refuses_binary_replaced_after_verified_spec_creation() {
+    fn real_runner_refuses_binary_replaced_after_spec_creation() {
         use std::os::unix::fs::PermissionsExt;
         let root = TestFixtureDir::new("replace-after-spec");
         let bin = root.path("rclone");
@@ -1558,10 +1524,7 @@ mod tests {
             .build_with_manifest(&manifest)
             .unwrap();
 
-        // Create a verified ProcessSpec while the binary is still intact.
-        let spec = req
-            .to_verified_process_spec_with_manifest(&manifest)
-            .unwrap();
+        let spec = req.build_process_spec().unwrap();
 
         // Replace binary on disk AFTER spec creation, BEFORE RealProcessRunner::spawn executes.
         fs::write(&bin, b"tampered binary bytes after spec creation").unwrap();

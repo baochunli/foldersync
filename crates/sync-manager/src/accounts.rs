@@ -10,7 +10,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use rclone_adapter::{
@@ -419,6 +419,7 @@ pub struct AccountService {
     process_runner: Arc<dyn ProcessRunner>,
     clock: Arc<dyn Clock>,
     rclone_binary_override: Option<PathBuf>,
+    qualified_engine: Mutex<Option<EngineIdentity>>,
     credential_helper_binary: Option<PathBuf>,
     password_command_factory: Option<PasswordCommandFactory>,
     acquire_state_lock: bool,
@@ -438,6 +439,7 @@ impl AccountService {
             process_runner: config.process_runner,
             clock: config.clock,
             rclone_binary_override: config.rclone_binary_override,
+            qualified_engine: Mutex::new(None),
             credential_helper_binary: config.credential_helper_binary,
             password_command_factory: config.password_command_factory,
             acquire_state_lock: config.acquire_state_lock,
@@ -573,21 +575,25 @@ impl AccountService {
     }
 
     fn qualify_engine(&self) -> Result<EngineIdentity, AccountError> {
-        let qualified = match self.rclone_binary_override.as_deref() {
+        let mut qualified = self.qualified_engine.lock().unwrap();
+        if let Some(engine) = qualified.as_ref() {
+            return Ok(engine.clone());
+        }
+        let engine = match self.rclone_binary_override.as_deref() {
             Some(path) => qualify_binary(path).map(Some),
             None => qualify_pinned_binary(),
-        };
-        qualified
-            .map_err(|err| AccountError::Engine {
-                cause: err.to_string(),
-                next_step: "Verify the installed FolderSync rclone executable.".to_string(),
-            })?
-            .ok_or_else(|| AccountError::Engine {
-                cause: "Pinned rclone binary is not installed.".to_string(),
-                next_step:
-                    "Run scripts/fetch-rclone.sh to install the verified development engine."
-                        .to_string(),
-            })
+        }
+        .map_err(|err| AccountError::Engine {
+            cause: err.to_string(),
+            next_step: "Verify the installed FolderSync rclone executable.".to_string(),
+        })?
+        .ok_or_else(|| AccountError::Engine {
+            cause: "Pinned rclone binary is not installed.".to_string(),
+            next_step: "Run scripts/fetch-rclone.sh to install the verified development engine."
+                .to_string(),
+        })?;
+        *qualified = Some(engine.clone());
+        Ok(engine)
     }
 
     fn reject_reserved_account_id(id: &AccountId) -> Result<(), AccountError> {
@@ -1492,6 +1498,30 @@ mod tests {
             )
             .unwrap())
         })
+    }
+
+    #[test]
+    fn account_service_caches_successful_qualification_for_its_lifetime() {
+        let Some(pinned) = pinned_binary_path() else {
+            eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        let engine_path = tmp.path().join("rclone");
+        let mut cfg = AccountServiceConfig::with_state_dir(tmp.path().join("state"));
+        cfg.secret_store = Arc::new(InMemorySecretStore::new());
+        cfg.rclone_binary_override = Some(engine_path.clone());
+        let svc = AccountService::new(cfg).unwrap();
+
+        assert!(matches!(
+            svc.qualify_engine(),
+            Err(AccountError::Engine { .. })
+        ));
+        fs::copy(pinned, &engine_path).unwrap();
+        let original = svc.qualify_engine().unwrap();
+
+        fs::write(&engine_path, b"replacement after qualification").unwrap();
+        assert_eq!(svc.qualify_engine().unwrap(), original);
     }
 
     #[test]
