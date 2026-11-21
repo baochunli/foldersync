@@ -37,8 +37,8 @@ Options:
                       non-"-" enables --options runtime --timestamp)
   --arch <arch>       Target architecture: arm64 or x86_64 (default: host arch)
   --nsh-bin <path>    Path to pinned NSH 0.6.1 CLI (default: \$HOME/.local/bin/nsh)
-  --dev-shared-dir    Create a fresh disposable Finder handoff directory via mktemp under
-                      <repo>/target/ instead of using the production home-relative exception
+  --dev-shared-dir    Create a fresh disposable state directory under <repo>/target/
+                      with an absolute-path temporary exception for its finder/ child
   -h, --help          Show this help
 EOF
 }

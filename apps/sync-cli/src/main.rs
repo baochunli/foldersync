@@ -11,9 +11,10 @@ use rclone_adapter::{ProcessRunner, RealProcessRunner};
 use sync_core::{AccountId, MappingId, Readiness, RunId, RunOutcome};
 use sync_manager::{
     AccountError, AccountService, AccountServiceConfig, AddDriveAccountRequest, AddMappingCommand,
-    ImportAccountRequest, InitializeCommand, ManagerConfig, ManagerError, MappingStatusSnapshot,
-    PasswordCommandFactory, RESERVED_LOCAL_FIXTURE_ACCOUNT_ID, SecretStore, SecretStoreError,
-    SecretString, SyncManager, SystemSecretStore, run_credential_helper,
+    CollectionSkipReason, FolderSizeStatus, ImportAccountRequest, InitializeCommand, ManagerConfig,
+    ManagerError, MappingStatusSnapshot, PasswordCommandFactory, RESERVED_LOCAL_FIXTURE_ACCOUNT_ID,
+    SecretStore, SecretStoreError, SecretString, SyncManager, SystemSecretStore,
+    run_credential_helper,
 };
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -39,14 +40,33 @@ impl CliRuntime {
         }
     }
 
-    fn account_service(&self, state_dir: Option<PathBuf>) -> Result<AccountService, CliError> {
-        let state_dir = require_state_dir(state_dir)?;
+    fn account_config(&self, state_dir: PathBuf) -> AccountServiceConfig {
         let mut cfg = AccountServiceConfig::with_state_dir(state_dir);
         cfg.secret_store = Arc::clone(&self.secret_store);
         cfg.process_runner = Arc::clone(&self.process_runner);
         cfg.rclone_binary_override = self.rclone_binary_override.clone();
         cfg.password_command_factory = self.password_command_factory.clone();
-        Ok(AccountService::new(cfg)?)
+        cfg
+    }
+
+    fn account_service(&self, state_dir: Option<PathBuf>) -> Result<AccountService, CliError> {
+        Ok(AccountService::new(
+            self.account_config(require_state_dir(state_dir)?),
+        )?)
+    }
+
+    fn open_manager(
+        &self,
+        state_dir: Option<PathBuf>,
+        finder_dir: Option<PathBuf>,
+    ) -> Result<SyncManager, CliError> {
+        let state_dir = require_state_dir(state_dir)?;
+        let mut cfg = ManagerConfig::with_state_dir(&state_dir);
+        cfg.finder_status_dir = finder_dir;
+        Ok(SyncManager::open_with_account_config(
+            cfg,
+            self.account_config(state_dir),
+        )?)
     }
 }
 
@@ -107,12 +127,14 @@ fn dispatch(
             let _ = print_help(out);
             ExitCode::SUCCESS
         }
-        "status" => run_cmd(cmd_status(&rest, out), err_out),
-        "add-mapping" => run_cmd(cmd_add_mapping(&rest, out), err_out),
-        "init" => run_cmd(cmd_init(&rest, out), err_out),
-        "run-once" => run_cmd(cmd_run_once(&rest, out), err_out),
-        "pause" => run_cmd(cmd_pause(&rest, out), err_out),
-        "resume" => run_cmd(cmd_resume(&rest, out), err_out),
+        "status" => run_cmd(cmd_status(rt, &rest, out), err_out),
+        "collections" => run_cmd(cmd_collections(rt, &rest, out), err_out),
+        "add-mapping" => run_cmd(cmd_add_mapping(rt, &rest, out), err_out),
+        "init" => run_cmd(cmd_init(rt, &rest, out), err_out),
+        "run-once" => run_cmd(cmd_run_once(rt, &rest, out), err_out),
+        "pause" => run_cmd(cmd_pause(rt, &rest, out), err_out),
+        "resume" => run_cmd(cmd_resume(rt, &rest, out), err_out),
+        "scheduling" => run_cmd(cmd_scheduling(rt, &rest, out), err_out),
         "credential-helper" => run_cmd(cmd_credential_helper(rt, &rest, out), err_out),
         "account" => run_cmd(cmd_account(rt, &rest, out), err_out),
         "remote" => run_cmd(cmd_remote(rt, &rest, out), err_out),
@@ -209,6 +231,10 @@ Usage: sync-cli <command> [options]
 Commands:
   version                                      Print FolderSync version
   status --state-dir <dir> [--json]            Show current mapping status snapshot
+  collections list --state-dir <dir> --account <id> [--json]
+  collections size --state-dir <dir> --account <id> --folder-id <id> [--json]
+  add-mapping --state-dir <dir> --account <id> --folder-id <id>
+    --local <dir> --local-recovery <dir> [--id <mapping-id>] [--max-delete-percent <1-100>]
   add-mapping --state-dir <dir> [options]      Add a local-to-local fixture mapping
     --id <mapping-id>
     --local-dir <path>
@@ -217,10 +243,11 @@ Commands:
     [--remote-recovery-dir <path>]
     [--collection <path>]
     [--max-delete-percent <1-100>]
-  init <mapping> --state-dir <dir>             Initialize a mapping (local-to-local)
+  init <mapping> --state-dir <dir>             Initialize a mapping
   run-once <mapping> --state-dir <dir>         Run one manual synchronization pass
   pause <mapping> --state-dir <dir>            Persist pause intent for a mapping
   resume <mapping> --state-dir <dir>           Clear pause intent for a mapping
+  scheduling pause|resume --state-dir <dir>  Pause or resume automatic scheduling
 
   credential-helper --account <id>             Print account rclone config passphrase on stdout
   account add-drive --state-dir <dir> [opts]   Create encrypted Drive config and authorize
@@ -263,16 +290,6 @@ fn require_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
                 .to_string(),
         )),
     }
-}
-
-fn open_manager(
-    state_dir: Option<PathBuf>,
-    finder_dir: Option<PathBuf>,
-) -> Result<SyncManager, CliError> {
-    let state_dir = require_state_dir(state_dir)?;
-    let mut cfg = ManagerConfig::with_state_dir(state_dir);
-    cfg.finder_status_dir = finder_dir;
-    Ok(SyncManager::open(cfg)?)
 }
 
 fn take_value<'a>(args: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a str, CliError> {
@@ -812,7 +829,7 @@ fn cmd_remote_resolve(
     Ok(())
 }
 
-fn cmd_status(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+fn cmd_status(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let mut state_dir = None;
     let mut finder_dir = None;
     let mut json = false;
@@ -831,7 +848,7 @@ fn cmd_status(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
         i += 1;
     }
 
-    let mgr = open_manager(state_dir, finder_dir)?;
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
     let snap = mgr.snapshot();
     if json {
         writeln!(
@@ -854,10 +871,107 @@ fn cmd_status(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+fn cmd_collections(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+    let (sub, args) = split_subcommand(args)?;
+    if !matches!(sub.as_str(), "list" | "size") {
+        return Err(CliError::Usage(format!(
+            "Unknown collections action `{sub}`."
+        )));
+    }
+    let mut state_dir = None;
+    let mut finder_dir = None;
+    let mut account_id = None;
+    let mut folder_id = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(take_value(&args, &mut i, "--state-dir")?))
+            }
+            "--finder-dir" => {
+                finder_dir = Some(PathBuf::from(take_value(&args, &mut i, "--finder-dir")?))
+            }
+            "--account" => account_id = Some(take_value(&args, &mut i, "--account")?),
+            "--folder-id" if sub == "size" => {
+                folder_id = Some(take_value(&args, &mut i, "--folder-id")?)
+            }
+            "--json" => json = true,
+            other => return Err(CliError::Usage(format!("Unknown argument `{other}`."))),
+        }
+        i += 1;
+    }
+    let account_id = AccountId::new(required_text(account_id, "--account <id>")?);
+    let folder_id = if sub == "size" {
+        Some(required_text(folder_id, "--folder-id <id>")?)
+    } else {
+        None
+    };
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
+    let result = (|| {
+        if let Some(folder_id) = folder_id {
+            let size = mgr.request_folder_size(&account_id, folder_id)?.wait()?;
+            let FolderSizeStatus::Known { bytes, files } = size.status else {
+                return Err(CliError::Failed(
+                    "Folder size could not be verified.".into(),
+                ));
+            };
+            if json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&size).expect("Folder size serializes")
+                )?;
+            } else {
+                writeln!(out, "{folder_id} | {bytes} bytes | {files} files")?;
+            }
+        } else {
+            let listing = mgr.list_collection_candidates(&account_id)?;
+            if json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&listing).expect("Collection listing serializes")
+                )?;
+            } else if listing.candidates.is_empty() && listing.skipped.is_empty() {
+                writeln!(out, "No collections found under Data.")?;
+            } else {
+                for candidate in listing.candidates {
+                    writeln!(
+                        out,
+                        "{} | {}",
+                        candidate.collection.folder_id, candidate.collection.display_path
+                    )?;
+                }
+                for skipped in listing.skipped {
+                    let reason = match skipped.reason {
+                        CollectionSkipReason::Duplicate => "duplicate",
+                        CollectionSkipReason::UnsupportedName => "unsupported name",
+                    };
+                    writeln!(out, "Skipped {} ({reason}).", skipped.name)?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    mgr.shutdown()?;
+    result
+}
+
+fn required_text<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str, CliError> {
+    value
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Usage(format!("Missing required {flag}.")))
+}
+
+fn cmd_add_mapping(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let mut state_dir = None;
     let mut finder_dir = None;
     let mut id: Option<String> = None;
+    let mut account_id = None;
+    let mut folder_id = None;
+    let mut drive_local = None;
+    let mut drive_recovery = None;
     let mut local_dir: Option<PathBuf> = None;
     let mut remote_dir: Option<PathBuf> = None;
     let mut recovery_dir: Option<PathBuf> = None;
@@ -875,6 +989,12 @@ fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError>
                 finder_dir = Some(PathBuf::from(take_value(args, &mut i, "--finder-dir")?))
             }
             "--id" => id = Some(take_value(args, &mut i, "--id")?.to_string()),
+            "--account" => account_id = Some(take_value(args, &mut i, "--account")?),
+            "--folder-id" => folder_id = Some(take_value(args, &mut i, "--folder-id")?),
+            "--local" => drive_local = Some(take_value(args, &mut i, "--local")?),
+            "--local-recovery" => {
+                drive_recovery = Some(take_value(args, &mut i, "--local-recovery")?)
+            }
             "--local-dir" => {
                 local_dir = Some(PathBuf::from(take_value(args, &mut i, "--local-dir")?))
             }
@@ -906,8 +1026,57 @@ fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError>
         i += 1;
     }
 
-    let id =
-        id.ok_or_else(|| CliError::Usage("Missing required --id <mapping-id>.".to_string()))?;
+    let state_dir = require_state_dir(state_dir)?;
+    if account_id.is_some()
+        || folder_id.is_some()
+        || drive_local.is_some()
+        || drive_recovery.is_some()
+    {
+        if local_dir.is_some()
+            || remote_dir.is_some()
+            || recovery_dir.is_some()
+            || remote_recovery_dir.is_some()
+            || collection.is_some()
+        {
+            return Err(CliError::Usage(
+                "Drive and local fixture options cannot be combined.".into(),
+            ));
+        }
+        let account_id = AccountId::new(required_text(account_id, "--account <id>")?);
+        let folder_id = required_text(folder_id, "--folder-id <id>")?;
+        let local = Path::new(required_text(drive_local, "--local <dir>")?);
+        let recovery = Path::new(required_text(drive_recovery, "--local-recovery <dir>")?);
+        let mgr = rt.open_manager(Some(state_dir), finder_dir)?;
+        let result = (|| {
+            let mut candidates = mgr
+                .list_collection_candidates(&account_id)?
+                .candidates
+                .into_iter()
+                .filter(|candidate| candidate.collection.folder_id == folder_id);
+            let candidate = candidates.next()
+                .filter(|_| candidates.next().is_none())
+                .ok_or_else(|| CliError::Failed(format!(
+                    "Folder ID `{folder_id}` is not selectable for `{account_id}`. List the account's collections and choose a current folder ID."
+                )))?;
+            let id = match id {
+                Some(id) => id,
+                None => {
+                    let snapshot = mgr.snapshot();
+                    (1..)
+                        .map(|n| format!("drive-{n}"))
+                        .find(|id| snapshot.mappings.iter().all(|m| m.id.as_str() != id))
+                        .expect("A finite set of mappings cannot exhaust mapping IDs")
+                }
+            };
+            let cmd =
+                AddMappingCommand::drive(id, account_id, candidate.collection, local, recovery)?;
+            save_mapping(&mgr, cmd, max_delete_percent, out)
+        })();
+        mgr.shutdown()?;
+        return result;
+    }
+
+    let id = required_text(id.as_deref(), "--id <mapping-id>")?;
     let local_dir = local_dir
         .ok_or_else(|| CliError::Usage("Missing required --local-dir <path>.".to_string()))?;
     let remote_dir = remote_dir
@@ -920,7 +1089,7 @@ fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError>
     };
     let collection_path = collection.unwrap_or_else(|| format!("Data/{id}"));
 
-    let mgr = open_manager(state_dir, finder_dir)?;
+    let mgr = rt.open_manager(Some(state_dir), finder_dir)?;
     // Finding 8: Refuse to overwrite an existing non-fixture account with the
     // reserved `local-fixture` ID.
     let acct_svc =
@@ -935,8 +1104,8 @@ fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError>
         )));
     }
     mgr.register_local_fixture_account(LOCAL_FIXTURE_ACCOUNT_ID, "Local Fixture")?;
-    let mut cmd = AddMappingCommand::local_fixture(
-        id.clone(),
+    let cmd = AddMappingCommand::local_fixture(
+        id,
         LOCAL_FIXTURE_ACCOUNT_ID,
         collection_path,
         local_dir,
@@ -944,23 +1113,60 @@ fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError>
         recovery_dir,
         remote_recovery_dir,
     )?;
+    save_mapping(&mgr, cmd, max_delete_percent, out)?;
+    mgr.shutdown()?;
+    Ok(())
+}
+
+fn save_mapping(
+    mgr: &SyncManager,
+    mut cmd: AddMappingCommand,
+    max_delete_percent: Option<u8>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
     if let Some(pct) = max_delete_percent {
         cmd.max_delete_percent = pct;
     }
+    let id = cmd.id.clone();
     let ack = mgr.add_mapping(cmd)?;
-    if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id.as_str() == id) {
+    if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id == id) {
         writeln!(out, "Added mapping `{}` ({}).", m.id, m.status_text)?;
     }
+    Ok(())
+}
+
+fn cmd_scheduling(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+    const EXPECTED_ACTION: &str = "Expected scheduling pause or resume.";
+    let (action, state_dir, finder_dir) = parse_positional_and_flags(args, EXPECTED_ACTION)?;
+    let paused = match action.as_str() {
+        "pause" => true,
+        "resume" => false,
+        _ => return Err(CliError::Usage(EXPECTED_ACTION.into())),
+    };
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
+    mgr.set_scheduling_paused(paused)?;
     mgr.shutdown()?;
+    writeln!(
+        out,
+        "Automatic scheduling {}.",
+        if paused { "paused" } else { "resumed" }
+    )?;
     Ok(())
 }
 
 fn parse_mapping_and_flags(
     args: &[String],
 ) -> Result<(String, Option<PathBuf>, Option<PathBuf>), CliError> {
+    parse_positional_and_flags(args, "Missing <mapping> argument.")
+}
+
+fn parse_positional_and_flags(
+    args: &[String],
+    missing_positional: &str,
+) -> Result<(String, Option<PathBuf>, Option<PathBuf>), CliError> {
     let mut state_dir = None;
     let mut finder_dir = None;
-    let mut mapping_id = None;
+    let mut positional_arg = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -974,19 +1180,19 @@ fn parse_mapping_and_flags(
                 return Err(CliError::Usage(format!("Unknown argument `{other}`.")));
             }
             positional => {
-                if mapping_id.is_some() {
+                if positional_arg.is_some() {
                     return Err(CliError::Usage(format!(
                         "Unexpected extra argument `{positional}`."
                     )));
                 }
-                mapping_id = Some(positional.to_string());
+                positional_arg = Some(positional.to_string());
             }
         }
         i += 1;
     }
-    let id =
-        mapping_id.ok_or_else(|| CliError::Usage("Missing <mapping> argument.".to_string()))?;
-    Ok((id, state_dir, finder_dir))
+    let positional_arg =
+        positional_arg.ok_or_else(|| CliError::Usage(missing_positional.into()))?;
+    Ok((positional_arg, state_dir, finder_dir))
 }
 
 fn default_remote_recovery_dir(local_recovery_dir: &Path) -> Result<PathBuf, CliError> {
@@ -1033,12 +1239,14 @@ fn verify_new_run_succeeded(
         ));
     }
     let runs = mgr
-        .list_runs(mapping_id)
+        .list_recent_runs(mapping_id, 2)
         .map_err(|err| format!("Failed to read run record `{new_run_id}`: {}", err.cause()))?;
     let run = runs
-        .iter()
-        .find(|r| &r.id == new_run_id)
-        .ok_or_else(|| format!("Recorded run `{new_run_id}` was not found in SQLite."))?;
+        .first()
+        .filter(|r| &r.id == new_run_id && runs.get(1).map(|r| &r.id) == prev_run_id)
+        .ok_or_else(|| {
+            format!("Could not identify run `{new_run_id}` as the only new run in SQLite.")
+        })?;
     let ok_outcome = matches!(
         run.outcome_kind.as_deref(),
         Some("success" | "success_with_conflicts")
@@ -1064,12 +1272,11 @@ fn verify_new_run_succeeded(
     }
 }
 
-fn cmd_init(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+fn cmd_init(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
     let mapping_id = MappingId::new(id.clone());
-    let mgr = open_manager(state_dir, finder_dir)?;
-    let prev_run_id = mgr.last_run_id(&mapping_id);
-    mgr.initialize(InitializeCommand {
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
+    let ack = mgr.initialize(InitializeCommand {
         mapping_id: mapping_id.clone(),
         expected_direction: None,
     })?;
@@ -1080,7 +1287,13 @@ fn cmd_init(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
         .find(|m| m.id == mapping_id)
         .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after init.")))?
         .clone();
-    let verification = verify_new_run_succeeded(&mgr, &mapping_id, prev_run_id.as_ref(), &mapping);
+    let prev_run_id = ack
+        .snapshot
+        .mappings
+        .iter()
+        .find(|m| m.id == mapping_id)
+        .and_then(|m| m.last_run_id.as_ref());
+    let verification = verify_new_run_succeeded(&mgr, &mapping_id, prev_run_id, &mapping);
     mgr.shutdown()?;
 
     match verification {
@@ -1095,12 +1308,11 @@ fn cmd_init(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     }
 }
 
-fn cmd_run_once(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+fn cmd_run_once(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
     let mapping_id = MappingId::new(id.clone());
-    let mgr = open_manager(state_dir, finder_dir)?;
-    let prev_run_id = mgr.last_run_id(&mapping_id);
-    mgr.run_now(mapping_id.clone())?;
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
+    let ack = mgr.run_now(mapping_id.clone())?;
     let snap = mgr.wait_until_idle(DEFAULT_WAIT_TIMEOUT)?;
     let mapping = snap
         .mappings
@@ -1108,7 +1320,13 @@ fn cmd_run_once(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
         .find(|m| m.id == mapping_id)
         .ok_or_else(|| CliError::Failed(format!("Mapping `{id}` disappeared after run.")))?
         .clone();
-    let verification = verify_new_run_succeeded(&mgr, &mapping_id, prev_run_id.as_ref(), &mapping);
+    let prev_run_id = ack
+        .snapshot
+        .mappings
+        .iter()
+        .find(|m| m.id == mapping_id)
+        .and_then(|m| m.last_run_id.as_ref());
+    let verification = verify_new_run_succeeded(&mgr, &mapping_id, prev_run_id, &mapping);
     mgr.shutdown()?;
 
     match verification {
@@ -1124,9 +1342,9 @@ fn cmd_run_once(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     }
 }
 
-fn cmd_pause(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+fn cmd_pause(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
-    let mgr = open_manager(state_dir, finder_dir)?;
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
     let ack = mgr.pause(id.clone())?;
     if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id.as_str() == id) {
         writeln!(out, "Paused `{}`: {}", m.id, m.status_text)?;
@@ -1135,9 +1353,9 @@ fn cmd_pause(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_resume(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+fn cmd_resume(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
-    let mgr = open_manager(state_dir, finder_dir)?;
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
     let ack = mgr.resume(id.clone())?;
     if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id.as_str() == id) {
         writeln!(out, "Resumed `{}`: {}", m.id, m.status_text)?;
@@ -1169,6 +1387,140 @@ mod tests {
             String::from_utf8_lossy(&out).into_owned(),
             String::from_utf8_lossy(&err).into_owned(),
         )
+    }
+
+    #[test]
+    fn drive_collections_size_and_mapping_use_the_selected_account_and_id() {
+        use sync_manager::{AccountRecord, SqliteStateStore, scoped_credential_key};
+
+        let Some(binary) = pinned_binary_path() else {
+            eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = root.join("state");
+        let local = root.join("local");
+        let recovery = root.join("recovery");
+        let config = state.join("accounts/drive/rclone.conf");
+        fs::create_dir(&local).unwrap();
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, b"fixture config").unwrap();
+        let runner = Arc::new(FakeProcessRunner::new());
+        let secrets = Arc::new(InMemorySecretStore::new());
+        let rt = CliRuntime {
+            secret_store: secrets.clone(),
+            process_runner: runner.clone(),
+            rclone_binary_override: Some(binary),
+            password_command_factory: None,
+            echo_auth_url_to_process_stdout: false,
+        };
+        let state_arg = state.to_str().unwrap();
+        assert_eq!(
+            run_args(&rt, &["--state-dir", state_arg, "scheduling", "pause"]).0,
+            ExitCode::SUCCESS
+        );
+        let store = SqliteStateStore::open(&state.join("state.sqlite")).unwrap();
+        let device = store.get_default_device().unwrap().unwrap();
+        secrets
+            .create_secret(
+                &scoped_credential_key(device.id.as_str(), "drive").unwrap(),
+                &SecretString::new("fixture"),
+            )
+            .unwrap();
+        store
+            .upsert_account(&AccountRecord {
+                id: AccountId::new("drive"),
+                display_name: "Fixture".into(),
+                kind: "drive".into(),
+                remote_name: "household".into(),
+                remote_root_folder_id: "parent-id".into(),
+                config_path: config,
+                auth_status: "ready".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        drop(store);
+
+        let cli = |args: &[&str]| {
+            let mut flags = vec!["--state-dir", state_arg];
+            flags.extend_from_slice(args);
+            let (status, out, err) = run_args(&rt, &flags);
+            assert_eq!(status, ExitCode::SUCCESS, "{err}");
+            out
+        };
+        let output = |json: &str| {
+            runner.push_run(FakeRunScript {
+                lines: vec![OutputLine {
+                    stream: StreamKind::Stdout,
+                    text: json.into(),
+                    truncated: false,
+                }],
+                ..Default::default()
+            });
+        };
+        let listing = || {
+            output(r#"[{"Name":"Data","Path":"Data","IsDir":true,"ID":"data-id"}]"#);
+            output(r#"[{"Name":"Research","Path":"Research","IsDir":true,"ID":"chosen-id"}]"#);
+        };
+
+        listing();
+        let listed = cli(&["collections", "list", "--account", "drive", "--json"]);
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(
+            listed["candidates"][0]["collection"]["folder_id"],
+            "chosen-id"
+        );
+        assert_eq!(
+            listed["candidates"][0]["collection"]["display_path"],
+            "Data/Research"
+        );
+
+        listing();
+        output(r#"{"count":2,"bytes":42,"sizeless":0}"#);
+        listing();
+        let size = cli(&[
+            "collections",
+            "size",
+            "--account",
+            "drive",
+            "--folder-id",
+            "chosen-id",
+            "--json",
+        ]);
+        let size: serde_json::Value = serde_json::from_str(&size).unwrap();
+        assert_eq!(
+            size["status"]["Known"],
+            serde_json::json!({"bytes": 42, "files": 2})
+        );
+
+        listing();
+        listing();
+        let added = cli(&[
+            "add-mapping",
+            "--account",
+            "drive",
+            "--folder-id",
+            "chosen-id",
+            "--local",
+            local.to_str().unwrap(),
+            "--local-recovery",
+            recovery.to_str().unwrap(),
+        ]);
+        assert!(added.contains("Added mapping `drive-1`"));
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&cli(&["status", "--json"])).unwrap();
+        let mapping = &snapshot["mappings"][0];
+        assert_eq!(mapping["id"], "drive-1");
+        assert_eq!(mapping["account_id"], "drive");
+        assert_eq!(mapping["collection_folder_id"], "chosen-id");
+        assert_eq!(
+            mapping["cloud_recovery_path"],
+            "household:Recovery/chosen-id"
+        );
+        assert_eq!(mapping["readiness"], "NeedsInitialization");
+        assert_eq!(snapshot["scheduling_paused"], true);
     }
 
     #[test]

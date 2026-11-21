@@ -31,7 +31,12 @@ python3 -m unittest discover -s tests/qualification -p "test_*.py" -v
 tests/qualification/run-local.sh
 ```
 
-The harness generates deterministic uniquely identifiable file contents (`--seed`), stores an external truth set outside all sync trees for every generated file, isolates `HOME` and `--state-dir` / `--finder-dir` to fresh temporary directories, runs multi-cycle verification across three independent client state directories sharing one local remote fixture, and writes structured evidence to:
+The harness generates deterministic file contents (`--seed`) and saves each
+version outside the sync trees. It isolates `HOME`, `FOLDERSYNC_STATE_DIR`,
+`--state-dir`, and `--finder-dir` in a temporary workspace and pauses
+automatic scheduling in each client state. Three independent clients share
+one local remote fixture. The harness writes multi-cycle hash evidence to the
+following files.
 
 - `target/qualification/local-evidence.json`
 - `target/qualification/local-evidence.md`
@@ -55,59 +60,126 @@ Verified local scenarios (`sync-cli` + `sync-manager` + pinned `rclone 1.76.0` o
 
 The following scenarios require real Google Drive credentials, two separately authenticated household accounts, physical removable storage, or an Apple Developer account. Never mark M0 or household-release milestones complete until the owner completes and archives evidence for them.
 
-### 1. Real Google Drive Qualification (`tests/qualification/run-drive.sh`)
+### 1. Real Google Drive qualification
 
-`tests/qualification/run-drive.sh` enforces strict safety guardrails: it refuses to run unless `--remote <name>`, `--state-dir <dir>` (must be a fresh, empty, non-symlinked directory), and `--rclone-config <disposable-config>` are explicitly passed; refuses `~/Library/Application Support/FolderSync` and `~/.config/rclone`; redacts `--password-command stderr:` payloads at the capture boundary; and uses only the SHA-256-verified pinned `rclone 1.76.0` binary.
+Run this from the repository root with two separately authenticated accounts if
+the intended household workflow has two writers. For a single-account trial,
+omit `--account-b qual-b`. Account B runs client B when supplied. A and C use
+account A, and all three clients have independent state, device IDs, workdirs,
+and local trees.
 
-The runner covers account connectivity and folder-ID preflight in the disposable shared parent. It records unexercised Drive sync scenarios as `NOT RUN` with overall status `INCOMPLETE` and a nonzero exit. `sync-cli` can check Drive accounts and resolve folder IDs. Drive mapping setup and sync use the desktop app. Use the [pilot guide](pilot-and-rollback.md) for those owner checks.
+1. In Drive, create a disposable shared parent with immediate `Data` and
+   `Recovery` folders. Share the parent with Account B as an editor, and record
+   the parent's folder ID from its URL. Keep production files out of this
+   parent. Follow the OAuth client setup in [Google Drive accounts](accounts.md).
+2. Install the pinned binary, build the CLI, and open a private rclone config
+   for the export.
 
-**Prerequisites (owner setup on a disposable shared Drive parent folder):**
+   ```bash
+   scripts/fetch-rclone.sh
+   cargo build --release -p sync-cli
 
-1. Create a disposable shared parent folder in Google Drive (never production household data).
-2. Configure a disposable app-owned rclone config file outside `~/.config/rclone` (e.g., inside a fresh `$QUAL_WORK/rclone.conf`) rooted at the actual shared parent folder ID using your own OAuth client credentials (plan §7, §8). Encrypt the config and retrieve its passphrase only via `--password-command`.
-3. Optionally configure a second remote (`--remote-b <name>`) authenticated as the second household Google account pointing at the same actual shared parent folder ID.
+   umask 077
+   QUAL_WORK="$(mktemp -d)"
+   QUAL_CONFIG="$QUAL_WORK/drive-export.conf"
+   SYNC_CLI="$PWD/target/release/sync-cli"
+   RCLONE="$PWD/.tools/rclone/1.76.0/rclone"
 
-**Execution:**
+   mkdir "$QUAL_WORK/setup-home"
+   touch "$QUAL_CONFIG"
+   chmod 600 "$QUAL_CONFIG"
+   env HOME="$QUAL_WORK/setup-home" FOLDERSYNC_STATE_DIR="$QUAL_WORK/setup-state" \
+     "$RCLONE" config --config "$QUAL_CONFIG"
+   ```
 
-```bash
-QUAL_WORK="$(mktemp -d)"
+   In the config editor, add the `qual-a` Google Drive remote using the
+   dedicated OAuth client, full Drive scope, and the disposable
+   `root_folder_id`. In a two-account trial, add `qual-b` with an OAuth token from
+   the second account and the same `root_folder_id`. Keep the export unencrypted
+   and mode `0600` for `sync-cli account import`. The selected sections should
+   contain only `type`, `client_id`, `client_secret`, `scope`, `token`, and
+   `root_folder_id`. The harness imports them into encrypted client configs and
+   uses the macOS Keychain through FolderSync's credential helper.
+3. Preview the planned scenarios and fixture names. The preview leaves the
+   state path available for the real run.
 
-# Preview plan and verify guardrails without contacting Google Drive:
-tests/qualification/run-drive.sh \
-  --remote qualdrive \
-  --state-dir "$QUAL_WORK/state" \
-  --rclone-config "$QUAL_WORK/rclone.conf" \
-  --dry-run
+   ```bash
+   QUAL_ARGS=(
+     --remote qual-a --account-b qual-b
+     --rclone-config "$QUAL_CONFIG"
+     --state-dir "$QUAL_WORK/state"
+     --out-dir "$QUAL_WORK/evidence"
+     --sync-cli "$SYNC_CLI"
+   )
+   tests/qualification/run-drive.sh "${QUAL_ARGS[@]}" --dry-run
+   ```
+4. Run the suite and retain both evidence files and the private state tree.
+   Each invocation chooses new names under `Data/FolderSyncQual-…`. Keep the
+   terminal open while the suite runs. Use a fresh state and evidence directory
+   for each repeat. The source export contains OAuth tokens. Remove it when you
+   are finished with qualification.
 
-# Run account connectivity and folder-ID preflight:
-tests/qualification/run-drive.sh \
-  --remote qualdrive \
-  --state-dir "$QUAL_WORK/state" \
-  --rclone-config "$QUAL_WORK/rclone.conf" \
-  --password-command "/path/to/credential-helper --account qual"
-```
+   ```bash
+   tests/qualification/run-drive.sh "${QUAL_ARGS[@]}"
+   cat "$QUAL_WORK/evidence/drive-evidence.md"
+   ```
 
-**Owner Drive checklist (plan §8, §15, §20):**
+The suite pauses automatic scheduling before importing accounts or adding
+mappings. It checks folder identity from each participating client before
+initialization. Client B has up to 60 seconds to see collections Client A creates.
+The suite retries the listing with backoff and records the attempt count and
+elapsed time in `outcomes.collection_visibility`.
 
-- [ ] **Shared parent & folder IDs:** Confirm `rclone lsjson --dirs-only` returns an unambiguous folder ID for `Data/<collection>` without `shared_with_me`. After setup, confirm the recovery folder at `Recovery/<folder-id>/<device-id>` is separate from the collection.
-  - *Expected outcome:* Exactly one folder ID matches the recorded collection ID; sync proceeds only on exact ID match.
-- [ ] **Changed Drive sharing permissions or changed root/collection folder ID:** Revoke/downgrade sharing on the disposable collection (or rename/replace the Drive folder at the same path so its object ID changes) before a run.
-  - *Expected outcome:* Preflight detects the ID mismatch or permission denial before any mutating transfer, pauses the mapping in `EndpointChanged` (on folder-ID change) or `AuthenticationRequired` / attention hold (on revoked sharing), and leaves local and cloud files untouched.
-- [ ] **Duplicate cloud folder or file names:** Create two identically named folders or files in the disposable Google Drive collection (Google Drive permits duplicate names in one parent).
-  - *Expected outcome:* Preflight `lsjson` / engine diagnostics detect ambiguous duplicate names and stop the mapping in an attention / `EndpointChanged` hold for manual resolution rather than choosing one arbitrarily or overwriting data.
-- [ ] **Cloud quota exhaustion:** Attempt an upload into an account or disposable test pool that hits Google Drive storage quota exhaustion.
-  - *Expected outcome:* Upload fails cleanly with an actionable quota error; existing local and cloud files remain intact and uncorrupted, no local deletion is triggered, and no automatic `--resync` runs.
-- [ ] **Two-account ownership, quota & recovery moves:** Using two separately authenticated accounts, verify list, upload, overwrite, deletion, and moving another account's overwritten/deleted file into `Recovery/<folder-id>/<device-id>/<run-id>`. Confirm which account's Google One / Drive quota is charged (plan §8).
-  - *Expected outcome:* Both accounts can read, edit, and preserve overwritten/deleted copies in `Recovery/` with exact truth-set SHA-256 hashes; quota ownership is documented explicitly.
-- [ ] **Three independent client states on Drive:** Run distinct edits, same-file conflict (`--conflict-resolve none --conflict-loser num`), edit/delete, edit/rename, Drive web edit, delayed upload, overlapping runs, and third-client offline return across multiple follow-up cycles; verify every truth-set SHA-256.
-  - *Expected outcome:* All versions accounted for (live file, `.conflict*` copy, or `Recovery/` copy) across follow-up cycles with zero silent data loss or resurrected deletions.
-- [ ] **Drive object policy:** Place a Google Doc/Sheet and a Drive shortcut in the disposable collection; confirm `--drive-skip-gdocs` and `--drive-skip-shortcuts` skip them without traversing shortcut targets or corrupting listings.
-  - *Expected outcome:* Native Google documents and shortcuts are skipped cleanly without exporting or pulling shortcut target contents into local storage.
-- [ ] **OAuth & encrypted config refresh:** Verify token refresh persists cleanly to the encrypted `--config` via `--password-command`, and verify reauthorization after several days and after token revocation.
-  - *Expected outcome:* Refreshed tokens persist cleanly; revoked tokens transition the mapping into `AuthenticationRequired` without hanging on hidden stdin prompts or leaking secrets in logs.
-- [ ] **Rate limiting & network loss:** Observe HTTP 403/429 throttling and network disconnect mid-run.
-  - *Expected outcome:* Bounded backoff or safe recovery hold without data corruption or duplicate concurrent runs.
-- [ ] **Scale benchmark (representative subset toward 20 TB):** Measure file count, no-change scan time, changed-file scan time, memory use, API throttling, and recovery-directory growth before enabling automatic scheduling on large collections (plan §13).
+Clients run distinct edits, same-file edits, edit/delete, and a stale third-client
+return after two paused cycles. Each reconciliation scenario checks local and
+Drive paths and bytes after two follow-up cycles. Separate collections exercise
+the 10% deletion guard and SIGINT during a transfer.
+The interruption check requires a partial batch, the run's recorded outcome, a
+preserved workdir, and stable hashes while the interrupted mapping stays in
+`RecoveryRequired`. The optional two-account scenario downloads the first
+account's overwritten and deleted bytes from the second client's Drive recovery
+directory.
+
+Read `drive-evidence.md` for the result per scenario. In `drive-evidence.json`,
+inspect `outcomes.runs` for run IDs and `outcomes.checkpoints` for each complete
+inventory and SHA-256 accounting. Each truth version has a private
+`truth_file` path and its observed current, conflict, and recovery locations.
+The `cloud-checks` directory holds the downloaded evidence. A `PASS` requires
+all selected scenarios to verify. `FAIL` identifies a failed check.
+`INCOMPLETE` means a scenario was `NOT RUN` or `NOT VERIFIED`. A real run
+returns 0 for `PASS` and 3 for a failed or incomplete suite. Input or setup
+errors return 2.
+
+**Owner checks for the §15 decision**
+
+- [ ] Confirm the intended workload and its tolerance for conflicts before
+  starting. Exercise one active editor with other clients catching up, then
+  review the scripted distinct-edit, same-file edit, edit/delete, and offline
+  return evidence.
+- [ ] Stress same-file changes during overlapping runs. In the disposable
+  shared parent, repeat with a rename against an edit, a Drive web edit, and a
+  deliberately delayed upload. Save each intended version outside the sync
+  trees and compare full SHA-256 hashes on Drive and on each client after at
+  least two follow-up cycles. Record the account and run IDs, overlap timing,
+  and the locations of all conflict and recovery copies. Verify that a selected
+  recovery copy can be opened and restored.
+- [ ] Confirm permissions, object identity, and account behavior. In separate
+  disposable trials, change sharing permissions, replace a collection with a
+  new folder of the same name, add duplicate names, exercise native documents
+  and shortcuts, revoke OAuth authorization, and observe throttling, quota
+  exhaustion, and network loss. Check that existing data is preserved and
+  record any hold. In a two-account trial, inspect Drive ownership and quota
+  attribution for the uploaded and recovered files. Benchmark a representative
+  subset before enabling scheduling on large collections.
+- [ ] Proceed to the household pilot only if the observed behavior fits the
+  intended workflow and its remaining limitations are acceptable. Block
+  unattended release for any workload with repeatable loss or unacceptable
+  resurrection. If arbitrary concurrent editing needs a strict losslessness
+  guarantee, select a different engine or explicitly expand the architecture.
+  Keep collaborative live editing in a tool designed for that workflow.
+
+Use the scripted evidence to qualify the workload you observed. Complete the
+physical-disk and installed-app checks below for release acceptance.
 
 ### 2. Physical External Disk & Unplug Tests (Owner Only — Plan §11, §20)
 
