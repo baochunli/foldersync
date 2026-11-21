@@ -741,7 +741,18 @@ impl RunHandleBackend for RealRunHandleBackend {
 
 impl ProcessRunner for RealProcessRunner {
     fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
-        // Re-hash immediately before `exec` whenever the spec carries a pinned digest.
+        let mut cmd = Command::new(&spec.program);
+        cmd.args(&spec.args)
+            .env_clear()
+            .envs(&spec.env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(dir) = &spec.current_dir {
+            cmd.current_dir(dir);
+        }
+
+        // Check the pinned digest immediately before spawning the executable.
         if let Some(expected_sha256) = &spec.expected_binary_sha256 {
             let actual = crate::qualification::sha256_file(&spec.program).map_err(|err| {
                 ProcessError::IntegrityCheck {
@@ -756,17 +767,6 @@ impl ProcessRunner for RealProcessRunner {
                     actual,
                 });
             }
-        }
-
-        let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.args)
-            .env_clear()
-            .envs(&spec.env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(dir) = &spec.current_dir {
-            cmd.current_dir(dir);
         }
 
         let mut child = cmd.spawn().map_err(|source| ProcessError::Spawn {

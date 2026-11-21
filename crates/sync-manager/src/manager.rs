@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     io::{self, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::DateTime;
+use chrono::{DateTime, TimeDelta, Utc};
 use rclone_adapter::{
     BackupDir2, InitPreference, LogEvent, Outcome, OutputLimits, OutputLine, Path2, RunMode,
     SpawnOptions, StreamKind, classify_run_outcome, parse_log_line,
@@ -54,6 +54,10 @@ use crate::{
         resolve_state_dir, space_and_writability, validate_safe_path_id,
         write_private_file_atomic_under, write_private_file_under,
     },
+    scheduler::{
+        LocalChangeWatcher, MAX_RETRY_COUNT, NativeWatcher, Schedule, Schedules, backoff,
+        network_addresses,
+    },
     snapshot::{
         DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, ManagerEvent, MappingCounters,
         MappingStatusSnapshot, SnapshotReceiver, StatusSnapshot,
@@ -65,6 +69,7 @@ use crate::{
 };
 
 const ENGINE_PROFILE_VERSION: &str = "v1";
+const SCHEDULE_TICK: Duration = Duration::from_secs(1);
 const VOLUME_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const MIN_FREE_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -229,6 +234,62 @@ pub struct PreflightPreview {
     pub local_inventory: Result<DetailedEndpointInventory, String>,
     pub remote_inventory: Result<DetailedEndpointInventory, String>,
     pub direction: Result<InitPreference, String>,
+}
+
+/// Proposed exclusion changes and an advisory first-sync preview.
+#[derive(Debug, Clone)]
+pub struct FilterChangePreview {
+    mapping_id: MappingId,
+    previous_generation_id: GenerationId,
+    effective_exclusions: Vec<String>,
+    added_exclusions: Vec<String>,
+    removed_exclusions: Vec<String>,
+    preflight: PreflightPreview,
+}
+
+impl FilterChangePreview {
+    pub fn mapping_id(&self) -> &MappingId {
+        &self.mapping_id
+    }
+
+    pub fn previous_generation_id(&self) -> &GenerationId {
+        &self.previous_generation_id
+    }
+
+    pub fn effective_exclusions(&self) -> &[String] {
+        &self.effective_exclusions
+    }
+
+    pub fn added_exclusions(&self) -> &[String] {
+        &self.added_exclusions
+    }
+
+    pub fn removed_exclusions(&self) -> &[String] {
+        &self.removed_exclusions
+    }
+
+    pub fn preflight(&self) -> &PreflightPreview {
+        &self.preflight
+    }
+}
+
+fn effective_exclusions(extra: &BTreeSet<String>) -> Result<BTreeSet<String>, ManagerError> {
+    let mut patterns = default_exclusion_patterns();
+    for pattern in extra
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty())
+    {
+        if pattern.chars().any(char::is_control) {
+            return Err(ManagerError::PreflightRejected {
+                cause: "Exclusion patterns must be single lines without control characters."
+                    .to_owned(),
+                next_step: "Enter each exclusion separately.".to_owned(),
+            });
+        }
+        patterns.insert(pattern.to_owned());
+    }
+    Ok(patterns)
 }
 
 /// Input for [`ManagerCommand::AddMapping`].
@@ -893,6 +954,7 @@ enum QueuedJobKind {
 
 #[derive(Debug, Clone)]
 struct QueuedJob {
+    automatic: bool,
     mapping_id: MappingId,
     kind: QueuedJobKind,
 }
@@ -910,6 +972,7 @@ struct ActiveRunControl {
 struct SharedState {
     store: SqliteStateStore,
     volumes: BTreeMap<MappingId, BoundVolume>,
+    last_space_snapshot: DateTime<Utc>,
     device: DeviceRecord,
     snapshot_seq: u64,
     latest_snapshot: Arc<StatusSnapshot>,
@@ -920,6 +983,7 @@ struct SharedState {
     active_init_attempt: Option<(MappingId, u64)>,
     cancelled_init_attempts: BTreeSet<u64>,
     scheduling_paused: bool,
+    schedules: Schedules,
     worker_busy: bool,
     shutdown: bool,
     last_terminal_error: Option<(String, String)>,
@@ -950,6 +1014,7 @@ struct ManagerInner {
 pub struct SyncManager {
     worker_thread: Mutex<Option<JoinHandle<()>>>,
     volume_thread: Mutex<Option<JoinHandle<()>>>,
+    scheduler_thread: Mutex<Option<JoinHandle<()>>>,
     inner: Arc<ManagerInner>,
     _lock: StateLock,
 }
@@ -966,6 +1031,15 @@ impl SyncManager {
     pub fn open_with_volume_probe(
         config: ManagerConfig,
         volume_probe: Arc<dyn VolumeProbe>,
+    ) -> Result<Self, ManagerError> {
+        Self::open_with_watcher(config, volume_probe, Box::new(NativeWatcher::new()))
+    }
+
+    /// Opens with injected volume and local-change sources.
+    pub fn open_with_watcher(
+        config: ManagerConfig,
+        volume_probe: Arc<dyn VolumeProbe>,
+        watcher: Box<dyn LocalChangeWatcher>,
     ) -> Result<Self, ManagerError> {
         let state_dir = resolve_state_dir(config.state_dir.as_deref())?;
 
@@ -1033,12 +1107,16 @@ impl SyncManager {
             &event_bus,
         )?;
 
+        let scheduling_paused = store.scheduling_paused(&device.id)?;
+        let opened_at = config.clock.now_utc();
+        let schedules = restore_schedules(&store, opened_at)?;
+
         let initial_snapshot = Arc::new(StatusSnapshot {
             sequence: 0,
             generated_at: config.clock.now_rfc3339(),
             active_job_mapping_id: None,
             queue_order: Vec::new(),
-            scheduling_paused: false,
+            scheduling_paused,
             mappings: Vec::new(),
         });
 
@@ -1055,6 +1133,7 @@ impl SyncManager {
             state: Mutex::new(SharedState {
                 store,
                 volumes: BTreeMap::new(),
+                last_space_snapshot: opened_at,
                 device,
                 snapshot_seq: 0,
                 latest_snapshot: initial_snapshot,
@@ -1064,7 +1143,8 @@ impl SyncManager {
                 next_init_attempt_id: 0,
                 active_init_attempt: None,
                 cancelled_init_attempts: BTreeSet::new(),
-                scheduling_paused: false,
+                scheduling_paused,
+                schedules,
                 worker_busy: false,
                 shutdown: false,
                 last_terminal_error: None,
@@ -1074,12 +1154,12 @@ impl SyncManager {
             idle_cv: Condvar::new(),
         });
 
+        refresh_volumes(&inner)?;
         {
             let mut guard = inner.state.lock().unwrap();
-            for mut mapping in guard.store.list_mappings()? {
-                refresh_mapping_volume_locked(&inner, &mut guard, &mut mapping)?;
+            if guard.snapshot_seq == 0 {
+                publish_updated_snapshot(&inner, &mut guard)?;
             }
-            publish_updated_snapshot(&inner, &mut guard)?;
         }
         let worker_inner = Arc::clone(&inner);
         let handle = thread::Builder::new()
@@ -1093,18 +1173,28 @@ impl SyncManager {
         let manager = Self {
             worker_thread: Mutex::new(Some(handle)),
             volume_thread: Mutex::new(None),
+            scheduler_thread: Mutex::new(None),
             inner,
             _lock: lock,
         };
         let volume_inner = Arc::clone(&manager.inner);
-        let watcher = thread::Builder::new()
+        let volume_watcher = thread::Builder::new()
             .name("foldersync-volumes".to_owned())
             .spawn(move || volume_watch_loop(&volume_inner))
             .map_err(|err| ManagerError::Io {
                 cause: format!("Failed to start the disk watcher: {err}."),
                 next_step: "Check system thread limits and retry.".to_owned(),
             })?;
-        *manager.volume_thread.lock().unwrap() = Some(watcher);
+        *manager.volume_thread.lock().unwrap() = Some(volume_watcher);
+        let scheduling_inner = Arc::clone(&manager.inner);
+        let scheduler = thread::Builder::new()
+            .name("foldersync-scheduler".to_owned())
+            .spawn(move || scheduling_loop(&scheduling_inner, watcher))
+            .map_err(|err| ManagerError::Io {
+                cause: format!("Failed to start automatic scheduling: {err}."),
+                next_step: "Check system thread limits and retry.".to_owned(),
+            })?;
+        *manager.scheduler_thread.lock().unwrap() = Some(scheduler);
         Ok(manager)
     }
 
@@ -1264,12 +1354,7 @@ impl SyncManager {
             }
         }
 
-        let mut exclusions = default_exclusion_patterns();
-        for pat in &cmd.extra_exclusions {
-            if !pat.trim().is_empty() {
-                exclusions.insert(pat.trim().to_string());
-            }
-        }
+        let exclusions = effective_exclusions(&cmd.extra_exclusions)?;
 
         let local_inventory =
             inspect_local_endpoint_detailed(&local_path, &cmd.collection, &exclusions)
@@ -1311,6 +1396,141 @@ impl SyncManager {
             local_inventory,
             remote_inventory,
             direction,
+        })
+    }
+
+    /// Previews a replacement filter set without mutating the mapping or its baseline.
+    /// Supply all user exclusions; FolderSync always includes its built-in exclusions.
+    pub fn propose_filter_change(
+        &self,
+        mapping_id: &MappingId,
+        extra_exclusions: BTreeSet<String>,
+    ) -> Result<FilterChangePreview, ManagerError> {
+        let mapping = lookup_mapping(&self.inner.state.lock().unwrap().store, mapping_id)?;
+        let previous_generation_id =
+            mapping
+                .active_generation_id
+                .clone()
+                .ok_or_else(|| ManagerError::InvalidState {
+                    mapping_id: mapping_id.clone(),
+                    cause: "Changes to an established baseline require verified first sync."
+                        .to_owned(),
+                    next_step: "Review first-sync setup before saving exclusions.".to_owned(),
+                })?;
+        let old: BTreeSet<_> = mapping.exclusions.iter().cloned().collect();
+        let new = effective_exclusions(&extra_exclusions)?;
+        let cmd = AddMappingCommand {
+            id: mapping.id,
+            account_id: mapping.account_id,
+            collection: mapping.collection,
+            local_binding: mapping.local_binding,
+            remote_endpoint: RemoteEndpoint::from_db_cols(
+                &mapping.remote_endpoint_kind,
+                &mapping.remote_endpoint_value,
+            )?,
+            local_recovery_root: mapping.local_recovery_root,
+            cloud_recovery_path: mapping.cloud_recovery_path,
+            extra_exclusions,
+            max_delete_percent: mapping.max_delete_percent,
+            schedule_interval: Duration::from_secs(mapping.schedule_interval_secs),
+        };
+        let preflight = self.preflight_mapping_preview(&cmd, Some(mapping_id))?;
+        Ok(FilterChangePreview {
+            mapping_id: mapping_id.clone(),
+            previous_generation_id,
+            effective_exclusions: new.iter().cloned().collect(),
+            added_exclusions: new.difference(&old).cloned().collect(),
+            removed_exclusions: old.difference(&new).cloned().collect(),
+            preflight,
+        })
+    }
+
+    /// Stops normal runs for the old generation and queues a fresh first-sync
+    /// preflight using the reviewed direction. Prior generations remain on disk.
+    pub fn apply_filter_change(
+        &self,
+        preview: FilterChangePreview,
+    ) -> Result<CommandAcceptance, ManagerError> {
+        let mut guard = self.inner.state.lock().unwrap();
+        let mut mapping = lookup_mapping(&guard.store, &preview.mapping_id)?;
+        if guard.shutdown
+            || guard.storage_blocked_mappings.contains(&mapping.id)
+            || mapping.active_generation_id.as_ref() != Some(&preview.previous_generation_id)
+            || mapping.state.readiness() != Readiness::Ready
+            || !matches!(mapping.state.execution, Execution::Idle | Execution::Queued)
+        {
+            return Err(ManagerError::InvalidState {
+                mapping_id: mapping.id,
+                cause: "Folder selection changed or the mapping is busy or held.".to_owned(),
+                next_step: "Wait for the active run to finish or resolve the hold, then review the selection again.".to_owned(),
+            });
+        }
+        if let Some(blocking) =
+            find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
+        {
+            return Err(ManagerError::ActiveJobConflict {
+                active_mapping_id: blocking.mapping_id.clone(),
+                cause: format!(
+                    "Cannot start first sync while `{}` has an unresolved hold ({}).",
+                    blocking.mapping_id,
+                    plain_recovery_reason_label(&blocking.reason_kind)
+                ),
+                next_step:
+                    "Open recovery details to resolve the earlier sync process before starting another sync."
+                        .to_string(),
+            });
+        }
+        if preview.added_exclusions.is_empty() && preview.removed_exclusions.is_empty() {
+            return Err(ManagerError::PreflightRejected {
+                cause: "The exclusion set has not changed.".to_owned(),
+                next_step: "Change the selection before starting a new setup.".to_owned(),
+            });
+        }
+        if let Some(cause) = preview
+            .preflight
+            .layout_error
+            .or_else(|| preview.preflight.detected_volume.err())
+        {
+            return Err(ManagerError::PreflightRejected {
+                cause,
+                next_step: "Correct the folder setup and review the new selection again."
+                    .to_owned(),
+            });
+        }
+        let direction = preview.preflight.direction.map_err(|cause| ManagerError::PreflightRejected {
+            cause,
+            next_step: "Review both folders and preserve the existing copies before initializing again.".to_owned(),
+        })?;
+
+        mapping.state = MappingState::new(
+            Readiness::NeedsInitialization,
+            Execution::Queued,
+            mapping.state.intent,
+        );
+        mapping.scheduling_enabled = false;
+        mapping.active_generation_id = None;
+        mapping.exclusions = preview.effective_exclusions;
+        mapping.updated_at = self.inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(&mapping)?;
+        guard.schedules.remove(&mapping.id);
+        guard.job_queue.retain(|job| job.mapping_id != mapping.id);
+        guard.next_init_attempt_id += 1;
+        let attempt_id = guard.next_init_attempt_id;
+        guard.job_queue.push_front(QueuedJob {
+            automatic: false,
+            mapping_id: mapping.id.clone(),
+            kind: QueuedJobKind::InitializePreflight {
+                expected_direction: Some(direction),
+                attempt_id,
+            },
+        });
+        self.inner.worker_cv.notify_all();
+        let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
+        Ok(CommandAcceptance {
+            outcome: CommandOutcome::InitializationPreflightQueued {
+                mapping_id: mapping.id,
+            },
+            snapshot,
         })
     }
 
@@ -1405,6 +1625,12 @@ impl SyncManager {
 
     pub fn set_scheduling_paused(&self, paused: bool) -> Result<CommandAcceptance, ManagerError> {
         self.execute(ManagerCommand::SetSchedulingPaused { paused })
+    }
+
+    /// Marks eligible mappings for a fresh check after wake or network return.
+    pub fn notify_environment_changed(&self) {
+        let mut guard = self.inner.state.lock().unwrap();
+        mark_environment_changed(&self.inner, &mut guard);
     }
 
     pub fn stop_run(
@@ -2051,7 +2277,7 @@ impl SyncManager {
             }
         };
 
-        self.join_volume_watcher();
+        self.join_watchers();
         if let Some((mapping_id, run_id)) = timed_out_info {
             return Ok(ControlledShutdownOutcome::TimedOutInterrupted { mapping_id, run_id });
         }
@@ -2069,7 +2295,10 @@ impl SyncManager {
         Ok(())
     }
 
-    fn join_volume_watcher(&self) {
+    fn join_watchers(&self) {
+        if let Some(handle) = self.scheduler_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.volume_thread.lock().unwrap().take() {
             let _ = handle.join();
         }
@@ -2094,7 +2323,7 @@ impl SyncManager {
         if let Some(stopper) = stopper {
             let _ = stopper.request_stop();
         }
-        self.join_volume_watcher();
+        self.join_watchers();
         // If controlled_shutdown already timed out on a hung child, do NOT block indefinitely on join (HIGH #6).
         if !self.inner.timed_out_shutdown.load(Ordering::SeqCst)
             && let Some(handle) = self.worker_thread.lock().unwrap().take()
@@ -2159,9 +2388,9 @@ impl SyncManager {
             other => (other, cmd.cloud_recovery_path),
         };
 
-        let mut guard = self.inner.state.lock().unwrap();
         let volume = observe_binding(self.inner.volume_probe.as_ref(), &cmd.local_binding);
         volume.check(&cmd.id, &cmd.local_binding)?;
+        let mut guard = self.inner.state.lock().unwrap();
         let existing_same = guard.store.get_mapping(&cmd.id)?;
         let updating_draft = match &existing_same {
             Some(m) if m.state.readiness() == Readiness::Unconfigured => true,
@@ -2225,12 +2454,7 @@ impl SyncManager {
         });
         validate_cloud_collections(&cloud_assignments).map_err(ManagerError::ValidationList)?;
 
-        let mut effective_exclusions = default_exclusion_patterns();
-        for pat in cmd.extra_exclusions {
-            if !pat.trim().is_empty() {
-                effective_exclusions.insert(pat);
-            }
-        }
+        let effective_exclusions = effective_exclusions(&cmd.extra_exclusions)?;
 
         let (remote_kind, remote_value) = remote_endpoint.to_db_cols();
         let now = self.inner.clock.now_rfc3339();
@@ -2406,6 +2630,7 @@ impl SyncManager {
         mapping.updated_at = self.inner.clock.now_rfc3339();
         guard.store.update_mapping_runtime(&mapping)?;
         guard.job_queue.push_back(QueuedJob {
+            automatic: false,
             mapping_id: mapping.id.clone(),
             kind: QueuedJobKind::InitializePreflight {
                 expected_direction: cmd.expected_direction,
@@ -2465,7 +2690,11 @@ impl SyncManager {
                             .to_string(),
                 });
             }
-            if let Some(in_preflight) = &guard.preflight_mapping {
+            if let Some(in_preflight) = guard
+                .preflight_mapping
+                .as_ref()
+                .or_else(|| guard.active_init_attempt.as_ref().map(|(id, _)| id))
+            {
                 return Err(ManagerError::ActiveJobConflict {
                     active_mapping_id: in_preflight.clone(),
                     cause: format!("First sync setup is already checking `{in_preflight}`."),
@@ -2528,6 +2757,7 @@ impl SyncManager {
             fn drop(&mut self) {
                 if let Ok(mut g) = self.0.state.lock() {
                     g.preflight_mapping = None;
+                    self.0.worker_cv.notify_all();
                 }
             }
         }
@@ -2568,7 +2798,9 @@ impl SyncManager {
                     cause: format!("Mapping `{}` no longer exists.", cmd.mapping_id),
                     next_step: "Add the mapping again to set it up.".to_string(),
                 })?;
-        if mapping.state.readiness() != Readiness::NeedsInitialization
+        if !same_volume_inputs(&mapping_snap, &mapping)
+            || mapping_snap.exclusions != mapping.exclusions
+            || mapping.state.readiness() != Readiness::NeedsInitialization
             || mapping.state.execution != Execution::Idle
         {
             return Err(ManagerError::InvalidState {
@@ -2592,14 +2824,14 @@ impl SyncManager {
         mapping.updated_at = self.inner.clock.now_rfc3339();
         guard.store.update_mapping_runtime(&mapping)?;
 
-        guard.job_queue.push_back(QueuedJob {
+        guard.job_queue.push_front(QueuedJob {
+            automatic: false,
             mapping_id: mapping.id.clone(),
             kind: QueuedJobKind::Prepared {
                 generation_id: gen_id,
                 mode: RunMode::Initialize(direction),
             },
         });
-        guard.preflight_mapping = None;
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         self.inner.worker_cv.notify_all();
 
@@ -2613,6 +2845,7 @@ impl SyncManager {
     }
 
     fn handle_run_now(&self, mapping_id: MappingId) -> Result<CommandAcceptance, ManagerError> {
+        let mut checked = read_mapping_check(&self.inner, &mapping_id)?;
         let mut guard = self.inner.state.lock().unwrap();
         if guard.storage_blocked_mappings.contains(&mapping_id) {
             return Err(ManagerError::Storage {
@@ -2640,16 +2873,8 @@ impl SyncManager {
             });
         }
 
-        let mut mapping =
-            guard
-                .store
-                .get_mapping(&mapping_id)?
-                .ok_or_else(|| ManagerError::NotFound {
-                    cause: format!("Mapping `{mapping_id}` does not exist."),
-                    next_step: "Check the mapping list and try again.".to_string(),
-                })?;
-
-        if refresh_mapping_volume_locked(&self.inner, &mut guard, &mut mapping)? {
+        let mut mapping = reload_checked_mapping(&guard, &checked.mapping)?;
+        if apply_checked_volume(&self.inner, &mut guard, &mut mapping, &checked)? {
             publish_updated_snapshot(&self.inner, &mut guard)?;
         }
         if let Some(volume) = guard.volumes.get(&mapping.id) {
@@ -2698,9 +2923,9 @@ impl SyncManager {
                 .job_queue
                 .iter()
                 .position(|j| j.mapping_id == mapping.id)
-                && pos > 0
-                && let Some(job) = guard.job_queue.remove(pos)
+                && let Some(mut job) = guard.job_queue.remove(pos)
             {
+                job.automatic = false;
                 guard.job_queue.push_front(job);
             }
             let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
@@ -2732,19 +2957,7 @@ impl SyncManager {
             });
         };
 
-        let generation =
-            guard
-                .store
-                .get_generation(&gen_id)?
-                .ok_or_else(|| ManagerError::NotFound {
-                    cause: format!("Active generation `{gen_id}` is missing from database."),
-                    next_step: "Open recovery details for this mapping.".to_string(),
-                })?;
-
-        // Re-verify both roots and access-marker contents against stored generation before queueing (§9, §11).
-        if let Err((event, err)) =
-            verify_endpoints_for_generation(&self.inner, &mapping, &generation)
-        {
+        if let Some(Err((event, err))) = checked.endpoints.take() {
             record_preflight_check_failure(&self.inner, &mut guard, &mut mapping, event, &err)?;
             publish_updated_snapshot(&self.inner, &mut guard)?;
             return Err(*err);
@@ -2763,7 +2976,8 @@ impl SyncManager {
         mapping.updated_at = self.inner.clock.now_rfc3339();
         guard.store.update_mapping_runtime(&mapping)?;
 
-        guard.job_queue.push_back(QueuedJob {
+        guard.job_queue.push_front(QueuedJob {
+            automatic: false,
             mapping_id: mapping.id.clone(),
             kind: QueuedJobKind::Prepared {
                 generation_id: gen_id,
@@ -2782,6 +2996,16 @@ impl SyncManager {
     }
 
     fn handle_sync_ready_mappings(&self) -> Result<CommandAcceptance, ManagerError> {
+        let candidates = mapping_check_inputs(&self.inner, true)?;
+        let checks = candidates
+            .into_iter()
+            .filter(|(m, _)| {
+                m.state.readiness() == Readiness::Ready
+                    && m.state.execution == Execution::Idle
+                    && m.state.intent == Intent::Enabled
+            })
+            .map(|(m, g)| check_mapping_volume(&self.inner, m, g, true))
+            .collect::<Vec<_>>();
         let mut guard = self.inner.state.lock().unwrap();
         if let Some(blocking) =
             find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
@@ -2799,11 +3023,17 @@ impl SyncManager {
             });
         }
 
-        let mappings = guard.store.list_mappings()?;
         let mut queued_ids = Vec::new();
         let now = self.inner.clock.now_rfc3339();
 
-        for mut mapping in mappings {
+        for checked in checks {
+            let Some(mut mapping) = guard.store.get_mapping(&checked.mapping.id)? else {
+                continue;
+            };
+            if !same_volume_inputs(&checked.mapping, &mapping) {
+                continue;
+            }
+            apply_checked_volume(&self.inner, &mut guard, &mut mapping, &checked)?;
             if guard.storage_blocked_mappings.contains(&mapping.id)
                 || mapping.state.readiness() != Readiness::Ready
                 || mapping.state.execution != Execution::Idle
@@ -2814,12 +3044,7 @@ impl SyncManager {
             let Some(gen_id) = mapping.active_generation_id.clone() else {
                 continue;
             };
-            let Some(generation) = guard.store.get_generation(&gen_id)? else {
-                continue;
-            };
-            if let Err((event, err)) =
-                verify_endpoints_for_generation(&self.inner, &mapping, &generation)
-            {
+            if let Some(Err((event, err))) = checked.endpoints {
                 record_preflight_check_failure(&self.inner, &mut guard, &mut mapping, event, &err)?;
                 continue;
             }
@@ -2831,6 +3056,7 @@ impl SyncManager {
             mapping.updated_at = now.clone();
             guard.store.update_mapping_runtime(&mapping)?;
             guard.job_queue.push_back(QueuedJob {
+                automatic: false,
                 mapping_id: mapping.id.clone(),
                 kind: QueuedJobKind::Prepared {
                     generation_id: gen_id,
@@ -2857,7 +3083,11 @@ impl SyncManager {
         paused: bool,
     ) -> Result<CommandAcceptance, ManagerError> {
         let mut guard = self.inner.state.lock().unwrap();
+        guard
+            .store
+            .set_scheduling_paused(&guard.device.id, paused)?;
         guard.scheduling_paused = paused;
+        self.inner.worker_cv.notify_all();
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         Ok(CommandAcceptance {
             outcome: CommandOutcome::SchedulingPauseUpdated { paused },
@@ -2892,40 +3122,20 @@ impl SyncManager {
     }
 
     fn handle_check_again(&self, mapping_id: MappingId) -> Result<CommandAcceptance, ManagerError> {
+        let mut checked = read_mapping_check(&self.inner, &mapping_id)?;
         let mut guard = self.inner.state.lock().unwrap();
-        let mut mapping =
-            guard
-                .store
-                .get_mapping(&mapping_id)?
-                .ok_or_else(|| ManagerError::NotFound {
-                    cause: format!("Mapping `{mapping_id}` does not exist."),
-                    next_step: "Check the mapping list and try again.".to_string(),
-                })?;
-        if refresh_mapping_volume_locked(&self.inner, &mut guard, &mut mapping)? {
+        let mut mapping = reload_checked_mapping(&guard, &checked.mapping)?;
+        if apply_checked_volume(&self.inner, &mut guard, &mut mapping, &checked)? {
             publish_updated_snapshot(&self.inner, &mut guard)?;
         }
-        let Some(gen_id) = mapping.active_generation_id.clone() else {
+        let Some(result) = checked.endpoints.take() else {
             return Err(ManagerError::InvalidState {
                 mapping_id,
                 cause: format!("Mapping `{}` has not completed first sync yet.", mapping.id),
                 next_step: "Finish first sync setup before checking folder identity.".to_string(),
             });
         };
-        let generation =
-            guard
-                .store
-                .get_generation(&gen_id)?
-                .ok_or_else(|| ManagerError::NotFound {
-                    cause: format!("Active generation `{gen_id}` is missing from database."),
-                    next_step: "Open recovery details for this mapping.".to_string(),
-                })?;
-
-        // Only clear identity/volume holds when verification ACTUALLY passes!
-        if let Err((_event, err)) =
-            verify_endpoints_for_generation(&self.inner, &mapping, &generation)
-        {
-            return Err(*err);
-        }
+        result.map_err(|(_, err)| *err)?;
 
         match mapping.state.readiness() {
             Readiness::EndpointChanged => {
@@ -2970,6 +3180,7 @@ impl SyncManager {
         mapping_id: MappingId,
         resume_and_run: bool,
     ) -> Result<CommandAcceptance, ManagerError> {
+        let mut checked = read_mapping_check(&self.inner, &mapping_id)?;
         let mut guard = self.inner.state.lock().unwrap();
         if let Some(blocking) =
             find_blocking_global_orphan(&guard.store, self.inner.process_inspector.as_ref())?
@@ -2987,15 +3198,8 @@ impl SyncManager {
             });
         }
 
-        let mut mapping =
-            guard
-                .store
-                .get_mapping(&mapping_id)?
-                .ok_or_else(|| ManagerError::NotFound {
-                    cause: format!("Mapping `{mapping_id}` does not exist."),
-                    next_step: "Check the mapping list and try again.".to_string(),
-                })?;
-        if refresh_mapping_volume_locked(&self.inner, &mut guard, &mut mapping)? {
+        let mut mapping = reload_checked_mapping(&guard, &checked.mapping)?;
+        if apply_checked_volume(&self.inner, &mut guard, &mut mapping, &checked)? {
             publish_updated_snapshot(&self.inner, &mut guard)?;
         }
         if mapping.state.readiness() != Readiness::RecoveryRequired {
@@ -3010,20 +3214,8 @@ impl SyncManager {
             });
         }
 
-        let next_readiness = if let Some(gen_id) = mapping.active_generation_id.as_ref() {
-            let generation =
-                guard
-                    .store
-                    .get_generation(gen_id)?
-                    .ok_or_else(|| ManagerError::NotFound {
-                        cause: format!("Active generation `{gen_id}` is missing."),
-                        next_step: "Export diagnostics before trying again.".to_string(),
-                    })?;
-            if let Err((_ev, err)) =
-                verify_endpoints_for_generation(&self.inner, &mapping, &generation)
-            {
-                return Err(*err);
-            }
+        let next_readiness = if let Some(result) = checked.endpoints.take() {
+            result.map_err(|(_, err)| *err)?;
             sync_core::PostRecoveryReadiness::Ready
         } else {
             sync_core::PostRecoveryReadiness::NeedsInitialization
@@ -3061,6 +3253,7 @@ impl SyncManager {
 
         if let Some(gen_id) = queue_gen_id {
             guard.job_queue.push_back(QueuedJob {
+                automatic: false,
                 mapping_id: mapping.id.clone(),
                 kind: QueuedJobKind::Prepared {
                     generation_id: gen_id,
@@ -3157,6 +3350,7 @@ impl SyncManager {
         // Deletes only DB records; local folder, cloud folder, and recovery copies stay untouched (§7).
         guard.store.delete_mapping_cascade(&mapping.id)?;
         guard.volumes.remove(&mapping.id);
+        guard.schedules.remove(&mapping.id);
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         self.inner.idle_cv.notify_all();
 
@@ -3254,6 +3448,16 @@ impl SyncManager {
         // Persist BEFORE mutating in-memory queue or acknowledging!
         guard.store.update_mapping_runtime(&mapping)?;
         guard.job_queue.retain(|j| j.mapping_id != mapping.id);
+        if let Some((id, attempt)) = &guard.active_init_attempt
+            && id == &mapping.id
+        {
+            let attempt = *attempt;
+            guard.cancelled_init_attempts.insert(attempt);
+            guard.active_init_attempt = None;
+        }
+        if let Some(schedule) = guard.schedules.get_mut(&mapping.id) {
+            schedule.hint_at = None;
+        }
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         self.inner.idle_cv.notify_all();
 
@@ -3278,13 +3482,16 @@ impl SyncManager {
 
         let transition = apply_user_action(mapping.state, UserAction::Resume);
         mapping.state = transition.state;
-        if transition.effect == TransitionEffect::ScheduleRun && !mapping.scheduling_enabled {
+        if transition.effect == TransitionEffect::ScheduleRun {
             mapping.state.execution = Execution::Idle;
         }
         mapping.updated_at = self.inner.clock.now_rfc3339();
 
         // Persist BEFORE acknowledging!
         guard.store.update_mapping_runtime(&mapping)?;
+        if let Some(schedule) = guard.schedules.get_mut(&mapping.id) {
+            schedule.hint_at = Some(self.inner.clock.now_utc());
+        }
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
 
         Ok(CommandAcceptance {
@@ -3347,6 +3554,12 @@ impl SyncManager {
                     guard.cancelled_init_attempts.insert(attempt_id);
                 }
                 guard.job_queue.retain(|j| j.mapping_id != mapping.id);
+                if mapping.state.execution == Execution::Idle
+                    && let Some(schedule) = guard.schedules.get_mut(&mapping.id)
+                {
+                    schedule.finish(self.inner.clock.now_utc(), false, "");
+                    schedule.hint_at = None;
+                }
 
                 if transition.effect == TransitionEffect::RequestGracefulStop {
                     if let Some(active) = guard.active_run.as_mut()
@@ -3457,6 +3670,12 @@ impl SyncManager {
                 .commit_mapping_and_recovery(&mapping, recovery_case.as_ref())?;
 
             guard.job_queue.retain(|j| j.mapping_id != mapping.id);
+            if mapping.state.execution == Execution::Idle
+                && let Some(schedule) = guard.schedules.get_mut(&mapping.id)
+            {
+                schedule.finish(self.inner.clock.now_utc(), false, "");
+                schedule.hint_at = None;
+            }
             let stopper = if let Some(active) = guard.active_run.as_mut()
                 && active.mapping_id == mapping.id
             {
@@ -3503,16 +3722,9 @@ impl SyncManager {
         &self,
         mapping_id: MappingId,
     ) -> Result<CommandAcceptance, ManagerError> {
+        let checked = read_mapping_check(&self.inner, &mapping_id)?;
         let guard = self.inner.state.lock().unwrap();
-        let mapping =
-            guard
-                .store
-                .get_mapping(&mapping_id)?
-                .ok_or_else(|| ManagerError::NotFound {
-                    cause: format!("Mapping `{mapping_id}` does not exist."),
-                    next_step: "Check the mapping ID with `status`.".to_string(),
-                })?;
-
+        let mapping = reload_checked_mapping(&guard, &checked.mapping)?;
         let raw_cases = guard.store.list_open_recovery_cases(&mapping.id)?;
         let recent_runs = guard.store.list_runs_for_mapping(&mapping.id)?;
 
@@ -3543,29 +3755,17 @@ impl SyncManager {
             .map(inspect_workdir_readonly)
             .unwrap_or_default();
 
-        let (identities_verified, identity_check_detail) =
-            if let Some(gid) = mapping.active_generation_id.as_ref() {
-                match guard.store.get_generation(gid)? {
-                    Some(generation) => {
-                        match verify_endpoints_for_generation(&self.inner, &mapping, &generation) {
-                            Ok(()) => (
-                                true,
-                                "Local and destination folders match setup.".to_string(),
-                            ),
-                            Err((_ev, err)) => (false, err.cause()),
-                        }
-                    }
-                    None => (
-                        false,
-                        format!("Active setup generation `{gid}` is missing."),
-                    ),
-                }
-            } else {
-                (
-                    false,
-                    "First sync has not established folder identities yet.".to_string(),
-                )
-            };
+        let (identities_verified, identity_check_detail) = match checked.endpoints {
+            Some(Ok(())) => (
+                true,
+                "Local and destination folders match setup.".to_owned(),
+            ),
+            Some(Err((_, err))) => (false, err.cause()),
+            None => (
+                false,
+                "First sync has not established folder identities yet.".to_owned(),
+            ),
+        };
 
         let report = RecoveryReport {
             mapping_id: mapping.id,
@@ -3592,11 +3792,12 @@ impl Drop for SyncManager {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BoundVolume {
     Present(MountedVolume),
     Missing,
     WrongDisk(String),
+    Inaccessible(String),
     Moved(MountedVolume),
     Legacy,
 }
@@ -3605,7 +3806,7 @@ impl BoundVolume {
     fn mounted(&self) -> Option<&MountedVolume> {
         match self {
             Self::Present(volume) | Self::Moved(volume) => Some(volume),
-            Self::Missing | Self::WrongDisk(_) | Self::Legacy => None,
+            Self::Missing | Self::WrongDisk(_) | Self::Inaccessible(_) | Self::Legacy => None,
         }
     }
 
@@ -3614,6 +3815,9 @@ impl BoundVolume {
             Self::Present(volume) => volume.display_name.clone(),
             Self::Missing => format!("Waiting for {}", binding.volume_display_name()),
             Self::WrongDisk(name) => format!("A different disk named {name} is connected"),
+            Self::Inaccessible(reason) => {
+                format!("Can’t access {}: {reason}", binding.volume_display_name())
+            }
             Self::Moved(volume) => format!(
                 "{} is mounted at a new location. Review the local folder before syncing.",
                 volume.display_name
@@ -3635,6 +3839,7 @@ impl BoundVolume {
                 next_step: match self {
                     Self::Moved(_) => "Reconnect the disk at its original mount or review setup.",
                     Self::Legacy => "Verify the drive and set up the mapping again.",
+                    Self::Inaccessible(_) => "Check disk permissions and try again.",
                     _ => "Connect the disk selected during setup.",
                 }
                 .to_owned(),
@@ -3678,48 +3883,163 @@ fn observe_binding(probe: &dyn VolumeProbe, binding: &LocalBinding) -> BoundVolu
             }
             Ok(_) => break,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => break,
+            Err(err) => return BoundVolume::Inaccessible(err.to_string()),
         }
     }
     match probe.find(binding) {
         Ok(Some(volume)) if volume.binding_mount(&root) != binding.mount_path => {
             BoundVolume::Moved(volume)
         }
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            BoundVolume::Inaccessible(err.to_string())
+        }
         _ => BoundVolume::Missing,
     }
 }
 
-/// Returns true when a new snapshot is needed. The caller holds the manager lock
-/// across probing, the durable state transition, and any graceful stop request.
-fn refresh_mapping_volume_locked(
+struct MappingVolumeCheck {
+    mapping: MappingRecord,
+    observation: BoundVolume,
+    paths_valid: Option<bool>,
+    endpoints: Option<Result<(), EndpointCheckError>>,
+}
+
+fn active_generation(
+    store: &SqliteStateStore,
+    mapping: &MappingRecord,
+) -> Result<Option<GenerationRecord>, ManagerError> {
+    mapping
+        .active_generation_id
+        .as_ref()
+        .map(|id| {
+            store
+                .get_generation(id)?
+                .ok_or_else(|| ManagerError::Storage {
+                    cause: format!("Active setup generation `{id}` is missing."),
+                    next_step: "Open recovery details before syncing.".to_owned(),
+                })
+        })
+        .transpose()
+}
+
+fn mapping_check_inputs(
+    inner: &ManagerInner,
+    verify_all: bool,
+) -> Result<Vec<(MappingRecord, Option<GenerationRecord>)>, ManagerError> {
+    let guard = inner.state.lock().unwrap();
+    guard
+        .store
+        .list_mappings()?
+        .into_iter()
+        .map(|mapping| {
+            let generation = if verify_all || mapping.state.readiness() != Readiness::Ready {
+                active_generation(&guard.store, &mapping)?
+            } else {
+                None
+            };
+            Ok((mapping, generation))
+        })
+        .collect()
+}
+
+fn read_mapping_check(
+    inner: &ManagerInner,
+    id: &MappingId,
+) -> Result<MappingVolumeCheck, ManagerError> {
+    let (mapping, generation) = {
+        let guard = inner.state.lock().unwrap();
+        let mapping = lookup_mapping(&guard.store, id)?;
+        let generation = active_generation(&guard.store, &mapping)?;
+        (mapping, generation)
+    };
+    Ok(check_mapping_volume(inner, mapping, generation, true))
+}
+
+fn lookup_mapping(store: &SqliteStateStore, id: &MappingId) -> Result<MappingRecord, ManagerError> {
+    store
+        .get_mapping(id)?
+        .ok_or_else(|| ManagerError::NotFound {
+            cause: format!("Mapping `{id}` does not exist."),
+            next_step: "Check the mapping list and try again.".to_owned(),
+        })
+}
+
+fn same_volume_inputs(previous: &MappingRecord, current: &MappingRecord) -> bool {
+    previous.local_binding == current.local_binding
+        && previous.active_generation_id == current.active_generation_id
+        && previous.remote_endpoint_kind == current.remote_endpoint_kind
+        && previous.remote_endpoint_value == current.remote_endpoint_value
+        && previous.local_recovery_root == current.local_recovery_root
+        && previous.cloud_recovery_path == current.cloud_recovery_path
+        && previous.collection == current.collection
+}
+
+fn reload_checked_mapping(
+    guard: &SharedState,
+    previous: &MappingRecord,
+) -> Result<MappingRecord, ManagerError> {
+    let mapping = lookup_mapping(&guard.store, &previous.id)?;
+    if !same_volume_inputs(previous, &mapping) {
+        return Err(ManagerError::InvalidState {
+            mapping_id: previous.id.clone(),
+            cause: "The mapping changed while checking its folders.".to_owned(),
+            next_step: "Review the current mapping and try again.".to_owned(),
+        });
+    }
+    Ok(mapping)
+}
+
+fn check_mapping_volume(
+    inner: &ManagerInner,
+    mapping: MappingRecord,
+    generation: Option<GenerationRecord>,
+    verify_all: bool,
+) -> MappingVolumeCheck {
+    let observation = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+    let endpoints = generation
+        .as_ref()
+        .filter(|_| verify_all)
+        .map(|generation| {
+            verify_endpoints_for_generation(inner, &mapping, generation, &observation)
+        });
+    let paths_valid = match &endpoints {
+        Some(Err((Some(ObservedEvent::EndpointChanged), _))) => Some(false),
+        Some(_) => Some(true),
+        None => match generation.as_ref() {
+            Some(generation) if matches!(observation, BoundVolume::Present(_)) => {
+                Some(verify_generation_paths(&inner.state_dir, &mapping, generation).is_ok())
+            }
+            _ if mapping.active_generation_id.is_none() => Some(true),
+            _ => None,
+        },
+    };
+    MappingVolumeCheck {
+        mapping,
+        observation,
+        paths_valid,
+        endpoints,
+    }
+}
+
+/// Applies a completed observation to the current durable state with the lock held.
+fn apply_checked_volume(
     inner: &ManagerInner,
     guard: &mut SharedState,
     mapping: &mut MappingRecord,
+    checked: &MappingVolumeCheck,
 ) -> Result<bool, ManagerError> {
-    let observation = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+    let observation = &checked.observation;
     let old_state = mapping.state;
     let mut stop = false;
-    let next = match &observation {
+    let next = match observation {
         BoundVolume::Present(_) => {
             let available = apply_event(old_state, ObservedEvent::VolumeAvailable).state;
-            if available != old_state
-                && let Some(id) = &mapping.active_generation_id
-            {
-                let generation =
-                    guard
-                        .store
-                        .get_generation(id)?
-                        .ok_or_else(|| ManagerError::Storage {
-                            cause: format!("Active setup generation `{id}` is missing."),
-                            next_step: "Open recovery details before syncing.".to_owned(),
-                        })?;
-                if verify_generation_paths(&inner.state_dir, mapping, &generation).is_err() {
+            match checked.paths_valid {
+                Some(false) if available != old_state => {
                     apply_event(available, ObservedEvent::EndpointChanged).state
-                } else {
-                    available
                 }
-            } else {
-                available
+                Some(_) => available,
+                None => old_state,
             }
         }
         BoundVolume::Legacy => apply_event(old_state, ObservedEvent::EndpointChanged).state,
@@ -3733,7 +4053,8 @@ fn refresh_mapping_volume_locked(
             }
         }
     };
-    let changed = guard.volumes.get(&mapping.id) != Some(&observation);
+    let previous = guard.volumes.get(&mapping.id);
+    let changed = previous.is_none_or(|previous| !same_volume_status(previous, observation));
     let is_present = matches!(observation, BoundVolume::Present(_));
 
     if next != old_state {
@@ -3767,16 +4088,255 @@ fn refresh_mapping_volume_locked(
         }
     }
 
-    if changed {
-        guard.volumes.insert(mapping.id.clone(), observation);
+    if previous != Some(observation) {
+        guard
+            .volumes
+            .insert(mapping.id.clone(), observation.clone());
+    }
+    if old_state.readiness() == Readiness::VolumeUnavailable
+        && next.readiness() == Readiness::Ready
+        && let Some(schedule) = guard.schedules.get_mut(&mapping.id)
+    {
+        schedule.hint_at = Some(inner.clock.now_utc());
     }
     Ok(changed || next != old_state)
 }
 
-fn volume_watch_loop(inner: &ManagerInner) {
+fn restore_schedules(
+    store: &SqliteStateStore,
+    now: DateTime<Utc>,
+) -> Result<Schedules, ManagerError> {
+    let mut schedules = Schedules::new();
+    for mapping in store.list_mappings()? {
+        let Some(generation) = mapping.active_generation_id else {
+            continue;
+        };
+        if !mapping.scheduling_enabled {
+            continue;
+        }
+        let recent = store.retry_runs(&generation)?;
+        let finished = recent
+            .first()
+            .and_then(|run| run.finished_at.as_deref())
+            .or(mapping.last_run_completed_at.as_deref())
+            .and_then(|ts| ts.parse::<DateTime<Utc>>().ok())
+            .unwrap_or(now);
+        let mut schedule = Schedule::new(generation, finished);
+        let streak = recent
+            .iter()
+            .take_while(|run| run.outcome_kind.as_deref() == Some("retryable"))
+            .count();
+        if let Some(run) = recent.first().filter(|_| streak > 0) {
+            schedule.retry_count = (streak as u32).min(MAX_RETRY_COUNT);
+            schedule.retry_at = Some(finished + backoff(schedule.retry_count, run.id.as_str()));
+        }
+        schedules.insert(mapping.id, schedule);
+    }
+    Ok(schedules)
+}
+
+fn mark_environment_changed(inner: &ManagerInner, guard: &mut SharedState) {
+    let now = inner.clock.now_utc();
+    for schedule in guard.schedules.values_mut() {
+        schedule.hint_at = Some(now);
+    }
+}
+
+fn cancel_queued_automatic(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    mapping_id: &MappingId,
+) -> Result<(), ManagerError> {
+    if let Some(mut mapping) = guard.store.get_mapping(mapping_id)?
+        && mapping.state.execution == Execution::Queued
+    {
+        mapping.state.execution = Execution::Idle;
+        mapping.updated_at = inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(&mapping)?;
+    }
+    publish_updated_snapshot(inner, guard)?;
+    Ok(())
+}
+
+fn scheduling_loop(inner: &ManagerInner, mut watcher: Box<dyn LocalChangeWatcher>) {
+    let mut last_tick = inner.clock.now_utc();
+    let mut previous_addresses = network_addresses().ok();
+    loop {
+        let changed = watcher.take_changed_roots();
+        let now = inner.clock.now_utc();
+        let addresses = network_addresses().ok();
+        let network_returned = addresses.as_ref().is_some_and(|current| {
+            !current.is_empty()
+                && previous_addresses
+                    .as_ref()
+                    .is_some_and(|old| old != current)
+        });
+        if addresses.is_some() {
+            previous_addresses = addresses;
+        }
+        let woke = now - last_tick > TimeDelta::seconds(15);
+        if now < last_tick {
+            // A backward wall-clock adjustment must not delay every deadline indefinitely.
+            let shift = now - last_tick;
+            let mut guard = inner.state.lock().unwrap();
+            for schedule in guard.schedules.values_mut() {
+                schedule.last_finished += shift;
+                schedule.retry_at = schedule.retry_at.map(|at| at + shift);
+                schedule.hint_at = schedule.hint_at.map(|at| at + shift);
+            }
+        }
+        last_tick = now;
+        let roots = {
+            let mut guard = inner.state.lock().unwrap();
+            if guard.shutdown {
+                break;
+            }
+            if woke || network_returned {
+                mark_environment_changed(inner, &mut guard);
+            }
+            match schedule_tick(inner, &mut guard, &changed) {
+                Ok(roots) => roots,
+                Err(err) => {
+                    eprintln!("Automatic scheduling failed: {err}");
+                    BTreeSet::new()
+                }
+            }
+        };
+        watcher.set_roots(&roots);
+        let guard = inner.state.lock().unwrap();
+        if guard.shutdown {
+            break;
+        }
+        let _guard = inner
+            .worker_cv
+            .wait_timeout_while(guard, SCHEDULE_TICK, |state| !state.shutdown)
+            .unwrap()
+            .0;
+    }
+}
+
+fn schedule_tick(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    changed: &BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, ManagerError> {
+    let now = inner.clock.now_utc();
+    let mut roots = BTreeSet::new();
+    let mut queued = false;
+    let mappings = guard.store.list_mappings()?;
+    let mut orphan = None;
+    for mut mapping in mappings {
+        if !mapping.scheduling_enabled
+            || mapping.state.readiness() != Readiness::Ready
+            || mapping.state.intent != Intent::Enabled
+            || guard.storage_blocked_mappings.contains(&mapping.id)
+        {
+            continue;
+        }
+        let Some(generation) = mapping.active_generation_id.clone() else {
+            continue;
+        };
+        let root = mapping.local_binding.resolved_path();
+        let hint = changed.contains(&root);
+        roots.insert(root);
+        let schedule = guard
+            .schedules
+            .entry(mapping.id.clone())
+            .or_insert_with(|| Schedule::new(generation.clone(), now));
+        if schedule.generation != generation {
+            *schedule = Schedule::new(generation.clone(), now);
+        }
+        if hint {
+            schedule.hint_at = Some(now);
+        }
+        if guard.scheduling_paused
+            || mapping.state.execution != Execution::Idle
+            || !schedule.due(now, mapping.schedule_interval_secs)
+        {
+            continue;
+        }
+        if orphan.is_none() {
+            orphan = Some(
+                find_blocking_global_orphan(&guard.store, inner.process_inspector.as_ref())?
+                    .is_some(),
+            );
+        }
+        if orphan == Some(true) {
+            continue;
+        }
+        let transition = apply_user_action(mapping.state, UserAction::RunNow);
+        mapping.state = transition.state;
+        mapping.updated_at = inner.clock.now_rfc3339();
+        guard.store.update_mapping_runtime(&mapping)?;
+        guard.job_queue.push_back(QueuedJob {
+            automatic: true,
+            mapping_id: mapping.id,
+            kind: QueuedJobKind::Prepared {
+                generation_id: generation,
+                mode: RunMode::Normal,
+            },
+        });
+        queued = true;
+        // Wake the worker even if persisting a later mapping in this tick fails.
+        inner.worker_cv.notify_all();
+    }
+    if queued {
+        publish_updated_snapshot(inner, guard)?;
+    }
+    Ok(roots)
+}
+
+fn same_volume_status(a: &BoundVolume, b: &BoundVolume) -> bool {
+    match (a, b) {
+        (BoundVolume::Present(a), BoundVolume::Present(b))
+        | (BoundVolume::Moved(a), BoundVolume::Moved(b)) => {
+            a.identity == b.identity
+                && a.mount_path == b.mount_path
+                && a.display_name == b.display_name
+                && a.filesystem == b.filesystem
+        }
+        _ => a == b,
+    }
+}
+
+fn refresh_volumes(inner: &ManagerInner) -> Result<(), ManagerError> {
+    let mut changed = false;
+    for (mapping, generation) in mapping_check_inputs(inner, false)? {
+        let checked = check_mapping_volume(inner, mapping, generation, false);
+        let mut guard = inner.state.lock().unwrap();
+        if guard.shutdown {
+            return Ok(());
+        }
+        let Some(mut mapping) = guard.store.get_mapping(&checked.mapping.id)? else {
+            continue;
+        };
+        if same_volume_inputs(&checked.mapping, &mapping) {
+            changed |= apply_checked_volume(inner, &mut guard, &mut mapping, &checked)?;
+        }
+    }
     let mut guard = inner.state.lock().unwrap();
-    while !guard.shutdown {
-        guard = inner
+    let now = inner.clock.now_utc();
+    if changed {
+        publish_updated_snapshot(inner, &mut guard)?;
+    } else if now - guard.last_space_snapshot >= TimeDelta::seconds(30)
+        && guard.latest_snapshot.mappings.iter().any(|mapping| {
+            mapping.volume_space
+                != guard
+                    .volumes
+                    .get(&mapping.id)
+                    .and_then(BoundVolume::mounted)
+                    .map(|volume| volume.space)
+        })
+    {
+        publish_snapshot(inner, &mut guard, false)?;
+    }
+    Ok(())
+}
+
+fn volume_watch_loop(inner: &ManagerInner) {
+    loop {
+        let guard = inner.state.lock().unwrap();
+        let guard = inner
             .worker_cv
             .wait_timeout_while(guard, VOLUME_POLL_INTERVAL, |state| !state.shutdown)
             .unwrap()
@@ -3784,22 +4344,9 @@ fn volume_watch_loop(inner: &ManagerInner) {
         if guard.shutdown {
             break;
         }
-        let mappings = match guard.store.list_mappings() {
-            Ok(mappings) => mappings,
-            Err(err) => {
-                eprintln!("Failed to load mappings for disk checks: {err}");
-                continue;
-            }
-        };
-        let mut changed = false;
-        for mut mapping in mappings {
-            match refresh_mapping_volume_locked(inner, &mut guard, &mut mapping) {
-                Ok(updated) => changed |= updated,
-                Err(err) => eprintln!("Failed to save disk status for `{}`: {err}", mapping.id),
-            }
-        }
-        if changed && let Err(err) = publish_updated_snapshot(inner, &mut guard) {
-            eprintln!("Failed to publish disk status: {err}");
+        drop(guard);
+        if let Err(err) = refresh_volumes(inner) {
+            eprintln!("Failed to refresh disk status: {err}");
         }
     }
 }
@@ -3818,9 +4365,6 @@ fn record_preflight_check_failure(
     mapping.updated_at = now.clone();
     mapping.last_run_summary_text = Some(err.cause());
     guard.store.update_mapping_runtime(mapping)?;
-    if event.is_some() {
-        refresh_mapping_volume_locked(inner, guard, mapping)?;
-    }
     inner
         .event_bus
         .publish_event(ManagerEvent::PreflightFailed {
@@ -3838,8 +4382,8 @@ fn verify_endpoints_for_generation(
     inner: &ManagerInner,
     mapping: &MappingRecord,
     generation: &GenerationRecord,
+    observation: &BoundVolume,
 ) -> Result<(), EndpointCheckError> {
-    let observation = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
     let volume = observation
         .check(&mapping.id, &mapping.local_binding)
         .map_err(|err| {
@@ -3853,11 +4397,16 @@ fn verify_endpoints_for_generation(
         .map_err(|err| (Some(ObservedEvent::EndpointChanged), Box::new(err)))?;
     require_free_space(&volume.display_name, volume.space.free_bytes)
         .and_then(|()| writable_directory_space(&generation.config.path1))
-        .and_then(|_| verify_recovery_root(&mapping.local_recovery_root))
+        .and_then(|_| {
+            verify_recovery_root(inner.volume_probe.as_ref(), &mapping.local_recovery_root)
+        })
         .and_then(|()| {
             if mapping.remote_endpoint_kind == "local_dir" {
                 writable_directory_space(Path::new(&generation.config.path2))?;
-                verify_recovery_root(Path::new(&mapping.cloud_recovery_path))?;
+                verify_recovery_root(
+                    inner.volume_probe.as_ref(),
+                    Path::new(&mapping.cloud_recovery_path),
+                )?;
             }
             Ok(())
         })
@@ -3926,11 +4475,21 @@ fn writable_directory_space(path: &Path) -> Result<DiskSpaceInfo, ManagerError> 
     })
 }
 
-fn verify_recovery_root(path: &Path) -> Result<(), ManagerError> {
-    let space = writable_directory_space(path).map_err(|err| ManagerError::PreflightRejected {
+fn verify_recovery_root(probe: &dyn VolumeProbe, path: &Path) -> Result<(), ManagerError> {
+    writable_directory_space(path).map_err(|err| ManagerError::PreflightRejected {
         cause: format!("Recovery destination is unavailable. {}", err.cause()),
         next_step: err.next_step(),
     })?;
+    let space = probe
+        .probe(path)
+        .map_err(|err| ManagerError::PreflightRejected {
+            cause: format!(
+                "Can’t check recovery destination `{}`: {err}",
+                path.display()
+            ),
+            next_step: "Confirm that the recovery disk is connected and accessible.".to_owned(),
+        })?
+        .space;
     require_free_space(
         &format!("the recovery destination at `{}`", path.display()),
         space.free_bytes,
@@ -4489,11 +5048,13 @@ fn build_snapshot(
             && let Some(observed) = observed_volume
             && matches!(
                 (m.state.readiness(), observed),
-                (Readiness::VolumeUnavailable, BoundVolume::WrongDisk(_))
-                    | (
-                        Readiness::EndpointChanged,
-                        BoundVolume::Moved(_) | BoundVolume::Legacy
-                    )
+                (
+                    Readiness::VolumeUnavailable,
+                    BoundVolume::WrongDisk(_) | BoundVolume::Inaccessible(_)
+                ) | (
+                    Readiness::EndpointChanged,
+                    BoundVolume::Moved(_) | BoundVolume::Legacy
+                )
             )
         {
             text = observed.message(&m.local_binding);
@@ -4502,7 +5063,8 @@ fn build_snapshot(
             }
         }
         // Never promise automatic retry while scheduling is disabled (HIGH #11).
-        if !m.scheduling_enabled && text == "Last run failed — will retry" {
+        if (!m.scheduling_enabled || scheduling_paused) && text == "Last run failed — will retry"
+        {
             text = "Last run failed — retry manually".to_string();
         }
         let actions = available_actions(&m.state);
@@ -4571,7 +5133,16 @@ fn publish_updated_snapshot(
     inner: &ManagerInner,
     guard: &mut SharedState,
 ) -> Result<Arc<StatusSnapshot>, ManagerError> {
+    publish_snapshot(inner, guard, true)
+}
+
+fn publish_snapshot(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    update_finder: bool,
+) -> Result<Arc<StatusSnapshot>, ManagerError> {
     guard.snapshot_seq += 1;
+    guard.last_space_snapshot = inner.clock.now_utc();
     let active = guard.active_run.as_ref().map(|a| a.mapping_id.clone());
     let queue_order: Vec<MappingId> = guard
         .job_queue
@@ -4596,7 +5167,7 @@ fn publish_updated_snapshot(
             sequence: snap.sequence,
             timestamp: snap.generated_at.clone(),
         });
-    if let Err(err) = inner.finder_writer.write_snapshot(&snap) {
+    if update_finder && let Err(err) = inner.finder_writer.write_snapshot(&snap) {
         eprintln!("Warning: failed to publish Finder status.json: {err}");
     }
     Ok(snap)
@@ -4651,12 +5222,32 @@ fn run_init_preflight_unlocked(
 
     let effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
 
+    let mut gen_num = gen_num;
+    let mapping_dir = inner.state_dir.join("mappings").join(mapping.id.as_str());
+    let raw_gen_dir = loop {
+        let candidate = mapping_dir.join(format!("generation-{gen_num}"));
+        reject_symlinks_under_root("generation", &inner.state_dir, &candidate)?;
+        match fs::symlink_metadata(&candidate) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break candidate,
+            Ok(meta) if meta.is_dir() => {
+                for leaf in ["bisync", "filters.txt", "volume-binding"] {
+                    reject_symlinks_under_root(leaf, &inner.state_dir, &candidate.join(leaf))?;
+                }
+                gen_num += 1;
+            }
+            other => {
+                return Err(ManagerError::Io {
+                    cause: format!(
+                        "Unable to use setup generation path `{}`: {other:?}",
+                        candidate.display()
+                    ),
+                    next_step: "Inspect the private state directory before trying again."
+                        .to_owned(),
+                });
+            }
+        }
+    };
     let gen_id = GenerationId::new(format!("{}-gen-{gen_num}", mapping.id));
-    let raw_gen_dir = inner
-        .state_dir
-        .join("mappings")
-        .join(mapping.id.as_str())
-        .join(format!("generation-{gen_num}"));
     let raw_workdir_path = raw_gen_dir.join("bisync");
     let raw_filters_file_path = raw_gen_dir.join("filters.txt");
     reject_symlinks_under_root("workdir_path", &inner.state_dir, &raw_workdir_path)?;
@@ -4706,8 +5297,8 @@ fn run_init_preflight_unlocked(
                 return Ok(None);
             }
             verify_local_disk()?;
-            verify_recovery_root(&mapping.local_recovery_root)?;
-            verify_recovery_root(&remote_recovery_dir)?;
+            verify_recovery_root(inner.volume_probe.as_ref(), &mapping.local_recovery_root)?;
+            verify_recovery_root(inner.volume_probe.as_ref(), &remote_recovery_dir)?;
             establish_local_pair_markers(
                 &canonical_local,
                 remote_root,
@@ -4730,17 +5321,35 @@ fn run_init_preflight_unlocked(
         return Ok(None);
     }
 
+    ensure_private_dir_under("mapping", &inner.state_dir, &mapping_dir)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&raw_gen_dir)
+        .map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed to reserve setup generation `{}`: {err}",
+                raw_gen_dir.display()
+            ),
+            next_step: "Check the FolderSync state directory and try again.".to_owned(),
+        })?;
     let workdir_path =
         ensure_private_dir_under("workdir_path", &inner.state_dir, &raw_workdir_path)?;
     let filters_file_path =
         reject_symlinks_under_root("filters_file", &inner.state_dir, &raw_filters_file_path)?;
-    let filters_content = render_filters_file(&effective_filters);
-    write_private_file_under(
-        "filters_file",
-        &inner.state_dir,
-        &filters_file_path,
-        filters_content.as_bytes(),
-    )?;
+    let write_filters = || -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&filters_file_path)?;
+        file.write_all(render_filters_file(&effective_filters).as_bytes())?;
+        file.sync_all()
+    };
+    write_filters().map_err(|err| ManagerError::Io {
+        cause: format!("Failed to freeze setup filters: {err}"),
+        next_step: "Check the FolderSync state directory and try again.".to_owned(),
+    })?;
 
     let config_gen = ConfigGeneration {
         path1: canonical_local,
@@ -4884,12 +5493,14 @@ fn worker_loop(inner: Arc<ManagerInner>) {
         // all under ONE mutex acquisition (HIGH #5).
         let outcome = {
             let mut guard = inner.state.lock().unwrap();
-            while !guard.shutdown && guard.job_queue.is_empty() {
+            while !guard.shutdown
+                && (guard.job_queue.is_empty() || guard.preflight_mapping.is_some())
+            {
                 if let Some(heartbeat) = inner.finder_heartbeat_interval {
                     let remaining = heartbeat.saturating_sub(last_heartbeat.elapsed());
                     guard = inner.worker_cv.wait_timeout(guard, remaining).unwrap().0;
                     if !guard.shutdown
-                        && guard.job_queue.is_empty()
+                        && (guard.job_queue.is_empty() || guard.preflight_mapping.is_some())
                         && last_heartbeat.elapsed() >= heartbeat
                     {
                         // Refresh Finder status.json generated_at periodically so idle running
@@ -4910,6 +5521,13 @@ fn worker_loop(inner: Arc<ManagerInner>) {
             if guard.shutdown {
                 DequeueOutcome::Shutdown
             } else if let Some(job) = guard.job_queue.pop_front() {
+                if job.automatic && guard.scheduling_paused {
+                    if let Err(err) = cancel_queued_automatic(&inner, &mut guard, &job.mapping_id) {
+                        record_terminal_db_error_locked(&mut guard, &job.mapping_id, err);
+                    }
+                    inner.idle_cv.notify_all();
+                    continue;
+                }
                 match &job.kind {
                     QueuedJobKind::Prepared {
                         generation_id,
@@ -5187,10 +5805,8 @@ struct PreparedRun {
     log_file: fs::File,
 }
 
-/// Atomically rechecks eligibility (shutdown, pause, stop, global orphan,
-/// generation roots, access-marker contents), persists the pre-spawn `runs`
-/// row, transitions `Execution::Running`, and claims `guard.active_run` while
-/// holding the manager state mutex (HIGH #4, #5, #6).
+/// Rechecks durable eligibility and claims the active run under the state
+/// mutex. The worker checks folders and volume identity outside the mutex.
 fn claim_and_prepare_locked(
     inner: &ManagerInner,
     guard: &mut SharedState,
@@ -5212,7 +5828,9 @@ fn claim_and_prepare_locked(
     }
     let is_init = matches!(mode, RunMode::Initialize(_));
     if !is_init
-        && (mapping.state.intent == Intent::Paused || mapping.state.readiness() != Readiness::Ready)
+        && (mapping.state.intent == Intent::Paused
+            || mapping.state.readiness() != Readiness::Ready
+            || mapping.active_generation_id.as_ref() != Some(generation_id))
     {
         mapping.state.execution = Execution::Idle;
         mapping.updated_at = inner.clock.now_rfc3339();
@@ -5253,14 +5871,6 @@ fn claim_and_prepare_locked(
             next_step: "Reconnect account.".to_string(),
         })?;
 
-    // Fast pre-claim verification (re-run again as the VERY LAST step right before spawn!).
-    if let Err((event, err)) = verify_endpoints_for_generation(inner, &mapping, &generation) {
-        mapping.state.execution = Execution::Idle;
-        record_preflight_check_failure(inner, guard, &mut mapping, event, &err)?;
-        publish_updated_snapshot(inner, guard)?;
-        return Ok(None);
-    }
-
     let run_id = RunId::new(format!("run-{}", Uuid::new_v4()));
     validate_safe_path_id("run_id", run_id.as_str())?;
     validate_safe_path_id("mapping_id", mapping.id.as_str())?;
@@ -5275,24 +5885,15 @@ fn claim_and_prepare_locked(
         &mapping.remote_endpoint_kind,
         &mapping.remote_endpoint_value,
     )?;
-    let backup_dir1 = reject_symlinks_under_root(
-        "backup_dir1",
-        &mapping.local_recovery_root,
-        &mapping
-            .local_recovery_root
-            .join(mapping.id.as_str())
-            .join(run_id.as_str()),
-    )?;
+    let backup_dir1 = mapping
+        .local_recovery_root
+        .join(mapping.id.as_str())
+        .join(run_id.as_str());
     let (backup_dir2, backup_dir2_str) = match &remote_ep {
         RemoteEndpoint::LocalDir(_) => {
-            let rec_root = PathBuf::from(&mapping.cloud_recovery_path);
-            let p = reject_symlinks_under_root(
-                "backup_dir2",
-                &rec_root,
-                &rec_root
-                    .join(mapping.device_id.as_str())
-                    .join(run_id.as_str()),
-            )?;
+            let p = Path::new(&mapping.cloud_recovery_path)
+                .join(mapping.device_id.as_str())
+                .join(run_id.as_str());
             let s = p.to_string_lossy().into_owned();
             (BackupDir2::LocalDir(p), s)
         }
@@ -5363,6 +5964,9 @@ fn claim_and_prepare_locked(
     mapping.updated_at = started_at.clone();
     guard.store.update_mapping_runtime(&mapping)?;
 
+    if let Some(schedule) = guard.schedules.get_mut(mapping_id) {
+        schedule.hint_at = None;
+    }
     guard.active_run = Some(ActiveRunControl {
         mapping_id: mapping.id.clone(),
         run_id: run_id.clone(),
@@ -5523,6 +6127,9 @@ fn abort_before_spawn_locked(
         return;
     }
 
+    if let Some(schedule) = guard.schedules.get_mut(&run.mapping_id) {
+        schedule.finish(inner.clock.now_utc(), false, run.id.as_str());
+    }
     let _ = publish_updated_snapshot(inner, guard);
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
         mapping_id: run.mapping_id,
@@ -5541,6 +6148,7 @@ fn abort_endpoint_check_failed_locked(
     mut run: RunRecord,
     event: Option<ObservedEvent>,
     err: ManagerError,
+    volume: BoundVolume,
 ) {
     let now = inner.clock.now_rfc3339();
     let (outcome_kind, run_outcome) = match event {
@@ -5593,9 +6201,9 @@ fn abort_endpoint_check_failed_locked(
     }
 
     guard.active_run = None;
-    if let Some(mapping) = &updated_mapping {
-        let volume = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
-        guard.volumes.insert(mapping.id.clone(), volume);
+    guard.volumes.insert(run.mapping_id.clone(), volume);
+    if let Some(schedule) = guard.schedules.get_mut(&run.mapping_id) {
+        schedule.finish(inner.clock.now_utc(), false, run.id.as_str());
     }
     let _ = publish_updated_snapshot(inner, guard);
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
@@ -5702,8 +6310,38 @@ fn finish_with_child_identity_error(
     inner.idle_cv.notify_all();
 }
 
+fn launch_cancellation(guard: &SharedState, run_id: &RunId) -> Option<bool> {
+    match guard.active_run.as_ref() {
+        Some(active) if &active.run_id == run_id => {
+            (active.force_stopped || active.stop_requested || guard.shutdown)
+                .then_some(active.force_stopped)
+        }
+        _ => Some(false),
+    }
+}
+
 fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
-    // 1. Qualify engine and construct request OUTSIDE the state mutex.
+    let volume = observe_binding(inner.volume_probe.as_ref(), &prepared.mapping.local_binding);
+    if let Err((event, err)) =
+        verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)
+    {
+        let mut guard = inner.state.lock().unwrap();
+        if let Some(forced) = launch_cancellation(&guard, &prepared.run.id) {
+            abort_before_spawn_locked(inner, &mut guard, prepared.run, forced);
+        } else {
+            abort_endpoint_check_failed_locked(
+                inner,
+                &mut guard,
+                prepared.run,
+                event,
+                *err,
+                volume,
+            );
+        }
+        return;
+    }
+
+    // Qualify engine and construct the request outside the state mutex.
     let prepared_launch = match inner.launcher.prepare(&prepared.plan) {
         Ok(p) => p,
         Err(err) => {
@@ -5776,20 +6414,31 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
         let _ = log_file.sync_all();
     });
 
-    // 2. Hold state mutex across final stop/shutdown check (HIGH #5, #9),
-    //    final root/marker check (HIGH #4), spawn, child identity commit (HIGH #8),
-    //    and stopper registration — zero gap between cancel/check and spawn!
+    // Validate filesystem inputs outside the mutex. Recheck the active run
+    // and cancellation under the lock immediately before spawn and PID commit.
+    let volume = observe_binding(inner.volume_probe.as_ref(), &prepared.mapping.local_binding);
+    let verify_backups = || {
+        reject_symlinks_under_root(
+            "backup_dir1",
+            &prepared.mapping.local_recovery_root,
+            &prepared.run.backup_dir1,
+        )?;
+        if prepared.mapping.remote_endpoint_kind == "local_dir" {
+            reject_symlinks_under_root(
+                "backup_dir2",
+                Path::new(&prepared.mapping.cloud_recovery_path),
+                Path::new(&prepared.run.backup_dir2),
+            )?;
+        }
+        Ok(())
+    };
+    let verification =
+        verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)
+            .and_then(|()| verify_backups().map_err(|err| (None, Box::new(err))));
     let mut run = prepared.run;
     let launched = {
         let mut guard = inner.state.lock().unwrap();
-        let (is_force_stopped, is_stop_requested) = match guard.active_run.as_ref() {
-            Some(active) if active.run_id == run.id => (
-                active.force_stopped,
-                active.stop_requested || guard.shutdown,
-            ),
-            _ => (false, true),
-        };
-        if is_force_stopped || is_stop_requested {
+        if let Some(is_force_stopped) = launch_cancellation(&guard, &run.id) {
             drop(prepared_launch);
             drop(line_tx);
             abort_before_spawn_locked(inner, &mut guard, run, is_force_stopped);
@@ -5798,30 +6447,10 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
             return;
         }
 
-        // VERY LAST step immediately before spawn: re-verify both roots and
-        // access-marker contents against the stored generation (HIGH #4).
-        let verify_backups = || {
-            reject_symlinks_under_root(
-                "backup_dir1",
-                &prepared.mapping.local_recovery_root,
-                &run.backup_dir1,
-            )?;
-            if prepared.mapping.remote_endpoint_kind == "local_dir" {
-                reject_symlinks_under_root(
-                    "backup_dir2",
-                    Path::new(&prepared.mapping.cloud_recovery_path),
-                    Path::new(&run.backup_dir2),
-                )?;
-            }
-            Ok(())
-        };
-        let verification =
-            verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation)
-                .and_then(|()| verify_backups().map_err(|err| (None, Box::new(err))));
         if let Err((event, err)) = verification {
             drop(prepared_launch);
             drop(line_tx);
-            abort_endpoint_check_failed_locked(inner, &mut guard, run, event, *err);
+            abort_endpoint_check_failed_locked(inner, &mut guard, run, event, *err, volume);
             drop(guard);
             let _ = forwarder.join();
             return;
@@ -6238,6 +6867,7 @@ fn finalize_completed_run(
     }
 
     let classified = classify_run_outcome(&run_out);
+    let volume = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
     let mut guard = inner.state.lock().unwrap();
     let already_timed_out = guard
         .active_run
@@ -6255,7 +6885,6 @@ fn finalize_completed_run(
         return;
     }
 
-    let volume = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
     let volume_lost = observed_loss || !matches!(volume, BoundVolume::Present(_));
     let (core_outcome, outcome_kind, outcome_detail, conflict_paths, recovery_seed) =
         if volume_lost && !already_force_stopped {
@@ -6327,7 +6956,7 @@ fn finalize_completed_run(
                 mapping.state.execution = Execution::Idle;
                 mapping.state =
                     apply_event(mapping.state, ObservedEvent::InitializationCompleted).state;
-                mapping.scheduling_enabled = false;
+                mapping.scheduling_enabled = true;
             } else {
                 mapping.state =
                     apply_event(mapping.state, ObservedEvent::RunFinished(core_outcome)).state;
@@ -6388,6 +7017,17 @@ fn finalize_completed_run(
         return;
     }
 
+    if let Some(mapping) = &updated_mapping
+        && mapping.scheduling_enabled
+        && let Some(generation) = &mapping.active_generation_id
+    {
+        let now = inner.clock.now_utc();
+        let schedule = guard
+            .schedules
+            .entry(mapping.id.clone())
+            .or_insert_with(|| Schedule::new(generation.clone(), now));
+        schedule.finish(now, outcome_kind == "retryable", run.id.as_str());
+    }
     guard.volumes.insert(run.mapping_id.clone(), volume);
     let _ = publish_updated_snapshot(inner, &mut guard);
     if let Some(c) = case {

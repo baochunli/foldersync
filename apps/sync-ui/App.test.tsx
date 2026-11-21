@@ -19,6 +19,7 @@ test("Overview shows every state label, actions, Sync now verb, and Paper Mono p
   // Volume groups with free space, low space, and missing drive
   expect(allTexts).toContain("Internal SSD");
   expect(allTexts).toContain("212 GB free of 994 GB");
+  expect(allTexts).toContain("APFS");
   expect(allTexts).toContain("WorkSSD");
   expect(allTexts).toContain("1.4 TB free of 2 TB");
   expect(allTexts).toContain("PhotoSSD");
@@ -141,9 +142,10 @@ test("Interactive Pause/Resume, Scheduling hold banner, and window close keep-al
   expect(app.shows("id:pause-documents")).toBe(true);
 
   // Pause scheduling -> global hold banner appears, Sync now still allowed (D1)
-  await app.press("id:demo-toggle-scheduling");
+  await app.press("id:toggle-scheduling");
   expect(app.shows("id:scheduling-paused-banner")).toBe(true);
   expect(app.texts().join("\n")).toContain("Scheduling paused. No mapping starts on its own. Sync now still works.");
+  expect(app.texts().join("\n")).not.toContain("retrying at 14:50");
 
   // Closing the window hides it (keep-alive-on-close) and Show window reopens it (§3, #11)
   expect(app.window("main").state()?.visible).toBe(true);
@@ -154,14 +156,28 @@ test("Interactive Pause/Resume, Scheduling hold banner, and window close keep-al
   expect(app.texts()).toContain("Overview");
 });
 
-test("Mapping detail hides Change subfolders and Activity raw log toggles open", async () => {
+test("Mapping schedule, volume, and subfolder change review; Activity raw log toggles open", async () => {
   const app = await open(".", DESKTOP);
 
   // Open Family detail
   await app.press("id:open-detail-family");
   const detailText = app.texts().join("\n");
   expect(detailText).toContain("Included subfolders");
-  expect(detailText).not.toContain("Change subfolders");
+  expect(detailText).toContain("Change subfolders…");
+  expect(detailText).toContain("Automatic sync on");
+  expect(detailText).toContain("212 GB free of 994 GB");
+
+  await app.press("id:change-subfolders-btn");
+  expect(app.texts().join("\n")).toContain("Free on Internal SSD");
+  await app.press("id:subfolder-photos");
+  await app.press("id:filter-change-preview");
+  expect(app.texts().join("\n")).toContain("Previous sync setup is kept");
+  expect(app.enabled("id:filter-change-confirm")).toBe(false);
+  expect(app.texts().join("\n")).toContain("/Photos/**");
+  await app.press("id:filter-change-consent");
+  expect(app.enabled("id:filter-change-confirm")).toBe(true);
+  await app.press("id:filter-change-confirm");
+  expect(app.texts().join("\n")).toContain("First sync");
   expect(detailText).toContain("Sync now");
 
   // Activity screen: indeterminate scanning + elapsed time, raw log closed by default
@@ -357,4 +373,16 @@ test("Deferred UI fixes: resumable draft, new folder, queue order, conflict pres
   expect(app.texts().join("\n")).toContain("Uploading to the cloud");
   await app.press("id:wizard-demo-complete-first-sync-btn");
   expect(app.texts().join("\n")).toContain("Automatic sync is now on");
+});
+
+
+test("Accounts show sign-in, browser wait, and connected states", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:nav-accounts");
+  expect(app.texts().join("\n")).toContain("Sign-in required");
+  await app.press("id:accounts-connect-btn");
+  expect(app.texts().join("\n")).toContain("Connect Google Drive");
+  expect(app.texts().join("\n")).toContain("Finish signing in in your browser");
+  await app.press("id:accounts-simulate-signin-btn");
+  expect(app.texts().join("\n")).toContain("work-2");
 });

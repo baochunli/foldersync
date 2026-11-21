@@ -84,23 +84,13 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
         };
 
         // Queue and Held summary cards — reflect actual `queue_order` (#6).
-        let mut queued_names: Vec<String> = Vec::new();
-        for qid in &snap.queue_order {
-            if let Some(m) = snap.mapping(qid)
-                && !m.is_variant_showcase
-                && m.state.execution == sync_core::Execution::Queued
-            {
-                queued_names.push(m.display_name.clone());
-            }
-        }
-        for m in &snap.mappings {
-            if !m.is_variant_showcase
-                && m.state.execution == sync_core::Execution::Queued
-                && !snap.queue_order.contains(&m.id)
-            {
-                queued_names.push(m.display_name.clone());
-            }
-        }
+        let queued_names: Vec<_> = snap
+            .queue_order
+            .iter()
+            .filter_map(|id| snap.mapping(id))
+            .filter(|mapping| !mapping.is_variant_showcase)
+            .map(|mapping| mapping.display_name.as_str())
+            .collect();
         let queue_body = if !queued_names.is_empty() {
             format!("Queued (in order): {}", queued_names.join(" → "))
         } else if snap.scheduling_paused {
@@ -624,7 +614,11 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         .child(kv_row("Elapsed", text(move || {
                             format_duration(base_secs.saturating_add(elapsed_sig.get()))
                         }).tabular_nums()))
-                        .child(kv_row("Started", text(format!("{} · {}", run.started_label, run.trigger_label)).tabular_nums()))
+                        .child(kv_row("Started", text(if run.trigger_label.is_empty() {
+                            run.started_label.clone()
+                        } else {
+                            format!("{} · {}", run.started_label, run.trigger_label)
+                        }).tabular_nums()))
                         .child(kv_row("Transferred", text("Nothing yet"))),
                 )
                 .child(

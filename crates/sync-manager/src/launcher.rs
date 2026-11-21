@@ -10,7 +10,7 @@ use std::{
 use rclone_adapter::{
     BackupDir2, BisyncRequest, BoundedLineBuffer, ChildIdentity, EngineIdentity, ExitStatusInfo,
     OutputLine, Path2, RealProcessRunner, RunHandle, RunMode, RunOutput, SpawnOptions, StopHandle,
-    pinned_binary_path, qualify_binary,
+    qualify_binary, qualify_pinned_binary,
 };
 
 use crate::error::ManagerError;
@@ -122,24 +122,33 @@ pub trait BisyncLauncher: Send + Sync {
 #[derive(Debug, Default, Clone)]
 pub struct RealBisyncLauncher {
     binary_override: Option<PathBuf>,
+    qualified: Arc<Mutex<Option<EngineIdentity>>>,
 }
 
 impl RealBisyncLauncher {
     pub fn new(binary_override: Option<PathBuf>) -> Self {
-        Self { binary_override }
+        Self {
+            binary_override,
+            ..Self::default()
+        }
     }
 
     fn resolve_and_qualify(&self) -> Result<EngineIdentity, ManagerError> {
-        let path = match &self.binary_override {
-            Some(p) => p.clone(),
-            None => pinned_binary_path().ok_or_else(|| ManagerError::Engine {
+        let mut qualified = self.qualified.lock().unwrap();
+        if let Some(engine) = qualified.as_ref() {
+            return Ok(engine.clone());
+        }
+        let engine = match self.binary_override.as_deref() {
+            Some(path) => qualify_binary(path)?,
+            None => qualify_pinned_binary()?.ok_or_else(|| ManagerError::Engine {
                 cause: "Pinned rclone binary is not installed.".to_string(),
                 next_step:
-                    "Run scripts/fetch-rclone.sh (or set FOLDERSYNC_RCLONE to the verified binary)."
+                    "Run scripts/fetch-rclone.sh to install the verified development engine."
                         .to_string(),
             })?,
         };
-        Ok(qualify_binary(&path)?)
+        *qualified = Some(engine.clone());
+        Ok(engine)
     }
 }
 

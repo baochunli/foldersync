@@ -443,10 +443,12 @@ mod os {
             if filesystem_uuid(&mount).as_deref() != Some(uuid) {
                 continue;
             }
-            if let Ok(volume) = probe(&mount.path)
-                && volume.identity.stable_id == binding.volume.stable_id
-            {
-                return Ok(Some(volume));
+            match probe(&mount.path) {
+                Ok(volume) if volume.identity.stable_id == binding.volume.stable_id => {
+                    return Ok(Some(volume));
+                }
+                Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+                _ => {}
             }
         }
         Ok(None)

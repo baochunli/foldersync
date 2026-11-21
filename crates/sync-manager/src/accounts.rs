@@ -10,7 +10,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use rclone_adapter::{
@@ -20,8 +20,9 @@ use rclone_adapter::{
     ResolvedRemotePath, check_config_recovery_state, cleanup_account_setup_temp_files,
     create_drive_remote_config_locked, find_duplicate_dir_names,
     import_single_remote_into_encrypted_config_locked, is_global_default_rclone_config,
-    list_dirs_with_runner, pinned_binary_path, qualify_binary, resolve_folder_path_with_runner,
-    run_drive_auth_locked, verify_encrypted_config, verify_expected_folder_identity_with_runner,
+    list_dirs_with_runner, pinned_binary_path, qualify_binary, qualify_pinned_binary,
+    resolve_folder_path_with_runner, run_drive_auth_locked, verify_encrypted_config,
+    verify_expected_folder_identity_with_runner,
 };
 use serde::{Deserialize, Serialize};
 use sync_core::{AccountId, CloudCollection, DeviceId};
@@ -418,6 +419,7 @@ pub struct AccountService {
     process_runner: Arc<dyn ProcessRunner>,
     clock: Arc<dyn Clock>,
     rclone_binary_override: Option<PathBuf>,
+    qualified_engine: Mutex<Option<EngineIdentity>>,
     credential_helper_binary: Option<PathBuf>,
     password_command_factory: Option<PasswordCommandFactory>,
     acquire_state_lock: bool,
@@ -437,6 +439,7 @@ impl AccountService {
             process_runner: config.process_runner,
             clock: config.clock,
             rclone_binary_override: config.rclone_binary_override,
+            qualified_engine: Mutex::new(None),
             credential_helper_binary: config.credential_helper_binary,
             password_command_factory: config.password_command_factory,
             acquire_state_lock: config.acquire_state_lock,
@@ -571,26 +574,26 @@ impl AccountService {
         self.clock.now_rfc3339()
     }
 
-    fn resolve_rclone_path(&self) -> Result<PathBuf, AccountError> {
-        match &self.rclone_binary_override {
-            Some(p) => Ok(p.clone()),
-            None => pinned_binary_path().ok_or_else(|| AccountError::Engine {
-                cause: "Pinned rclone binary is not installed.".to_string(),
-                next_step:
-                    "Run scripts/fetch-rclone.sh (or set FOLDERSYNC_RCLONE to the verified binary)."
-                        .to_string(),
-            }),
-        }
-    }
-
     fn qualify_engine(&self) -> Result<EngineIdentity, AccountError> {
-        let path = self.resolve_rclone_path()?;
-        qualify_binary(&path).map_err(|err| AccountError::Engine {
+        let mut qualified = self.qualified_engine.lock().unwrap();
+        if let Some(engine) = qualified.as_ref() {
+            return Ok(engine.clone());
+        }
+        let engine = match self.rclone_binary_override.as_deref() {
+            Some(path) => qualify_binary(path).map(Some),
+            None => qualify_pinned_binary(),
+        }
+        .map_err(|err| AccountError::Engine {
             cause: err.to_string(),
-            next_step:
-                "Verify the bundled rclone executable against packaging/qualification-manifest.toml."
-                    .to_string(),
-        })
+            next_step: "Verify the installed FolderSync rclone executable.".to_string(),
+        })?
+        .ok_or_else(|| AccountError::Engine {
+            cause: "Pinned rclone binary is not installed.".to_string(),
+            next_step: "Run scripts/fetch-rclone.sh to install the verified development engine."
+                .to_string(),
+        })?;
+        *qualified = Some(engine.clone());
+        Ok(engine)
     }
 
     fn reject_reserved_account_id(id: &AccountId) -> Result<(), AccountError> {
@@ -1085,6 +1088,13 @@ impl AccountService {
             return Err(AccountError::GlobalDefaultConfigRefused { path: source_abs });
         }
 
+        let engine = self.qualify_engine()?;
+        if !req.allow_global_default_source
+            && is_global_default_rclone_config(&source_abs, None, None, engine.path().parent())
+        {
+            return Err(AccountError::GlobalDefaultConfigRefused { path: source_abs });
+        }
+
         let _state_lock = self.maybe_lock_state()?;
         // Hold ONE per-account lock across existence checks, credential registration,
         // config encryption/publication, root verification, and DB insert.
@@ -1103,7 +1113,6 @@ impl AccountService {
         // Refuse if recovery-needed backups exist; remove any orphaned unregistered config.
         self.clear_orphaned_unregistered_config(&target_config_path)?;
 
-        let engine = self.qualify_engine()?;
         let cred_key = self.credential_key_for(&store, &req.id)?;
 
         let passphrase = SecretString::generate_random_passphrase()?;
@@ -1489,6 +1498,30 @@ mod tests {
             )
             .unwrap())
         })
+    }
+
+    #[test]
+    fn account_service_caches_successful_qualification_for_its_lifetime() {
+        let Some(pinned) = pinned_binary_path() else {
+            eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        let engine_path = tmp.path().join("rclone");
+        let mut cfg = AccountServiceConfig::with_state_dir(tmp.path().join("state"));
+        cfg.secret_store = Arc::new(InMemorySecretStore::new());
+        cfg.rclone_binary_override = Some(engine_path.clone());
+        let svc = AccountService::new(cfg).unwrap();
+
+        assert!(matches!(
+            svc.qualify_engine(),
+            Err(AccountError::Engine { .. })
+        ));
+        fs::copy(pinned, &engine_path).unwrap();
+        let original = svc.qualify_engine().unwrap();
+
+        fs::write(&engine_path, b"replacement after qualification").unwrap();
+        assert_eq!(svc.qualify_engine().unwrap(), original);
     }
 
     #[test]

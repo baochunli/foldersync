@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// Current highest SQLite schema migration version supported by this build.
-pub const LATEST_SCHEMA_VERSION: i64 = 2;
+pub const LATEST_SCHEMA_VERSION: i64 = 3;
 
 struct Migration {
     version: i64,
@@ -159,6 +159,22 @@ UPDATE mappings
 SET unreviewed_conflict_run_id = last_run_id
 WHERE last_run_outcome IN ('"SuccessWithConflicts"', 'SuccessWithConflicts')
   AND last_run_id IS NOT NULL;
+"#,
+    },
+    Migration {
+        version: 3,
+        name: "automatic_scheduling",
+        sql: r#"
+ALTER TABLE devices ADD COLUMN scheduling_paused INTEGER NOT NULL DEFAULT 0;
+UPDATE mappings SET scheduling_enabled = 1
+WHERE EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.generation_id = mappings.active_generation_id
+      AND runs.mapping_id = mappings.id
+      AND runs.mode IN ('init_path1', 'init_path2')
+      AND runs.status = 'completed'
+      AND runs.outcome_kind = 'success'
+);
 "#,
     },
 ];
@@ -821,6 +837,52 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    pub(crate) fn scheduling_paused(&self, device: &DeviceId) -> Result<bool, ManagerError> {
+        self.conn
+            .query_row(
+                "SELECT scheduling_paused FROM devices WHERE id = ?1",
+                [device.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| storage_err("Failed to read scheduling pause", e))
+    }
+
+    pub(crate) fn set_scheduling_paused(
+        &self,
+        device: &DeviceId,
+        paused: bool,
+    ) -> Result<(), ManagerError> {
+        self.conn
+            .execute(
+                "UPDATE devices SET scheduling_paused = ?2 WHERE id = ?1",
+                params![device.as_str(), paused],
+            )
+            .map_err(|e| storage_err("Failed to save scheduling pause", e))?;
+        Ok(())
+    }
+
+    /// Restore a retry streak from durable, classified engine outcomes for this baseline.
+    pub(crate) fn retry_runs(
+        &self,
+        generation: &GenerationId,
+    ) -> Result<Vec<RunRecord>, ManagerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, mapping_id, generation_id, mode, status, started_at, finished_at,
+                    workdir_path, backup_dir1, backup_dir2, run_dir, log_path,
+                    child_pid, child_start_time_kind, child_start_time_value, child_executable,
+                    engine_version, engine_sha256, engine_platform,
+                    exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
+                    last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+             FROM runs WHERE generation_id = ?1 AND finished_at IS NOT NULL
+               AND child_pid IS NOT NULL ORDER BY rowid DESC LIMIT 8",
+        ).map_err(|e| storage_err("Failed to query scheduling history", e))?;
+        let rows = stmt
+            .query_map([generation.as_str()], Self::map_run_row)
+            .map_err(|e| storage_err("Failed to read scheduling history", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| storage_err("Failed to collect scheduling history", e))
+    }
+
     pub fn update_mapping_schedule_interval(
         &self,
         mapping_id: &MappingId,
@@ -859,7 +921,8 @@ impl SqliteStateStore {
                     last_run_completed_at = ?10,
                     last_run_summary_text = ?11,
                     unreviewed_conflict_run_id = ?12,
-                    updated_at = ?13
+                    updated_at = ?13,
+                    exclusions_json = ?14
                  WHERE id = ?1",
                 params![
                     m.id.as_str(),
@@ -875,6 +938,8 @@ impl SqliteStateStore {
                     m.last_run_summary_text,
                     m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                     m.updated_at,
+                    serde_json::to_string(&m.exclusions)
+                        .map_err(|e| storage_err("Failed to serialize exclusions", e))?,
                 ],
             )
             .map_err(|e| storage_err("Failed to update mapping state", e))?;

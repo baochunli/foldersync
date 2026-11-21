@@ -1,7 +1,4 @@
 //! Mapping detail screen (`ui-spec.md` §5.3).
-//!
-//! Note per approved spec header & brief: "Change subfolders…" is hidden in Group 3
-//! (controlled migration built in Group 4).
 
 use nsh_base::{
     SelectItem, SelectValue, select, table, table_body, table_cell, table_head, table_header,
@@ -45,7 +42,7 @@ pub fn detail_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEleme
 
 fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) -> View {
     let p = Palette::current();
-    let pres = m.presented_status(snap.active_run.as_ref());
+    let pres = m.presented_status(snap.active_run.as_ref(), snap.scheduling_paused);
 
     let ctrl_back = ctrl.clone();
     let ctrl_sync = ctrl.clone();
@@ -192,7 +189,9 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     let vol_snap = snap.volumes.iter().find(|v| v.identity == m.volume_id);
     let vol_fs = vol_snap.map(|v| v.filesystem.as_str()).unwrap_or("Unknown");
     let local_changed = matches!(endpoint_change, Some((false, _, _)));
-    let vol_status_note = if vol_snap.is_some_and(|v| !v.connected)
+    let vol_status_note = if let Some(issue) = &m.volume_issue {
+        issue.as_str()
+    } else if vol_snap.is_some_and(|v| !v.connected)
         || m.state.readiness() == Readiness::VolumeUnavailable
     {
         "not connected"
@@ -295,6 +294,17 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             .text_color(p.fg)
             .into_element(),
     ));
+    if let Some(vol) = vol_snap {
+        let space = if vol.total_gb > 0 {
+            format!("{} free of {}", vol.free_label, vol.total_label)
+        } else {
+            "Free space unknown".to_owned()
+        };
+        locations = locations.child(kv_row(
+            "Capacity",
+            text(space).text_color(p.fg).into_element(),
+        ));
+    }
     let locations_card = locations_card.child(locations).child(
         view()
             .flex_row()
@@ -328,7 +338,6 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             )),
     );
 
-    // Included subfolders card — "Change subfolders…" intentionally HIDDEN in Group 3 per brief!
     let mut subfolders_card = card()
         .flex_1()
         .child(
@@ -340,13 +349,17 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .child(card_title("Included subfolders")),
         )
         .child(
-            text(format!(
-                "{} of {} subfolders · about {} of {}",
-                m.included_subfolders,
-                m.total_subfolders,
-                m.included_size_label,
-                m.total_size_label
-            ))
+            text(if snap.is_demo_mode {
+                format!(
+                    "{} of {} subfolders · about {} of {}",
+                    m.included_subfolders,
+                    m.total_subfolders,
+                    m.included_size_label,
+                    m.total_size_label
+                )
+            } else {
+                "Review the selection to check individual folder sizes.".to_owned()
+            })
             .text_color(p.fg)
             .tabular_nums(),
         );
@@ -376,6 +389,35 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .text_color(p.muted),
         );
     }
+
+    let can_change = m.generation > 0
+        && m.state.readiness() == Readiness::Ready
+        && matches!(
+            m.state.execution,
+            sync_core::Execution::Idle | sync_core::Execution::Queued
+        );
+    let snap_is_demo = snap.is_demo_mode;
+    let c_change = ctrl.clone();
+    let change_id = m.id.clone();
+    subfolders_card = subfolders_card.child(
+        view().items_start().child(
+            app_button(
+                "Change subfolders…",
+                BtnKind::Default,
+                true,
+                !can_change,
+                None,
+                (!can_change).then_some("Available after first sync when this mapping is ready"),
+                move || {
+                    c_change.send(UiCommand::ChangeSubfolders(change_id.clone()));
+                    if snap_is_demo {
+                        c_change.navigate(ScreenRoute::AddMapping);
+                    }
+                },
+            )
+            .test_id("change-subfolders-btn"),
+        ),
+    );
 
     // Recent runs table card
     let mut runs_body = table_body().flex_col().w_full();
@@ -551,10 +593,21 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             }
         });
 
-    let local_changes_copy = if snap.is_demo_mode {
-        "Also start a run shortly after files change here"
+    let scheduling = if m.generation == 0 {
+        "Starts after first sync"
+    } else if m.state.intent == sync_core::Intent::Paused {
+        "Mapping paused"
+    } else if snap.scheduling_paused {
+        "Scheduling paused"
+    } else if !m.scheduling_enabled || m.state.readiness() != Readiness::Ready {
+        "Automatic sync on hold"
     } else {
-        "Manual sync only in this build (automatic scheduling is not enabled yet)"
+        "Automatic sync on"
+    };
+    let next_check = if scheduling == "Automatic sync on" {
+        m.next_check_label.as_str()
+    } else {
+        scheduling
     };
     let schedule_card = card()
         .flex_1()
@@ -562,20 +615,19 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         .child(view().flex_col().gap(px(KV_ROW_GAP))
         .child(kv_row("Check schedule", sched_select.into_element()))
         .child(kv_row(
-            "Local changes",
-            text(local_changes_copy)
+            "Automatic sync",
+            text(scheduling)
                 .text_color(p.fg)
                 .into_element(),
         ))
         .child(kv_row(
             "Next check",
-            text(m.next_check_label.clone())
-                .text_color(p.fg)
-                .into_element(),
+            text(next_check.to_owned()).text_color(p.fg).into_element(),
         ))
+        .child(kv_row("Last run", text(m.last_completed_label.clone()).text_color(p.fg).into_element()))
         )
         .child(
-            text("Changes made in the cloud are found only by a run.")
+            text("Local changes can prompt an earlier run. Changes in the cloud are found when a run checks them.")
                 .text_size(px(S_SMALL))
                 .text_color(p.muted),
         )

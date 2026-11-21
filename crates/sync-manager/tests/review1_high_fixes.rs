@@ -698,6 +698,7 @@ fn h11_retryable_failure_does_not_claim_will_retry_when_scheduling_disabled() {
     .unwrap();
     mgr.wait_until_idle(Duration::from_secs(5)).unwrap();
 
+    mgr.set_scheduling_paused(true).unwrap();
     mgr.run_now("research").unwrap();
     let snap = mgr.wait_until_idle(Duration::from_secs(5)).unwrap();
     assert_eq!(

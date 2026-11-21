@@ -593,12 +593,135 @@ impl DemoSource {
                     load_mapping_into_wizard(&mut snap, &m, WizardStep::Review);
                 }
             }
+            UiCommand::ChangeSubfolders(id) => {
+                if let Some(m) = snap.mapping(&id).cloned() {
+                    snap.wizard = default_wizard_draft(true);
+                    load_mapping_into_wizard(&mut snap, &m, WizardStep::Subfolders);
+                    snap.wizard.changing_subfolders = true;
+                    snap.wizard.first_sync_mapping_id = None;
+                    snap.wizard.step = WizardStep::Subfolders;
+                    snap.wizard.volume_free_bytes =
+                        Some(snap.wizard.volume_free_gb * 1_000_000_000);
+                    if m.id.as_str() == "family" {
+                        snap.wizard.subfolders = [
+                            ("root", "Family", 86.0, true),
+                            ("photos", "Photos", 36.0, true),
+                            ("videos", "Videos", 22.0, true),
+                            ("scans", "Scans", 6.0, true),
+                            ("albums", "Albums", 5.0, true),
+                            ("shared", "Shared", 2.0, true),
+                            ("recipes", "Recipes", 1.0, true),
+                            ("video-raw", "Video-Raw", 11.0, false),
+                            ("old-backups", "Old-Backups", 3.0, false),
+                        ]
+                        .into_iter()
+                        .map(|(id, name, size_gb, included)| SubfolderNode {
+                            id: id.to_owned(),
+                            name: name.to_owned(),
+                            depth: u32::from(id != "root"),
+                            has_children: id == "root",
+                            size_gb,
+                            size_label: format!("{size_gb:.0} GB"),
+                            included,
+                        })
+                        .collect();
+                    }
+                }
+            }
+            UiCommand::PreviewFilterChange if snap.wizard.changing_subfolders => {
+                let Some(m) = snap
+                    .wizard
+                    .editing_mapping_id
+                    .as_ref()
+                    .and_then(|id| snap.mapping(id))
+                else {
+                    return snap.clone();
+                };
+                let previous: std::collections::BTreeSet<_> = m
+                    .excluded_subfolders
+                    .iter()
+                    .filter_map(|(path, _)| {
+                        path.rsplit('/').next().map(|name| format!("/{name}/**"))
+                    })
+                    .chain(m.custom_exclusions.iter().cloned())
+                    .collect();
+                let proposed = snap.wizard.extra_exclusions();
+                snap.wizard.filter_review = Some(crate::contract::FilterReview {
+                    added: proposed.difference(&previous).cloned().collect(),
+                    removed: previous.difference(&proposed).cloned().collect(),
+                    checks: vec![
+                        LocationCheck {
+                            ok: true,
+                            message: "Local folder checked · 0 files".to_owned(),
+                        },
+                        LocationCheck {
+                            ok: true,
+                            message: "Cloud folder checked · download first sync".to_owned(),
+                        },
+                    ],
+                });
+                snap.wizard.no_other_sync_confirmed = false;
+                snap.wizard.step = WizardStep::Review;
+            }
+            UiCommand::ApplyFilterChange
+                if snap.wizard.changing_subfolders
+                    && snap.wizard.no_other_sync_confirmed
+                    && snap.wizard.step == WizardStep::Review
+                    && snap
+                        .wizard
+                        .filter_review
+                        .as_ref()
+                        .is_some_and(|review| review.can_apply()) =>
+            {
+                if let Some(id) = snap.wizard.editing_mapping_id.clone() {
+                    let excluded = snap
+                        .wizard
+                        .subfolders
+                        .iter()
+                        .filter(|n| n.depth == 1 && !n.included)
+                        .map(|n| (n.name.clone(), n.size_label.clone()))
+                        .collect();
+                    let custom_patterns = snap.wizard.custom_patterns.clone();
+                    if let Some(mapping) = snap.mappings.iter_mut().find(|m| m.id == id) {
+                        mapping.excluded_subfolders = excluded;
+                        mapping.custom_exclusions = custom_patterns;
+                        mapping.generation += 1;
+                        mapping.scheduling_enabled = false;
+                        mapping.state = MappingState::new(
+                            Readiness::NeedsInitialization,
+                            Execution::Queued,
+                            mapping.state.intent,
+                        );
+                        mapping.available_actions = available_actions(&mapping.state);
+                    }
+                    snap.queue_order.retain(|id_in_queue| id_in_queue != &id);
+                    snap.queue_order.insert(0, id.clone());
+                    snap.wizard.first_sync_mapping_id = Some(id);
+                    snap.wizard.step = WizardStep::FirstSync;
+                }
+            }
+            UiCommand::PreviewFilterChange | UiCommand::ApplyFilterChange => {}
             UiCommand::SetScheduleInterval {
                 mapping_id,
                 minutes,
             } => {
                 if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == mapping_id) {
                     m.schedule_minutes = minutes;
+                    m.next_check_label = "Time not available".to_owned();
+                }
+            }
+            UiCommand::ConnectDrive { .. } | UiCommand::ImportDrive { .. } => {}
+            UiCommand::ReopenDriveAuthorization => {
+                if snap.reconnecting_account.is_some() {
+                    let _ = self
+                        .system_actions
+                        .open_drive_authorization("https://accounts.google.com/o/oauth2/auth");
+                    self.push_event(
+                        &mut snap,
+                        "14:46",
+                        "Reopened sign-in (demo)".to_owned(),
+                        None,
+                    );
                 }
             }
             UiCommand::ConnectDemoAccount => {
@@ -624,6 +747,7 @@ impl DemoSource {
                         shared_parent_label: format!("{parent_dir} (demo local fixture)"),
                         status: AccountStatus::Connected,
                         access_summary: "Ready for local testing (demo mode).".to_owned(),
+                        is_drive: true,
                         mapping_count: 0,
                     });
                 }
@@ -671,6 +795,7 @@ impl DemoSource {
                         access_summary:
                             "Checked today at 14:46. List, upload, overwrite, move to Recovery and delete were tested on test files."
                                 .to_owned(),
+                        is_drive: true,
                         mapping_count: 0,
                     });
                 }
@@ -941,16 +1066,21 @@ impl DemoSource {
                     "First sync stopped before completion. You can review and start again."
                         .to_owned(),
                 );
-                snap.wizard.step = WizardStep::Review;
+                if !snap.wizard.changing_subfolders {
+                    snap.wizard.step = WizardStep::Review;
+                }
             }
             UiCommand::WizardCompleteDemoFirstSync => {
                 // #3: Finish the demo first sync into a real Ready mapping.
                 if let Some(mid) = snap.wizard.first_sync_mapping_id.clone() {
                     let mut completed_name = snap.wizard.selected_folder.clone();
                     let mut vol_name = snap.wizard.volume_name.clone();
+                    snap.queue_order.retain(|queued| queued != &mid);
                     if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == mid) {
                         m.state =
                             MappingState::new(Readiness::Ready, Execution::Idle, Intent::Enabled);
+                        m.scheduling_enabled = true;
+
                         m.last_run = Some(LastRunSummary {
                             outcome: RunOutcome::Success,
                             completed_at: WallTime::new(14, 46).expect("valid wall time"),
@@ -1143,6 +1273,7 @@ impl DemoSource {
                 snap.status_notice = Some("Stopping… (demo mode).".to_owned());
             }
         }
+        snap.active_job_mapping_id = snap.active_run.as_ref().map(|run| run.mapping_id.clone());
         snap.clone()
     }
 
@@ -1649,6 +1780,7 @@ fn sync_wizard_volume_from_path(snap: &mut UiSnapshot) {
         snap.wizard.volume_kind = vol.identity.kind;
         snap.wizard.volume_fs = vol.filesystem;
         snap.wizard.volume_free_gb = vol.free_gb;
+        snap.wizard.volume_free_bytes = Some(vol.free_gb * 1_000_000_000);
         snap.wizard.volume_total_gb = vol.total_gb;
     }
 }
@@ -1921,6 +2053,9 @@ fn recount_account_mappings(snap: &mut UiSnapshot) {
 fn default_wizard_draft(skip_account: bool) -> WizardDraft {
     let local_path = "/Volumes/WorkSSD/Projects".to_owned();
     WizardDraft {
+        changing_subfolders: false,
+        filter_review: None,
+        volume_free_bytes: Some(1_400_000_000_000),
         step: if skip_account {
             WizardStep::Folder
         } else {
@@ -2128,6 +2263,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             is_demo_mode: true,
             device_id: "studio-mac".to_owned(),
             scheduling_paused: false,
+            active_job_mapping_id: None,
             demo_preset: preset,
             accounts: Vec::new(),
             volumes,
@@ -2144,6 +2280,8 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             wizard: default_wizard_draft(false),
             preferences,
             reconnecting_account: None,
+            account_operation_pending: false,
+            can_reopen_authorization: false,
             status_notice: None,
             action_error: None,
         };
@@ -2156,6 +2294,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             is_demo_mode: true,
             device_id: "studio-mac".to_owned(),
             scheduling_paused: false,
+            active_job_mapping_id: None,
             demo_preset: preset,
             accounts: vec![AccountSnapshot {
                 id: AccountId::new("household"),
@@ -2165,6 +2304,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
                 access_summary:
                     "Checked today at 14:30. List, upload, overwrite, move to Recovery and delete were tested on test files."
                         .to_owned(),
+                is_drive: true,
                 mapping_count: 0,
             }],
             volumes,
@@ -2181,6 +2321,8 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             wizard: default_wizard_draft(true),
             preferences,
             reconnecting_account: None,
+            account_operation_pending: false,
+            can_reopen_authorization: false,
             status_notice: None,
             action_error: None,
         };
@@ -2197,6 +2339,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             access_summary:
                 "Checked today at 14:30. List, upload, overwrite, move to Recovery and delete were tested on test files."
                     .to_owned(),
+            is_drive: true,
             mapping_count: 7,
         },
         AccountSnapshot {
@@ -2205,6 +2348,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             shared_parent_label: "Lab shared (contains Data and Recovery)".to_owned(),
             status: AccountStatus::SignInRequired,
             access_summary: "Sign-in expired yesterday at 17:52. Measurements is held.".to_owned(),
+            is_drive: true,
             mapping_count: 1,
         },
     ];
@@ -2871,6 +3015,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
         is_demo_mode: true,
         device_id: "studio-mac".to_owned(),
         scheduling_paused: false,
+        active_job_mapping_id: active_run.as_ref().map(|r| r.mapping_id.clone()),
         demo_preset: preset,
         accounts,
         volumes,
@@ -2887,6 +3032,8 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
         wizard: default_wizard_draft(false),
         preferences,
         reconnecting_account: None,
+        account_operation_pending: false,
+        can_reopen_authorization: false,
         status_notice: None,
         action_error: None,
     };
@@ -2945,6 +3092,8 @@ fn make_mapping(
         available_actions: available,
         schedule_minutes,
         next_check_label: next_check_label.to_owned(),
+        scheduling_enabled: state.readiness() == Readiness::Ready,
+        volume_issue: None,
         included_subfolders,
         total_subfolders,
         included_size_label: included_size_label.to_owned(),
@@ -3112,9 +3261,7 @@ pub fn rebuild_attention(snap: &mut UiSnapshot) {
                         "Connect {}. FolderSync checks it and continues on its own.",
                         m.volume_name
                     ),
-                    kind: AttentionKind::VolumeMissing {
-                        volume_name: m.volume_name.clone(),
-                    },
+                    kind: AttentionKind::VolumeMissing { can_check_again: false },
                 });
             }
             Readiness::Ready => {

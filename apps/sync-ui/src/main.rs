@@ -11,6 +11,7 @@ use nsh_platform_windows as platform;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
+    nsh_app_sync_ui::handle_credential_helper_invocation();
     env_logger::init();
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<nsh_app_sync_ui::App>()),

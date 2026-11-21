@@ -11,6 +11,12 @@ subfolders. The app shows each selected folder's size next to the free space on
 its target volume. Mappings on the internal disk and on external disks sync
 independently to Google Drive.
 
+The manager schedules verified mappings automatically. Active mappings use a
+five-minute interval by default. The suggested archive preset is 15 minutes.
+Active schedules, user pauses, and recovery holds are managed independently.
+Changing an exclusion set requires reviewing and initializing a new generation.
+A pair of populated folders requires reconciliation before that initialization.
+
 The first intended workflow is asynchronous editing across computers. Each
 computer runs independently, so editing a file during overlapping syncs can
 cause conflicts. Two clients editing different files and a third returning

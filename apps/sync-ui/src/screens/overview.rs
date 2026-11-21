@@ -221,7 +221,7 @@ fn volume_group_card(
         format!("{}, connected, {} free", vol.display_name, vol.free_label)
     };
 
-    let cap_block = if missing {
+    let cap_block = if missing || vol.total_gb == 0 {
         view().w(px(180.0)).items_end().child(
             text("Free space unknown")
                 .text_size(px(S_CAPTION))
@@ -253,6 +253,11 @@ fn volume_group_card(
             )
     };
 
+    let cap_block = cap_block.child(
+        text(vol.filesystem.clone())
+            .text_size(px(S_CAPTION))
+            .text_color(p.muted),
+    );
     let meta_block = if missing {
         let last_seen = vol.last_seen_label.as_deref().unwrap_or("earlier");
         let all_paused = !rows.is_empty()
@@ -409,7 +414,7 @@ fn mapping_row(
     top_border: bool,
 ) -> nsh_base::TableRowElement {
     let p = Palette::current();
-    let pres = m.presented_status(snap.active_run.as_ref());
+    let pres = m.presented_status(snap.active_run.as_ref(), snap.scheduling_paused);
     let id_detail = m.id.clone();
     let id_row = m.id.clone();
     let ctrl_row = ctrl.clone();
