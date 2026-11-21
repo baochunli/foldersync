@@ -6,7 +6,11 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -23,9 +27,9 @@ use sync_core::{
     DeviceCloudCollection, DeviceId, EngineCompatibility, Execution, GenerationId, Intent,
     LastRunSummary, LocalBinding, LocalLayoutEntry, MappingId, MappingState, MaxDeletePercent,
     ObservedEvent, PathResolutionError, PathResolver, Readiness, RecoveryPolicy, RunId, RunOutcome,
-    StdPathResolver, SupportedTypesPolicy, TransitionEffect, UserAction, VolumeIdentity,
-    VolumeKind, apply_event, apply_user_action, available_actions, default_exclusion_patterns,
-    status_text, validate_cloud_collections, validate_local_binding, validate_local_layout,
+    StdPathResolver, SupportedTypesPolicy, TransitionEffect, UserAction, apply_event,
+    apply_user_action, available_actions, default_exclusion_patterns, status_text,
+    validate_cloud_collections, validate_local_binding, validate_local_layout,
 };
 use uuid::Uuid;
 
@@ -33,11 +37,12 @@ use crate::{
     clock::{Clock, SystemClock},
     error::ManagerError,
     finder::{
-        DarwinFinderNotifier, FinderActionFileOutcome, FinderNotifier, FinderStatusWriter,
-        ValidatedFinderAction, drain_finder_action_files,
+        FinderActionFileOutcome, FinderNotifier, FinderStatusWriter, NoopFinderNotifier,
+        ValidatedFinderAction, claim_finder_action_files,
     },
     init::{
-        decide_init_direction, establish_local_pair_markers, inspect_local_endpoint,
+        DetailedEndpointInventory, DetectedVolume, decide_init_direction, detect_volume_identity,
+        establish_local_pair_markers, inspect_local_endpoint, inspect_local_endpoint_detailed,
         render_filters_file, verify_endpoint_access_marker,
     },
     launcher::{BisyncLauncher, LaunchPlan, LaunchStopper, RealBisyncLauncher},
@@ -179,6 +184,8 @@ pub struct ManagerConfig {
     pub finder_status_dir: Option<PathBuf>,
     /// Darwin notification sink invoked after every Finder `status.json` write.
     pub finder_notifier: Arc<dyn FinderNotifier>,
+    /// Periodic Finder `status.json` heartbeat refresh interval (well under the 300s TTL).
+    pub finder_heartbeat_interval: Option<Duration>,
     /// Clock implementation (defaults to [`SystemClock`]).
     pub clock: Arc<dyn Clock>,
     /// Live process inspector (defaults to [`OsProcessInspector`]).
@@ -190,18 +197,32 @@ pub struct ManagerConfig {
 }
 
 impl ManagerConfig {
-    /// Creates a config rooted at an explicit state directory with real OS/rclone defaults.
+    /// Creates a config rooted at an explicit state directory with safe defaults
+    /// (uses [`NoopFinderNotifier`] by default so tests never post live Darwin notifications).
     pub fn with_state_dir(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state_dir: Some(state_dir.into()),
             finder_status_dir: None,
-            finder_notifier: Arc::new(DarwinFinderNotifier),
+            finder_notifier: Arc::new(NoopFinderNotifier),
+            finder_heartbeat_interval: Some(Duration::from_secs(60)),
             clock: Arc::new(SystemClock),
             process_inspector: Arc::new(OsProcessInspector),
             launcher: Arc::new(RealBisyncLauncher::new(None)),
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
         }
     }
+}
+
+/// Non-mutating preflight preview returned by [`SyncManager::preflight_mapping_preview`],
+/// sharing the exact same layout validation, volume detection, and endpoint inspection
+/// logic that initialization runs (§9, HIGH #2).
+#[derive(Debug, Clone)]
+pub struct PreflightPreview {
+    pub detected_volume: Result<DetectedVolume, String>,
+    pub layout_error: Option<String>,
+    pub local_inventory: Result<DetailedEndpointInventory, String>,
+    pub remote_inventory: Result<DetailedEndpointInventory, String>,
+    pub direction: Result<InitPreference, String>,
 }
 
 /// Input for [`ManagerCommand::AddMapping`].
@@ -237,15 +258,25 @@ impl AddMappingCommand {
 
         let local_dir = local_dir.into();
         let remote_dir = remote_dir.into();
-        let canonical_local = fs::canonicalize(&local_dir).map_err(|err| ManagerError::Io {
+        let detected = detect_volume_identity(&local_dir)?;
+        let remote_meta = fs::symlink_metadata(&remote_dir).map_err(|err| ManagerError::Io {
             cause: format!(
-                "Local folder `{}` does not exist or cannot be accessed: {err}.",
-                local_dir.display()
+                "Remote fixture folder `{}` does not exist or cannot be accessed: {err}.",
+                remote_dir.display()
             ),
             next_step:
-                "Select an existing local folder (FolderSync never auto-creates missing roots)."
+                "Select an existing remote destination folder (FolderSync never auto-creates missing roots)."
                     .to_string(),
         })?;
+        if remote_meta.file_type().is_symlink() || !remote_meta.is_dir() {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!(
+                    "Remote fixture folder `{}` must be an ordinary directory, not a file or symbolic link.",
+                    remote_dir.display()
+                ),
+                next_step: "Choose an ordinary directory for this mapping.".to_string(),
+            });
+        }
         let canonical_remote = fs::canonicalize(&remote_dir).map_err(|err| ManagerError::Io {
             cause: format!(
                 "Remote fixture folder `{}` does not exist or cannot be accessed: {err}.",
@@ -255,25 +286,6 @@ impl AddMappingCommand {
                 "Select an existing remote destination folder (FolderSync never auto-creates missing roots)."
                     .to_string(),
         })?;
-        let mount_path = canonical_local
-            .parent()
-            .ok_or_else(|| ManagerError::PreflightRejected {
-                cause: format!(
-                    "Cannot use filesystem root `{}` as a mapping folder.",
-                    canonical_local.display()
-                ),
-                next_step: "Choose a dedicated subdirectory instead of a volume root.".to_string(),
-            })?
-            .to_path_buf();
-        let relative_dir = PathBuf::from(canonical_local.file_name().ok_or_else(|| {
-            ManagerError::PreflightRejected {
-                cause: format!(
-                    "Local folder `{}` has no directory name.",
-                    canonical_local.display()
-                ),
-                next_step: "Choose a dedicated subdirectory.".to_string(),
-            }
-        })?);
 
         let local_recovery_root =
             resolve_absolute_path("local_recovery_root", &local_recovery_root.into())?;
@@ -281,7 +293,11 @@ impl AddMappingCommand {
             resolve_absolute_path("remote_recovery_root", &remote_recovery_root.into())?;
 
         let collection_path = collection_path.into();
-        let folder_id = format!("local-col-{}", collection_path.replace('/', "_"));
+        let folder_id = format!(
+            "local-col-{}-{}",
+            account_id.as_str(),
+            collection_path.replace('/', "_")
+        );
         Ok(Self {
             id,
             account_id,
@@ -291,9 +307,9 @@ impl AddMappingCommand {
                 ancestor_ids: vec!["local-root".to_string()],
             },
             local_binding: LocalBinding {
-                volume: VolumeIdentity::new(VolumeKind::Internal, "local-fixture-volume"),
-                mount_path,
-                relative_dir,
+                volume: detected.identity,
+                mount_path: detected.mount_path,
+                relative_dir: detected.relative_dir,
             },
             remote_endpoint: RemoteEndpoint::LocalDir(canonical_remote),
             local_recovery_root,
@@ -437,6 +453,10 @@ pub struct RecoveryReport {
     pub workdir_files: Vec<String>,
     pub has_lock_file: bool,
     pub recent_runs: Vec<RunRecord>,
+    /// True only when endpoint root & access-marker verification passed during inspection.
+    pub identities_verified: bool,
+    /// Human-readable result of endpoint identity verification.
+    pub identity_check_detail: String,
 }
 
 /// Structured detail accompanying a durable command acceptance.
@@ -861,6 +881,7 @@ enum QueuedJobKind {
     },
     InitializePreflight {
         expected_direction: Option<InitPreference>,
+        attempt_id: u64,
     },
 }
 
@@ -876,6 +897,7 @@ struct ActiveRunControl {
     stopper: Option<Arc<dyn LaunchStopper>>,
     stop_requested: bool,
     force_stopped: bool,
+    timed_out_during_shutdown: bool,
 }
 
 struct SharedState {
@@ -886,6 +908,9 @@ struct SharedState {
     job_queue: VecDeque<QueuedJob>,
     active_run: Option<ActiveRunControl>,
     preflight_mapping: Option<MappingId>,
+    next_init_attempt_id: u64,
+    active_init_attempt: Option<(MappingId, u64)>,
+    cancelled_init_attempts: BTreeSet<u64>,
     scheduling_paused: bool,
     worker_busy: bool,
     shutdown: bool,
@@ -896,6 +921,8 @@ struct SharedState {
 struct ManagerInner {
     state_dir: PathBuf,
     finder_writer: FinderStatusWriter,
+    finder_heartbeat_interval: Option<Duration>,
+    timed_out_shutdown: AtomicBool,
     clock: Arc<dyn Clock>,
     process_inspector: Arc<dyn ProcessInspector>,
     launcher: Arc<dyn BisyncLauncher>,
@@ -923,10 +950,6 @@ impl SyncManager {
     /// (including Finder `status.json`), and starts the background worker.
     pub fn open(config: ManagerConfig) -> Result<Self, ManagerError> {
         let state_dir = resolve_state_dir(config.state_dir.as_deref())?;
-        let finder_dir = match config.finder_status_dir {
-            Some(dir) => resolve_absolute_path("finder_status_dir", &dir)?,
-            None => state_dir.join("finder"),
-        };
 
         let lock = StateLock::acquire(&state_dir)?;
 
@@ -938,6 +961,39 @@ impl SyncManager {
             &state_dir,
             &state_dir.join("recovery-records"),
         )?;
+
+        let finder_dir = match config.finder_status_dir {
+            Some(dir) => {
+                // Refuse symlinked handoff root or symlinked immediate parent BEFORE canonicalizing (HIGH #10).
+                if let Some(parent) = dir.parent()
+                    && let Ok(meta) = fs::symlink_metadata(parent)
+                    && (meta.file_type().is_symlink() || !meta.is_dir())
+                {
+                    return Err(ManagerError::PreflightRejected {
+                        cause: format!(
+                            "Refused symbolic link or non-directory Finder handoff parent `{}`.",
+                            parent.display()
+                        ),
+                        next_step: "Use an ordinary private directory for Finder status handoff."
+                            .to_string(),
+                    });
+                }
+                if let Ok(meta) = fs::symlink_metadata(&dir)
+                    && (meta.file_type().is_symlink() || !meta.is_dir())
+                {
+                    return Err(ManagerError::PreflightRejected {
+                        cause: format!(
+                            "Refused symbolic link or non-directory Finder handoff directory `{}`.",
+                            dir.display()
+                        ),
+                        next_step: "Use an ordinary private directory for Finder status handoff."
+                            .to_string(),
+                    });
+                }
+                resolve_absolute_path("finder_status_dir", &dir)?
+            }
+            None => ensure_private_dir_under("finder", &state_dir, &state_dir.join("finder"))?,
+        };
 
         let finder_writer = FinderStatusWriter::with_notifier(finder_dir, config.finder_notifier);
 
@@ -974,6 +1030,8 @@ impl SyncManager {
         let inner = Arc::new(ManagerInner {
             state_dir,
             finder_writer,
+            finder_heartbeat_interval: config.finder_heartbeat_interval,
+            timed_out_shutdown: AtomicBool::new(false),
             clock: config.clock,
             process_inspector: config.process_inspector,
             launcher: config.launcher,
@@ -986,6 +1044,9 @@ impl SyncManager {
                 job_queue: VecDeque::new(),
                 active_run: None,
                 preflight_mapping: None,
+                next_init_attempt_id: 0,
+                active_init_attempt: None,
+                cancelled_init_attempts: BTreeSet::new(),
                 scheduling_paused: false,
                 worker_busy: false,
                 shutdown: false,
@@ -1027,8 +1088,52 @@ impl SyncManager {
         account_id: impl Into<AccountId>,
         display_name: impl Into<String>,
     ) -> Result<AccountRecord, ManagerError> {
+        self.register_local_fixture_account_with_root(account_id, display_name, None)
+    }
+
+    /// Registers a local-fixture account and persists an optional parent directory
+    /// path in `remote_root_folder_id` so the folder catalog survives restarts (HIGH #3).
+    pub fn register_local_fixture_account_with_root(
+        &self,
+        account_id: impl Into<AccountId>,
+        display_name: impl Into<String>,
+        parent_dir: Option<&Path>,
+    ) -> Result<AccountRecord, ManagerError> {
         let account_id = account_id.into();
         validate_safe_path_id("account_id", account_id.as_str())?;
+
+        let remote_root_folder_id = match parent_dir {
+            Some(dir) => {
+                let meta = fs::symlink_metadata(dir).map_err(|err| ManagerError::Io {
+                    cause: format!(
+                        "Account parent folder `{}` does not exist or cannot be accessed: {err}.",
+                        dir.display()
+                    ),
+                    next_step: "Choose an existing folder containing the collections to sync."
+                        .to_string(),
+                })?;
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(ManagerError::PreflightRejected {
+                        cause: format!(
+                            "Account parent folder `{}` must be an ordinary directory.",
+                            dir.display()
+                        ),
+                        next_step: "Choose an ordinary directory for this account.".to_string(),
+                    });
+                }
+                fs::canonicalize(dir)
+                    .map_err(|err| ManagerError::Io {
+                        cause: format!(
+                            "Could not resolve account parent folder `{}`: {err}.",
+                            dir.display()
+                        ),
+                        next_step: "Confirm the folder exists and is readable.".to_string(),
+                    })?
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            None => "local-root".to_string(),
+        };
 
         let raw_account_dir = self
             .inner
@@ -1048,7 +1153,7 @@ impl SyncManager {
             display_name: display_name.into(),
             kind: "local_fixture".to_string(),
             remote_name: "local".to_string(),
-            remote_root_folder_id: "local-root".to_string(),
+            remote_root_folder_id,
             config_path,
             auth_status: "ready".to_string(),
             created_at: now.clone(),
@@ -1057,6 +1162,113 @@ impl SyncManager {
         let guard = self.inner.state.lock().unwrap();
         guard.store.upsert_account(&record)?;
         Ok(record)
+    }
+
+    /// Runs the exact same non-mutating preflight checks as initialization
+    /// (volume detection, cross-mapping layout/recovery disjointness, cloud
+    /// collection disjointness, endpoint inventory, and direction decision)
+    /// so the setup wizard and actual preflight always agree (HIGH #2).
+    pub fn preflight_mapping_preview(
+        &self,
+        cmd: &AddMappingCommand,
+        editing_id: Option<&MappingId>,
+    ) -> Result<PreflightPreview, ManagerError> {
+        let local_path = cmd.local_binding.resolved_path();
+        let detected_volume = detect_volume_identity(&local_path).map_err(|e| e.cause());
+
+        let (existing, device_id) = {
+            let guard = self.inner.state.lock().unwrap();
+            let list: Vec<MappingRecord> = guard
+                .store
+                .list_mappings()?
+                .into_iter()
+                .filter(|m| editing_id != Some(&m.id))
+                .collect();
+            (list, guard.device.id.clone())
+        };
+
+        let candidate = LayoutCandidate {
+            mapping_id: &cmd.id,
+            local_binding: &cmd.local_binding,
+            remote_endpoint: cmd.remote_endpoint.clone(),
+            local_recovery_root: cmd.local_recovery_root.clone(),
+            cloud_recovery_path: &cmd.cloud_recovery_path,
+        };
+        let mut layout_error = validate_complete_layout(
+            &existing,
+            Some(&candidate),
+            &self.inner.state_dir,
+            self.inner.finder_writer.dir(),
+        )
+        .err()
+        .map(|e| e.cause());
+
+        if layout_error.is_none() {
+            let mut cloud_assignments: Vec<DeviceCloudCollection> = existing
+                .iter()
+                .filter(|m| m.account_id == cmd.account_id)
+                .map(|m| DeviceCloudCollection {
+                    device_id: m.device_id.clone(),
+                    collection: m.collection.clone(),
+                })
+                .collect();
+            cloud_assignments.push(DeviceCloudCollection {
+                device_id,
+                collection: cmd.collection.clone(),
+            });
+            if let Err(errs) = validate_cloud_collections(&cloud_assignments) {
+                layout_error = Some(ManagerError::ValidationList(errs).cause());
+            }
+        }
+
+        let mut exclusions = default_exclusion_patterns();
+        for pat in &cmd.extra_exclusions {
+            if !pat.trim().is_empty() {
+                exclusions.insert(pat.trim().to_string());
+            }
+        }
+
+        let local_inventory =
+            inspect_local_endpoint_detailed(&local_path, &cmd.collection, &exclusions)
+                .map_err(|e| e.cause());
+
+        let remote_inventory = match &cmd.remote_endpoint {
+            RemoteEndpoint::LocalDir(remote_root) => {
+                inspect_local_endpoint_detailed(remote_root, &cmd.collection, &exclusions)
+                    .map_err(|e| e.cause())
+            }
+            RemoteEndpoint::DriveRemote { .. } | RemoteEndpoint::OtherRemote { .. } => {
+                Err("Google Drive inventory is not connected in this build yet.".to_string())
+            }
+        };
+
+        let direction = match (&local_inventory, &remote_inventory) {
+            (Ok(l), Ok(r)) => {
+                let l_inv = crate::init::EndpointInventory {
+                    root: l.root.clone(),
+                    classification: l.classification,
+                    item_count: l.all_items_count,
+                    has_valid_marker: l.has_valid_marker,
+                };
+                let r_inv = crate::init::EndpointInventory {
+                    root: r.root.clone(),
+                    classification: r.classification,
+                    item_count: r.all_items_count,
+                    has_valid_marker: r.has_valid_marker,
+                };
+                decide_init_direction(&cmd.id, &l_inv, &r_inv, None).map_err(|e| e.cause())
+            }
+            (Err(e), _) => Err(format!("Can't check local folder: {e}")),
+            (_, Err(e)) => Err(format!("Can't check destination folder: {e}")),
+        };
+
+        Ok(PreflightPreview {
+            detected_volume,
+            layout_error,
+            local_inventory,
+            remote_inventory,
+            direction,
+        })
     }
 
     pub fn execute(&self, cmd: ManagerCommand) -> Result<CommandAcceptance, ManagerError> {
@@ -1339,6 +1551,7 @@ impl SyncManager {
 
     /// Lists preserved recovery copies for a specific run (local `backup_dir1`
     /// and local-fixture `backup_dir2`) without mutating anything (§12).
+    /// Surfaces directory read / symlink errors rather than returning an empty list (HIGH #9).
     pub fn list_recovery_copies(
         &self,
         run_id: &RunId,
@@ -1351,19 +1564,19 @@ impl SyncManager {
             })?;
 
         let mut entries = Vec::new();
-        collect_recovery_files_readonly(&run.backup_dir1, RecoveryCopySide::Local, &mut entries);
+        collect_recovery_files_readonly(&run.backup_dir1, RecoveryCopySide::Local, &mut entries)?;
         let remote_path = PathBuf::from(&run.backup_dir2);
-        if remote_path.is_absolute() && remote_path.is_dir() {
-            collect_recovery_files_readonly(&remote_path, RecoveryCopySide::Remote, &mut entries);
+        if remote_path.is_absolute() {
+            collect_recovery_files_readonly(&remote_path, RecoveryCopySide::Remote, &mut entries)?;
         }
         entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         Ok(entries)
     }
 
     /// Copies one preserved recovery copy into a separate user-chosen inspection
-    /// directory (plan §12 steps 1–4). Refuses any destination overlapping a
-    /// synced mapping root (never restores over live data) and creates the output
-    /// file exclusively (`create_new`, never overwriting existing files).
+    /// directory (plan §12 steps 1–4). Refuses symlinks BEFORE canonicalizing,
+    /// refuses any destination overlapping a synced mapping root (never restores
+    /// over live data), and creates the output file exclusively (`create_new`).
     pub fn copy_recovery_file_to_inspection(
         &self,
         run_id: &RunId,
@@ -1389,23 +1602,25 @@ impl SyncManager {
             });
         }
 
-        let dest_dir = resolve_absolute_path("inspection_dir", inspection_dir)?;
-        let dest_meta = fs::symlink_metadata(&dest_dir).map_err(|err| ManagerError::Io {
-            cause: format!(
-                "Inspection folder `{}` does not exist or cannot be accessed: {err}.",
-                dest_dir.display()
-            ),
-            next_step: "Choose an existing folder outside every synced folder.".to_string(),
-        })?;
-        if dest_meta.file_type().is_symlink() || !dest_meta.is_dir() {
+        // Check inspection_dir type via lstat BEFORE canonicalizing (HIGH #10).
+        let raw_dest_meta =
+            fs::symlink_metadata(inspection_dir).map_err(|err| ManagerError::Io {
+                cause: format!(
+                    "Inspection folder `{}` does not exist or cannot be accessed: {err}.",
+                    inspection_dir.display()
+                ),
+                next_step: "Choose an existing folder outside every synced folder.".to_string(),
+            })?;
+        if raw_dest_meta.file_type().is_symlink() || !raw_dest_meta.is_dir() {
             return Err(ManagerError::PreflightRejected {
                 cause: format!(
-                    "Inspection path `{}` is not an ordinary folder.",
-                    dest_dir.display()
+                    "Inspection path `{}` is a symbolic link or not an ordinary folder.",
+                    inspection_dir.display()
                 ),
                 next_step: "Choose an ordinary folder outside every synced folder.".to_string(),
             });
         }
+        let dest_dir = resolve_absolute_path("inspection_dir", inspection_dir)?;
 
         let (run, mappings) = {
             let guard = self.inner.state.lock().unwrap();
@@ -1454,10 +1669,42 @@ impl SyncManager {
             }
         }
 
+        let owning_mapping = mappings.iter().find(|m| m.id == run.mapping_id);
         let backup_root = match side {
             RecoveryCopySide::Local => run.backup_dir1.clone(),
             RecoveryCopySide::Remote => PathBuf::from(&run.backup_dir2),
         };
+        // Refuse symlinked mapping recovery root and any symlinked component down to backup_root
+        // BEFORE canonicalizing (HIGH #10).
+        if let Some(m) = owning_mapping {
+            let rec_root = match side {
+                RecoveryCopySide::Local => Some(m.local_recovery_root.clone()),
+                RecoveryCopySide::Remote => {
+                    let p = PathBuf::from(&m.cloud_recovery_path);
+                    p.is_absolute().then_some(p)
+                }
+            };
+            if let Some(root) = rec_root {
+                reject_symlinks_under_root("recovery_root", &root, &backup_root)?;
+            }
+        }
+        let backup_meta = fs::symlink_metadata(&backup_root).map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Run recovery folder `{}` cannot be inspected: {err}.",
+                backup_root.display()
+            ),
+            next_step: "Refresh the recovery list and check that the recovery drive is connected."
+                .to_string(),
+        })?;
+        if backup_meta.file_type().is_symlink() || !backup_meta.is_dir() {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!(
+                    "Run recovery folder `{}` is a symbolic link or not an ordinary directory.",
+                    backup_root.display()
+                ),
+                next_step: "Inspect the recovery directory before copying files.".to_string(),
+            });
+        }
         let source_path =
             reject_symlinks_under_root("recovery_copy", &backup_root, &backup_root.join(rel))?;
         let src_meta = fs::symlink_metadata(&source_path).map_err(|err| ManagerError::Io {
@@ -1517,54 +1764,60 @@ impl SyncManager {
             ),
             next_step: "Check free space in the inspection folder.".to_string(),
         })?;
-        let _ = out_file.sync_all();
+        out_file.sync_all().map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Failed flushing inspection copy `{}`: {err}.",
+                dest_path.display()
+            ),
+            next_step: "Check free space and drive health in the inspection folder.".to_string(),
+        })?;
         Ok(dest_path)
     }
 
-    /// Drains and validates pending ADR 0002 v1 Finder action files under
-    /// `<finder_dir>/actions/*.json`, executing manager commands (`sync_now`,
-    /// `pause`) and returning UI-routed actions (`open_app`, `show_last_run`).
+    /// Atomically claims pending ADR 0002 v1 Finder action files by renaming each
+    /// to a hidden `.processing-*` name, dispatches manager/UI commands, and deletes
+    /// each claimed file AFTER dispatch (HIGH #11).
     pub fn drain_finder_actions(&self) -> Vec<FinderActionDispatch> {
         let actions_dir = self.inner.finder_writer.actions_dir_path();
-        let outcomes = drain_finder_action_files(&actions_dir);
-        let mut results = Vec::with_capacity(outcomes.len());
+        let claimed = claim_finder_action_files(&actions_dir);
+        let mut results = Vec::with_capacity(claimed.len());
 
-        for outcome in outcomes {
-            match outcome {
+        for item in claimed {
+            let dispatch = match item.outcome {
                 FinderActionFileOutcome::Rejected { file_name, reason } => {
-                    results.push(FinderActionDispatch::Rejected { file_name, reason });
+                    FinderActionDispatch::Rejected { file_name, reason }
                 }
-                FinderActionFileOutcome::Accepted { file_name, action } => {
-                    match &action {
-                        ValidatedFinderAction::SyncNow { mapping_id, .. } => {
-                            match self.run_now(mapping_id.clone()) {
-                                Ok(_) => results
-                                    .push(FinderActionDispatch::Executed { file_name, action }),
-                                Err(err) => results.push(FinderActionDispatch::CommandFailed {
-                                    file_name,
-                                    action,
-                                    cause: err.cause(),
-                                }),
-                            }
-                        }
-                        ValidatedFinderAction::Pause { mapping_id, .. } => {
-                            match self.pause(mapping_id.clone()) {
-                                Ok(_) => results
-                                    .push(FinderActionDispatch::Executed { file_name, action }),
-                                Err(err) => results.push(FinderActionDispatch::CommandFailed {
-                                    file_name,
-                                    action,
-                                    cause: err.cause(),
-                                }),
-                            }
-                        }
-                        ValidatedFinderAction::OpenApp { .. }
-                        | ValidatedFinderAction::ShowLastRun { .. } => {
-                            results.push(FinderActionDispatch::UiRequested { file_name, action });
+                FinderActionFileOutcome::Accepted { file_name, action } => match &action {
+                    ValidatedFinderAction::SyncNow { mapping_id, .. } => {
+                        match self.run_now(mapping_id.clone()) {
+                            Ok(_) => FinderActionDispatch::Executed { file_name, action },
+                            Err(err) => FinderActionDispatch::CommandFailed {
+                                file_name,
+                                action,
+                                cause: err.cause(),
+                            },
                         }
                     }
-                }
+                    ValidatedFinderAction::Pause { mapping_id, .. } => {
+                        match self.pause(mapping_id.clone()) {
+                            Ok(_) => FinderActionDispatch::Executed { file_name, action },
+                            Err(err) => FinderActionDispatch::CommandFailed {
+                                file_name,
+                                action,
+                                cause: err.cause(),
+                            },
+                        }
+                    }
+                    ValidatedFinderAction::OpenApp { .. }
+                    | ValidatedFinderAction::ShowLastRun { .. } => {
+                        FinderActionDispatch::UiRequested { file_name, action }
+                    }
+                },
+            };
+            if let Some(claimed_path) = item.claimed_path {
+                let _ = fs::remove_file(claimed_path);
             }
+            results.push(dispatch);
         }
         results
     }
@@ -1677,72 +1930,76 @@ impl SyncManager {
                 }
             }
 
-            if let Some(active) = guard.active_run.as_ref() {
+            if let Some(active) = guard.active_run.as_mut() {
                 let mid = active.mapping_id.clone();
                 let rid = active.run_id.clone();
-                // Persist an interrupted outcome + recovery case before exiting (§14).
+                active.timed_out_during_shutdown = true;
+                self.inner.timed_out_shutdown.store(true, Ordering::SeqCst);
+
+                // Persist an interrupted outcome + recovery case BEFORE returning; surface DB errors (HIGH #6).
                 let now = self.inner.clock.now_rfc3339();
-                if let Ok(Some(mut run)) = guard.store.get_run(&rid) {
-                    run.status = "interrupted".to_string();
-                    run.finished_at = Some(now.clone());
-                    run.outcome_kind = Some("interrupted".to_string());
-                    run.outcome_detail = Some(
-                        "Quit timed out while waiting for the active run to stop gracefully."
-                            .to_string(),
-                    );
-                    run.last_verified_phase = "shutdown_timeout".to_string();
+                let mut run = guard
+                    .store
+                    .get_run(&rid)?
+                    .ok_or_else(|| ManagerError::Storage {
+                        cause: format!(
+                            "Could not load active run `{rid}` to persist shutdown timeout."
+                        ),
+                        next_step: "Inspect state.sqlite before restarting FolderSync.".to_string(),
+                    })?;
+                run.status = "interrupted".to_string();
+                run.finished_at = Some(now.clone());
+                run.outcome_kind = Some("interrupted".to_string());
+                run.outcome_detail = Some(
+                    "Quit timed out while waiting for the active run to stop gracefully."
+                        .to_string(),
+                );
+                run.last_verified_phase = "shutdown_timeout".to_string();
 
-                    let updated_mapping =
-                        guard.store.get_mapping(&mid).ok().flatten().map(|mut m| {
-                            m.state = apply_event(
-                                m.state,
-                                ObservedEvent::RunFinished(RunOutcome::Interrupted),
-                            )
+                let updated_mapping = guard.store.get_mapping(&mid)?.map(|mut m| {
+                    m.state =
+                        apply_event(m.state, ObservedEvent::RunFinished(RunOutcome::Interrupted))
                             .state;
-                            m.last_run_id = Some(rid.clone());
-                            m.last_run_outcome = Some(RunOutcome::Interrupted);
-                            m.last_run_completed_at = Some(now.clone());
-                            m.last_run_summary_text =
-                                Some("Interrupted during quit — recovery required".to_string());
-                            m.updated_at = now.clone();
-                            m
-                        });
+                    m.last_run_id = Some(rid.clone());
+                    m.last_run_outcome = Some(RunOutcome::Interrupted);
+                    m.last_run_completed_at = Some(now.clone());
+                    m.last_run_summary_text =
+                        Some("Interrupted during quit — recovery required".to_string());
+                    m.updated_at = now.clone();
+                    m
+                });
 
-                    let case = RecoveryCaseRecord {
-                        id: format!("rc-{}", Uuid::new_v4()),
-                        mapping_id: mid.clone(),
-                        run_id: Some(rid.clone()),
-                        status: "open".to_string(),
-                        reason_kind: "shutdown_timeout".to_string(),
-                        cause: "FolderSync quit before the active sync finished stopping."
+                let case = RecoveryCaseRecord {
+                    id: format!("rc-{}", Uuid::new_v4()),
+                    mapping_id: mid.clone(),
+                    run_id: Some(rid.clone()),
+                    status: "open".to_string(),
+                    reason_kind: "shutdown_timeout".to_string(),
+                    cause: "FolderSync quit before the active sync finished stopping.".to_string(),
+                    next_step:
+                        "Open recovery details to confirm no earlier sync process remains before resuming."
                             .to_string(),
-                        next_step:
-                            "Open recovery details to confirm no earlier sync process remains before resuming."
-                                .to_string(),
-                        workdir_path: Some(run.workdir_path.clone()),
-                        backup_dir1: Some(run.backup_dir1.clone()),
-                        backup_dir2: Some(run.backup_dir2.clone()),
-                        log_path: Some(run.log_path.clone()),
-                        orphan_pid: run.child_pid,
-                        created_at: now.clone(),
-                        resolved_at: None,
-                        resolution_note: None,
-                    };
-                    write_run_outcome_json(&self.inner.state_dir, &run);
-                    let _ = guard.store.commit_run_terminal(
-                        &run,
-                        updated_mapping.as_ref(),
-                        Some(&case),
-                    );
-                    let _ = publish_updated_snapshot(&self.inner, &mut guard);
-                    self.inner
-                        .event_bus
-                        .publish_event(ManagerEvent::ShutdownTimedOut {
-                            mapping_id: mid.clone(),
-                            run_id: rid.clone(),
-                            timestamp: now,
-                        });
-                }
+                    workdir_path: Some(run.workdir_path.clone()),
+                    backup_dir1: Some(run.backup_dir1.clone()),
+                    backup_dir2: Some(run.backup_dir2.clone()),
+                    log_path: Some(run.log_path.clone()),
+                    orphan_pid: run.child_pid,
+                    created_at: now.clone(),
+                    resolved_at: None,
+                    resolution_note: None,
+                };
+                write_run_outcome_json(&self.inner.state_dir, &run);
+                guard
+                    .store
+                    .commit_run_terminal(&run, updated_mapping.as_ref(), Some(&case))?;
+                let _ = publish_updated_snapshot(&self.inner, &mut guard);
+                self.inner
+                    .event_bus
+                    .publish_event(ManagerEvent::ShutdownTimedOut {
+                        mapping_id: mid.clone(),
+                        run_id: rid.clone(),
+                        timestamp: now,
+                    });
                 Some((mid, rid))
             } else {
                 None
@@ -1783,7 +2040,10 @@ impl SyncManager {
         if let Some(stopper) = stopper {
             let _ = stopper.request_stop();
         }
-        if let Some(handle) = self.worker_thread.lock().unwrap().take() {
+        // If controlled_shutdown already timed out on a hung child, do NOT block indefinitely on join (HIGH #6).
+        if !self.inner.timed_out_shutdown.load(Ordering::SeqCst)
+            && let Some(handle) = self.worker_thread.lock().unwrap().take()
+        {
             let _ = handle.join();
         }
     }
@@ -1848,6 +2108,15 @@ impl SyncManager {
         let existing_same = guard.store.get_mapping(&cmd.id)?;
         let updating_draft = match &existing_same {
             Some(m) if m.state.readiness() == Readiness::Unconfigured => true,
+            Some(m)
+                if !is_draft
+                    && m.state.readiness() == Readiness::NeedsInitialization
+                    && m.active_generation_id.is_none()
+                    && m.state.execution == Execution::Idle =>
+            {
+                // Allow Finish Setup to save reviewed edits & exclusions before starting first sync (HIGH #1).
+                true
+            }
             Some(_) => {
                 return Err(ManagerError::PreflightRejected {
                     cause: format!("A mapping with ID `{}` already exists.", cmd.id),
@@ -1887,6 +2156,7 @@ impl SyncManager {
 
         let mut cloud_assignments: Vec<DeviceCloudCollection> = existing
             .iter()
+            .filter(|m| m.account_id == cmd.account_id)
             .map(|m| DeviceCloudCollection {
                 device_id: m.device_id.clone(),
                 collection: m.collection.clone(),
@@ -2008,6 +2278,16 @@ impl SyncManager {
                         .to_string(),
             });
         }
+        if let Some((in_preflight, attempt_id)) = &guard.active_init_attempt
+            && !guard.cancelled_init_attempts.contains(attempt_id)
+        {
+            return Err(ManagerError::ActiveJobConflict {
+                active_mapping_id: in_preflight.clone(),
+                cause: format!("First sync setup is already checking `{in_preflight}`."),
+                next_step: "Wait for that check to finish before starting another first sync."
+                    .to_string(),
+            });
+        }
         if let Some(in_preflight) = &guard.preflight_mapping {
             return Err(ManagerError::ActiveJobConflict {
                 active_mapping_id: in_preflight.clone(),
@@ -2062,6 +2342,8 @@ impl SyncManager {
             });
         }
 
+        guard.next_init_attempt_id += 1;
+        let attempt_id = guard.next_init_attempt_id;
         mapping.state.execution = Execution::Queued;
         mapping.updated_at = self.inner.clock.now_rfc3339();
         guard.store.update_mapping_runtime(&mapping)?;
@@ -2069,6 +2351,7 @@ impl SyncManager {
             mapping_id: mapping.id.clone(),
             kind: QueuedJobKind::InitializePreflight {
                 expected_direction: cmd.expected_direction,
+                attempt_id,
             },
         });
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
@@ -2202,7 +2485,13 @@ impl SyncManager {
             &all_mappings,
             gen_num,
             cmd.expected_direction,
-        )?;
+            &|| false,
+        )?
+        .ok_or_else(|| ManagerError::InvalidState {
+            mapping_id: cmd.mapping_id.clone(),
+            cause: "First sync setup was cancelled.".to_string(),
+            next_step: "Start first sync again when ready.".to_string(),
+        })?;
 
         // Phase 3 (re-acquire mutex): recheck state, persist generation, queue job, publish snapshot.
         let mut guard = self.inner.state.lock().unwrap();
@@ -2751,6 +3040,43 @@ impl SyncManager {
             });
         }
 
+        // Refuse removal while any live or ambiguous orphan evidence exists for this mapping (HIGH #7).
+        for case in guard.store.list_open_recovery_cases(&mapping.id)? {
+            let blocks_removal = match case.reason_kind.as_str() {
+                "orphan_ambiguous" => true,
+                "orphan_running" | "shutdown_timeout" => {
+                    let run = case
+                        .run_id
+                        .as_ref()
+                        .map(|rid| guard.store.get_run(rid))
+                        .transpose()?
+                        .flatten();
+                    let alive = case.orphan_pid.and_then(|pid| {
+                        probe_orphan_liveness(
+                            self.inner.process_inspector.as_ref(),
+                            pid,
+                            run.as_ref(),
+                        )
+                    });
+                    alive != Some(false)
+                }
+                _ => false,
+            };
+            if blocks_removal {
+                return Err(ManagerError::ActiveJobConflict {
+                    active_mapping_id: mapping.id.clone(),
+                    cause: format!(
+                        "Cannot remove mapping `{}` while an earlier sync process may still be running ({}).",
+                        mapping.id,
+                        plain_recovery_reason_label(&case.reason_kind)
+                    ),
+                    next_step:
+                        "Open recovery details to confirm the earlier sync process has stopped before removing this mapping."
+                            .to_string(),
+                });
+            }
+        }
+
         guard.job_queue.retain(|j| j.mapping_id != mapping.id);
         guard.storage_blocked_mappings.remove(&mapping.id);
         // Deletes only DB records; local folder, cloud folder, and recovery copies stay untouched (§7).
@@ -2924,6 +3250,26 @@ impl SyncManager {
                 mapping.state = transition.state;
                 mapping.updated_at = self.inner.clock.now_rfc3339();
                 guard.store.update_mapping_runtime(&mapping)?;
+                // Cancel any active or queued initialization preflight attempt for this mapping (HIGH #5).
+                if let Some((active_mid, attempt_id)) = guard.active_init_attempt.as_ref()
+                    && active_mid == &mapping.id
+                {
+                    let cancelled_id = *attempt_id;
+                    guard.cancelled_init_attempts.insert(cancelled_id);
+                    guard.active_init_attempt = None;
+                }
+                let queued_attempts: Vec<u64> = guard
+                    .job_queue
+                    .iter()
+                    .filter(|j| j.mapping_id == mapping.id)
+                    .filter_map(|j| match j.kind {
+                        QueuedJobKind::InitializePreflight { attempt_id, .. } => Some(attempt_id),
+                        QueuedJobKind::Prepared { .. } => None,
+                    })
+                    .collect();
+                for attempt_id in queued_attempts {
+                    guard.cancelled_init_attempts.insert(attempt_id);
+                }
                 guard.job_queue.retain(|j| j.mapping_id != mapping.id);
 
                 if transition.effect == TransitionEffect::RequestGracefulStop {
@@ -3121,6 +3467,29 @@ impl SyncManager {
             .map(inspect_workdir_readonly)
             .unwrap_or_default();
 
+        let (identities_verified, identity_check_detail) = if let Some(gid) =
+            mapping.active_generation_id.as_ref()
+        {
+            match guard.store.get_generation(gid)? {
+                Some(generation) => match verify_endpoints_for_generation(&mapping, &generation) {
+                    Ok(()) => (
+                        true,
+                        "Local and destination folders match setup.".to_string(),
+                    ),
+                    Err((_ev, err)) => (false, err.cause()),
+                },
+                None => (
+                    false,
+                    format!("Active setup generation `{gid}` is missing."),
+                ),
+            }
+        } else {
+            (
+                false,
+                "First sync has not established folder identities yet.".to_string(),
+            )
+        };
+
         let report = RecoveryReport {
             mapping_id: mapping.id,
             state: mapping.state,
@@ -3128,6 +3497,8 @@ impl SyncManager {
             workdir_files,
             has_lock_file,
             recent_runs,
+            identities_verified,
+            identity_check_detail,
         };
         let snapshot = Arc::clone(&guard.latest_snapshot);
 
@@ -3315,8 +3686,8 @@ fn probe_orphan_liveness(
     }
 }
 
-/// Returns any open `orphan_ambiguous` or live/inconclusive `orphan_running`
-/// case across ALL mappings that must block the global worker (§3, §14).
+/// Returns any open `orphan_ambiguous` or live/inconclusive `orphan_running` /
+/// `shutdown_timeout` case across ALL mappings that must block the global worker (§3, §14, HIGH #6).
 fn find_blocking_global_orphan(
     store: &SqliteStateStore,
     inspector: &dyn ProcessInspector,
@@ -3324,7 +3695,7 @@ fn find_blocking_global_orphan(
     for case in store.list_all_open_recovery_cases()? {
         match case.reason_kind.as_str() {
             "orphan_ambiguous" => return Ok(Some(case)),
-            "orphan_running" => {
+            "orphan_running" | "shutdown_timeout" => {
                 let run = case
                     .run_id
                     .as_ref()
@@ -3334,7 +3705,7 @@ fn find_blocking_global_orphan(
                 let alive = case
                     .orphan_pid
                     .and_then(|pid| probe_orphan_liveness(inspector, pid, run.as_ref()));
-                // Block when positively alive (`Some(true)`) OR inconclusive (`None`).
+                // Block when positively alive (`Some(true)`), missing PID, or inconclusive (`None`).
                 if alive != Some(false) {
                     return Ok(Some(case));
                 }
@@ -3847,6 +4218,9 @@ struct InitPreflightOutput {
 /// Runs initialization preflight (layout validation, recursive endpoint inventory,
 /// engine metadata qualification, recovery dir creation, marker setup, and frozen
 /// generation artifacts) strictly WITHOUT holding `inner.state` mutex.
+///
+/// Checks `is_cancelled()` before every mutating side effect (recovery dirs,
+/// markers, workdir, `filters.txt`) so a cancelled attempt never writes after Stop (HIGH #5).
 fn run_init_preflight_unlocked(
     inner: &ManagerInner,
     mapping: &MappingRecord,
@@ -3854,7 +4228,11 @@ fn run_init_preflight_unlocked(
     all_mappings: &[MappingRecord],
     gen_num: i64,
     expected_direction: Option<InitPreference>,
-) -> Result<InitPreflightOutput, ManagerError> {
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<InitPreflightOutput>, ManagerError> {
+    if is_cancelled() {
+        return Ok(None);
+    }
     let canonical_local = validate_local_binding(&mapping.local_binding, &StdPathResolver)?;
     validate_complete_layout(
         all_mappings,
@@ -3865,6 +4243,7 @@ fn run_init_preflight_unlocked(
 
     let cloud_assignments: Vec<DeviceCloudCollection> = all_mappings
         .iter()
+        .filter(|m| m.account_id == mapping.account_id)
         .map(|m| DeviceCloudCollection {
             device_id: m.device_id.clone(),
             collection: m.collection.clone(),
@@ -3893,6 +4272,9 @@ fn run_init_preflight_unlocked(
         RemoteEndpoint::LocalDir(remote_root) => {
             let local_inv =
                 inspect_local_endpoint(&canonical_local, &mapping.collection, &effective_filters)?;
+            if is_cancelled() {
+                return Ok(None);
+            }
             let remote_inv =
                 inspect_local_endpoint(remote_root, &mapping.collection, &effective_filters)?;
             let dir =
@@ -3900,6 +4282,9 @@ fn run_init_preflight_unlocked(
 
             // Qualify engine metadata BEFORE mutating endpoints (creating recovery dirs/markers).
             let engine_meta = inner.launcher.engine_metadata()?;
+            if is_cancelled() {
+                return Ok(None);
+            }
 
             fs::create_dir_all(&mapping.local_recovery_root).map_err(|err| ManagerError::Io {
                 cause: format!(
@@ -3916,6 +4301,9 @@ fn run_init_preflight_unlocked(
                 ),
                 next_step: "Verify permissions on the remote recovery path and retry.".to_string(),
             })?;
+            if is_cancelled() {
+                return Ok(None);
+            }
             establish_local_pair_markers(
                 &canonical_local,
                 remote_root,
@@ -3933,6 +4321,10 @@ fn run_init_preflight_unlocked(
             });
         }
     };
+
+    if is_cancelled() {
+        return Ok(None);
+    }
 
     let workdir_path =
         ensure_private_dir_under("workdir_path", &inner.state_dir, &raw_workdir_path)?;
@@ -3984,31 +4376,48 @@ fn run_init_preflight_unlocked(
         created_at: now,
     };
 
-    Ok(InitPreflightOutput {
+    Ok(Some(InitPreflightOutput {
         direction,
         gen_record,
-    })
+    }))
 }
 
 fn collect_recovery_files_readonly(
     root: &Path,
     side: RecoveryCopySide,
     out: &mut Vec<RecoveryCopyEntry>,
-) {
-    fn walk(base: &Path, dir: &Path, side: RecoveryCopySide, out: &mut Vec<RecoveryCopyEntry>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
+) -> Result<(), ManagerError> {
+    fn walk(
+        base: &Path,
+        dir: &Path,
+        side: RecoveryCopySide,
+        out: &mut Vec<RecoveryCopyEntry>,
+    ) -> Result<(), ManagerError> {
+        let entries = fs::read_dir(dir).map_err(|err| ManagerError::Io {
+            cause: format!("Could not read recovery folder `{}`: {err}.", dir.display()),
+            next_step: "Check permissions on the recovery folder and try again.".to_string(),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| ManagerError::Io {
+                cause: format!(
+                    "Could not read recovery folder entry in `{}`: {err}.",
+                    dir.display()
+                ),
+                next_step: "Check permissions on the recovery folder and try again.".to_string(),
+            })?;
             let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                continue;
-            };
+            let meta = fs::symlink_metadata(&path).map_err(|err| ManagerError::Io {
+                cause: format!(
+                    "Could not inspect recovery copy `{}`: {err}.",
+                    path.display()
+                ),
+                next_step: "Check permissions on the recovery folder and try again.".to_string(),
+            })?;
             if meta.file_type().is_symlink() {
                 continue;
             }
             if meta.is_dir() {
-                walk(base, &path, side, out);
+                walk(base, &path, side, out)?;
             } else if meta.is_file()
                 && let Ok(rel) = path.strip_prefix(base)
             {
@@ -4020,13 +4429,36 @@ fn collect_recovery_files_readonly(
                 });
             }
         }
+        Ok(())
     }
-    if fs::symlink_metadata(root).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir()) {
-        walk(root, root, side, out);
+
+    match fs::symlink_metadata(root) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Recovery folder `{}` is a symbolic link or not an ordinary directory.",
+                        root.display()
+                    ),
+                    next_step: "Check the recovery folder on disk before copying files."
+                        .to_string(),
+                });
+            }
+            walk(root, root, side, out)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ManagerError::Io {
+            cause: format!(
+                "Could not inspect recovery folder `{}`: {err}.",
+                root.display()
+            ),
+            next_step: "Check permissions on the recovery folder and try again.".to_string(),
+        }),
     }
 }
 
 struct InitPreflightClaim {
+    attempt_id: u64,
     mapping: MappingRecord,
     account: AccountRecord,
     all_mappings: Vec<MappingRecord>,
@@ -4048,7 +4480,24 @@ fn worker_loop(inner: Arc<ManagerInner>) {
         let outcome = {
             let mut guard = inner.state.lock().unwrap();
             while !guard.shutdown && guard.job_queue.is_empty() {
-                guard = inner.worker_cv.wait(guard).unwrap();
+                if let Some(heartbeat) = inner.finder_heartbeat_interval {
+                    let (next_guard, wait_res) =
+                        inner.worker_cv.wait_timeout(guard, heartbeat).unwrap();
+                    guard = next_guard;
+                    if wait_res.timed_out() && !guard.shutdown && guard.job_queue.is_empty() {
+                        // Refresh Finder status.json generated_at periodically so idle running
+                        // apps never trip the 5-minute TTL (HIGH #12).
+                        let mut refreshed = (*guard.latest_snapshot).clone();
+                        refreshed.generated_at = inner.clock.now_rfc3339();
+                        let refreshed = Arc::new(refreshed);
+                        guard.latest_snapshot = Arc::clone(&refreshed);
+                        if let Err(err) = inner.finder_writer.write_snapshot(&refreshed) {
+                            eprintln!("Warning: failed Finder heartbeat status.json write: {err}");
+                        }
+                    }
+                } else {
+                    guard = inner.worker_cv.wait(guard).unwrap();
+                }
             }
             if guard.shutdown {
                 DequeueOutcome::Shutdown
@@ -4089,12 +4538,16 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                             }
                         }
                     }
-                    QueuedJobKind::InitializePreflight { expected_direction } => {
+                    QueuedJobKind::InitializePreflight {
+                        expected_direction,
+                        attempt_id,
+                    } => {
                         match claim_init_preflight_locked(
                             &inner,
                             &mut guard,
                             &job.mapping_id,
                             *expected_direction,
+                            *attempt_id,
                         ) {
                             Ok(Some(claim)) => {
                                 guard.worker_busy = true;
@@ -4139,6 +4592,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
             }
             DequeueOutcome::InitPreflight(claim) => {
                 let InitPreflightClaim {
+                    attempt_id,
                     mapping,
                     account,
                     all_mappings,
@@ -4146,6 +4600,12 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                     expected_direction,
                 } = *claim;
                 let mapping_id = mapping.id.clone();
+                let is_cancelled = || {
+                    let g = inner.state.lock().unwrap();
+                    g.shutdown
+                        || g.cancelled_init_attempts.contains(&attempt_id)
+                        || g.active_init_attempt.as_ref() != Some(&(mapping_id.clone(), attempt_id))
+                };
                 // Run inventory + engine probe completely OUTSIDE the state mutex!
                 let preflight_res = run_init_preflight_unlocked(
                     &inner,
@@ -4154,14 +4614,57 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                     &all_mappings,
                     gen_num,
                     expected_direction,
+                    &is_cancelled,
                 );
                 let maybe_prepared = {
                     let mut guard = inner.state.lock().unwrap();
-                    match preflight_res {
-                        Ok(out) => {
-                            let gen_id = out.gen_record.id.clone();
-                            let mode = RunMode::Initialize(out.direction);
-                            if let Err(err) = guard.store.insert_generation(&out.gen_record) {
+                    let still_active_attempt = !guard.shutdown
+                        && !guard.cancelled_init_attempts.remove(&attempt_id)
+                        && guard.active_init_attempt.as_ref()
+                            == Some(&(mapping_id.clone(), attempt_id));
+                    if guard.active_init_attempt.as_ref() == Some(&(mapping_id.clone(), attempt_id))
+                    {
+                        guard.active_init_attempt = None;
+                    }
+                    if !still_active_attempt {
+                        // Cancelled attempt MUST NOT write generation or hijack a newer attempt (HIGH #5).
+                        None
+                    } else {
+                        match preflight_res {
+                            Ok(Some(out)) => {
+                                let gen_id = out.gen_record.id.clone();
+                                let mode = RunMode::Initialize(out.direction);
+                                if let Err(err) = guard.store.insert_generation(&out.gen_record) {
+                                    record_init_preflight_failure_locked(
+                                        &inner,
+                                        &mut guard,
+                                        &mapping_id,
+                                        err,
+                                    );
+                                    None
+                                } else {
+                                    match claim_and_prepare_locked(
+                                        &inner,
+                                        &mut guard,
+                                        &mapping_id,
+                                        &gen_id,
+                                        mode,
+                                    ) {
+                                        Ok(opt) => opt,
+                                        Err(err) => {
+                                            record_prepare_failure_locked(
+                                                &inner,
+                                                &mut guard,
+                                                &mapping_id,
+                                                err,
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => None,
+                            Err(err) => {
                                 record_init_preflight_failure_locked(
                                     &inner,
                                     &mut guard,
@@ -4169,35 +4672,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                                     err,
                                 );
                                 None
-                            } else {
-                                match claim_and_prepare_locked(
-                                    &inner,
-                                    &mut guard,
-                                    &mapping_id,
-                                    &gen_id,
-                                    mode,
-                                ) {
-                                    Ok(opt) => opt,
-                                    Err(err) => {
-                                        record_prepare_failure_locked(
-                                            &inner,
-                                            &mut guard,
-                                            &mapping_id,
-                                            err,
-                                        );
-                                        None
-                                    }
-                                }
                             }
-                        }
-                        Err(err) => {
-                            record_init_preflight_failure_locked(
-                                &inner,
-                                &mut guard,
-                                &mapping_id,
-                                err,
-                            );
-                            None
                         }
                     }
                 };
@@ -4219,8 +4694,12 @@ fn claim_init_preflight_locked(
     guard: &mut SharedState,
     mapping_id: &MappingId,
     expected_direction: Option<InitPreference>,
+    attempt_id: u64,
 ) -> Result<Option<InitPreflightClaim>, ManagerError> {
-    if guard.shutdown || guard.storage_blocked_mappings.contains(mapping_id) {
+    if guard.shutdown
+        || guard.storage_blocked_mappings.contains(mapping_id)
+        || guard.cancelled_init_attempts.remove(&attempt_id)
+    {
         return Ok(None);
     }
     let Some(mut mapping) = guard.store.get_mapping(mapping_id)? else {
@@ -4247,7 +4726,9 @@ fn claim_init_preflight_locked(
         })?;
     let all_mappings = guard.store.list_mappings()?;
     let gen_num = guard.store.next_generation_number(&mapping.id)?;
+    guard.active_init_attempt = Some((mapping.id.clone(), attempt_id));
     Ok(Some(InitPreflightClaim {
+        attempt_id,
         mapping,
         account,
         all_mappings,
@@ -4477,6 +4958,7 @@ fn claim_and_prepare_locked(
         stopper: None,
         stop_requested: false,
         force_stopped: false,
+        timed_out_during_shutdown: false,
     });
 
     let plan = LaunchPlan {
@@ -4814,13 +5296,53 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
     let fwd_mapping = prepared.run.mapping_id.clone();
     let fwd_run = prepared.run.id.clone();
     let mut log_file = prepared.log_file;
-    // Stream valid NDJSON lines to disk live during the run (HIGH #8).
+    // Stream valid NDJSON lines to disk live during the run (HIGH #8) and emit
+    // live transfer progress events from parsed rclone JSON stats (HIGH #14).
     let forwarder = thread::spawn(move || {
+        let mut last_progress_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let mut last_heartbeat = Instant::now();
+        let mut max_bytes = 0u64;
+        let mut max_transfers = 0u64;
+        let mut max_checks = 0u64;
         while let Ok(line) = line_rx.recv() {
             let ts = forwarder_inner.clock.now_rfc3339();
             let ndjson_line = format_ndjson_line(&line, &ts);
             let _ = writeln!(log_file, "{ndjson_line}");
             let _ = log_file.flush();
+            if let LogEvent::Structured(ev) = parse_log_line(&line.text)
+                && let Some(stats) = ev.stats
+            {
+                let first_bytes = max_bytes == 0 && stats.bytes > 0;
+                max_bytes = max_bytes.max(stats.bytes);
+                max_transfers = max_transfers.max(stats.transfers);
+                max_checks = max_checks.max(stats.checks);
+                let total_bytes = (stats.total_bytes > 0).then_some(stats.total_bytes);
+                if first_bytes || last_progress_emit.elapsed() >= Duration::from_millis(250) {
+                    last_progress_emit = Instant::now();
+                    forwarder_inner
+                        .event_bus
+                        .publish_event(ManagerEvent::RunProgress {
+                            mapping_id: fwd_mapping.clone(),
+                            run_id: fwd_run.clone(),
+                            bytes_transferred: max_bytes,
+                            total_bytes,
+                            files_transferred: max_transfers,
+                            files_checked: max_checks,
+                            timestamp: ts.clone(),
+                        });
+                }
+            }
+            if let Some(hb) = forwarder_inner.finder_heartbeat_interval
+                && last_heartbeat.elapsed() >= hb
+            {
+                last_heartbeat = Instant::now();
+                let mut refreshed =
+                    (*forwarder_inner.state.lock().unwrap().latest_snapshot).clone();
+                refreshed.generated_at = ts.clone();
+                let _ = forwarder_inner.finder_writer.write_snapshot(&refreshed);
+            }
             forwarder_inner
                 .event_bus
                 .publish_event(ManagerEvent::RunOutputLine {
@@ -4979,8 +5501,17 @@ fn finish_with_launch_error(inner: &ManagerInner, mut run: RunRecord, err: Manag
     run.last_verified_phase = "launch_failed".to_string();
 
     let mut guard = inner.state.lock().unwrap();
+    let already_timed_out = guard
+        .active_run
+        .as_ref()
+        .is_some_and(|a| a.timed_out_during_shutdown);
     let already_force_stopped = guard.active_run.as_ref().is_some_and(|a| a.force_stopped);
     guard.active_run = None;
+    if already_timed_out {
+        // Never overwrite a persisted shutdown-timeout record (HIGH #6).
+        inner.idle_cv.notify_all();
+        return;
+    }
 
     let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
         Ok(Some(mut mapping)) => {
@@ -5303,8 +5834,17 @@ fn finalize_completed_run(
     };
 
     let mut guard = inner.state.lock().unwrap();
+    let already_timed_out = guard
+        .active_run
+        .as_ref()
+        .is_some_and(|a| a.timed_out_during_shutdown);
     let already_force_stopped = guard.active_run.as_ref().is_some_and(|a| a.force_stopped);
     guard.active_run = None;
+    if already_timed_out {
+        // Never overwrite a persisted shutdown-timeout record (HIGH #6).
+        inner.idle_cv.notify_all();
+        return;
+    }
 
     let updated_mapping = match guard.store.get_mapping(&run.mapping_id) {
         Ok(Some(mut mapping)) => {

@@ -9,7 +9,10 @@ use std::{
 };
 
 use rclone_adapter::InitPreference;
-use sync_core::{ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, validate_names};
+use sync_core::{
+    ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, VolumeIdentity, VolumeKind,
+    validate_names,
+};
 
 use crate::error::ManagerError;
 
@@ -75,24 +78,297 @@ pub fn disk_space_for_path(path: &Path) -> Option<DiskSpaceInfo> {
     }
 }
 
+/// Real volume identity and mount information detected for a local folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedVolume {
+    pub identity: VolumeIdentity,
+    pub display_name: String,
+    pub mount_path: PathBuf,
+    pub relative_dir: PathBuf,
+    pub filesystem: String,
+}
+
+/// Detects the mounted volume kind, stable filesystem ID (or `"unknown"`),
+/// mount point, and relative path for an existing ordinary local directory,
+/// rejecting symbolic links and mounted volume roots (`/` or `/Volumes/<vol>`).
+pub fn detect_volume_identity(path: &Path) -> Result<DetectedVolume, ManagerError> {
+    let meta = fs::symlink_metadata(path).map_err(|err| ManagerError::Io {
+        cause: format!(
+            "Local folder `{}` does not exist or cannot be accessed: {err}.",
+            path.display()
+        ),
+        next_step: "Select an existing local folder (FolderSync never auto-creates missing roots)."
+            .to_string(),
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Local folder `{}` must be an ordinary directory, not a file or symbolic link.",
+                path.display()
+            ),
+            next_step: "Choose an ordinary directory for this mapping.".to_string(),
+        });
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|err| ManagerError::Io {
+        cause: format!(
+            "Local folder `{}` cannot be resolved: {err}.",
+            path.display()
+        ),
+        next_step: "Confirm the folder exists and is accessible.".to_string(),
+    })?;
+
+    if canonical == Path::new("/") || canonical == Path::new("/Volumes") {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Cannot use volume root `{}` as a mapping folder.",
+                canonical.display()
+            ),
+            next_step: "Choose a dedicated subdirectory instead of a volume root.".to_string(),
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{CStr, CString};
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(canonical.as_os_str().as_bytes()).map_err(|_| {
+            ManagerError::PreflightRejected {
+                cause: format!(
+                    "Local path `{}` contains an invalid NUL byte.",
+                    canonical.display()
+                ),
+                next_step: "Choose a different local folder.".to_string(),
+            }
+        })?;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+        if rc == 0 {
+            let mount_str = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let fs_type = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let raw_mount = PathBuf::from(&mount_str);
+            if canonical == raw_mount {
+                return Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Cannot use mounted volume root `{}` as a mapping folder.",
+                        canonical.display()
+                    ),
+                    next_step: "Choose a dedicated subfolder inside the volume instead."
+                        .to_string(),
+                });
+            }
+            // On macOS APFS firmlinks, paths under `/Users` or `/private/var` report
+            // `f_mntonname == "/System/Volumes/Data"` while their canonical path starts at `/`.
+            let (mount_path, relative_dir) = match canonical.strip_prefix(&raw_mount) {
+                Ok(rel) => (raw_mount.clone(), rel.to_path_buf()),
+                Err(_) if raw_mount == Path::new("/System/Volumes/Data") => {
+                    let rel = canonical
+                        .strip_prefix(Path::new("/"))
+                        .map(Path::to_path_buf)
+                        .map_err(|_| ManagerError::PreflightRejected {
+                            cause: format!(
+                                "Local folder `{}` could not be resolved relative to mount `/`.",
+                                canonical.display()
+                            ),
+                            next_step: "Choose a dedicated subfolder inside a mounted volume."
+                                .to_string(),
+                        })?;
+                    (PathBuf::from("/"), rel)
+                }
+                Err(_) => {
+                    return Err(ManagerError::PreflightRejected {
+                        cause: format!(
+                            "Local folder `{}` could not be resolved relative to mount `{}`.",
+                            canonical.display(),
+                            raw_mount.display()
+                        ),
+                        next_step: "Choose a dedicated subfolder inside a mounted volume."
+                            .to_string(),
+                    });
+                }
+            };
+            if relative_dir.as_os_str().is_empty() {
+                return Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Cannot use mounted volume root `{}` as a mapping folder.",
+                        canonical.display()
+                    ),
+                    next_step: "Choose a dedicated subfolder inside the volume instead."
+                        .to_string(),
+                });
+            }
+            let is_external = raw_mount.starts_with("/Volumes/");
+            let kind = if is_external {
+                VolumeKind::External
+            } else {
+                VolumeKind::Internal
+            };
+            let display_name = if is_external {
+                raw_mount
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("External Volume")
+                    .to_string()
+            } else if raw_mount == Path::new("/") || raw_mount == Path::new("/System/Volumes/Data")
+            {
+                "Internal SSD".to_string()
+            } else {
+                raw_mount
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Internal SSD")
+                    .to_string()
+            };
+            use std::os::unix::fs::MetadataExt;
+            let stable_id = fs::metadata(&canonical)
+                .map(|m| format!("vol-{:x}", m.dev()))
+                .unwrap_or_else(|_| "unknown".to_string());
+            let filesystem = if fs_type.is_empty() {
+                "unknown".to_string()
+            } else {
+                fs_type.to_uppercase()
+            };
+            return Ok(DetectedVolume {
+                identity: VolumeIdentity::new(kind, stable_id),
+                display_name,
+                mount_path,
+                relative_dir,
+                filesystem,
+            });
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir_meta = fs::metadata(&canonical).map_err(|err| ManagerError::Io {
+            cause: format!("Could not inspect `{}`: {err}.", canonical.display()),
+            next_step: "Confirm the folder exists and is accessible.".to_string(),
+        })?;
+        let dev_id = dir_meta.dev();
+        if let Some(parent) = canonical.parent()
+            && let Ok(p_meta) = fs::metadata(parent)
+            && p_meta.dev() != dev_id
+        {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!(
+                    "Cannot use mounted volume root `{}` as a mapping folder.",
+                    canonical.display()
+                ),
+                next_step: "Choose a dedicated subfolder inside the volume instead.".to_string(),
+            });
+        }
+        let mut mount_path = canonical.clone();
+        while let Some(parent) = mount_path.parent() {
+            if parent == mount_path {
+                break;
+            }
+            match fs::metadata(parent) {
+                Ok(pm) if pm.dev() == dev_id => mount_path = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+        let relative_dir = canonical
+            .strip_prefix(&mount_path)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        if relative_dir.as_os_str().is_empty() {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!(
+                    "Cannot use mounted volume root `{}` as a mapping folder.",
+                    canonical.display()
+                ),
+                next_step: "Choose a dedicated subfolder inside the volume instead.".to_string(),
+            });
+        }
+        let is_external = mount_path.starts_with("/Volumes/")
+            || mount_path.starts_with("/media/")
+            || mount_path.starts_with("/mnt/");
+        let kind = if is_external {
+            VolumeKind::External
+        } else {
+            VolumeKind::Internal
+        };
+        let display_name = if is_external {
+            mount_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("External Volume")
+                .to_string()
+        } else {
+            "Internal SSD".to_string()
+        };
+        return Ok(DetectedVolume {
+            identity: VolumeIdentity::new(kind, format!("dev-{dev_id:x}")),
+            display_name,
+            mount_path,
+            relative_dir,
+            filesystem: "unknown".to_string(),
+        });
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let mount_path = canonical
+            .parent()
+            .ok_or_else(|| ManagerError::PreflightRejected {
+                cause: format!(
+                    "Cannot use filesystem root `{}` as a mapping folder.",
+                    canonical.display()
+                ),
+                next_step: "Choose a dedicated subdirectory instead of a volume root.".to_string(),
+            })?
+            .to_path_buf();
+        let relative_dir = PathBuf::from(canonical.file_name().ok_or_else(|| {
+            ManagerError::PreflightRejected {
+                cause: format!(
+                    "Local folder `{}` has no directory name.",
+                    canonical.display()
+                ),
+                next_step: "Choose a dedicated subdirectory.".to_string(),
+            }
+        })?);
+        Ok(DetectedVolume {
+            identity: VolumeIdentity::new(VolumeKind::Internal, "unknown"),
+            display_name: "unknown".to_string(),
+            mount_path,
+            relative_dir,
+            filesystem: "unknown".to_string(),
+        })
+    }
+}
+
 /// Detailed preflight inventory for UI wizard review and selective sync (§9, §18).
+///
+/// This is the single source of truth shared by both wizard preview and actual
+/// manager preflight (`inspect_local_endpoint` delegates directly here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetailedEndpointInventory {
     pub root: PathBuf,
     pub classification: SideClassification,
+    /// Total ordinary items (including excluded items) used for empty-vs-populated classification.
+    pub all_items_count: usize,
+    /// Included (non-excluded) file count for transfer estimates.
     pub file_count: usize,
+    /// Included (non-excluded) byte total for disk-space fit checks.
     pub total_bytes: u64,
     pub has_valid_marker: bool,
     pub marker_conflict: Option<String>,
+    pub marker_conflict_path: Option<PathBuf>,
     pub subfolders: Vec<SubfolderInventory>,
     pub symlinks: Vec<String>,
     pub special_files: Vec<String>,
     pub name_findings: Vec<String>,
+    pub first_name_finding_next_step: Option<String>,
 }
 
 /// Inspects a local directory tree without following symlinks and returns a
-/// rich non-mutating inventory (byte counts, immediate subfolders, symlinks,
-/// naming findings, and access-marker status) for the wizard selective-sync UI.
+/// rich non-mutating inventory (classification, byte counts, immediate subfolders,
+/// symlinks, special files, naming findings, and access-marker status).
 pub fn inspect_local_endpoint_detailed(
     root: &Path,
     collection: &CloudCollection,
@@ -117,11 +393,12 @@ pub fn inspect_local_endpoint_detailed(
         });
     }
 
-    let mut relative_paths = Vec::new();
+    let mut all_relative_paths = Vec::new();
     let mut symlinks = Vec::new();
     let mut special_files = Vec::new();
     let mut has_valid_marker = false;
     let mut marker_conflict = None;
+    let mut marker_conflict_path = None;
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
     let mut top_subfolders: std::collections::BTreeMap<String, SubfolderInventory> =
@@ -133,21 +410,22 @@ pub fn inspect_local_endpoint_detailed(
         None,
         collection,
         exclusions,
-        &mut relative_paths,
+        &mut all_relative_paths,
         &mut symlinks,
         &mut special_files,
         &mut has_valid_marker,
         &mut marker_conflict,
+        &mut marker_conflict_path,
         &mut file_count,
         &mut total_bytes,
         &mut top_subfolders,
     )?;
 
-    let name_findings: Vec<String> = validate_names(&relative_paths)
-        .into_iter()
-        .map(|f| f.cause)
-        .collect();
-    let classification = if relative_paths.is_empty() {
+    let findings = validate_names(&all_relative_paths);
+    let first_name_finding_next_step = findings.first().map(|f| f.next_step.clone());
+    let name_findings: Vec<String> = findings.into_iter().map(|f| f.cause).collect();
+    let all_items_count = all_relative_paths.len();
+    let classification = if all_items_count == 0 {
         SideClassification::Empty
     } else {
         SideClassification::HasData
@@ -156,14 +434,17 @@ pub fn inspect_local_endpoint_detailed(
     Ok(DetailedEndpointInventory {
         root: root.to_path_buf(),
         classification,
+        all_items_count,
         file_count,
         total_bytes,
         has_valid_marker,
         marker_conflict,
+        marker_conflict_path,
         subfolders: top_subfolders.into_values().collect(),
         symlinks,
         special_files,
         name_findings,
+        first_name_finding_next_step,
     })
 }
 
@@ -174,11 +455,12 @@ fn walk_detailed(
     top_subdir: Option<&str>,
     collection: &CloudCollection,
     exclusions: &BTreeSet<String>,
-    relative_paths: &mut Vec<String>,
+    all_relative_paths: &mut Vec<String>,
     symlinks: &mut Vec<String>,
     special_files: &mut Vec<String>,
     has_valid_marker: &mut bool,
     marker_conflict: &mut Option<String>,
+    marker_conflict_path: &mut Option<PathBuf>,
     file_count: &mut usize,
     total_bytes: &mut u64,
     top_subfolders: &mut std::collections::BTreeMap<String, SubfolderInventory>,
@@ -212,12 +494,17 @@ fn walk_detailed(
         if rel_prefix.is_empty() && name.eq_ignore_ascii_case(ACCESS_MARKER_FILENAME) {
             if name != ACCESS_MARKER_FILENAME {
                 *marker_conflict = Some(format!(
-                    "Existing `{name}` collides case-insensitively with FolderSync's `{ACCESS_MARKER_FILENAME}` access marker."
+                    "Existing `{name}` at `{}` collides case-insensitively with FolderSync's `{ACCESS_MARKER_FILENAME}` access marker.",
+                    path.display()
                 ));
+                *marker_conflict_path = Some(path);
             } else {
                 match validate_marker_file(&path, &meta, collection) {
                     Ok(()) => *has_valid_marker = true,
-                    Err(err) => *marker_conflict = Some(err.cause()),
+                    Err(err) => {
+                        *marker_conflict = Some(err.cause());
+                        *marker_conflict_path = Some(path);
+                    }
                 }
             }
             continue;
@@ -247,13 +534,14 @@ fn walk_detailed(
                 });
         }
 
+        // Count ALL ordinary entries for side classification & filename validation so
+        // preview and actual preflight always agree (§9, HIGH #2).
+        all_relative_paths.push(rel.clone());
+
         let excluded = is_excluded(&rel, exclusions);
-        if !excluded {
-            relative_paths.push(rel.clone());
-            if ft.is_file() {
-                *file_count += 1;
-                *total_bytes = total_bytes.saturating_add(meta.len());
-            }
+        if !excluded && ft.is_file() {
+            *file_count += 1;
+            *total_bytes = total_bytes.saturating_add(meta.len());
         }
 
         if let Some(top) = top_subdir
@@ -279,11 +567,12 @@ fn walk_detailed(
                 next_top,
                 collection,
                 exclusions,
-                relative_paths,
+                all_relative_paths,
                 symlinks,
                 special_files,
                 has_valid_marker,
                 marker_conflict,
+                marker_conflict_path,
                 file_count,
                 total_bytes,
                 top_subfolders,
@@ -384,57 +673,34 @@ fn is_excluded(rel_path: &str, exclusions: &BTreeSet<String>) -> bool {
         .any(|pat| matches_exclusion_pattern(rel_path, pat))
 }
 
-/// Inspects a local directory tree without following symlinks, validates
-/// filenames via `sync_core::validate_names` (preserving literal backslashes),
-/// rejects special files (FIFOs, sockets, devices), honors explicit exclusions
-/// for symlinks, detects root-level `RCLONE_TEST` case-insensitively without
-/// overwriting unrecognized data, and classifies the directory as empty or populated.
+/// Inspects a local directory tree without following symlinks, delegating directly
+/// to [`inspect_local_endpoint_detailed`] so wizard preview and manager preflight
+/// use the exact same inspection logic (§9, §18).
 pub fn inspect_local_endpoint(
     root: &Path,
     collection: &CloudCollection,
     exclusions: &BTreeSet<String>,
 ) -> Result<EndpointInventory, ManagerError> {
-    let meta = fs::symlink_metadata(root).map_err(|err| ManagerError::Io {
-        cause: format!(
-            "Endpoint directory `{}` does not exist or cannot be inspected: {err}.",
-            root.display()
-        ),
-        next_step:
-            "Confirm the directory exists and is accessible (FolderSync never auto-creates missing roots)."
-                .to_string(),
-    })?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(ManagerError::PreflightRejected {
-            cause: format!(
-                "Endpoint `{}` must be an ordinary directory, not a file or symbolic link.",
-                root.display()
-            ),
-            next_step: "Choose an ordinary directory for this mapping.".to_string(),
+    let inv = inspect_local_endpoint_detailed(root, collection, exclusions)?;
+
+    if let Some(cause) = inv.marker_conflict {
+        return Err(ManagerError::AccessMarkerConflict {
+            path: inv
+                .marker_conflict_path
+                .unwrap_or_else(|| root.join(ACCESS_MARKER_FILENAME)),
+            cause,
+            next_step:
+                "Rename or move the existing item before initializing so FolderSync never overwrites or truncates user data."
+                    .to_string(),
         });
     }
 
-    let mut relative_paths = Vec::new();
-    let mut symlinks_found = Vec::new();
-    let mut special_files_found = Vec::new();
-    let mut has_valid_marker = false;
-
-    walk_endpoint(
-        root,
-        "",
-        collection,
-        exclusions,
-        &mut relative_paths,
-        &mut symlinks_found,
-        &mut special_files_found,
-        &mut has_valid_marker,
-    )?;
-
-    if !symlinks_found.is_empty() {
+    if !inv.symlinks.is_empty() {
         return Err(ManagerError::PreflightRejected {
             cause: format!(
                 "Endpoint `{}` contains unsupported symbolic link(s): {}.",
                 root.display(),
-                symlinks_found.join(", ")
+                inv.symlinks.join(", ")
             ),
             next_step:
                 "Remove the symbolic links or add them to the mapping's exclusions; FolderSync does not traverse symlinks."
@@ -442,128 +708,33 @@ pub fn inspect_local_endpoint(
         });
     }
 
-    if !special_files_found.is_empty() {
+    if !inv.special_files.is_empty() {
         return Err(ManagerError::PreflightRejected {
             cause: format!(
                 "Endpoint `{}` contains unsupported special file(s) (FIFO, socket, or device): {}.",
                 root.display(),
-                special_files_found.join(", ")
+                inv.special_files.join(", ")
             ),
             next_step: "Remove or relocate the special files outside the synchronized folder."
                 .to_string(),
         });
     }
 
-    let name_findings = validate_names(&relative_paths);
-    if let Some(first) = name_findings.first() {
+    if let Some(first_cause) = inv.name_findings.first() {
         return Err(ManagerError::PreflightRejected {
-            cause: first.cause.clone(),
-            next_step: first.next_step.clone(),
+            cause: first_cause.clone(),
+            next_step: inv.first_name_finding_next_step.unwrap_or_else(|| {
+                "Rename the conflicting file or folder before initializing.".to_string()
+            }),
         });
     }
 
-    let item_count = relative_paths.len();
-    let classification = if item_count == 0 {
-        SideClassification::Empty
-    } else {
-        SideClassification::HasData
-    };
-
     Ok(EndpointInventory {
-        root: root.to_path_buf(),
-        classification,
-        item_count,
-        has_valid_marker,
+        root: inv.root,
+        classification: inv.classification,
+        item_count: inv.all_items_count,
+        has_valid_marker: inv.has_valid_marker,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_endpoint(
-    current: &Path,
-    rel_prefix: &str,
-    collection: &CloudCollection,
-    exclusions: &BTreeSet<String>,
-    relative_paths: &mut Vec<String>,
-    symlinks_found: &mut Vec<String>,
-    special_files_found: &mut Vec<String>,
-    has_valid_marker: &mut bool,
-) -> Result<(), ManagerError> {
-    let entries = fs::read_dir(current).map_err(|err| ManagerError::Io {
-        cause: format!("Failed to read directory `{}`: {err}.", current.display()),
-        next_step: "Check filesystem permissions on the folder and retry.".to_string(),
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|err| ManagerError::Io {
-            cause: format!(
-                "Failed to read directory entry in `{}`: {err}.",
-                current.display()
-            ),
-            next_step: "Check filesystem permissions and retry.".to_string(),
-        })?;
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path).map_err(|err| ManagerError::Io {
-            cause: format!("Failed to inspect `{}`: {err}.", path.display()),
-            next_step: "Check filesystem permissions and retry.".to_string(),
-        })?;
-
-        // Build `/`-separated relative paths from raw component names WITHOUT replacing
-        // literal backslashes so `sync_core::validate_names` catches `\` as reserved (§18).
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let rel = if rel_prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel_prefix}/{name}")
-        };
-        let ft = meta.file_type();
-
-        // Check root-level RCLONE_TEST access marker case-insensitively (§9, §11).
-        if rel_prefix.is_empty() && name.eq_ignore_ascii_case(ACCESS_MARKER_FILENAME) {
-            if name != ACCESS_MARKER_FILENAME {
-                return Err(ManagerError::AccessMarkerConflict {
-                    path: path.clone(),
-                    cause: format!(
-                        "Existing `{name}` at `{}` collides case-insensitively with FolderSync's `{ACCESS_MARKER_FILENAME}` access marker.",
-                        path.display()
-                    ),
-                    next_step:
-                        "Rename or move the existing item before initializing so FolderSync never overwrites or truncates user data."
-                            .to_string(),
-                });
-            }
-            validate_marker_file(&path, &meta, collection)?;
-            *has_valid_marker = true;
-            continue;
-        }
-
-        if ft.is_symlink() {
-            if !is_excluded(&rel, exclusions) {
-                symlinks_found.push(rel);
-            }
-            continue;
-        }
-
-        if !ft.is_file() && !ft.is_dir() {
-            special_files_found.push(rel);
-            continue;
-        }
-
-        relative_paths.push(rel.clone());
-        if ft.is_dir() {
-            walk_endpoint(
-                &path,
-                &rel,
-                collection,
-                exclusions,
-                relative_paths,
-                symlinks_found,
-                special_files_found,
-                has_valid_marker,
-            )?;
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_marker_file(

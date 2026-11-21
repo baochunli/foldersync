@@ -177,13 +177,29 @@ pub fn ensure_contained_path(
     Ok(resolved_derived)
 }
 
-/// Verifies that `target` stays inside `root` and that neither `target` nor any
-/// existing path component under `root` is a symbolic link (`symlink_metadata`).
+/// Verifies that `target` stays inside `root` and that neither `root`, `target`,
+/// nor any existing path component under `root` is a symbolic link (`symlink_metadata`).
 pub fn reject_symlinks_under_root(
     field: &str,
     root: &Path,
     target: &Path,
 ) -> Result<PathBuf, ManagerError> {
+    let root_meta = fs::symlink_metadata(root).map_err(|err| ManagerError::Io {
+        cause: format!(
+            "Could not inspect root `{}` for {field}: {err}.",
+            root.display()
+        ),
+        next_step: "Verify the FolderSync directory exists and is accessible.".to_string(),
+    })?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Refused symbolic link or non-directory root `{}` for {field}.",
+                root.display()
+            ),
+            next_step: "Use an ordinary directory with no symbolic links.".to_string(),
+        });
+    }
     let canonical_root = fs::canonicalize(root).map_err(|err| ManagerError::Io {
         cause: format!("Could not resolve state root `{}`: {err}.", root.display()),
         next_step: "Verify the FolderSync state directory exists and is accessible.".to_string(),

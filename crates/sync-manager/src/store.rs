@@ -153,7 +153,13 @@ CREATE INDEX idx_recovery_cases_mapping_status ON recovery_cases(mapping_id, sta
     Migration {
         version: 2,
         name: "unreviewed_conflict_acknowledgment",
-        sql: "ALTER TABLE mappings ADD COLUMN unreviewed_conflict_run_id TEXT;",
+        sql: r#"
+ALTER TABLE mappings ADD COLUMN unreviewed_conflict_run_id TEXT;
+UPDATE mappings
+SET unreviewed_conflict_run_id = last_run_id
+WHERE last_run_outcome IN ('"SuccessWithConflicts"', 'SuccessWithConflicts')
+  AND last_run_id IS NOT NULL;
+"#,
     },
 ];
 

@@ -18,9 +18,10 @@ use sync_core::{Execution, Intent, MappingId, Readiness, RunOutcome};
 
 use crate::{
     error::ManagerError,
-    platform::{validate_safe_path_id, write_private_file_atomic},
+    platform::{validate_safe_path_id, write_private_file_atomic_under},
     snapshot::{MappingStatusSnapshot, StatusSnapshot},
 };
+use uuid::Uuid;
 
 /// Schema version matching `apps/finder-extension/Sources/SnapshotModel.swift`.
 pub const FINDER_SNAPSHOT_VERSION: u32 = 1;
@@ -43,8 +44,17 @@ pub trait FinderNotifier: Send + Sync + std::fmt::Debug {
     fn post_notification(&self, notification_name: &str);
 }
 
+/// No-op [`FinderNotifier`] used by default in tests and CLI runs so tests
+/// never post live macOS Darwin notifications.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopFinderNotifier;
+
+impl FinderNotifier for NoopFinderNotifier {
+    fn post_notification(&self, _notification_name: &str) {}
+}
+
 /// Real macOS Darwin notification publisher using `libSystem`'s `notify_post`.
-/// No-op on non-macOS targets.
+/// Instantiated only in the real interactive desktop app.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DarwinFinderNotifier;
 
@@ -127,8 +137,12 @@ pub struct FinderStatusSnapshot {
     pub mappings: Vec<FinderMappingSnapshot>,
 }
 
-/// Maps a manager [`MappingStatusSnapshot`] into the v1 Finder badge state enum.
-pub fn derive_finder_state(mapping: &MappingStatusSnapshot) -> FinderMappingState {
+/// Maps a manager [`MappingStatusSnapshot`] into the v1 Finder badge state enum,
+/// accounting for the global scheduling pause hold.
+pub fn derive_finder_state_with_pause(
+    mapping: &MappingStatusSnapshot,
+    scheduling_paused: bool,
+) -> FinderMappingState {
     if matches!(
         mapping.execution,
         Execution::Running | Execution::Stopping | Execution::Queued
@@ -160,8 +174,14 @@ pub fn derive_finder_state(mapping: &MappingStatusSnapshot) -> FinderMappingStat
 
     match mapping.last_run_outcome {
         Some(RunOutcome::RetryableFailure) => FinderMappingState::Attention,
+        _ if scheduling_paused => FinderMappingState::Paused,
         _ => FinderMappingState::Synced,
     }
+}
+
+/// Maps a manager [`MappingStatusSnapshot`] into the v1 Finder badge state enum.
+pub fn derive_finder_state(mapping: &MappingStatusSnapshot) -> FinderMappingState {
+    derive_finder_state_with_pause(mapping, false)
 }
 
 /// Atomically writes `status.json` into a configured handoff directory and
@@ -174,7 +194,7 @@ pub struct FinderStatusWriter {
 
 impl FinderStatusWriter {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self::with_notifier(dir, Arc::new(DarwinFinderNotifier))
+        Self::with_notifier(dir, Arc::new(NoopFinderNotifier))
     }
 
     pub fn with_notifier(dir: impl Into<PathBuf>, notifier: Arc<dyn FinderNotifier>) -> Self {
@@ -204,11 +224,23 @@ impl FinderStatusWriter {
             .map(|m| {
                 let canonical =
                     fs::canonicalize(&m.local_root).unwrap_or_else(|_| m.local_root.clone());
+                let state = derive_finder_state_with_pause(m, snapshot.scheduling_paused);
+                let label = if snapshot.scheduling_paused
+                    && m.readiness == Readiness::Ready
+                    && m.execution == Execution::Idle
+                    && m.intent == Intent::Enabled
+                    && m.unreviewed_conflict_run_id.is_none()
+                    && m.last_run_outcome != Some(RunOutcome::RetryableFailure)
+                {
+                    "Scheduling paused".to_string()
+                } else {
+                    m.status_text.clone()
+                };
                 FinderMappingSnapshot {
                     id: m.id.as_str().to_string(),
                     root_path: canonical.to_string_lossy().into_owned(),
-                    state: derive_finder_state(m),
-                    label: m.status_text.clone(),
+                    state,
+                    label,
                     last_run_summary: m.last_run_summary.clone(),
                 }
             })
@@ -228,8 +260,23 @@ impl FinderStatusWriter {
             cause: format!("Failed to serialize Finder status snapshot: {err}."),
             next_step: "Check application logs and retry.".to_string(),
         })?;
+        // Refuse symlinked handoff directory before writing.
+        if let Ok(meta) = fs::symlink_metadata(&self.dir) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Refused symbolic link or non-directory Finder handoff path `{}`.",
+                        self.dir.display()
+                    ),
+                    next_step: "Use an ordinary private directory for Finder status handoff."
+                        .to_string(),
+                });
+            }
+        } else {
+            crate::platform::ensure_private_dir(&self.dir)?;
+        }
         let target = self.status_file_path();
-        write_private_file_atomic(&target, &bytes)?;
+        write_private_file_atomic_under("finder_status", &self.dir, &target, &bytes)?;
         self.notifier
             .post_notification(DARWIN_SNAPSHOT_UPDATED_NOTIFICATION);
         Ok(target)
@@ -366,9 +413,26 @@ pub fn parse_and_validate_finder_action(bytes: &[u8]) -> Result<ValidatedFinderA
     })
 }
 
-/// Drains and deletes all `*.json` action files in `actions_dir` (refusing symlinks
-/// and ignoring hidden/temporary files such as `.action-*.tmp`).
-pub fn drain_finder_action_files(actions_dir: &Path) -> Vec<FinderActionFileOutcome> {
+/// One claimed Finder action file renamed atomically to a hidden `.processing-*` path
+/// prior to dispatch (ADR 0002). Caller deletes `claimed_path` only AFTER dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedFinderAction {
+    pub file_name: String,
+    pub claimed_path: Option<PathBuf>,
+    pub outcome: FinderActionFileOutcome,
+}
+
+/// Atomically claims each `*.json` action file in `actions_dir` by renaming it to a
+/// hidden `.processing-<uuid>-<name>` path, validates it without following symlinks,
+/// and returns it ready for dispatch. If atomic claim (rename) fails, the file is NOT
+/// dispatched (`Rejected`, `claimed_path: None`).
+pub fn claim_finder_action_files(actions_dir: &Path) -> Vec<ClaimedFinderAction> {
+    // Refuse symlinked parent or actions_dir itself.
+    if let Some(parent) = actions_dir.parent()
+        && fs::symlink_metadata(parent).is_ok_and(|m| m.file_type().is_symlink() || !m.is_dir())
+    {
+        return Vec::new();
+    }
     let dir_meta = match fs::symlink_metadata(actions_dir) {
         Ok(m) => m,
         Err(_) => return Vec::new(),
@@ -392,14 +456,88 @@ pub fn drain_finder_action_files(actions_dir: &Path) -> Vec<FinderActionFileOutc
     };
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut outcomes = Vec::with_capacity(files.len());
+    let mut claimed = Vec::with_capacity(files.len());
     for (file_name, path) in files {
-        let outcome = read_single_action_file(&file_name, &path);
-        // Always remove processed `.json` file (valid or rejected) so it never loops.
-        let _ = fs::remove_file(&path);
-        outcomes.push(outcome);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(err) => {
+                claimed.push(ClaimedFinderAction {
+                    file_name: file_name.clone(),
+                    claimed_path: None,
+                    outcome: FinderActionFileOutcome::Rejected {
+                        file_name,
+                        reason: format!("Could not inspect action file: {err}"),
+                    },
+                });
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            let _ = fs::remove_file(&path);
+            claimed.push(ClaimedFinderAction {
+                file_name: file_name.clone(),
+                claimed_path: None,
+                outcome: FinderActionFileOutcome::Rejected {
+                    file_name,
+                    reason:
+                        "Refused non-regular file or symbolic link in Finder actions directory."
+                            .to_string(),
+                },
+            });
+            continue;
+        }
+
+        // Atomically claim via rename to hidden `.processing-<uuid>-<file_name>` BEFORE dispatch.
+        // If rename/unlink fails (e.g. read-only directory), do NOT dispatch so it cannot replay!
+        let processing_path =
+            actions_dir.join(format!(".processing-{}-{file_name}", Uuid::new_v4()));
+        if let Err(err) = fs::rename(&path, &processing_path) {
+            claimed.push(ClaimedFinderAction {
+                file_name: file_name.clone(),
+                claimed_path: None,
+                outcome: FinderActionFileOutcome::Rejected {
+                    file_name,
+                    reason: format!("Could not claim Finder action file for processing: {err}"),
+                },
+            });
+            continue;
+        }
+
+        let outcome = read_single_action_file(&file_name, &processing_path);
+        match &outcome {
+            FinderActionFileOutcome::Rejected { .. } => {
+                let _ = fs::remove_file(&processing_path);
+                claimed.push(ClaimedFinderAction {
+                    file_name,
+                    claimed_path: None,
+                    outcome,
+                });
+            }
+            FinderActionFileOutcome::Accepted { .. } => {
+                claimed.push(ClaimedFinderAction {
+                    file_name,
+                    claimed_path: Some(processing_path),
+                    outcome,
+                });
+            }
+        }
     }
-    outcomes
+    claimed
+}
+
+/// Drains and deletes all `*.json` action files in `actions_dir` (refusing symlinks
+/// and ignoring hidden/temporary files such as `.action-*.tmp`).
+pub fn drain_finder_action_files(actions_dir: &Path) -> Vec<FinderActionFileOutcome> {
+    let claimed = claim_finder_action_files(actions_dir);
+    claimed
+        .into_iter()
+        .map(|item| {
+            if let Some(p) = item.claimed_path {
+                let _ = fs::remove_file(p);
+            }
+            item.outcome
+        })
+        .collect()
 }
 
 fn read_single_action_file(file_name: &str, path: &Path) -> FinderActionFileOutcome {

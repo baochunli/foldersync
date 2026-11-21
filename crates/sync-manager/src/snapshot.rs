@@ -115,6 +115,15 @@ pub enum ManagerEvent {
         line: String,
         timestamp: String,
     },
+    RunProgress {
+        mapping_id: MappingId,
+        run_id: RunId,
+        bytes_transferred: u64,
+        total_bytes: Option<u64>,
+        files_transferred: u64,
+        files_checked: u64,
+        timestamp: String,
+    },
     RunFinished {
         mapping_id: MappingId,
         run_id: RunId,

@@ -15,15 +15,17 @@ pub mod store;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::ManagerError;
 pub use finder::{
-    DARWIN_ACTION_REQUESTED_NOTIFICATION, DARWIN_SNAPSHOT_UPDATED_NOTIFICATION,
-    DarwinFinderNotifier, FINDER_SNAPSHOT_VERSION, FinderActionFileOutcome, FinderActionKind,
-    FinderActionRequest, FinderMappingSnapshot, FinderMappingState, FinderNotifier,
-    FinderStatusSnapshot, FinderStatusWriter, RecordingFinderNotifier, ValidatedFinderAction,
-    drain_finder_action_files, parse_and_validate_finder_action,
+    ClaimedFinderAction, DARWIN_ACTION_REQUESTED_NOTIFICATION,
+    DARWIN_SNAPSHOT_UPDATED_NOTIFICATION, DarwinFinderNotifier, FINDER_SNAPSHOT_VERSION,
+    FinderActionFileOutcome, FinderActionKind, FinderActionRequest, FinderMappingSnapshot,
+    FinderMappingState, FinderNotifier, FinderStatusSnapshot, FinderStatusWriter,
+    NoopFinderNotifier, RecordingFinderNotifier, ValidatedFinderAction, claim_finder_action_files,
+    derive_finder_state_with_pause, drain_finder_action_files, parse_and_validate_finder_action,
 };
 pub use init::{
-    DetailedEndpointInventory, DiskSpaceInfo, EndpointInventory, SideClassification,
-    SubfolderInventory, disk_space_for_path, inspect_local_endpoint_detailed,
+    DetailedEndpointInventory, DetectedVolume, DiskSpaceInfo, EndpointInventory,
+    SideClassification, SubfolderInventory, detect_volume_identity, disk_space_for_path,
+    inspect_local_endpoint_detailed,
 };
 pub use launcher::{
     BisyncLauncher, FakeBisyncLauncher, FakeLaunchScript, LaunchPlan, LaunchedRun,
@@ -31,8 +33,9 @@ pub use launcher::{
 };
 pub use manager::{
     AddMappingCommand, CommandAcceptance, CommandOutcome, ControlledShutdownOutcome,
-    FinderActionDispatch, InitializeCommand, ManagerCommand, ManagerConfig, RecoveryCaseView,
-    RecoveryCopyEntry, RecoveryCopySide, RecoveryReport, RemoteEndpoint, SyncManager,
+    FinderActionDispatch, InitializeCommand, ManagerCommand, ManagerConfig, PreflightPreview,
+    RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide, RecoveryReport, RemoteEndpoint,
+    SyncManager,
 };
 pub use platform::{
     FakeProcessInspector, LiveProcessInfo, OsProcessInspector, ProcessInspector,
