@@ -106,6 +106,8 @@ class QualificationHarnessTests(unittest.TestCase):
                     str(script),
                     "--remote",
                     "qualdrive",
+                    "--account-b",
+                    "seconddrive",
                     "--state-dir",
                     str(Path(tmp) / "state"),
                     "--rclone-config",
@@ -119,9 +121,12 @@ class QualificationHarnessTests(unittest.TestCase):
             plan = json.loads(p.stdout)
             self.assertEqual(plan["mode"], "dry-run")
             self.assertEqual(plan["remote"], "qualdrive")
+            self.assertEqual(plan["account_b"], "seconddrive")
             self.assertEqual(plan["overall_expected_status"], "INCOMPLETE")
-            self.assertIn("drive_preflight_account_and_folder_ids", plan["preflight_scenarios"])
-            self.assertIn("drive_three_client_same_file_edit_conflict", plan["not_run_scenarios"])
+            self.assertIn("drive_preflight_account_and_folder_ids", plan["scenarios"])
+            self.assertIn("drive_three_client_same_file_edit_conflict", plan["scenarios"])
+            self.assertIn("drive_two_account_ownership_and_recovery_move", plan["scenarios"])
+            self.assertFalse((Path(tmp) / "state").exists())
 
     def test_evidence_writer_emits_json_and_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -312,11 +317,12 @@ class QualificationHarnessTests(unittest.TestCase):
 
         self.assertEqual(common.redact_credential_stderr(benign), benign)
 
-        # Verify Drive run_rclone passes --use-json-log and redacts multiline stderr in both records and exceptions.
+        # Verify the Drive capture boundary redacts multiline stderr in records and exceptions.
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
-            fake_home = Path(tmp) / "home"
-            fake_home.mkdir()
+            client = run_drive_qualification.Client("client-a", Path(tmp), "qual")
+            runner = run_drive_qualification.DriveRunner(Path("/fixture path/sync-cli"), Path("/bin/true"))
+            runner.device_ids[client.name] = "device-123"
             fake_proc = subprocess.CompletedProcess(
                 args=["rclone"],
                 returncode=1,
@@ -324,28 +330,15 @@ class QualificationHarnessTests(unittest.TestCase):
                 stderr=raw_plain,
             )
             with mock.patch("subprocess.run", return_value=fake_proc) as mocked_run:
-                rec = run_drive_qualification.run_rclone(
-                    Path("/bin/true"),
-                    Path(tmp) / "cfg",
-                    fake_home,
-                    ["about", "qual:"],
-                    password_command="/bin/helper",
-                    check=False,
-                )
+                with self.assertRaises(RuntimeError) as ctx:
+                    runner.cloud(client, "lsjson", "qual:")
                 called_cmd = mocked_run.call_args[0][0]
                 self.assertIn("--use-json-log", called_cmd)
+                self.assertIn('"/fixture path/sync-cli" credential-helper --account device-123/qual', called_cmd)
+                rec = runner.commands[-1]
+                self.assertNotIn("--password-command", rec["args"])
                 self.assertNotIn("SECRET_AFTER_BLANK_LINE", rec["stderr"])
                 self.assertNotIn("SECRET_AFTER_BARE_TIMESTAMP", rec["stderr"])
-
-                with self.assertRaises(RuntimeError) as ctx:
-                    run_drive_qualification.run_rclone(
-                        Path("/bin/true"),
-                        Path(tmp) / "cfg",
-                        fake_home,
-                        ["about", "qual:"],
-                        password_command="/bin/helper",
-                        check=True,
-                    )
                 self.assertNotIn("SECRET_AFTER_BLANK_LINE", str(ctx.exception))
                 self.assertNotIn("SECRET_AFTER_OPEN_BRACE", str(ctx.exception))
                 self.assertNotIn("SECRET_AFTER_BARE_TIMESTAMP", str(ctx.exception))

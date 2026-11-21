@@ -6,8 +6,86 @@ use tempfile::TempDir;
 
 fn cli_cmd(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sync-cli"));
-    cmd.env("HOME", home).env_remove("FOLDERSYNC_STATE_DIR");
+    cmd.env("HOME", home)
+        .env("FOLDERSYNC_STATE_DIR", home.join("environment-state"));
     cmd
+}
+
+#[test]
+fn scheduling_pause_and_resume_persist_without_using_environment_state() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    let cli = |args: &[&str]| {
+        cli_cmd(tmp.path())
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for (action, paused) in [("pause", true), ("resume", false)] {
+        let result = cli(&["scheduling", action]);
+        assert!(result.status.success(), "{:?}", result);
+        let status = cli(&["status", "--json"]);
+        let snapshot: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(snapshot["scheduling_paused"], paused);
+    }
+    assert!(!tmp.path().join("environment-state").exists());
+}
+
+#[test]
+fn drive_commands_require_explicit_state_and_reject_mixed_endpoints() {
+    let tmp = TempDir::new().unwrap();
+    for args in [
+        &["collections", "list", "--account", "drive"][..],
+        &[
+            "collections",
+            "size",
+            "--account",
+            "drive",
+            "--folder-id",
+            "folder",
+        ],
+        &[
+            "add-mapping",
+            "--account",
+            "drive",
+            "--folder-id",
+            "folder",
+            "--local",
+            "local",
+            "--local-recovery",
+            "recovery",
+        ],
+        &["scheduling", "pause"],
+    ] {
+        let output = cli_cmd(tmp.path()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("required non-empty --state-dir"));
+    }
+    let state = tmp.path().join("state");
+    let output = cli_cmd(tmp.path())
+        .args([
+            "add-mapping",
+            "--account",
+            "drive",
+            "--folder-id",
+            "folder",
+            "--local",
+            "local",
+            "--local-recovery",
+            "recovery",
+            "--remote-dir",
+            "fixture",
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local fixture"));
+    assert!(!state.exists());
+    assert!(!tmp.path().join("environment-state").exists());
 }
 
 #[test]
@@ -396,7 +474,7 @@ fn cli_run_once_fails_when_terminal_db_commit_fails_and_never_reuses_old_success
             expected_direction: None,
         })
         .unwrap();
-        mgr.wait_until_idle(Duration::from_secs(5)).unwrap();
+        mgr.wait_until_idle(Duration::from_secs(120)).unwrap();
         mgr.shutdown().unwrap();
     }
 

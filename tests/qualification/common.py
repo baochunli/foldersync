@@ -9,6 +9,7 @@ import os
 import platform
 import random
 import re
+import signal
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -186,16 +187,19 @@ def resolve_verified_pinned_rclone(manifest_path: Path = MANIFEST_PATH) -> tuple
     return resolved, version, actual_sha
 
 
-def get_tool_versions(sync_cli: Path, rclone_bin: Path, rclone_version: str, rclone_sha256: str) -> dict[str, str]:
-    def capture(cmd: list[str]) -> str:
+def get_tool_versions(
+    sync_cli: Path, rclone_bin: Path, rclone_version: str, rclone_sha256: str,
+    *, cli_env: dict[str, str],
+) -> dict[str, str]:
+    def capture(cmd: list[str], env: dict[str, str] | None = None) -> str:
         try:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=15)
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=15, env=env)
             return out.strip().splitlines()[0] if out.strip() else "unknown"
         except Exception as exc:  # noqa: BLE001
             return f"unavailable ({exc})"
 
     return {
-        "sync_cli": capture([str(sync_cli), "--version"]),
+        "sync_cli": capture([str(sync_cli), "--version"], cli_env),
         "rclone_version": rclone_version,
         "rclone_sha256": rclone_sha256,
         "rclone_path": str(rclone_bin),
@@ -204,6 +208,15 @@ def get_tool_versions(sync_cli: Path, rclone_bin: Path, rclone_version: str, rcl
         "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
         "python": platform.python_version(),
     }
+
+
+def stop_owned_process(proc: subprocess.Popen) -> None:
+    """Stop only the process group created for this invocation, then reap the child."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
 
 
 def is_forbidden_real_state_dir(path: Path) -> bool:
