@@ -242,7 +242,46 @@ By default, `account import` refuses to read `<rclone-exe-dir>/rclone.conf`,
 `$XDG_CONFIG_HOME/rclone/rclone.conf`, `~/.config/rclone/rclone.conf`, or
 `~/.rclone.conf` unless `--allow-global-config` is passed explicitly.
 
+### Select and sync a Drive collection
+
+Use a ready account and an existing local directory. For manual qualification,
+pause automatic scheduling before adding a mapping and leave it paused until
+you finish the scripted runs.
+
+```sh
+"$SYNC_CLI" --state-dir "$QUAL_STATE" scheduling pause
+"$SYNC_CLI" --state-dir "$QUAL_STATE" collections list --account household-a
+
+# Enter the exact folder ID printed for the disposable collection.
+IFS= read -r FOLDER_ID
+"$SYNC_CLI" --state-dir "$QUAL_STATE" collections size \
+  --account household-a --folder-id "$FOLDER_ID"
+
+QUAL_FOLDERS="$(mktemp -d)"
+mkdir "$QUAL_FOLDERS/local" "$QUAL_FOLDERS/recovery"
+"$SYNC_CLI" --state-dir "$QUAL_STATE" add-mapping --id research \
+  --account household-a --folder-id "$FOLDER_ID" \
+  --local "$QUAL_FOLDERS/local" --local-recovery "$QUAL_FOLDERS/recovery"
+"$SYNC_CLI" --state-dir "$QUAL_STATE" init research
+"$SYNC_CLI" --state-dir "$QUAL_STATE" run-once research
+"$SYNC_CLI" --state-dir "$QUAL_STATE" status --json
+```
+
+The manager rechecks the collection ID before saving the mapping and applies
+its first-sync checks during `init`. Use an empty local folder to initialize
+from an existing populated Drive collection. `collections list` and
+`collections size` accept `--json`. If you omit `--id` when adding a Drive
+mapping, use the assigned ID printed by the CLI.
+
+`pause research` blocks manual and scheduled runs for that mapping.
+`resume research` clears that hold. `scheduling pause` still permits manual
+runs on ready, resumed mappings. `scheduling resume` restores automatic
+scheduling for the state directory.
+
 ## Step 4: Owner qualification checks (real Google Drive)
+
+Use the [Drive qualification runner](qualification.md#1-real-google-drive-qualification)
+for scripted multi-client evidence.
 
 Before enabling household use, verify on the disposable shared parent with both
 Account A and Account B:

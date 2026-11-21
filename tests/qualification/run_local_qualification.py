@@ -30,6 +30,7 @@ from common import (
     redact_credential_stderr,
     resolve_verified_pinned_rclone,
     sha256_file,
+    stop_owned_process,
     utc_now,
     write_evidence_files,
 )
@@ -144,11 +145,12 @@ class ClientHarness:
         self.local_dir.mkdir(parents=True, exist_ok=True)
         self.recovery_dir.mkdir(parents=True, exist_ok=True)
         self.finder_dir.mkdir(parents=True, exist_ok=True)
+        self.run_cli(["scheduling", "pause", "--state-dir", str(self.state_dir), "--finder-dir", str(self.finder_dir)])
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["HOME"] = str(self.fake_home)
-        env.pop("FOLDERSYNC_STATE_DIR", None)
+        env["FOLDERSYNC_STATE_DIR"] = str(self.state_dir)
         env["FOLDERSYNC_RCLONE"] = str(self.rclone_bin)
         return env
 
@@ -273,8 +275,11 @@ class ClientHarness:
             str(self.finder_dir),
             "--json",
         ]
-        proc = subprocess.run(cmd, env=self._env(), capture_output=True, text=True, check=True)
-        return json.loads(proc.stdout)
+        proc = subprocess.run(cmd, env=self._env(), capture_output=True, text=True, check=True, timeout=180)
+        snapshot = json.loads(proc.stdout)
+        if not snapshot["scheduling_paused"] or any(m["next_poll_at"] for m in snapshot["mappings"]):
+            raise RuntimeError(f"Automatic scheduling is enabled for {self.name}.")
+        return snapshot
 
     def sqlite_runs(self) -> list[dict[str, Any]]:
         db_path = self.state_dir / "state.sqlite"
@@ -824,61 +829,65 @@ def run_interruption_scenarios(
             text=True,
         )
 
-        # Require BOTH: (1) a live `rclone bisync` child PID AND (2) observed partial transfer
-        # progress on the destination (1 <= files_transferred < batch_count) BEFORE sending SIGINT,
-        # THEN immediately re-sample AFTER os.kill() and AFTER process exit to prove the signal
-        # landed mid-transfer (not during finalization after all files had arrived).
-        signaled_pid: int | None = None
-        signal_confirmed = False
-        transferred_before_sigint = 0
-        transferred_after_sigint = batch_count
-        pb_remote_batch = pb_remote / "batch"
+        try:
+            # Require BOTH: (1) a live `rclone bisync` child PID AND (2) observed partial transfer
+            # progress on the destination (1 <= files_transferred < batch_count) BEFORE sending SIGINT,
+            # THEN immediately re-sample AFTER os.kill() and AFTER process exit to prove the signal
+            # landed mid-transfer (not during finalization after all files had arrived).
+            signaled_pid: int | None = None
+            signal_confirmed = False
+            transferred_before_sigint = 0
+            transferred_after_sigint = batch_count
+            pb_remote_batch = pb_remote / "batch"
 
-        def count_remote_batch() -> int:
-            if not pb_remote_batch.is_dir():
-                return 0
-            try:
-                return sum(1 for _ in pb_remote_batch.iterdir())
-            except OSError:
-                return 0
-
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline and proc_b.poll() is None:
-            cur_transferred = count_remote_batch()
-            if 1 <= cur_transferred < batch_count:
+            def count_remote_batch() -> int:
+                if not pb_remote_batch.is_dir():
+                    return 0
                 try:
-                    pg = subprocess.run(
-                        ["pgrep", "-P", str(proc_b.pid)],
-                        capture_output=True,
-                        text=True,
-                        timeout=2,
-                    )
-                    pids = [int(x) for x in pg.stdout.split() if x.isdigit()]
-                except Exception:  # noqa: BLE001
-                    pids = []
-                for pid in pids:
-                    ps_out = subprocess.run(
-                        ["ps", "-p", str(pid), "-o", "args="],
-                        capture_output=True,
-                        text=True,
-                        timeout=2,
-                    ).stdout
-                    if "bisync" in ps_out:
-                        try:
-                            os.kill(pid, signal.SIGINT)
-                            # Re-sample destination count immediately after sending SIGINT.
-                            transferred_after_sigint = count_remote_batch()
-                            signaled_pid = pid
-                            signal_confirmed = True
-                            transferred_before_sigint = cur_transferred
-                        except ProcessLookupError:
-                            signal_confirmed = False
-                        break
-                if signal_confirmed:
-                    break
-            time.sleep(0.005)
+                    return sum(1 for _ in pb_remote_batch.iterdir())
+                except OSError:
+                    return 0
 
-        out_b, err_b = proc_b.communicate(timeout=90)
+            deadline = time.monotonic() + 180.0
+            while time.monotonic() < deadline and proc_b.poll() is None:
+                cur_transferred = count_remote_batch()
+                if 1 <= cur_transferred < batch_count:
+                    try:
+                        pg = subprocess.run(
+                            ["pgrep", "-P", str(proc_b.pid)],
+                            capture_output=True,
+                            text=True,
+                            timeout=2,
+                        )
+                        pids = [int(x) for x in pg.stdout.split() if x.isdigit()]
+                    except Exception:  # noqa: BLE001
+                        pids = []
+                    for pid in pids:
+                        ps_out = subprocess.run(
+                            ["ps", "-p", str(pid), "-o", "args="],
+                            capture_output=True,
+                            text=True,
+                            timeout=2,
+                        ).stdout
+                        if "bisync" in ps_out:
+                            try:
+                                os.kill(pid, signal.SIGINT)
+                                # Re-sample destination count immediately after sending SIGINT.
+                                transferred_after_sigint = count_remote_batch()
+                                signaled_pid = pid
+                                signal_confirmed = True
+                                transferred_before_sigint = cur_transferred
+                            except ProcessLookupError:
+                                signal_confirmed = False
+                            break
+                    if signal_confirmed:
+                        break
+                time.sleep(0.005)
+
+            out_b, err_b = proc_b.communicate(timeout=180)
+        except BaseException:
+            stop_owned_process(proc_b)
+            raise
         transferred_after_exit = count_remote_batch()
         cmds.append(
             {
@@ -929,6 +938,7 @@ def run_interruption_scenarios(
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "HOME": str(fake_home),
                 "TMPDIR": str(fake_home),
+                "FOLDERSYNC_STATE_DIR": str(pb_client.state_dir),
                 "LANG": "en_US.UTF-8",
             }
             for cycle_idx in (1, 2):
@@ -1211,7 +1221,6 @@ def main() -> int:
     started_at = utc_now()
     rclone_bin, rclone_ver, rclone_sha = resolve_verified_pinned_rclone()
     sync_cli = build_or_find_sync_cli(args.sync_cli)
-    versions = get_tool_versions(sync_cli, rclone_bin, rclone_ver, rclone_sha)
 
     out_dir = Path(args.out_dir).resolve()
     json_path = out_dir / "local-evidence.json"
@@ -1221,6 +1230,10 @@ def main() -> int:
         work_dir = Path(tmp)
         fake_home = work_dir / "home"
         fake_home.mkdir(parents=True, exist_ok=True)
+        versions = get_tool_versions(
+            sync_cli, rclone_bin, rclone_ver, rclone_sha,
+            cli_env={**os.environ, "HOME": str(fake_home), "FOLDERSYNC_STATE_DIR": str(work_dir / "version-state")},
+        )
 
         scenarios: list[ScenarioEvidence] = []
         scenarios.extend(run_three_client_scenarios(work_dir, sync_cli, rclone_bin, fake_home, args.seed))
