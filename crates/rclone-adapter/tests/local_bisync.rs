@@ -10,18 +10,15 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 
 use rclone_adapter::{
-    BackupDir2, BisyncRequest, EngineIdentity, InitPreference, LaunchError, Outcome, Path2,
-    QualificationError, RealProcessRunner, RunMode, SpawnOptions, classify_run_outcome,
-    pinned_binary_path, qualify_binary, sha256_file,
+    BackupDir2, BisyncMarker, BisyncRequest, EngineIdentity, InitPreference, LaunchError, LogEvent,
+    Outcome, Path2, QualificationError, RealProcessRunner, RunMode, SpawnOptions,
+    classify_run_outcome, pinned_binary_path, qualify_binary, sha256_file,
 };
 use sha2::{Digest, Sha256};
 
@@ -536,82 +533,110 @@ fn sigint_interrupts_larger_run_and_records_subsequent_recovery_behavior() {
         return;
     };
 
-    let mut ws = TempWorkspace::new("sigint-recovery");
-    // Initialize empty pair first so the large run is an ordinary `--resilient --recover` run.
-    let (init_req, _, _) =
-        ws.build_request(&engine, RunMode::Initialize(InitPreference::Path1), 10);
-    let (outcome, _) = run_bisync(&init_req);
-    assert_eq!(outcome, Outcome::Success);
+    const TIMEOUT: Duration = Duration::from_secs(120);
+    let mut file_count = 800;
+    let (mut ws, truth) = loop {
+        let mut ws = TempWorkspace::new("sigint-recovery");
+        // Initialize an empty pair so this is an ordinary `--resilient --recover` run.
+        let (init_req, _, _) =
+            ws.build_request(&engine, RunMode::Initialize(InitPreference::Path1), 10);
+        let (outcome, _) = run_bisync(&init_req);
+        assert_eq!(outcome, Outcome::Success);
 
-    // Populate a larger batch (400 x 32 KiB = ~12.8 MiB) of uniquely identifiable files so SIGINT
-    // reliably lands mid-run when triggered on the first queuing/transfer log event without slowing CI.
-    let mut truth = BTreeMap::new();
-    let mut template = vec![0u8; 32 * 1024];
-    for (idx, byte) in template.iter_mut().enumerate() {
-        *byte = (idx % 251) as u8;
-    }
-    for i in 0..400u32 {
-        let rel = format!("batch_{:02}/blob_{:03}.bin", i / 50, i);
-        let mut bytes = template.clone();
-        let header = format!("FS-UNIQUE-BLOB-{i:04}-");
-        bytes[..header.len()].copy_from_slice(header.as_bytes());
-        truth.insert(rel.clone(), sha256_bytes(&bytes));
-        write_file(&ws.path1, &rel, &bytes);
-    }
-
-    let (large_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
-    let runner = RealProcessRunner;
-    let (tx, rx) = mpsc::sync_channel(1024);
-    let handle = large_req
-        .spawn(
-            &runner,
-            SpawnOptions {
-                limits: Default::default(),
-                line_observer: Some(tx),
-            },
-        )
-        .expect("spawn large run");
-    let stopper = handle.stop_handle();
-    let started_at = SystemTime::now();
-    let waiter = thread::spawn(move || handle.wait().expect("wait large run"));
-
-    // Send SIGINT once as soon as rclone begins queuing or transferring files.
-    let mut sent_stop = false;
-    while let Ok(line) = rx.recv_timeout(Duration::from_secs(15)) {
-        if line.text.contains("Queue copy to")
-            || line.text.contains("Applying changes")
-            || line.text.contains("Copied")
-        {
-            stopper.request_stop().expect("SIGINT should succeed");
-            sent_stop = true;
-            break;
+        let mut truth = BTreeMap::new();
+        let mut bytes = vec![0u8; 32 * 1024];
+        for (idx, byte) in bytes.iter_mut().enumerate() {
+            *byte = (idx % 251) as u8;
         }
-    }
-    assert!(
-        sent_stop,
-        "expected rclone to emit queuing/transfer log lines before finishing"
-    );
+        for i in 0..file_count {
+            let rel = format!("blob_{i:04}.bin");
+            let header = format!("FS-UNIQUE-BLOB-{i:04}-");
+            bytes[..header.len()].copy_from_slice(header.as_bytes());
+            truth.insert(rel.clone(), sha256_bytes(&bytes));
+            write_file(&ws.path1, &rel, &bytes);
+        }
 
-    let run_out = waiter.join().unwrap();
-    let outcome = classify_run_outcome(&run_out);
-    let elapsed = started_at.elapsed().unwrap_or_default();
+        let (large_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
+        let handle = large_req
+            .spawn(&RealProcessRunner, SpawnOptions::default())
+            .expect("spawn large run");
+        let stopper = handle.stop_handle();
+        let waiter = thread::spawn(move || handle.wait().expect("wait large run"));
 
-    eprintln!(
-        "SIGINT observation: elapsed={elapsed:?}, exit={:?}, outcome={outcome:?}",
-        run_out.exit_status
-    );
-    assert!(
-        matches!(
-            outcome,
-            Outcome::Interrupted {
-                needs_recovery: true,
-                ..
+        // Count completed destination files, excluding rclone's temporary files and the marker.
+        let started = Instant::now();
+        let mut stop = None;
+        while !waiter.is_finished() {
+            if started.elapsed() >= TIMEOUT {
+                stopper.force_stop(Duration::from_secs(2)).unwrap();
+                let run_out = waiter.join().unwrap();
+                panic!(
+                    "timed out waiting for partial destination progress: {:?}",
+                    run_out.exit_status
+                );
             }
-        ),
-        "expected Outcome::Interrupted {{ needs_recovery: true, .. }}, got {outcome:?}"
-    );
+            let copied = fs::read_dir(&ws.path2)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "bin")
+                })
+                .count();
+            if (1..file_count).contains(&copied) {
+                eprintln!(
+                    "SIGINT at {copied}/{file_count} copied files after {:?}",
+                    started.elapsed()
+                );
+                stop = Some(stopper.request_stop());
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
 
-    // Next run with normal `--resilient --recover` should recover and finish propagating all 400 files.
+        let run_out = waiter.join().unwrap();
+        let outcome = classify_run_outcome(&run_out);
+        let sent_stop = stop
+            .map(|result| result.expect("SIGINT should succeed"))
+            .is_some();
+        eprintln!(
+            "SIGINT observation: exit={:?}, outcome={outcome:?}",
+            run_out.exit_status
+        );
+        if outcome == Outcome::Success && file_count == 800 {
+            eprintln!("The {file_count}-file run completed before it could be interrupted");
+            file_count = 3200;
+            continue;
+        }
+        assert!(
+            sent_stop,
+            "expected partial progress and SIGINT, got {outcome:?}"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Interrupted {
+                    needs_recovery: true,
+                    ..
+                }
+            ),
+            "expected Outcome::Interrupted {{ needs_recovery: true, .. }}, got {outcome:?}"
+        );
+        assert!(
+            run_out.exit_status.signal == Some(libc::SIGINT)
+                || run_out.exit_status.code == Some(128 + libc::SIGINT)
+                || run_out.output.diagnostic_events.iter().any(|event| {
+                    matches!(event, LogEvent::Structured(ev) if matches!(ev.marker, Some(BisyncMarker::SignalReceived { .. })))
+                }),
+            "rclone did not report receiving SIGINT"
+        );
+        break (ws, truth);
+    };
+
+    // Next run with normal `--resilient --recover` should recover and finish propagating the batch.
     let (next_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
     let (next_outcome, next_out) = run_bisync(&next_req);
     eprintln!(

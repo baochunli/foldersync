@@ -3,12 +3,14 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rclone_adapter::{InitPreference, pinned_binary_path};
 use sha2::{Digest, Sha256};
-use sync_core::{ACCESS_MARKER_FILENAME, AccessMarker, Execution, MappingId, Readiness};
+use sync_core::{
+    ACCESS_MARKER_FILENAME, AccessMarker, Execution, MappingId, Readiness, RunOutcome,
+};
 use sync_manager::{
     AddMappingCommand, CommandOutcome, InitializeCommand, ManagerConfig, ManagerError, SyncManager,
 };
@@ -392,74 +394,119 @@ fn interrupted_run_transitions_to_recovery_required_surviving_restart() {
         return;
     }
 
-    let fx = RealFixture::new();
-
-    {
+    const TIMEOUT: Duration = Duration::from_secs(120);
+    let mapping_id = MappingId::new("research");
+    for file_count in [800, 3200] {
+        let fx = RealFixture::new();
         let mgr = fx.open_manager();
         mgr.register_local_fixture_account("local-1", "Local Fixture")
             .unwrap();
         mgr.add_mapping(fx.add_mapping_cmd()).unwrap();
         // Initialize empty pair first.
         mgr.initialize(InitializeCommand {
-            mapping_id: MappingId::new("research"),
+            mapping_id: mapping_id.clone(),
             expected_direction: None,
         })
         .unwrap();
-        mgr.wait_until_idle(Duration::from_secs(30)).unwrap();
+        let initialized = mgr.wait_until_idle(TIMEOUT).unwrap();
+        assert_eq!(initialized.mappings[0].readiness, Readiness::Ready);
 
-        // Write a batch large enough to catch mid-transfer with StopRun (SIGINT).
-        let template = vec![0xABu8; 32 * 1024];
-        for i in 0..400u32 {
-            let mut bytes = template.clone();
+        let mut bytes = vec![0xABu8; 32 * 1024];
+        for i in 0..file_count {
             let hdr = format!("INT-BLOB-{i:04}-");
             bytes[..hdr.len()].copy_from_slice(hdr.as_bytes());
-            write_rel(
-                &fx.local_dir,
-                &format!("batch_{:02}/blob_{:03}.bin", i / 50, i),
-                &bytes,
-            );
+            write_rel(&fx.local_dir, &format!("blob_{i:04}.bin"), &bytes);
         }
 
-        let events = mgr.subscribe_events(1024);
+        let snapshots = mgr.subscribe_snapshots(1);
         mgr.run_now("research").unwrap();
 
-        let mut sent_stop = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            match events.recv_timeout(Duration::from_millis(200)) {
-                Ok(sync_manager::ManagerEvent::RunOutputLine { line, .. }) => {
-                    if line.contains("Queue copy to")
-                        || line.contains("Applying changes")
-                        || line.contains("Copied")
-                    {
-                        let _ = mgr.stop_run("research");
-                        sent_stop = true;
-                        break;
-                    }
-                }
-                Ok(sync_manager::ManagerEvent::RunFinished { .. }) => break,
-                _ => {}
+        // Only the running child can create final .bin files on the destination.
+        // The snapshot subscription reports completion even if the batch finishes between polls.
+        let started = Instant::now();
+        let stop = loop {
+            assert!(
+                started.elapsed() < TIMEOUT,
+                "timed out waiting for partial destination progress in a {file_count}-file run"
+            );
+            if snapshots.latest().is_some_and(|snap| {
+                snap.mappings[0].last_run_id != initialized.mappings[0].last_run_id
+            }) {
+                break None;
             }
+            let copied = fs::read_dir(&fx.remote_dir)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "bin")
+                })
+                .count();
+            if (1..file_count).contains(&copied) {
+                eprintln!(
+                    "StopRun at {copied}/{file_count} copied files after {:?}",
+                    started.elapsed()
+                );
+                break Some(mgr.stop_run("research"));
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        let snap = mgr.wait_until_idle(TIMEOUT).unwrap();
+        let mapping = &snap.mappings[0];
+        assert_ne!(mapping.last_run_id, initialized.mappings[0].last_run_id);
+        let stopped = match stop {
+            Some(Ok(ack)) => {
+                assert_eq!(
+                    ack.outcome,
+                    CommandOutcome::StopRequested {
+                        mapping_id: mapping_id.clone()
+                    }
+                );
+                true
+            }
+            Some(Err(ManagerError::InvalidState { .. }))
+                if mapping.last_run_outcome == Some(RunOutcome::Success) =>
+            {
+                false
+            }
+            Some(Err(err)) => panic!("StopRun failed: {err}"),
+            None => false,
+        };
+
+        // A clean exit can win the race even when StopRun was acknowledged.
+        if mapping.last_run_outcome == Some(RunOutcome::Success) {
+            assert_eq!(mapping.readiness, Readiness::Ready);
+            assert_eq!(mapping.execution, Execution::Idle);
+            eprintln!("The {file_count}-file run completed before it could be interrupted");
+            mgr.shutdown().unwrap();
+            continue;
         }
-        assert!(
-            sent_stop,
-            "expected to observe transfer lines and send StopRun"
-        );
-
-        let snap = mgr.wait_until_idle(Duration::from_secs(30)).unwrap();
-        assert_eq!(snap.mappings[0].readiness, Readiness::RecoveryRequired);
-        assert_eq!(snap.mappings[0].execution, Execution::Interrupted);
+        assert_eq!(mapping.last_run_outcome, Some(RunOutcome::Interrupted));
+        assert!(stopped, "expected partial progress and a StopRun request");
+        assert_eq!(mapping.readiness, Readiness::RecoveryRequired);
+        assert_eq!(mapping.execution, Execution::Interrupted);
         mgr.shutdown().unwrap();
-    }
 
-    // Reopen and confirm RecoveryRequired + Interrupted survive restart.
-    {
+        // Reopen and confirm the interrupted run and its recovery hold survive restart.
         let mgr = fx.open_manager();
         let snap = mgr.snapshot();
         assert_eq!(snap.mappings[0].readiness, Readiness::RecoveryRequired);
         assert_eq!(snap.mappings[0].execution, Execution::Interrupted);
+        assert_eq!(snap.mappings[0].last_run_id, mapping.last_run_id);
+        assert_eq!(
+            snap.mappings[0].last_run_outcome,
+            Some(RunOutcome::Interrupted)
+        );
         let report = mgr.inspect_recovery("research").unwrap();
-        assert!(!report.open_cases.is_empty());
+        assert_eq!(report.open_cases.len(), 1);
+        assert_eq!(report.open_cases[0].case.reason_kind, "interrupted");
+        assert_eq!(report.open_cases[0].case.run_id, mapping.last_run_id);
         mgr.shutdown().unwrap();
+        return;
     }
+    panic!("both batches completed before StopRun could interrupt a transfer");
 }
