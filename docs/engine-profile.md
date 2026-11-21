@@ -12,16 +12,49 @@ recording both archive and executable SHA-256 digests for macOS arm64
 Run `scripts/fetch-rclone.sh` to verify and install the pinned executable in
 `.tools/rclone/1.76.0/rclone`. `rclone-adapter` resolves that file to an
 absolute path (`FOLDERSYNC_RCLONE` may override it during development) and
-qualifies it before launching any sync:
+qualifies it against the **host platform's** manifest entry before launching any
+sync:
 
 1. Compute the executable's SHA-256 and compare it against the host platform
    entry in `packaging/qualification-manifest.toml` **before** spawning it
    (detects binary replacement).
-2. Run `<binary> version` with stdin closed (`Stdio::null`) and verify the
-   parsed version matches `1.76.0`.
-3. Record `EngineIdentity { version, sha256, path }` with the run.
+2. Run `<binary> version --config <throwaway-temp-config> --ask-password=false`
+   with stdin closed (`Stdio::null`) and an isolated environment (`env_clear` +
+   minimal allowlist with `HOME` pointed at the throwaway temp directory) so
+   startup never probes or creates `~/.config/rclone`, and verify the parsed
+   version matches `1.76.0`.
+3. Return an immutable `EngineIdentity` (private fields with read-only getters)
+   bound to the host platform and verified digest.
+4. Re-hash the executable on disk at the launch boundary of every sync run
+   (`BisyncRequest::spawn` / `verify_binary_integrity`) and refuse to spawn if
+   the bytes changed after qualification.
 
 `rclone selfupdate` and `rclone` on `PATH` are never used.
+
+## Process and credential isolation
+
+- **Cleared environment (`env_clear`):** Every `RealProcessRunner` spawn clears
+  the inherited environment and forwards only a minimal allowlist (`PATH`,
+  `TMPDIR`, `LANG`, `LC_ALL`, `TZ`), plus `HOME` directed to a run-owned or
+  throwaway directory (`workdir` for bisync runs, temp dir for version probes).
+  Ambient `RCLONE_*` variables (including `RCLONE_FORCE` and `RCLONE_RESYNC`)
+  and `XDG_*` variables cannot reach rclone.
+- **Credential-helper contract (`PasswordCommand`):** `--password-command`
+  accepts only an absolute path to a dedicated helper executable (shell
+  interpreters such as `sh`, `bash`, `zsh`, `cmd`, and `powershell` are
+  rejected) plus non-secret lookup arguments (e.g. `--account <id>`), encoded as
+  an RFC4180 CSV `SpaceSepList`. The helper prints the configuration passphrase
+  solely to stdout on success and must not emit secret material to stderr;
+  `rclone-adapter` additionally redacts `--password-command stderr:` payloads
+  before capture storage or live observer delivery.
+- **Bounded capture and observer delivery:** Stdout/stderr lines are bounded by
+  line length, line count, and total bytes. Live observer delivery uses a
+  bounded, nonblocking `SyncSender::try_send` with drop accounting. Recognized
+  diagnostic events (conflicts, critical errors, deletion-guard aborts, access
+  check failures, auth/config errors, interrupts, and raw lines) are retained in
+  a separate bounded store so high-volume `INFO` output cannot evict early
+  conflicts; if diagnostic events are dropped or lines are truncated, outcome
+  classification returns `Outcome::IncompleteDiagnosis`.
 
 ## Implemented argument profile (`BisyncRequest`)
 
@@ -68,85 +101,117 @@ Initialization uses the same validated base profile, except:
   `--resync-mode path2` (remote has data, local is empty) is emitted instead.
 - Ordinary runs never carry `--resync` or `--resync-mode`.
 
+### Comparison policy and known `--compare size,modtime` limitation (§10)
+
+The initial profile uses `--compare size,modtime` and retains normal
+post-transfer verification without silently enabling full-library checksum
+hashing or `--download-hash`. **Known limitation:** an in-place edit that
+preserves **both** exact byte length and modification timestamp is not selected
+for transfer by `--compare size,modtime`, and post-transfer verification cannot
+detect a file never selected. This limitation is demonstrated explicitly by
+`demonstrates_same_size_same_mtime_edit_is_missed_by_size_modtime_compare` in
+`crates/rclone-adapter/tests/local_bisync.rs`. Workflows that require detecting
+same-size, same-mtime mutations must wait for a qualified checksum comparison
+policy or explicit content-audit command.
+
 ### Validation boundaries
 
 `BisyncRequestBuilder::build()` rejects:
 
-- Unqualified engine version or SHA-256 not present in the qualification
-  manifest.
+- Unqualified engine version, non-host platform, or SHA-256 not matching the
+  host platform pin.
 - Relative or empty local paths (`path1`, `config_path`, `workdir`,
   `filters_file`, `backup_dir1`, and local `path2`/`backup_dir2`).
 - Identical or nested paths across `path1`, `path2`, `backup_dir1`,
-  `backup_dir2`, and `workdir` (lexical normalization plus `canonicalize` when
-  paths exist on disk; component-wise prefix checks for remote paths).
-- Mismatched `backup_dir2` kind or remote alias.
+  `backup_dir2`, and `workdir`, resolving the longest existing ancestor via
+  `canonicalize` before appending absent tail components (catching symlink
+  aliases to live trees and rejecting dangling/unresolvable ancestors).
+- Mismatched `backup_dir2` kind or remote alias, or overlapping remote paths.
 - `max_delete_percent` outside `1..=100`.
 - Invalid remote names/paths or invalid `check_filename` values.
-- Relative, non-UTF-8, or control-character-bearing `PasswordCommand` tokens.
+- Relative, shell-interpreter, non-UTF-8, or control-character-bearing
+  `PasswordCommand` arguments.
 
 ## Exit-code and diagnostic classification (`1.76.0`)
 
-`rclone-adapter` keeps the rclone `1.76.0` exit-code table in a single module
-(`crates/rclone-adapter/src/outcome.rs`) and always combines exit status with
-parsed `--use-json-log` diagnostics (never trusting exit code alone):
+`rclone-adapter` keeps the pinned rclone `v1.76.0` exit-code table in a single
+module (`crates/rclone-adapter/src/outcome.rs`), matching
+[rclone `v1.76.0` `lib/exitcode/exitcode.go`](https://github.com/rclone/rclone/blob/v1.76.0/lib/exitcode/exitcode.go#L13-L18),
+and always combines exit status with pinned-prefix `--use-json-log` diagnostics:
 
-- `0` / `9` → `Success`, or `SuccessWithConflicts { paths }` when conflict
-  rename/detection markers were logged.
+- `0` (`Success`) / `9` (`NoFilesTransferred`) → `Success`, or
+  `SuccessWithConflicts { paths }` when conflict rename/detection markers were
+  logged.
 - Signal termination, exit `130`/`137`/`143`, or a non-zero exit after
   `request_stop()` / interrupt log markers → `Interrupted { graceful, needs_recovery, reason }`.
-- Specific log diagnostics override coarse exit codes (`1` and `7`):
-  `DeletionGuardAborted`, `AccessCheckFailed`, `AuthFailure`, `InvalidConfig`,
-  `EndpointMismatch`, `Critical { requires_resync, reason }`, `Retryable`, and
-  `Unknown`.
+- Holds that never auto-retry take precedence over resilient-retry notices and
+  coarse exit codes: `DeletionGuardAborted`, `AccessCheckFailed`, `AuthFailure`,
+  `InvalidConfig` (and exit `2`), `EndpointMismatch` (and exit `3`), and
+  `Critical { requires_resync: true }` (unusable baseline / missing listings /
+  changed filters hash / explicit `Must run --resync`).
+- When none of those hold conditions are present, rclone's explicit
+  `--resilient` retryable notice (e.g. transient listing failure exiting `7`)
+  classifies as `Outcome::Retryable`.
+- Exit `5` (`RetryError`) or `stats.retryError` (without holds) → `Retryable`.
+- Exit `6` is `NoRetryError` in rclone `v1.76.0` and is **not** classified as
+  `Retryable`.
+- When diagnostic events are dropped or lines are truncated,
+  `classify_run_outcome` returns `Outcome::IncompleteDiagnosis` wrapping the
+  preliminary outcome.
 
 ## Observed local qualification results (rclone `1.76.0`)
 
 Verified locally on macOS arm64 (`osx-arm64`) using local-to-local fixtures in
-disposable temp directories with throwaway empty `--config` files, uniquely
-identifiable file contents, an external truth set, SHA-256 verification, and a
-second clean sync cycle (`crates/rclone-adapter/tests/local_bisync.rs`):
+disposable temp directories with throwaway empty `--config` files, cleared
+environments, uniquely identifiable file contents, external truth sets, SHA-256
+verification, and a second clean sync cycle
+(`crates/rclone-adapter/tests/local_bisync.rs`):
 
 | Scenario | Result | Observed details |
 | --- | --- | --- |
-| Binary SHA-256 + `version` qualification | Passed | Exact manifest digest and `rclone v1.76.0` match; replaced binary rejected before execution. |
+| Binary SHA-256 + isolated `version` qualification + launch re-hash | Passed | Exact host manifest digest and `rclone v1.76.0` match using throwaway `--config` and isolated env; binary replacement detected both before qualification and between qualification and sync launch. |
+| Parent `RCLONE_FORCE=true` & `RCLONE_RESYNC=true` isolation | Passed | `env_clear` + allowlist prevented parent `RCLONE_RESYNC=true` from initializing an uninitialized workdir (`Critical { requires_resync: true }`) and prevented `RCLONE_FORCE=true` from bypassing `--max-delete 10` (`DeletionGuardAborted`, zero deletes). |
 | Initialization (`--resync-mode path1` and `--resync-mode path2`) | Passed | Propagated initial tree in the chosen direction and remained clean on the second normal cycle. |
 | Bidirectional add / edit / delete + `--backup-dir1/2` | Passed | Changes propagated both ways; overwritten and deleted files were captured in `--backup-dir1` and `--backup-dir2` with exact pre-change SHA-256 hashes; second cycle preserved truth set without resurrection. |
-| Same-file edit conflict (`--conflict-resolve none --conflict-loser num`) | Passed | Exited `0`, emitted conflict rename markers for `.conflict1` and `.conflict2`, classified as `SuccessWithConflicts`, and preserved both contents by SHA-256 on both sides across two cycles. |
+| Same-file edit conflict (`--conflict-resolve none --conflict-loser num`) | Passed | Exercised `notes/draft - final.txt` (containing ` - `) alongside benign `notes/must run --resync.txt`; exited `0`, classified as `SuccessWithConflicts` with exact `.conflict1`/`.conflict2` paths, preserved both contents by SHA-256 across two cycles, and did not misclassify the benign filename. |
 | Deletion guard (`--max-delete 10` as 10%) | Passed | Deleting 4 of 10 files aborted with `DeletionGuardAborted`; zero files were deleted on Path2; restoring files allowed a clean subsequent cycle. |
 | Access check (`--check-access --check-filename RCLONE_TEST`) | Passed | Removing Path2's `RCLONE_TEST` aborted with `AccessCheckFailed` and left all synced files untouched. |
 | Graceful `SIGINT` during larger batch (400 × 32 KiB) + next run | Passed | First `SIGINT` triggered graceful shutdown (`exit 130`, `Signal received: interrupt`, `Graceful shutdown completed successfully`), leaving `.lst-new` files in `workdir`; classified as `Interrupted { graceful: true, needs_recovery: true }`. The subsequent normal `--resilient --recover` run completed with `exit 0` (`Outcome::Success`), converged all 400 files to exact truth-set hashes, and stayed clean on the following cycle. |
+| Same-size, same-mtime in-place edit (`--compare size,modtime`) | Known limitation verified | Overwriting a 9-byte file with different 9-byte contents while restoring its exact mtime exited `0` (`Outcome::Success`) without propagating the edit to Path2, confirming §10's documented limitation. |
 
 ### Surprises and engine quirks observed in `1.76.0`
 
 1. **ANSI escape codes inside `--use-json-log` messages**: rclone `1.76.0`
    embeds ANSI SGR escape sequences (such as `\u001b[31m`, `\u001b[36m`) inside
    JSON `msg` fields. `log_parser::strip_ansi_codes` strips CSI sequences
-   before marker matching while preserving the raw `msg` for diagnostics.
+   before prefix matching while preserving the raw `msg` for diagnostics.
 2. **`--max-delete` aborts with exit code `1` and `stats.retryError: true`**:
-   In `1.76.0`, exceeding `--max-delete` exits `1` (generic error) and sets
-   `"retryError": true` in the final stats JSON. Matching the `"too many
-   deletes"` / `"Safety abort"` diagnostic before generic retryable heuristics
-   prevents misclassifying a deletion-guard abort as `Retryable`.
-3. **`--resilient` emits a retryable notice even on `must run --resync` and
-   access-check failures**: On a fresh workdir with missing `filters.txt.md5`
-   or a missing `RCLONE_TEST` file, rclone exits `7` and logs both a critical
-   error (`(must run --resync)` / `check file check failed`) and `"Error is
-   retryable without --resync due to --resilient mode."`. Classifier priority
-   ensures `AccessCheckFailed` and `Critical { requires_resync: true }` win
-   over `--resilient` retry notices.
+   In `1.76.0`, exceeding `--max-delete` exits `1` and sets `"retryError": true`
+   in the final stats JSON. Matching the `"too many deletes"` / `"Safety abort"`
+   diagnostic before retryable heuristics prevents misclassifying a
+   deletion-guard abort as `Retryable`.
+3. **`--resilient` emits a retryable notice on both transient errors and some
+   holds**: On transient listing errors, rclone exits `7` with a generic
+   `Bisync critical error:` plus `"Error is retryable without --resync due to
+   --resilient mode."`, which is legitimately `Retryable`. It also emits that
+   notice on missing `RCLONE_TEST` and missing `filters.txt.md5`, so explicit
+   hold diagnostics (`AccessCheckFailed`, `MustResync`, `AuthFailure`,
+   `EndpointMismatch`) must always win over the resilient notice.
 4. **`--resync-mode path1|path2` implies resync without `--resync`**: Passing
    `--resync-mode path1` or `--resync-mode path2` alone performs initialization
-   in `1.76.0` and honors the specified winner preference (even backing up an
-   overwritten file on the non-winning side).
-5. **`--password-command` uses RFC4180 CSV `SpaceSepList` quoting**: Tokens
-   containing spaces or quotes must use CSV double-quote escaping (`""`), not
-   shell backslash escaping or single quotes.
+   in `1.76.0` and honors the specified winner preference.
+5. **`--password-command` uses RFC4180 CSV `SpaceSepList` quoting and logs
+   helper stderr on failure**: Tokens containing spaces or quotes must use CSV
+   double-quote escaping (`""`), and rclone logs failing helper stderr verbatim
+   at error level, so `rclone-adapter` redacts `--password-command stderr:`
+   payloads at the capture boundary.
 
 ## Remaining qualification TODO
 
-- **TODO (Real Google Drive)**: Qualify the full Drive profile (including
-  `--drive-skip-gdocs`, `--drive-skip-shortcuts`, shared-parent root IDs,
-  same-remote `Recovery/...` moves, two separately authenticated accounts,
-  OAuth token refresh with encrypted `--config` + `--password-command`,
-  concurrent clients, offline return, and removable-volume unplug races). Local
-  tests do not satisfy real-Drive qualification.
+See [`docs/qualification.md`](qualification.md) for the full pending matrix. In
+particular, **Real Google Drive** qualification (`--drive-skip-gdocs`,
+`--drive-skip-shortcuts`, shared-parent root IDs, same-remote `Recovery/...`
+moves, two separately authenticated accounts, OAuth token refresh with encrypted
+`--config` + Keychain `--password-command`, concurrent clients, offline return,
+and removable-volume unplug races) remains **TODO**; local tests do not satisfy
+real-Drive qualification.
