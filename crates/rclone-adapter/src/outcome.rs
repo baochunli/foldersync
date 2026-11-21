@@ -350,7 +350,9 @@ pub fn classify_outcome(
     // (access, identity/endpoint, auth, deletion guard, config, or unusable baseline)
     // is present — e.g. transient listing failures that exit 7 with a generic
     // Bisync critical error plus the resilient retryable notice (§14).
-    if let Some(resilient_msg) = &diag.resilient_retryable {
+    // Never retry exit 6 (NoRetryError).
+    let is_no_retry_exit = matches!(mapped_code, Some(RcloneExitCode::NoRetryError));
+    if !is_no_retry_exit && let Some(resilient_msg) = &diag.resilient_retryable {
         let reason = diag
             .critical_error
             .clone()
@@ -373,8 +375,11 @@ pub fn classify_outcome(
     }
 
     // 6. Retryable transient errors (exit 5 RetryError or stats.retry_error).
-    // Exit 6 is NoRetryError in rclone v1.76.0 and is deliberately NOT retryable.
-    if matches!(mapped_code, Some(RcloneExitCode::TemporaryError)) || diag.stats_retry_error {
+    // Exit 6 is NoRetryError in rclone v1.76.0 (lib/exitcode/exitcode.go) and
+    // is NEVER retryable, regardless of stats.retryError.
+    if !is_no_retry_exit
+        && (matches!(mapped_code, Some(RcloneExitCode::TemporaryError)) || diag.stats_retry_error)
+    {
         return Outcome::Retryable {
             reason: diag.fallback_reason(exit_status),
         };
@@ -716,5 +721,93 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn baseline_errors_listing_auth_failure_and_exit_6_with_retry_stats_never_retry() {
+        // 1. Unreadable prior listing with resilient-retry notice -> Critical { requires_resync: true }.
+        let unreadable_events = parse_log_stream([
+            r#"{"level":"error","msg":"\u001b[31mBisync critical error: cannot read prior listing of Path1: open /tmp/wd/a.path1.lst: permission denied\u001b[0m","source":"bisync/operations.go:216"}"#,
+            r#"{"level":"error","msg":"\u001b[33mBisync aborted. Error is retryable without --resync due to --resilient mode.\u001b[0m","source":"bisync/operations.go:217"}"#,
+        ]);
+        let unreadable_out = classify_outcome(
+            ExitStatusInfo {
+                code: Some(7),
+                signal: None,
+            },
+            &unreadable_events,
+            false,
+        );
+        assert!(
+            matches!(
+                unreadable_out,
+                Outcome::Critical {
+                    requires_resync: true,
+                    ..
+                }
+            ),
+            "unreadable prior listing must hold as Critical {{ requires_resync: true }}, got {unreadable_out:?}"
+        );
+
+        // 2. Out-of-sync prior listings with resilient-retry notice -> Critical { requires_resync: true }.
+        let out_of_sync_events = parse_log_stream([
+            r#"{"level":"error","msg":"\u001b[31mBisync critical error: path1 and path2 are out of sync, run --resync to recover\u001b[0m","source":"bisync/operations.go:216"}"#,
+            r#"{"level":"error","msg":"\u001b[33mBisync aborted. Error is retryable without --resync due to --resilient mode.\u001b[0m","source":"bisync/operations.go:217"}"#,
+        ]);
+        let out_of_sync_out = classify_outcome(
+            ExitStatusInfo {
+                code: Some(7),
+                signal: None,
+            },
+            &out_of_sync_events,
+            false,
+        );
+        assert!(
+            matches!(
+                out_of_sync_out,
+                Outcome::Critical {
+                    requires_resync: true,
+                    ..
+                }
+            ),
+            "out-of-sync listings must hold as Critical {{ requires_resync: true }}, got {out_of_sync_out:?}"
+        );
+
+        // 3. Listing-time OAuth failure (expired token / invalid_grant) with resilient notice + fatal stats -> AuthFailure.
+        let listing_auth_events = parse_log_stream([
+            r#"{"level":"error","msg":"error reading destination root directory: couldn't list directory: Get \"https://www.googleapis.com/drive/v3/files\": couldn't fetch token: invalid_grant: Token has been expired or revoked.","source":"bisync/march.go:45"}"#,
+            r#"{"level":"error","msg":"\u001b[31mBisync critical error: error listing Path2: oauth2: token expired and refresh token is not set\u001b[0m","source":"bisync/operations.go:216"}"#,
+            r#"{"level":"error","msg":"\u001b[33mBisync aborted. Error is retryable without --resync due to --resilient mode.\u001b[0m","source":"bisync/operations.go:217"}"#,
+            r#"{"level":"info","msg":"stats","stats":{"errors":1,"fatalError":true,"lastError":"bisync aborted","retryError":false},"source":"accounting/stats.go:554"}"#,
+        ]);
+        let listing_auth_out = classify_outcome(
+            ExitStatusInfo {
+                code: Some(7),
+                signal: None,
+            },
+            &listing_auth_events,
+            false,
+        );
+        assert!(
+            matches!(listing_auth_out, Outcome::AuthFailure { .. }),
+            "listing-time OAuth failure must hold as AuthFailure, got {listing_auth_out:?}"
+        );
+
+        // 4. Exit 6 (NoRetryError) WITH stats.retryError == true must NEVER be Retryable.
+        let exit6_retry_stats = parse_log_stream([
+            r#"{"level":"info","msg":"stats","stats":{"errors":1,"fatalError":false,"lastError":"non-retryable backend error","retryError":true},"source":"accounting/stats.go:554"}"#,
+        ]);
+        let exit6_out = classify_outcome(
+            ExitStatusInfo {
+                code: Some(6),
+                signal: None,
+            },
+            &exit6_retry_stats,
+            false,
+        );
+        assert!(
+            !matches!(exit6_out, Outcome::Retryable { .. }),
+            "exit 6 with stats.retryError=true must never be Retryable, got {exit6_out:?}"
+        );
     }
 }

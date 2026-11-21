@@ -241,13 +241,21 @@ fn detect_marker(plain_msg: &str, object: Option<&str>, level: &LogLevel) -> Opt
         });
     }
 
-    // Unusable baseline / must-resync diagnostics (cmd/bisync/operations.go:216,225,226).
+    // Unusable baseline / must-resync diagnostics (cmd/bisync/operations.go:216,225,226,278-305,462-489).
     // Matched strictly by pinned diagnostic prefixes so filenames containing "must run --resync"
     // in ordinary INFO lines never trigger recovery.
     if is_error_or_critical(level)
         && (trimmed == "Bisync aborted. Must run --resync to recover."
             || trimmed
                 .starts_with("Bisync critical error: cannot find prior Path1 or Path2 listings")
+            || trimmed.starts_with("Bisync critical error: cannot read prior listing of Path1")
+            || trimmed.starts_with("Bisync critical error: cannot read prior listing of Path2")
+            || trimmed.starts_with("cannot read prior listing of Path1")
+            || trimmed.starts_with("cannot read prior listing of Path2")
+            || trimmed.starts_with(
+                "Bisync critical error: path1 and path2 are out of sync, run --resync to recover",
+            )
+            || trimmed.starts_with("path1 and path2 are out of sync, run --resync to recover")
             || trimmed.starts_with("Bisync critical error: filters file md5 hash not found")
             || trimmed.starts_with("Bisync critical error: filters file has changed")
             || trimmed.starts_with("Bisync critical error: prior lock file found")
@@ -257,7 +265,9 @@ fn detect_marker(plain_msg: &str, object: Option<&str>, level: &LogLevel) -> Opt
                 .is_some_and(|body| {
                     // Check only the fixed message segment before any path separator `: `.
                     let header = body.split(": ").next().unwrap_or(body);
-                    header.to_ascii_lowercase().contains("must run --resync")
+                    let header_lower = header.to_ascii_lowercase();
+                    header_lower.contains("must run --resync")
+                        || header_lower.contains("run --resync to recover")
                 }))
     {
         return Some(BisyncMarker::MustResync {
@@ -265,27 +275,36 @@ fn detect_marker(plain_msg: &str, object: Option<&str>, level: &LogLevel) -> Opt
         });
     }
 
-    // Authentication / encrypted config password-command errors (fs/config/crypt.go & config.go).
-    if is_error_or_notice(level)
-        && (trimmed.starts_with("Using --password-command returned:")
+    // Authentication / encrypted config password-command and OAuth errors,
+    // including listing-time directory march failures (fs/config/crypt.go,
+    // lib/oauthutil/oauthutil.go, cmd/bisync/march.go).
+    if is_error_or_notice(level) {
+        let lower = trimmed.to_ascii_lowercase();
+        let is_oauth_error_text = lower.contains("oauth2: cannot fetch token")
+            || lower.contains("oauth2: token expired")
+            || lower.contains("couldn't fetch token")
+            || lower.contains("failed to refresh token")
+            || lower.contains("token has been expired or revoked")
+            || lower.contains("token expired")
+            || lower.contains("invalid_grant")
+            || lower.contains("401 unauthorized")
+            || lower.contains("invalid credentials");
+        let is_error_context = is_error_or_critical(level)
+            || trimmed.starts_with("Failed to ")
+            || trimmed.starts_with("Bisync ");
+
+        if trimmed.starts_with("Using --password-command returned:")
             || trimmed.starts_with("--password-command stderr:")
             || (trimmed.starts_with("Failed to load config file")
                 && trimmed.contains("password command failed"))
             || trimmed.starts_with("Unable to decrypt configuration")
             || trimmed.starts_with("Failed to configure token")
-            || (trimmed.starts_with("Failed to create file system") && {
-                let lower = trimmed.to_ascii_lowercase();
-                lower.contains("oauth2: cannot fetch token")
-                    || lower.contains("couldn't fetch token")
-                    || lower.contains("invalid_grant")
-                    || lower.contains("401 unauthorized")
-                    || lower.contains("invalid credentials")
-                    || lower.contains("token expired")
-            }))
-    {
-        return Some(BisyncMarker::AuthFailure {
-            detail: trimmed.to_string(),
-        });
+            || (is_error_context && is_oauth_error_text)
+        {
+            return Some(BisyncMarker::AuthFailure {
+                detail: trimmed.to_string(),
+            });
+        }
     }
 
     // Invalid configuration / arguments.

@@ -77,8 +77,8 @@ pub struct PlatformPin {
 /// Parsed rclone pin section from `packaging/qualification-manifest.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualificationManifest {
-    pub rclone_version: String,
-    pub platforms: BTreeMap<String, PlatformPin>,
+    rclone_version: String,
+    platforms: BTreeMap<String, PlatformPin>,
 }
 
 /// Failures encountered while qualifying an rclone binary.
@@ -158,20 +158,16 @@ fn is_valid_sha256_hex(value: &str) -> bool {
 impl QualificationManifest {
     /// Parses the manifest checked into `packaging/qualification-manifest.toml`.
     pub fn embedded() -> Result<Self, QualificationError> {
-        Self::from_toml_str(EMBEDDED_MANIFEST_TOML)
+        Self::from_toml_str_internal(EMBEDDED_MANIFEST_TOML)
     }
 
-    /// Loads and parses a qualification manifest from disk.
-    pub fn from_path(path: &Path) -> Result<Self, QualificationError> {
-        let text = fs::read_to_string(path).map_err(|source| QualificationError::ReadManifest {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Self::from_toml_str(&text)
+    /// Parses a qualification manifest from TOML text (test-only).
+    #[cfg(test)]
+    pub(crate) fn from_toml_str(toml_text: &str) -> Result<Self, QualificationError> {
+        Self::from_toml_str_internal(toml_text)
     }
 
-    /// Parses a qualification manifest from TOML text.
-    pub fn from_toml_str(toml_text: &str) -> Result<Self, QualificationError> {
+    fn from_toml_str_internal(toml_text: &str) -> Result<Self, QualificationError> {
         let raw: RawManifest = toml::from_str(toml_text)
             .map_err(|err| QualificationError::InvalidManifest(err.to_string()))?;
 
@@ -210,6 +206,11 @@ impl QualificationManifest {
             rclone_version: version,
             platforms,
         })
+    }
+
+    /// Returns the pinned rclone version string.
+    pub fn rclone_version(&self) -> &str {
+        &self.rclone_version
     }
 
     /// Returns the pin for the given platform key (e.g. `osx-arm64`).
@@ -334,8 +335,14 @@ impl Drop for ProbeTempDir {
 
 /// Re-hashes the binary referenced by `identity` on disk and confirms its
 /// version, platform, executable metadata, and SHA-256 still match the host
-/// platform's pin in `manifest` (replacement detection at the launch boundary, §19).
-pub fn verify_binary_integrity(
+/// platform's pin in the checked-in qualification manifest (replacement
+/// detection at the launch boundary, §19).
+pub fn verify_binary_integrity(identity: &EngineIdentity) -> Result<(), QualificationError> {
+    let manifest = QualificationManifest::embedded()?;
+    verify_binary_integrity_with_manifest(identity, &manifest)
+}
+
+pub(crate) fn verify_binary_integrity_with_manifest(
     identity: &EngineIdentity,
     manifest: &QualificationManifest,
 ) -> Result<(), QualificationError> {
@@ -384,19 +391,17 @@ pub fn verify_binary_integrity(
     Ok(())
 }
 
-/// Verifies binary SHA-256 and `<binary> version` against the manifest using
-/// the real process runner.
-pub fn qualify_binary(
-    binary_path: &Path,
-    manifest: &QualificationManifest,
-) -> Result<EngineIdentity, QualificationError> {
-    qualify_binary_with_runner(binary_path, manifest, &RealProcessRunner)
+/// Verifies binary SHA-256 and `<binary> version` against the checked-in
+/// qualification manifest using the real process runner.
+pub fn qualify_binary(binary_path: &Path) -> Result<EngineIdentity, QualificationError> {
+    let manifest = QualificationManifest::embedded()?;
+    qualify_binary_with_runner(binary_path, &manifest, &RealProcessRunner)
 }
 
 /// Verifies binary SHA-256 (before execution) and `<binary> version` using a
 /// supplied [`ProcessRunner`] with an explicit throwaway `--config` and cleared
 /// isolated environment.
-pub fn qualify_binary_with_runner(
+pub(crate) fn qualify_binary_with_runner(
     binary_path: &Path,
     manifest: &QualificationManifest,
     runner: &dyn ProcessRunner,
@@ -443,6 +448,7 @@ pub fn qualify_binary_with_runner(
         ],
         current_dir: None,
         env: minimal_isolated_env(Some(&probe_tmp.dir)),
+        expected_binary_sha256: Some(pin.binary_sha256.clone()),
     };
     let handle = runner
         .spawn(&spec, SpawnOptions::default())
@@ -486,8 +492,7 @@ pub fn qualify_pinned_binary() -> Result<Option<EngineIdentity>, QualificationEr
     let Some(path) = crate::pinned_binary_path() else {
         return Ok(None);
     };
-    let manifest = QualificationManifest::embedded()?;
-    qualify_binary(&path, &manifest).map(Some)
+    qualify_binary(&path).map(Some)
 }
 
 #[cfg(test)]
@@ -654,11 +659,11 @@ mod tests {
             ..Default::default()
         });
         let identity = qualify_binary_with_runner(&fake_bin, &manifest, &runner).unwrap();
-        assert!(verify_binary_integrity(&identity, &manifest).is_ok());
+        assert!(verify_binary_integrity_with_manifest(&identity, &manifest).is_ok());
 
         // Replace binary on disk AFTER qualification.
         fs::write(&fake_bin, b"replaced malicious bytes").unwrap();
-        let err = verify_binary_integrity(&identity, &manifest).unwrap_err();
+        let err = verify_binary_integrity_with_manifest(&identity, &manifest).unwrap_err();
         assert!(matches!(err, QualificationError::Sha256Mismatch { .. }));
 
         let _ = fs::remove_dir_all(&dir);
@@ -671,7 +676,7 @@ mod tests {
             return;
         };
         let manifest = QualificationManifest::embedded().unwrap();
-        let identity = qualify_binary(&path, &manifest).unwrap();
+        let identity = qualify_binary(&path).unwrap();
         assert_eq!(identity.version(), crate::PINNED_RCLONE_VERSION);
         assert_eq!(identity.path(), path);
         assert_eq!(identity.platform(), host_platform_key().unwrap());

@@ -25,8 +25,8 @@ pub use process::{
 };
 pub use qualification::{
     EngineIdentity, PlatformPin, QualificationError, QualificationManifest, host_platform_key,
-    parse_rclone_version, qualify_binary, qualify_binary_with_runner, qualify_pinned_binary,
-    sha256_file, verify_binary_integrity,
+    parse_rclone_version, qualify_binary, qualify_pinned_binary, sha256_file,
+    verify_binary_integrity,
 };
 pub use request::{
     BackupDir2, BisyncRequest, BisyncRequestBuilder, InitPreference, LaunchError, PasswordCommand,

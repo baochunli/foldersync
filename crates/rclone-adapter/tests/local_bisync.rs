@@ -20,8 +20,8 @@ use std::{
 
 use rclone_adapter::{
     BackupDir2, BisyncRequest, EngineIdentity, InitPreference, LaunchError, Outcome, Path2,
-    QualificationError, QualificationManifest, RealProcessRunner, RunMode, SpawnOptions,
-    classify_run_outcome, pinned_binary_path, qualify_binary, sha256_file,
+    QualificationError, RealProcessRunner, RunMode, SpawnOptions, classify_run_outcome,
+    pinned_binary_path, qualify_binary, sha256_file,
 };
 use sha2::{Digest, Sha256};
 
@@ -148,8 +148,7 @@ fn qualified_pinned_engine(test_name: &str) -> Option<EngineIdentity> {
         );
         return None;
     };
-    let manifest = QualificationManifest::embedded().expect("embedded manifest should parse");
-    Some(qualify_binary(&path, &manifest).expect("pinned binary should qualify"))
+    Some(qualify_binary(&path).expect("pinned binary should qualify"))
 }
 
 fn run_bisync(req: &BisyncRequest) -> (Outcome, rclone_adapter::RunOutput) {
@@ -729,8 +728,7 @@ fn refuses_launch_when_pinned_binary_is_replaced_after_qualification() {
     let copied_bin = ws.root.join("rclone-copy");
     fs::copy(&real_path, &copied_bin).unwrap();
 
-    let manifest = QualificationManifest::embedded().unwrap();
-    let engine = qualify_binary(&copied_bin, &manifest).unwrap();
+    let engine = qualify_binary(&copied_bin).unwrap();
     let (req, _, _) = ws.build_request(&engine, RunMode::Initialize(InitPreference::Path1), 10);
 
     // Replace the copied binary AFTER qualification succeeded.

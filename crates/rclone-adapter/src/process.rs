@@ -52,6 +52,8 @@ pub struct ProcessSpec {
     pub current_dir: Option<PathBuf>,
     /// Exact environment applied after `Command::env_clear()`.
     pub env: BTreeMap<OsString, OsString>,
+    /// Internal SHA-256 digest re-verified immediately before `exec` by [`RealProcessRunner`].
+    pub(crate) expected_binary_sha256: Option<String>,
 }
 
 /// Which standard stream produced a captured line.
@@ -107,6 +109,11 @@ pub struct SpawnOptions {
 
 /// Redacts credential-helper stderr payloads emitted by rclone's
 /// `--password-command` error logger before any storage or observer delivery.
+///
+/// Matches `--password-command stderr:` only at the START of the decoded
+/// message (or immediately after rclone's plaintext ` ERROR : ` prefix) so
+/// benign conflict or transfer lines referencing filenames containing that
+/// substring are never erased.
 pub(crate) fn sanitize_captured_line(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.starts_with('{')
@@ -115,7 +122,7 @@ pub(crate) fn sanitize_captured_line(text: &str) -> String {
         && let Some(msg) = obj.get("msg").and_then(|v| v.as_str())
     {
         let plain = strip_ansi_codes(msg);
-        if plain.contains(PW_CMD_STDERR_PREFIX) {
+        if plain.trim_start().starts_with(PW_CMD_STDERR_PREFIX) {
             obj.insert(
                 "msg".to_string(),
                 serde_json::Value::String(format!("{PW_CMD_STDERR_PREFIX} [REDACTED]")),
@@ -124,11 +131,18 @@ pub(crate) fn sanitize_captured_line(text: &str) -> String {
                 return serialized;
             }
         }
+        return text.to_string();
     }
 
-    if let Some(idx) = text.find(PW_CMD_STDERR_PREFIX) {
-        let prefix = &text[..idx + PW_CMD_STDERR_PREFIX.len()];
-        return format!("{prefix} [REDACTED]");
+    let plain_text = strip_ansi_codes(text);
+    if plain_text.trim_start().starts_with(PW_CMD_STDERR_PREFIX) {
+        return format!("{PW_CMD_STDERR_PREFIX} [REDACTED]");
+    }
+    if let Some((head, tail)) = plain_text.split_once(" ERROR : ")
+        && !head.contains(" - ")
+        && tail.trim_start().starts_with(PW_CMD_STDERR_PREFIX)
+    {
+        return format!("{head} ERROR : {PW_CMD_STDERR_PREFIX} [REDACTED]");
     }
 
     text.to_string()
@@ -360,6 +374,16 @@ pub enum ProcessError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "refused to spawn `{program}`: SHA-256 mismatch immediately before launch (expected {expected}, got {actual})"
+    )]
+    BinaryIntegrityMismatch {
+        program: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("failed to verify SHA-256 of `{program}` before launch: {reason}")]
+    IntegrityCheck { program: PathBuf, reason: String },
     #[error("failed to send signal {signal} to pid {pid}: {source}")]
     Signal {
         pid: u32,
@@ -717,6 +741,23 @@ impl RunHandleBackend for RealRunHandleBackend {
 
 impl ProcessRunner for RealProcessRunner {
     fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
+        // Re-hash immediately before `exec` whenever the spec carries a pinned digest.
+        if let Some(expected_sha256) = &spec.expected_binary_sha256 {
+            let actual = crate::qualification::sha256_file(&spec.program).map_err(|err| {
+                ProcessError::IntegrityCheck {
+                    program: spec.program.clone(),
+                    reason: err.to_string(),
+                }
+            })?;
+            if &actual != expected_sha256 {
+                return Err(ProcessError::BinaryIntegrityMismatch {
+                    program: spec.program.clone(),
+                    expected: expected_sha256.clone(),
+                    actual,
+                });
+            }
+        }
+
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .env_clear()
@@ -1149,6 +1190,7 @@ mod tests {
                     ],
                     current_dir: None,
                     env: child_env,
+                    expected_binary_sha256: None,
                 };
                 let out = runner
                     .spawn(&spec, SpawnOptions::default())
@@ -1186,6 +1228,7 @@ mod tests {
             ],
             current_dir: None,
             env: child_env,
+            expected_binary_sha256: None,
         }
     }
 
@@ -1261,6 +1304,7 @@ mod tests {
             args: vec![OsString::from("bisync")],
             current_dir: None,
             env: BTreeMap::new(),
+            expected_binary_sha256: None,
         };
         // Never drain `rx` while `wait()` runs: must not block and must count 9 drops.
         let out = runner
@@ -1308,6 +1352,7 @@ mod tests {
             args: vec![OsString::from("version")],
             current_dir: None,
             env: BTreeMap::new(),
+            expected_binary_sha256: None,
         };
         let handle = runner.spawn(&spec, SpawnOptions::default()).unwrap();
         let stopper = handle.stop_handle();
@@ -1457,6 +1502,7 @@ mod tests {
             args: vec![OsString::from("bisync")],
             current_dir: None,
             env: BTreeMap::new(),
+            expected_binary_sha256: None,
         };
         let out = runner
             .spawn(
@@ -1494,5 +1540,61 @@ mod tests {
             );
             assert!(line.contains("[REDACTED]"));
         }
+    }
+
+    #[test]
+    fn benign_conflict_filename_containing_helper_prefix_is_not_redacted() {
+        let runner = FakeProcessRunner::new();
+        runner.push_run(FakeRunScript {
+            lines: vec![
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: r#"{"level":"notice","msg":"- \u001b[34mWARNING\u001b[0m  \u001b[35mNew or changed in both paths\u001b[0m       - \u001b[36mnotes/--password-command stderr: draft.txt\u001b[0m","source":"bisync/deltas.go:386"}"#.to_string(),
+                    truncated: false,
+                },
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: r#"{"level":"notice","msg":"- \u001b[36mPath1\u001b[0m    \u001b[35mRenaming Path1 copy\u001b[0m                - \u001b[36m/tmp/p1/notes/--password-command stderr: draft.txt.conflict1\u001b[0m","source":"bisync/resolve.go:318"}"#.to_string(),
+                    truncated: false,
+                },
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: r#"{"level":"notice","msg":"- \u001b[34mPath2\u001b[0m    \u001b[35mRenaming Path2 copy\u001b[0m                - \u001b[36m/tmp/p2/notes/--password-command stderr: draft.txt.conflict2\u001b[0m","source":"bisync/resolve.go:318"}"#.to_string(),
+                    truncated: false,
+                },
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: r#"{"level":"info","msg":"\u001b[32mBisync successful\u001b[0m","source":"bisync/operations.go:234"}"#.to_string(),
+                    truncated: false,
+                },
+            ],
+            exit_status: ExitStatusInfo {
+                code: Some(0),
+                signal: None,
+            },
+            ..Default::default()
+        });
+        let spec = ProcessSpec {
+            program: PathBuf::from("/fake/rclone"),
+            args: vec![OsString::from("bisync")],
+            current_dir: None,
+            env: BTreeMap::new(),
+            expected_binary_sha256: None,
+        };
+        let out = runner
+            .spawn(&spec, SpawnOptions::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let outcome = crate::outcome::classify_run_outcome(&out);
+        assert_eq!(
+            outcome,
+            crate::outcome::Outcome::SuccessWithConflicts {
+                paths: vec![
+                    "/tmp/p1/notes/--password-command stderr: draft.txt.conflict1".to_string(),
+                    "/tmp/p2/notes/--password-command stderr: draft.txt.conflict2".to_string(),
+                ]
+            }
+        );
     }
 }

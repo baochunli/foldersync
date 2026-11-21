@@ -16,7 +16,8 @@ use crate::{
         ProcessError, ProcessRunner, ProcessSpec, RunHandle, SpawnOptions, minimal_isolated_env,
     },
     qualification::{
-        EngineIdentity, QualificationError, QualificationManifest, verify_binary_integrity,
+        EngineIdentity, QualificationError, QualificationManifest,
+        verify_binary_integrity_with_manifest,
     },
 };
 
@@ -428,48 +429,53 @@ impl BisyncRequest {
         args
     }
 
-    /// Re-verifies the qualified binary's SHA-256 on disk against the embedded
-    /// qualification manifest and builds an isolated [`ProcessSpec`].
-    pub fn to_verified_process_spec(&self) -> Result<ProcessSpec, QualificationError> {
-        let manifest = QualificationManifest::embedded()?;
-        self.to_verified_process_spec_with_manifest(&manifest)
-    }
-
     /// Re-verifies the qualified binary's SHA-256 on disk against `manifest`
-    /// and builds an isolated [`ProcessSpec`].
-    pub fn to_verified_process_spec_with_manifest(
+    /// and builds an isolated [`ProcessSpec`] pinned to that digest.
+    fn build_verified_spec(
         &self,
         manifest: &QualificationManifest,
     ) -> Result<ProcessSpec, QualificationError> {
-        verify_binary_integrity(&self.engine, manifest)?;
+        verify_binary_integrity_with_manifest(&self.engine, manifest)?;
         Ok(ProcessSpec {
             program: self.engine.path().to_path_buf(),
             args: self.to_args(),
             current_dir: None,
             env: minimal_isolated_env(Some(&self.workdir)),
+            expected_binary_sha256: Some(self.engine.sha256().to_string()),
         })
     }
 
-    /// Re-hashes the binary on disk at the launch boundary against the embedded
+    #[cfg(test)]
+    pub(crate) fn to_verified_process_spec_with_manifest(
+        &self,
+        manifest: &QualificationManifest,
+    ) -> Result<ProcessSpec, QualificationError> {
+        self.build_verified_spec(manifest)
+    }
+
+    /// Re-hashes the binary on disk at the launch boundary against the checked-in
     /// qualification manifest and spawns the process with a cleared, allowlisted
-    /// environment.
+    /// environment (where [`crate::RealProcessRunner`] also re-hashes immediately
+    /// before `exec`).
     pub fn spawn(
         &self,
         runner: &dyn ProcessRunner,
         options: SpawnOptions,
     ) -> Result<RunHandle, LaunchError> {
-        let spec = self.to_verified_process_spec()?;
+        let manifest = QualificationManifest::embedded()?;
+        let spec = self.build_verified_spec(&manifest)?;
         Ok(runner.spawn(&spec, options)?)
     }
 
-    /// Launch boundary variant accepting an explicit manifest (useful for tests).
-    pub fn spawn_with_manifest(
+    /// Test-only launch boundary variant accepting a synthetic manifest.
+    #[cfg(test)]
+    pub(crate) fn spawn_with_manifest(
         &self,
         runner: &dyn ProcessRunner,
         options: SpawnOptions,
         manifest: &QualificationManifest,
     ) -> Result<RunHandle, LaunchError> {
-        let spec = self.to_verified_process_spec_with_manifest(manifest)?;
+        let spec = self.build_verified_spec(manifest)?;
         Ok(runner.spawn(&spec, options)?)
     }
 }
@@ -739,11 +745,19 @@ impl BisyncRequestBuilder {
     pub fn build(self) -> Result<BisyncRequest, RequestError> {
         let manifest =
             QualificationManifest::embedded().expect("checked-in qualification manifest is valid");
-        self.build_with_manifest(&manifest)
+        self.build_with_manifest_internal(&manifest)
     }
 
-    /// Validates all fields against an explicit qualification manifest.
-    pub fn build_with_manifest(
+    /// Test-only builder accepting a synthetic qualification manifest.
+    #[cfg(test)]
+    pub(crate) fn build_with_manifest(
+        self,
+        manifest: &QualificationManifest,
+    ) -> Result<BisyncRequest, RequestError> {
+        self.build_with_manifest_internal(manifest)
+    }
+
+    fn build_with_manifest_internal(
         self,
         manifest: &QualificationManifest,
     ) -> Result<BisyncRequest, RequestError> {
@@ -775,10 +789,10 @@ impl BisyncRequestBuilder {
         let (host_platform, host_pin) = manifest
             .host_platform_pin()
             .expect("host platform is defined in qualification manifest");
-        if engine.version() != manifest.rclone_version {
+        if engine.version() != manifest.rclone_version() {
             return Err(RequestError::UnqualifiedEngineVersion {
                 version: engine.version().to_string(),
-                expected: manifest.rclone_version.clone(),
+                expected: manifest.rclone_version().to_string(),
             });
         }
         if engine.platform() != host_platform {
@@ -1456,6 +1470,64 @@ mod tests {
         assert!(
             launch_runner.spawned_specs().is_empty(),
             "replaced binary must never be launched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_refuses_binary_replaced_after_verified_spec_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TestFixtureDir::new("replace-after-spec");
+        let bin = root.path("rclone");
+        // Copy a harmless real executable (`current_exe`) so if spawn fails to re-hash it would actually execute.
+        fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let digest = sha256_file(&bin).unwrap();
+        let platform = host_platform_key().unwrap();
+        let manifest = QualificationManifest::from_toml_str(&format!(
+            "[rclone]\nversion = \"1.76.0\"\n[rclone.{platform}]\nurl = \"https://example.invalid/rclone.zip\"\narchive_sha256 = \"{digest}\"\nbinary_sha256 = \"{digest}\"\n"
+        ))
+        .unwrap();
+
+        let qual_runner = FakeProcessRunner::new();
+        qual_runner.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stdout,
+                text: "rclone v1.76.0".to_string(),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        let engine = qualify_binary_with_runner(&bin, &manifest, &qual_runner).unwrap();
+        let req = BisyncRequest::builder()
+            .engine(engine)
+            .mode(RunMode::Normal)
+            .path1(root.path("p1"))
+            .path2(Path2::LocalDir(root.path("p2")))
+            .config_path(root.path("rclone.conf"))
+            .workdir(root.path("workdir"))
+            .filters_file(root.path("filters.txt"))
+            .backup_dir1(root.path("b1"))
+            .backup_dir2(BackupDir2::LocalDir(root.path("b2")))
+            .build_with_manifest(&manifest)
+            .unwrap();
+
+        // Create a verified ProcessSpec while the binary is still intact.
+        let spec = req
+            .to_verified_process_spec_with_manifest(&manifest)
+            .unwrap();
+
+        // Replace binary on disk AFTER spec creation, BEFORE RealProcessRunner::spawn executes.
+        fs::write(&bin, b"tampered binary bytes after spec creation").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = crate::process::RealProcessRunner
+            .spawn(&spec, SpawnOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, ProcessError::BinaryIntegrityMismatch { .. }),
+            "must refuse replaced binary with BinaryIntegrityMismatch before exec, got {err:?}"
         );
     }
 }
