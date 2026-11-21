@@ -17,8 +17,9 @@ pub mod store;
 
 pub use accounts::{
     AccountCheckReport, AccountError, AccountService, AccountServiceConfig, AddDriveAccountRequest,
-    DriveAccountResult, ImportAccountRequest, PasswordCommandFactory,
-    RESERVED_LOCAL_FIXTURE_ACCOUNT_ID,
+    CollectionCandidate, CollectionListing, CollectionSkipReason, DriveAccountResult,
+    DriveAuthorization, ImportAccountRequest, PasswordCommandFactory,
+    RESERVED_LOCAL_FIXTURE_ACCOUNT_ID, SkippedCollection,
 };
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::ManagerError;
@@ -42,8 +43,8 @@ pub use launcher::{
 pub use manager::{
     AddMappingCommand, CommandAcceptance, CommandOutcome, ControlledShutdownOutcome,
     FilterChangePreview, FinderActionDispatch, InitializeCommand, ManagerCommand, ManagerConfig,
-    PreflightPreview, RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide, RecoveryReport,
-    RemoteEndpoint, SyncManager,
+    OperationHandle, PreflightPreview, RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide,
+    RecoveryReport, RemoteEndpoint, SyncManager,
 };
 pub use platform::{
     FakeProcessInspector, LiveProcessInfo, MountedVolume, OsProcessInspector, OsVolumeProbe,
@@ -57,7 +58,8 @@ pub use secrets::{
     SystemSecretStore, run_credential_helper, scoped_credential_key, validate_credential_key,
 };
 pub use snapshot::{
-    ManagerEvent, MappingCounters, MappingStatusSnapshot, SnapshotReceiver, StatusSnapshot,
+    FolderSizeSnapshot, FolderSizeStatus, ManagerEvent, MappingCounters, MappingStatusSnapshot,
+    SnapshotReceiver, StatusSnapshot,
 };
 pub use store::{
     AccountRecord, DeviceRecord, GenerationRecord, MappingRecord, RecoveryCaseRecord, RunRecord,

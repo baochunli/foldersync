@@ -2,19 +2,20 @@
 //! rendering, and access marker handling (§9, §11, §18).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
-use rclone_adapter::InitPreference;
+use rclone_adapter::{InitPreference, LsJsonEntry};
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, VolumeIdentity,
     validate_names,
 };
 
-use crate::error::ManagerError;
+use crate::{accounts::LockedDrive, error::ManagerError, manager::drive_error};
 
 /// Classification of one endpoint during §9 initialization preflight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,6 +753,255 @@ pub fn establish_local_pair_markers(
         create_marker_exclusively(&remote_marker_path, canonical_marker.as_bytes())?;
     }
 
+    Ok(())
+}
+
+const MAX_DRIVE_MARKER_BYTES: u64 = 4096;
+
+fn drive_marker_error(path: &str, cause: &str) -> ManagerError {
+    ManagerError::AccessMarkerConflict {
+        path: PathBuf::from(path),
+        cause: cause.to_owned(),
+        next_step: "Review the access marker in the Drive collection before continuing.".to_owned(),
+    }
+}
+
+fn read_marker_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?
+        .take(MAX_DRIVE_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_drive_marker(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+    entries: &[LsJsonEntry],
+) -> Result<Option<Vec<u8>>, ManagerError> {
+    let marker_path = format!("{}/{ACCESS_MARKER_FILENAME}", collection.display_path);
+    let mut matching = entries
+        .iter()
+        .filter(|entry| entry.path.eq_ignore_ascii_case(ACCESS_MARKER_FILENAME));
+    let Some(marker) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some()
+        || marker.path != ACCESS_MARKER_FILENAME
+        || marker.is_dir
+        || !(1..=MAX_DRIVE_MARKER_BYTES as i64).contains(&marker.size)
+    {
+        return Err(drive_marker_error(
+            &marker_path,
+            "The Drive access marker is ambiguous or is not an ordinary marker file.",
+        ));
+    }
+
+    let scratch = marker_scratch(drive)?;
+    let destination = scratch.path().join(ACCESS_MARKER_FILENAME);
+    drive
+        .request
+        .fetch_marker(&marker_path, &destination, &drive.runner)
+        .map_err(|err| drive_error(err.into()))?;
+    let bytes = read_marker_bytes(&destination).map_err(|_| {
+        drive_marker_error(&marker_path, "The Drive access marker could not be read.")
+    })?;
+    let valid = bytes.len() == marker.size as usize
+        && std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| AccessMarker::parse(text).ok())
+            .is_some_and(|parsed| parsed.matches_collection(collection));
+    if !valid {
+        return Err(drive_marker_error(
+            &marker_path,
+            "The Drive access marker is unrecognized or identifies another collection.",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn marker_scratch(drive: &LockedDrive<'_>) -> Result<tempfile::TempDir, ManagerError> {
+    tempfile::Builder::new()
+        .prefix(".marker-")
+        .tempdir_in(
+            drive
+                .account
+                .config_path
+                .parent()
+                .expect("validated account path"),
+        )
+        .map_err(|err| ManagerError::Io {
+            cause: format!(
+                "Could not create a temporary folder for the Drive access marker: {err}"
+            ),
+            next_step: "Check the FolderSync state directory and disk space.".into(),
+        })
+}
+
+pub(crate) fn inspect_drive_endpoint(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+    exclusions: &BTreeSet<String>,
+) -> Result<(DetailedEndpointInventory, Option<Vec<u8>>), ManagerError> {
+    let entries = drive
+        .request
+        .list_entries(&collection.display_path, true, &drive.runner)
+        .map_err(|err| drive_error(err.into()))?;
+    let marker = read_drive_marker(drive, collection, &entries)?;
+    let paths: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let findings = validate_names(&paths);
+    let mut subfolders = BTreeMap::<String, SubfolderInventory>::new();
+    let mut file_count = 0;
+    let mut total_bytes = 0_u64;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
+    {
+        if entry.is_dir && !entry.path.contains('/') {
+            subfolders
+                .entry(entry.path.clone())
+                .or_insert_with(|| SubfolderInventory {
+                    name: entry.name.clone(),
+                    relative_path: entry.path.clone(),
+                    total_bytes: 0,
+                    file_count: 0,
+                    has_children: false,
+                });
+        }
+    }
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
+    {
+        let size = u64::try_from(entry.size);
+        if !entry.is_dir && !is_excluded(&entry.path, exclusions) {
+            let size = size.map_err(|_| ManagerError::PreflightRejected {
+                cause: format!("The Drive file `{}` did not report a size.", entry.path),
+                next_step: "Review the file or exclude it before starting first sync.".into(),
+            })?;
+            file_count += 1;
+            total_bytes = total_bytes.saturating_add(size);
+        }
+        if let Some((top, _)) = entry.path.split_once('/')
+            && let Some(subfolder) = subfolders.get_mut(top)
+        {
+            if entry.is_dir {
+                subfolder.has_children = true;
+            } else {
+                subfolder.file_count += 1;
+                subfolder.total_bytes = subfolder
+                    .total_bytes
+                    .saturating_add(size.unwrap_or_default());
+            }
+        }
+    }
+    Ok((
+        DetailedEndpointInventory {
+            root: PathBuf::from(format!(
+                "{}:{}",
+                drive.account.remote_name, collection.display_path
+            )),
+            classification: if paths.is_empty() {
+                SideClassification::Empty
+            } else {
+                SideClassification::HasData
+            },
+            all_items_count: paths.len(),
+            file_count,
+            total_bytes,
+            has_valid_marker: marker.is_some(),
+            marker_conflict: None,
+            marker_conflict_path: None,
+            subfolders: subfolders.into_values().collect(),
+            symlinks: Vec::new(),
+            special_files: Vec::new(),
+            first_name_finding_next_step: findings.first().map(|finding| finding.next_step.clone()),
+            name_findings: findings.into_iter().map(|finding| finding.cause).collect(),
+        },
+        marker,
+    ))
+}
+
+pub(crate) fn verify_drive_marker(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+) -> Result<Vec<u8>, ManagerError> {
+    let entries = drive
+        .request
+        .list_entries(&collection.display_path, false, &drive.runner)
+        .map_err(|err| drive_error(err.into()))?;
+    read_drive_marker(drive, collection, &entries)?.ok_or_else(|| {
+        drive_marker_error(
+            &collection.display_path,
+            "The expected Drive access marker is missing.",
+        )
+    })
+}
+
+pub(crate) fn establish_drive_marker(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+    local: &EndpointInventory,
+    cloud_marker: Option<Vec<u8>>,
+    recovery_dir: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), ManagerError> {
+    if is_cancelled() {
+        return Ok(());
+    }
+    let marker = match cloud_marker {
+        Some(marker) => marker,
+        None => {
+            let canonical = AccessMarker::from_collection(collection).format();
+            if canonical.len() as u64 > MAX_DRIVE_MARKER_BYTES {
+                return Err(drive_marker_error(
+                    &collection.display_path,
+                    "The Drive folder path is too long for its access marker.",
+                ));
+            }
+            let scratch = marker_scratch(drive)?;
+            let source = scratch.path().join(ACCESS_MARKER_FILENAME);
+            create_marker_exclusively(&source, canonical.as_bytes())?;
+            let staging = format!("{recovery_dir}/marker-{}", uuid::Uuid::new_v4());
+            let destination = format!("{}/{ACCESS_MARKER_FILENAME}", collection.display_path);
+            if is_cancelled() {
+                return Ok(());
+            }
+            drive
+                .request
+                .stage_marker(&source, &staging, &drive.runner)
+                .map_err(|err| drive_error(err.into()))?;
+            if is_cancelled() {
+                return Ok(());
+            }
+            drive
+                .request
+                .publish_staged_marker(&staging, &destination, &drive.runner)
+                .map_err(|err| drive_error(err.into()))?;
+            verify_drive_marker(drive, collection)?
+        }
+    };
+    if is_cancelled() {
+        return Ok(());
+    }
+    let local_path = local.root.join(ACCESS_MARKER_FILENAME);
+    if local.has_valid_marker {
+        if read_marker_bytes(&local_path).ok().as_deref() != Some(&marker) {
+            return Err(drive_marker_error(
+                &collection.display_path,
+                "The local and Drive access markers have different contents.",
+            ));
+        }
+    } else {
+        create_marker_exclusively(&local_path, &marker)?;
+    }
     Ok(())
 }
 

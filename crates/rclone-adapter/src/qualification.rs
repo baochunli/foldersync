@@ -372,6 +372,14 @@ pub(crate) fn verify_binary_integrity_with_manifest(
     identity: &EngineIdentity,
     manifest: &QualificationManifest,
 ) -> Result<(), QualificationError> {
+    verify_binary_identity_with_manifest(identity, manifest)?;
+    verify_executable_digest(identity)
+}
+
+pub(crate) fn verify_binary_identity_with_manifest(
+    identity: &EngineIdentity,
+    manifest: &QualificationManifest,
+) -> Result<(), QualificationError> {
     let (host_platform, pin) = manifest.host_platform_pin()?;
     if identity.platform != host_platform {
         return Err(QualificationError::PlatformMismatch {
@@ -392,7 +400,7 @@ pub(crate) fn verify_binary_integrity_with_manifest(
             actual: identity.sha256.clone(),
         });
     }
-    verify_executable_digest(identity)
+    Ok(())
 }
 
 pub(crate) fn verify_executable_metadata(

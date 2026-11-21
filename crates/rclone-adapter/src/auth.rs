@@ -43,6 +43,7 @@ pub struct DriveAuthRequest {
     lock_path: PathBuf,
     remote_name: String,
     password_command: PasswordCommand,
+    caller_opens_browser: bool,
 }
 
 /// Completed OAuth authorization outcome.
@@ -107,7 +108,14 @@ impl DriveAuthRequest {
             lock_path,
             remote_name,
             password_command,
+            caller_opens_browser: false,
         })
+    }
+
+    /// Receives the loopback URL through the callback and lets the caller open it.
+    pub fn caller_opens_browser(mut self, enabled: bool) -> Self {
+        self.caller_opens_browser = enabled;
+        self
     }
 
     pub fn engine(&self) -> &EngineIdentity {
@@ -157,11 +165,22 @@ impl DriveAuthRequest {
             field: "config_path",
             reason: "must have a parent directory",
         })?;
+        let mut env = minimal_isolated_env(Some(account_dir));
+        if self.caller_opens_browser {
+            env.insert(
+                format!(
+                    "RCLONE_CONFIG_{}_CONFIG_AUTH_NO_BROWSER",
+                    self.remote_name.to_uppercase()
+                )
+                .into(),
+                "1".into(),
+            );
+        }
         Ok(ProcessSpec {
             program: self.engine.path().to_path_buf(),
             args: self.to_args(),
             current_dir: None,
-            env: minimal_isolated_env(Some(account_dir)),
+            env,
             expected_binary_sha256: Some(self.engine.sha256().to_string()),
         })
     }
@@ -283,7 +302,7 @@ pub(crate) fn run_drive_auth_with_manifest_locked(
         first_url
     });
 
-    let run_out = handle.wait()?;
+    let run_out = handle.wait();
     let observed_url = observer_thread.join().unwrap_or(None);
 
     // Clean ONLY FolderSync setup temp files; NEVER delete rclone.conf.old* backups.
@@ -297,6 +316,7 @@ pub(crate) fn run_drive_auth_with_manifest_locked(
         enforce_private_config_permissions(req.config_path())?;
     }
 
+    let run_out = run_out?;
     if !run_out.exit_status.is_success() {
         // Never include child stdout in config/auth errors.
         let stderr = run_out.output.stderr_text();

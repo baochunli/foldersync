@@ -9,8 +9,8 @@ use std::{
 
 use rclone_adapter::{
     BackupDir2, BisyncRequest, BoundedLineBuffer, ChildIdentity, EngineIdentity, ExitStatusInfo,
-    OutputLine, Path2, RealProcessRunner, RunHandle, RunMode, RunOutput, SpawnOptions, StopHandle,
-    qualify_binary, qualify_pinned_binary,
+    OutputLine, PasswordCommand, Path2, ProcessRunner, RealProcessRunner, RunHandle, RunMode,
+    RunOutput, SpawnOptions, StopHandle, qualify_binary, qualify_pinned_binary,
 };
 
 use crate::error::ManagerError;
@@ -25,6 +25,7 @@ pub struct LaunchPlan {
     pub path1: PathBuf,
     pub path2: Path2,
     pub config_path: PathBuf,
+    pub password_command: Option<PasswordCommand>,
     pub workdir: PathBuf,
     pub filters_file: PathBuf,
     pub check_filename: String,
@@ -119,17 +120,40 @@ pub trait BisyncLauncher: Send + Sync {
 
 /// Real launcher backed by `rclone-adapter`'s pinned binary qualification,
 /// `BisyncRequest`, and `RealProcessRunner`.
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct RealBisyncLauncher {
     binary_override: Option<PathBuf>,
     qualified: Arc<Mutex<Option<EngineIdentity>>>,
+    runner: Arc<dyn ProcessRunner>,
+}
+
+impl std::fmt::Debug for RealBisyncLauncher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealBisyncLauncher")
+            .field("binary_override", &self.binary_override)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for RealBisyncLauncher {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl RealBisyncLauncher {
     pub fn new(binary_override: Option<PathBuf>) -> Self {
+        Self::with_process_runner(binary_override, Arc::new(RealProcessRunner))
+    }
+
+    pub fn with_process_runner(
+        binary_override: Option<PathBuf>,
+        runner: Arc<dyn ProcessRunner>,
+    ) -> Self {
         Self {
             binary_override,
-            ..Self::default()
+            qualified: Arc::default(),
+            runner,
         }
     }
 
@@ -199,12 +223,12 @@ struct RealPreparedBackend {
     req: BisyncRequest,
     engine: EngineIdentity,
     sanitized_argv: Vec<String>,
+    runner: Arc<dyn ProcessRunner>,
 }
 
 impl PreparedLaunchBackend for RealPreparedBackend {
     fn spawn(self: Box<Self>, options: SpawnOptions) -> Result<LaunchedRun, ManagerError> {
-        let runner = RealProcessRunner;
-        let handle = self.req.spawn(&runner, options)?;
+        let handle = self.req.spawn(self.runner.as_ref(), options)?;
         let identity = handle.identity().clone();
         Ok(LaunchedRun {
             identity,
@@ -224,7 +248,7 @@ impl BisyncLauncher for RealBisyncLauncher {
 
     fn prepare(&self, plan: &LaunchPlan) -> Result<PreparedLaunch, ManagerError> {
         let engine = self.resolve_and_qualify()?;
-        let req = BisyncRequest::builder()
+        let mut builder = BisyncRequest::builder()
             .engine(engine.clone())
             .mode(plan.mode)
             .path1(&plan.path1)
@@ -235,8 +259,11 @@ impl BisyncLauncher for RealBisyncLauncher {
             .check_filename(&plan.check_filename)
             .max_delete_percent(plan.max_delete_percent)
             .backup_dir1(&plan.backup_dir1)
-            .backup_dir2(plan.backup_dir2.clone())
-            .build()?;
+            .backup_dir2(plan.backup_dir2.clone());
+        if let Some(password_command) = &plan.password_command {
+            builder = builder.password_command(password_command.clone());
+        }
+        let req = builder.build()?;
 
         let sanitized_argv = req
             .to_args()
@@ -249,6 +276,7 @@ impl BisyncLauncher for RealBisyncLauncher {
                 req,
                 engine,
                 sanitized_argv,
+                runner: Arc::clone(&self.runner),
             }),
         })
     }

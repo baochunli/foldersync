@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sync_core::{
     AccountId, AvailableAction, Execution, GenerationId, Intent, MappingId, Readiness, RunId,
@@ -55,6 +56,10 @@ pub struct MappingStatusSnapshot {
     pub scheduling_enabled: bool,
     #[serde(default = "default_schedule_interval_secs")]
     pub schedule_interval_secs: u64,
+    #[serde(default)]
+    pub next_poll_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub retry_at: Option<DateTime<Utc>>,
     pub active_generation_id: Option<GenerationId>,
     pub active_generation_fingerprint: Option<String>,
     pub last_run_id: Option<RunId>,
@@ -84,6 +89,22 @@ fn default_schedule_interval_secs() -> u64 {
     300
 }
 
+/// Latest result for a requested Drive folder size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSizeSnapshot {
+    pub account_id: AccountId,
+    pub folder_id: String,
+    pub updated_at: DateTime<Utc>,
+    pub status: FolderSizeStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FolderSizeStatus {
+    Calculating,
+    Known { bytes: u64, files: u64 },
+    Failed { cause: String },
+}
+
 /// Immutable manager-wide snapshot published to UI/CLI subscribers (§16).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
@@ -97,6 +118,8 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub scheduling_paused: bool,
     pub mappings: Vec<MappingStatusSnapshot>,
+    #[serde(default)]
+    pub folder_sizes: Vec<FolderSizeSnapshot>,
 }
 
 /// Bounded activity and diagnostic events emitted by the manager.

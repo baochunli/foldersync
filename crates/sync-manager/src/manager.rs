@@ -18,8 +18,8 @@ use std::{
 
 use chrono::{DateTime, TimeDelta, Utc};
 use rclone_adapter::{
-    BackupDir2, InitPreference, LogEvent, Outcome, OutputLimits, OutputLine, Path2, RunMode,
-    SpawnOptions, StreamKind, classify_run_outcome, parse_log_line,
+    AuthUrlCallback, BackupDir2, InitPreference, LogEvent, Outcome, OutputLimits, OutputLine,
+    Path2, ProcessControl, RunMode, SpawnOptions, StreamKind, classify_run_outcome, parse_log_line,
 };
 use serde::{Deserialize, Serialize};
 use sync_core::{
@@ -30,11 +30,17 @@ use sync_core::{
     ObservedEvent, PathResolutionError, PathResolver, Readiness, RecoveryPolicy, RunId, RunOutcome,
     StdPathResolver, SupportedTypesPolicy, TransitionEffect, UserAction, apply_event,
     apply_user_action, available_actions, default_exclusion_patterns, status_text,
-    validate_cloud_collections, validate_local_binding, validate_local_layout,
+    validate_cloud_collection_identity_pair, validate_cloud_collections, validate_local_binding,
+    validate_local_layout,
 };
 use uuid::Uuid;
 
 use crate::{
+    accounts::{
+        AccountError, AccountService, AccountServiceConfig, CollectionCandidate, CollectionListing,
+        DRIVE_COMMAND_TIMEOUT, DriveAccountResult, DriveAuthorization, LockedDrive,
+        validate_drive_folder_id,
+    },
     clock::{Clock, SystemClock},
     error::ManagerError,
     finder::{
@@ -42,9 +48,11 @@ use crate::{
         ValidatedFinderAction, claim_finder_action_files,
     },
     init::{
-        DetailedEndpointInventory, DetectedVolume, decide_init_direction, detect_volume_identity,
-        detect_volume_with, establish_local_pair_markers, inspect_local_endpoint,
-        inspect_local_endpoint_detailed, render_filters_file, verify_endpoint_access_marker,
+        DetailedEndpointInventory, DetectedVolume, EndpointInventory, decide_init_direction,
+        detect_volume_identity, detect_volume_with, establish_drive_marker,
+        establish_local_pair_markers, inspect_drive_endpoint, inspect_local_endpoint,
+        inspect_local_endpoint_detailed, render_filters_file, verify_drive_marker,
+        verify_endpoint_access_marker,
     },
     launcher::{BisyncLauncher, LaunchPlan, LaunchStopper, RealBisyncLauncher},
     platform::{
@@ -59,8 +67,8 @@ use crate::{
         network_addresses,
     },
     snapshot::{
-        DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, ManagerEvent, MappingCounters,
-        MappingStatusSnapshot, SnapshotReceiver, StatusSnapshot,
+        DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, FolderSizeSnapshot, FolderSizeStatus,
+        ManagerEvent, MappingCounters, MappingStatusSnapshot, SnapshotReceiver, StatusSnapshot,
     },
     store::{
         AccountRecord, DeviceRecord, GenerationRecord, MappingRecord, RecoveryCaseRecord,
@@ -308,6 +316,45 @@ pub struct AddMappingCommand {
 }
 
 impl AddMappingCommand {
+    /// Builds a Drive mapping request. The manager resolves the remote name, recovery
+    /// path and ancestry using the selected account before saving the mapping.
+    pub fn drive(
+        id: impl Into<MappingId>,
+        account_id: impl Into<AccountId>,
+        collection: CloudCollection,
+        local_dir: impl AsRef<Path>,
+        local_recovery_root: impl AsRef<Path>,
+    ) -> Result<Self, ManagerError> {
+        let id = id.into();
+        let account_id = account_id.into();
+        validate_safe_path_id("mapping_id", id.as_str())?;
+        validate_safe_path_id("account_id", account_id.as_str())?;
+        let detected = detect_volume_identity(local_dir.as_ref())?;
+        let remote_endpoint = RemoteEndpoint::DriveRemote {
+            remote: String::new(),
+            path: collection.display_path.clone(),
+        };
+        Ok(Self {
+            id,
+            account_id,
+            collection,
+            local_binding: LocalBinding {
+                volume: detected.identity,
+                mount_path: detected.mount_path,
+                relative_dir: detected.relative_dir,
+            },
+            remote_endpoint,
+            local_recovery_root: resolve_absolute_path(
+                "local_recovery_root",
+                local_recovery_root.as_ref(),
+            )?,
+            cloud_recovery_path: String::new(),
+            extra_exclusions: BTreeSet::new(),
+            max_delete_percent: DEFAULT_MAX_DELETE_PERCENT,
+            schedule_interval: DEFAULT_ACTIVE_SCHEDULE_INTERVAL,
+        })
+    }
+
     /// Builds a validated local-to-local fixture mapping command.
     pub fn local_fixture(
         id: impl Into<MappingId>,
@@ -969,6 +1016,69 @@ struct ActiveRunControl {
     timed_out_during_shutdown: bool,
 }
 
+const FOLDER_SIZE_CACHE_TTL: TimeDelta = TimeDelta::minutes(5);
+const FOLDER_SIZE_CACHE_CAPACITY: usize = 128;
+const AUXILIARY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Handle for an asynchronous account or sizing operation. Dropping the
+/// handle leaves the operation running. Call `cancel` to request a stop.
+#[derive(Debug)]
+pub struct OperationHandle<T> {
+    control: ProcessControl,
+    result: mpsc::Receiver<Result<T, ManagerError>>,
+}
+
+impl<T> OperationHandle<T> {
+    pub fn cancel(&self) {
+        self.control.cancel();
+    }
+
+    pub fn wait(self) -> Result<T, ManagerError> {
+        self.result.recv().map_err(|_| ManagerError::Io {
+            cause: "The account operation ended before reporting its result.".into(),
+            next_step: "Check the current status and try again.".into(),
+        })?
+    }
+}
+
+fn restore_size_status(
+    guard: &mut SharedState,
+    key: &(AccountId, String),
+    previous: Option<FolderSizeSnapshot>,
+) {
+    if let Some(previous) = previous {
+        guard.folder_sizes.insert(key.clone(), previous);
+    } else {
+        guard.folder_sizes.remove(key);
+    }
+}
+
+fn cancel_auxiliary_operations(guard: &SharedState) {
+    if let Some(control) = &guard.sizing {
+        control.cancel();
+    }
+    if let Some((_, control)) = &guard.authorization {
+        control.cancel();
+    }
+}
+
+pub(crate) fn drive_error(error: AccountError) -> ManagerError {
+    match error {
+        AccountError::Manager(error) => *error,
+        error => ManagerError::PreflightRejected {
+            cause: error.cause(),
+            next_step: error.next_step(),
+        },
+    }
+}
+
+fn account_worker_error(error: io::Error) -> ManagerError {
+    ManagerError::Io {
+        cause: format!("Could not start the account worker: {error}"),
+        next_step: "Check system resources and try again.".into(),
+    }
+}
+
 struct SharedState {
     store: SqliteStateStore,
     volumes: BTreeMap<MappingId, BoundVolume>,
@@ -984,6 +1094,9 @@ struct SharedState {
     cancelled_init_attempts: BTreeSet<u64>,
     scheduling_paused: bool,
     schedules: Schedules,
+    folder_sizes: BTreeMap<(AccountId, String), FolderSizeSnapshot>,
+    sizing: Option<ProcessControl>,
+    authorization: Option<(AccountId, ProcessControl)>,
     worker_busy: bool,
     shutdown: bool,
     last_terminal_error: Option<(String, String)>,
@@ -992,6 +1105,7 @@ struct SharedState {
 
 struct ManagerInner {
     state_dir: PathBuf,
+    accounts: AccountService,
     finder_writer: FinderStatusWriter,
     finder_heartbeat_interval: Option<Duration>,
     timed_out_shutdown: AtomicBool,
@@ -1016,7 +1130,7 @@ pub struct SyncManager {
     volume_thread: Mutex<Option<JoinHandle<()>>>,
     scheduler_thread: Mutex<Option<JoinHandle<()>>>,
     inner: Arc<ManagerInner>,
-    _lock: StateLock,
+    _lock: Arc<StateLock>,
 }
 
 impl SyncManager {
@@ -1041,9 +1155,32 @@ impl SyncManager {
         volume_probe: Arc<dyn VolumeProbe>,
         watcher: Box<dyn LocalChangeWatcher>,
     ) -> Result<Self, ManagerError> {
+        Self::open_inner(config, volume_probe, watcher, None)
+    }
+
+    /// Opens with injected account dependencies, including the process runner
+    /// and credential store. The account service uses the manager's state directory.
+    pub fn open_with_account_config(
+        config: ManagerConfig,
+        accounts: AccountServiceConfig,
+    ) -> Result<Self, ManagerError> {
+        Self::open_inner(
+            config,
+            Arc::new(OsVolumeProbe),
+            Box::new(NativeWatcher::new()),
+            Some(accounts),
+        )
+    }
+
+    fn open_inner(
+        config: ManagerConfig,
+        volume_probe: Arc<dyn VolumeProbe>,
+        watcher: Box<dyn LocalChangeWatcher>,
+        accounts: Option<AccountServiceConfig>,
+    ) -> Result<Self, ManagerError> {
         let state_dir = resolve_state_dir(config.state_dir.as_deref())?;
 
-        let lock = StateLock::acquire(&state_dir)?;
+        let lock = Arc::new(StateLock::acquire(&state_dir)?);
 
         ensure_private_dir_under("accounts", &state_dir, &state_dir.join("accounts"))?;
         ensure_private_dir_under("mappings", &state_dir, &state_dir.join("mappings"))?;
@@ -1118,10 +1255,18 @@ impl SyncManager {
             queue_order: Vec::new(),
             scheduling_paused,
             mappings: Vec::new(),
+            folder_sizes: Vec::new(),
         });
 
+        let mut account_config =
+            accounts.unwrap_or_else(|| AccountServiceConfig::with_state_dir(&state_dir));
+        account_config.state_dir = state_dir.clone();
+        account_config.acquire_state_lock = false;
+        account_config.clock = Arc::clone(&config.clock);
+        let accounts = AccountService::from_config(account_config).map_err(drive_error)?;
         let inner = Arc::new(ManagerInner {
             state_dir,
+            accounts,
             finder_writer,
             finder_heartbeat_interval: config.finder_heartbeat_interval,
             timed_out_shutdown: AtomicBool::new(false),
@@ -1145,6 +1290,9 @@ impl SyncManager {
                 cancelled_init_attempts: BTreeSet::new(),
                 scheduling_paused,
                 schedules,
+                folder_sizes: BTreeMap::new(),
+                sizing: None,
+                authorization: None,
                 worker_busy: false,
                 shutdown: false,
                 last_terminal_error: None,
@@ -1320,12 +1468,21 @@ impl SyncManager {
             (list, guard.device.id.clone())
         };
 
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = self.mapping_drive(cmd, &control)?;
+        let mut collection = cmd.collection.clone();
+        let (remote_endpoint, cloud_recovery_path) = if let Some(drive) = &drive {
+            collection = drive.verify_collection(&collection).map_err(drive_error)?;
+            drive_mapping_paths(drive, &collection)
+        } else {
+            (cmd.remote_endpoint.clone(), cmd.cloud_recovery_path.clone())
+        };
         let candidate = LayoutCandidate {
             mapping_id: &cmd.id,
             local_binding: &cmd.local_binding,
-            remote_endpoint: cmd.remote_endpoint.clone(),
+            remote_endpoint: remote_endpoint.clone(),
             local_recovery_root: cmd.local_recovery_root.clone(),
-            cloud_recovery_path: &cmd.cloud_recovery_path,
+            cloud_recovery_path: &cloud_recovery_path,
         };
         let mut layout_error = validate_complete_layout(
             &existing,
@@ -1337,36 +1494,37 @@ impl SyncManager {
         .map(|e| e.cause());
 
         if layout_error.is_none() {
-            let mut cloud_assignments: Vec<DeviceCloudCollection> = existing
-                .iter()
-                .filter(|m| m.account_id == cmd.account_id)
-                .map(|m| DeviceCloudCollection {
-                    device_id: m.device_id.clone(),
-                    collection: m.collection.clone(),
-                })
-                .collect();
-            cloud_assignments.push(DeviceCloudCollection {
-                device_id,
-                collection: cmd.collection.clone(),
-            });
-            if let Err(errs) = validate_cloud_collections(&cloud_assignments) {
-                layout_error = Some(ManagerError::ValidationList(errs).cause());
-            }
+            layout_error = validate_mapping_collections(
+                &existing,
+                &cmd.account_id,
+                &collection,
+                &device_id,
+                drive.is_some(),
+            )
+            .err()
+            .map(|err| err.cause());
         }
 
         let exclusions = effective_exclusions(&cmd.extra_exclusions)?;
 
         let local_inventory =
-            inspect_local_endpoint_detailed(&local_path, &cmd.collection, &exclusions)
+            inspect_local_endpoint_detailed(&local_path, &collection, &exclusions)
                 .map_err(|e| e.cause());
 
-        let remote_inventory = match &cmd.remote_endpoint {
+        let remote_inventory = match &remote_endpoint {
             RemoteEndpoint::LocalDir(remote_root) => {
-                inspect_local_endpoint_detailed(remote_root, &cmd.collection, &exclusions)
+                inspect_local_endpoint_detailed(remote_root, &collection, &exclusions)
                     .map_err(|e| e.cause())
             }
-            RemoteEndpoint::DriveRemote { .. } | RemoteEndpoint::OtherRemote { .. } => {
-                Err("Google Drive inventory is not connected in this build yet.".to_string())
+            RemoteEndpoint::DriveRemote { .. } => inspect_drive_endpoint(
+                drive.as_ref().expect("Drive account resolved"),
+                &collection,
+                &exclusions,
+            )
+            .map(|(inventory, _)| inventory)
+            .map_err(|err| err.cause()),
+            RemoteEndpoint::OtherRemote { .. } => {
+                Err("This remote does not support first sync.".into())
             }
         };
 
@@ -1740,6 +1898,211 @@ impl SyncManager {
     /// (the newest snapshot is never dropped when a consumer falls behind).
     pub fn subscribe_snapshots(&self, bound: usize) -> SnapshotReceiver {
         self.inner.event_bus.subscribe_snapshots(bound)
+    }
+
+    /// Lists immediate children of this ready account's shared Data folder.
+    pub fn list_collection_candidates(
+        &self,
+        account: &AccountId,
+    ) -> Result<CollectionListing, ManagerError> {
+        self.inner
+            .accounts
+            .list_collection_candidates(account)
+            .map_err(drive_error)
+    }
+
+    /// Creates and resolves one immediate child of Data on this account.
+    pub fn create_collection_folder(
+        &self,
+        account: &AccountId,
+        name: &str,
+    ) -> Result<CollectionCandidate, ManagerError> {
+        self.inner
+            .accounts
+            .create_collection_folder(account, name)
+            .map_err(drive_error)
+    }
+
+    /// Returns a recent cached result or starts the only active size calculation.
+    pub fn request_folder_size(
+        &self,
+        account: &AccountId,
+        folder_id: &str,
+    ) -> Result<OperationHandle<FolderSizeSnapshot>, ManagerError> {
+        validate_safe_path_id("account_id", account.as_str())?;
+        validate_drive_folder_id(folder_id).map_err(drive_error)?;
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let (sender, result) = mpsc::channel();
+        let mut guard = self.inner.state.lock().unwrap();
+        let key = (account.clone(), folder_id.to_owned());
+        let now = self.inner.clock.now_utc();
+        if !guard.shutdown
+            && guard
+                .store
+                .get_account(account)?
+                .is_some_and(|account| account.auth_status == "ready")
+            && let Some(cached) = guard.folder_sizes.get(&key)
+            && matches!(cached.status, FolderSizeStatus::Known { .. })
+            && now >= cached.updated_at
+            && now - cached.updated_at < FOLDER_SIZE_CACHE_TTL
+        {
+            let _ = sender.send(Ok(cached.clone()));
+            return Ok(OperationHandle { control, result });
+        }
+        if guard.shutdown || guard.sizing.is_some() {
+            return Err(ManagerError::PreflightRejected {
+                cause: "A folder size calculation is unavailable while another one is active or FolderSync is quitting.".into(),
+                next_step: "Wait for the current operation to finish and try again.".into(),
+            });
+        }
+        let mut status = FolderSizeSnapshot {
+            account_id: account.clone(),
+            folder_id: folder_id.to_owned(),
+            updated_at: now,
+            status: FolderSizeStatus::Calculating,
+        };
+        let old = guard.folder_sizes.insert(key.clone(), status.clone());
+        if let Err(error) = publish_snapshot(&self.inner, &mut guard, false) {
+            restore_size_status(&mut guard, &key, old);
+            return Err(error);
+        }
+        guard.sizing = Some(control.clone());
+        let worker_key = key.clone();
+        let worker_control = control.clone();
+        let inner = Arc::clone(&self.inner);
+        let lock = Arc::clone(&self._lock);
+        let spawned = thread::Builder::new()
+            .name("foldersync-size".into())
+            .spawn(move || {
+                let _lock = lock;
+                let measured = inner
+                    .accounts
+                    .measure_collection(&status.account_id, &status.folder_id, &worker_control)
+                    .map_err(drive_error)
+                    .and_then(|size| {
+                        if size.sizeless != 0 {
+                            return Err(ManagerError::PreflightRejected {
+                                cause: "Some files did not report a size.".into(),
+                                next_step: "Review the folder's contents and try again.".into(),
+                            });
+                        }
+                        Ok(FolderSizeStatus::Known {
+                            bytes: size.bytes,
+                            files: size.count,
+                        })
+                    });
+                let mut guard = inner.state.lock().unwrap();
+                status.updated_at = inner.clock.now_utc();
+                status.status = match &measured {
+                    Ok(status) => status.clone(),
+                    Err(error) => FolderSizeStatus::Failed {
+                        cause: error.cause(),
+                    },
+                };
+                guard
+                    .folder_sizes
+                    .insert(worker_key.clone(), status.clone());
+                if guard.folder_sizes.len() > FOLDER_SIZE_CACHE_CAPACITY
+                    && let Some(oldest) = guard
+                        .folder_sizes
+                        .iter()
+                        .filter(|(key, _)| *key != &worker_key)
+                        .min_by_key(|(_, entry)| entry.updated_at)
+                        .map(|(key, _)| key.clone())
+                {
+                    guard.folder_sizes.remove(&oldest);
+                }
+                guard.sizing = None;
+                let published = publish_snapshot(&inner, &mut guard, false);
+                inner.idle_cv.notify_all();
+                let _ = sender.send(published.and(measured).map(|_| status));
+            });
+        if let Err(error) = spawned {
+            guard.sizing = None;
+            restore_size_status(&mut guard, &key, old);
+            publish_snapshot(&self.inner, &mut guard, false)?;
+            return Err(account_worker_error(error));
+        }
+        Ok(OperationHandle { control, result })
+    }
+
+    /// Starts connecting or reconnecting a Drive account. The returned handle
+    /// can cancel the process independently of any browser window.
+    pub fn start_drive_authorization(
+        &self,
+        operation: DriveAuthorization,
+        on_auth_url: Option<AuthUrlCallback>,
+    ) -> Result<OperationHandle<DriveAccountResult>, ManagerError> {
+        let id = match &operation {
+            DriveAuthorization::Connect(request) => request.id.clone(),
+            DriveAuthorization::Reconnect(id) => id.clone(),
+        };
+        validate_safe_path_id("account_id", id.as_str())?;
+        let control = ProcessControl::default();
+        let worker_control = control.clone();
+        let (sender, result) = mpsc::channel();
+        let mut guard = self.inner.state.lock().unwrap();
+        if guard.shutdown || guard.authorization.is_some() {
+            return Err(ManagerError::PreflightRejected {
+                cause: "Drive authorization is unavailable while another sign-in is active or FolderSync is quitting.".into(),
+                next_step: "Wait for the current operation or cancel sign-in before trying again.".into(),
+            });
+        }
+        guard.authorization = Some((id, control.clone()));
+        let inner = Arc::clone(&self.inner);
+        let lock = Arc::clone(&self._lock);
+        let spawned = thread::Builder::new()
+            .name("foldersync-authorization".into())
+            .spawn(move || {
+                let _lock = lock;
+                let outcome = match operation {
+                    DriveAuthorization::Connect(mut request) => {
+                        request.run_oauth_flow = true;
+                        inner.accounts.add_drive_account_using(
+                            request,
+                            on_auth_url,
+                            Some(&worker_control),
+                        )
+                    }
+                    DriveAuthorization::Reconnect(id) => inner
+                        .accounts
+                        .reconnect_drive_account_using(&id, on_auth_url, Some(&worker_control)),
+                };
+                let mut guard = inner.state.lock().unwrap();
+                let result = outcome.map_err(drive_error).and_then(|outcome| {
+                    if outcome.account.auth_status == "ready" {
+                        let now = inner.clock.now_rfc3339();
+                        let mut updates = guard.store.list_mappings()?;
+                        updates.retain_mut(|mapping| {
+                            if mapping.account_id != outcome.account.id {
+                                return false;
+                            }
+                            let restored =
+                                apply_event(mapping.state, ObservedEvent::AuthenticationRestored)
+                                    .state;
+                            if restored == mapping.state {
+                                return false;
+                            }
+                            mapping.state = restored;
+                            mapping.updated_at.clone_from(&now);
+                            true
+                        });
+                        if !updates.is_empty() {
+                            guard.store.update_mapping_runtimes(&updates)?;
+                        }
+                        publish_updated_snapshot(&inner, &mut guard)?;
+                    }
+                    Ok(outcome)
+                });
+                guard.authorization = None;
+                inner.idle_cv.notify_all();
+                let _ = sender.send(result);
+            });
+        if let Err(error) = spawned {
+            guard.authorization = None;
+            return Err(account_worker_error(error));
+        }
+        Ok(OperationHandle { control, result })
     }
 
     pub fn list_accounts(&self) -> Result<Vec<AccountRecord>, ManagerError> {
@@ -2141,6 +2504,7 @@ impl SyncManager {
         let stopper = {
             let mut guard = self.inner.state.lock().unwrap();
             guard.shutdown = true;
+            cancel_auxiliary_operations(&guard);
             guard.scheduling_paused = true;
 
             // Cancel queued mappings back to Idle in SQLite without altering user intent.
@@ -2277,6 +2641,7 @@ impl SyncManager {
             }
         };
 
+        self.wait_for_canceled_operations(timeout.min(AUXILIARY_STOP_TIMEOUT));
         self.join_watchers();
         if let Some((mapping_id, run_id)) = timed_out_info {
             return Ok(ControlledShutdownOutcome::TimedOutInterrupted { mapping_id, run_id });
@@ -2295,6 +2660,18 @@ impl SyncManager {
         Ok(())
     }
 
+    fn wait_for_canceled_operations(&self, timeout: Duration) {
+        let guard = self.inner.state.lock().unwrap();
+        drop(
+            self.inner
+                .idle_cv
+                .wait_timeout_while(guard, timeout, |state| {
+                    state.sizing.is_some() || state.authorization.is_some()
+                })
+                .unwrap(),
+        );
+    }
+
     fn join_watchers(&self) {
         if let Some(handle) = self.scheduler_thread.lock().unwrap().take() {
             let _ = handle.join();
@@ -2308,6 +2685,7 @@ impl SyncManager {
         let stopper = {
             let mut guard = self.inner.state.lock().unwrap();
             guard.shutdown = true;
+            cancel_auxiliary_operations(&guard);
             guard.job_queue.clear();
             let stopper = if let Some(active) = guard.active_run.as_mut()
                 && !active.stop_requested
@@ -2323,6 +2701,9 @@ impl SyncManager {
         if let Some(stopper) = stopper {
             let _ = stopper.request_stop();
         }
+        if !self.inner.timed_out_shutdown.load(Ordering::SeqCst) {
+            self.wait_for_canceled_operations(AUXILIARY_STOP_TIMEOUT);
+        }
         self.join_watchers();
         // If controlled_shutdown already timed out on a hung child, do NOT block indefinitely on join (HIGH #6).
         if !self.inner.timed_out_shutdown.load(Ordering::SeqCst)
@@ -2332,9 +2713,25 @@ impl SyncManager {
         }
     }
 
+    fn mapping_drive<'a>(
+        &'a self,
+        command: &AddMappingCommand,
+        control: &'a ProcessControl,
+    ) -> Result<Option<LockedDrive<'a>>, ManagerError> {
+        if matches!(command.remote_endpoint, RemoteEndpoint::DriveRemote { .. }) {
+            return self
+                .inner
+                .accounts
+                .locked_drive(&command.account_id, control)
+                .map(Some)
+                .map_err(drive_error);
+        }
+        Ok(None)
+    }
+
     fn handle_add_mapping(
         &self,
-        cmd: AddMappingCommand,
+        mut cmd: AddMappingCommand,
         is_draft: bool,
     ) -> Result<CommandAcceptance, ManagerError> {
         validate_safe_path_id("mapping_id", cmd.id.as_str())?;
@@ -2354,6 +2751,16 @@ impl SyncManager {
         validate_local_binding(&cmd.local_binding, &StdPathResolver)?;
         let local_recovery_root =
             resolve_absolute_path("local_recovery_root", &cmd.local_recovery_root)?;
+        // Account lock precedes the state mutex and remains held through the mapping commit.
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = self.mapping_drive(&cmd, &control)?;
+        if let Some(drive) = &drive {
+            cmd.collection = drive
+                .verify_collection(&cmd.collection)
+                .map_err(drive_error)?;
+            (cmd.remote_endpoint, cmd.cloud_recovery_path) =
+                drive_mapping_paths(drive, &cmd.collection);
+        }
         let (remote_endpoint, cloud_recovery_path) = match cmd.remote_endpoint {
             RemoteEndpoint::LocalDir(remote_dir) => {
                 if !remote_dir.is_dir() {
@@ -2440,19 +2847,13 @@ impl SyncManager {
             self.inner.finder_writer.dir(),
         )?;
 
-        let mut cloud_assignments: Vec<DeviceCloudCollection> = existing
-            .iter()
-            .filter(|m| m.account_id == cmd.account_id)
-            .map(|m| DeviceCloudCollection {
-                device_id: m.device_id.clone(),
-                collection: m.collection.clone(),
-            })
-            .collect();
-        cloud_assignments.push(DeviceCloudCollection {
-            device_id: guard.device.id.clone(),
-            collection: cmd.collection.clone(),
-        });
-        validate_cloud_collections(&cloud_assignments).map_err(ManagerError::ValidationList)?;
+        validate_mapping_collections(
+            &existing,
+            &cmd.account_id,
+            &cmd.collection,
+            &guard.device.id,
+            drive.is_some(),
+        )?;
 
         let effective_exclusions = effective_exclusions(&cmd.extra_exclusions)?;
 
@@ -3137,6 +3538,18 @@ impl SyncManager {
         };
         result.map_err(|(_, err)| *err)?;
 
+        // A successful Drive endpoint check includes a ready account and a
+        // verified generation. Recheck readiness before clearing the hold.
+        if mapping.state.readiness() == Readiness::AuthenticationRequired
+            && mapping.remote_endpoint_kind == "drive_remote"
+            && guard
+                .store
+                .get_account(&mapping.account_id)?
+                .is_some_and(|account| account.auth_status == "ready")
+        {
+            mapping.state = apply_event(mapping.state, ObservedEvent::AuthenticationRestored).state;
+        }
+
         match mapping.state.readiness() {
             Readiness::EndpointChanged => {
                 mapping.state = apply_event(mapping.state, ObservedEvent::EndpointValidated).state;
@@ -3398,7 +3811,43 @@ impl SyncManager {
         &self,
         account_id: AccountId,
     ) -> Result<CommandAcceptance, ManagerError> {
+        let account = self
+            .inner
+            .accounts
+            .get_account(&account_id)
+            .map_err(drive_error)?;
+        let _account_lock = if account.is_some_and(|account| account.kind == "drive") {
+            Some(
+                self.inner
+                    .accounts
+                    .try_account_lock(&account_id)
+                    .map_err(drive_error)?,
+            )
+        } else {
+            None
+        };
         let mut guard = self.inner.state.lock().unwrap();
+        if guard.folder_sizes.values().any(|size| {
+            size.account_id == account_id && size.status == FolderSizeStatus::Calculating
+        }) {
+            return Err(ManagerError::PreflightRejected {
+                cause: "A folder size is being calculated for this account.".into(),
+                next_step:
+                    "Cancel the calculation or wait for it to finish before removing the account."
+                        .into(),
+            });
+        }
+        if guard
+            .authorization
+            .as_ref()
+            .is_some_and(|(id, _)| id == &account_id)
+        {
+            return Err(ManagerError::PreflightRejected {
+                cause: "This account is signing in.".into(),
+                next_step: "Cancel sign-in or wait for it to finish before removing the account."
+                    .into(),
+            });
+        }
         if guard.store.get_account(&account_id)?.is_none() {
             return Err(ManagerError::NotFound {
                 cause: format!("Account `{account_id}` does not exist."),
@@ -3423,6 +3872,7 @@ impl SyncManager {
             });
         }
         guard.store.delete_account(&account_id)?;
+        guard.folder_sizes.retain(|(id, _), _| id != &account_id);
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         Ok(CommandAcceptance {
             outcome: CommandOutcome::AccountRemoved { account_id },
@@ -3966,6 +4416,7 @@ fn lookup_mapping(store: &SqliteStateStore, id: &MappingId) -> Result<MappingRec
 
 fn same_volume_inputs(previous: &MappingRecord, current: &MappingRecord) -> bool {
     previous.local_binding == current.local_binding
+        && previous.account_id == current.account_id
         && previous.active_generation_id == current.active_generation_id
         && previous.remote_endpoint_kind == current.remote_endpoint_kind
         && previous.remote_endpoint_value == current.remote_endpoint_value
@@ -4000,7 +4451,16 @@ fn check_mapping_volume(
         .as_ref()
         .filter(|_| verify_all)
         .map(|generation| {
-            verify_endpoints_for_generation(inner, &mapping, generation, &observation)
+            verify_endpoints_for_generation(inner, &mapping, generation, &observation)?;
+            if mapping.remote_endpoint_kind == "drive_remote" {
+                let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+                let drive = inner
+                    .accounts
+                    .locked_drive(&mapping.account_id, &control)
+                    .map_err(drive_endpoint_error)?;
+                verify_drive_generation(&drive, &mapping, generation)?;
+            }
+            Ok(())
         });
     let paths_valid = match &endpoints {
         Some(Err((Some(ObservedEvent::EndpointChanged), _))) => Some(false),
@@ -4377,6 +4837,46 @@ fn record_preflight_check_failure(
 }
 
 type EndpointCheckError = (Option<ObservedEvent>, Box<ManagerError>);
+
+fn drive_endpoint_error(error: AccountError) -> EndpointCheckError {
+    let event = match &error {
+        AccountError::AuthenticationRequired { .. } => Some(ObservedEvent::AuthenticationFailed),
+        AccountError::FolderNotFound { .. }
+        | AccountError::FolderIdMismatch { .. }
+        | AccountError::AmbiguousDuplicate { .. } => Some(ObservedEvent::EndpointChanged),
+        _ => None,
+    };
+    (event, Box::new(drive_error(error)))
+}
+
+fn verify_drive_generation(
+    drive: &LockedDrive<'_>,
+    mapping: &MappingRecord,
+    generation: &GenerationRecord,
+) -> Result<(), EndpointCheckError> {
+    let endpoint_changed = |error| (Some(ObservedEvent::EndpointChanged), Box::new(error));
+    drive_mapping_configuration_matches(drive, mapping, &generation.config.remote_root_folder_id)
+        .map_err(endpoint_changed)?;
+    if generation.config.path2 != mapping.remote_endpoint_value
+        || generation.config.selected_folder_id != mapping.collection.folder_id
+    {
+        return Err(endpoint_changed(ManagerError::PreflightRejected {
+            cause: "The cloud folder does not match the saved sync generation.".into(),
+            next_step: "Review the Drive collection selected for this mapping.".into(),
+        }));
+    }
+    drive_recovery_directory(drive, mapping, false, &|| false)
+        .map_err(|error| (None, Box::new(error)))?;
+    drive
+        .verify_collection(&mapping.collection)
+        .map_err(drive_endpoint_error)?;
+    verify_drive_marker(drive, &mapping.collection).map_err(|error| {
+        let event = matches!(error, ManagerError::AccessMarkerConflict { .. })
+            .then_some(ObservedEvent::EndpointChanged);
+        (event, Box::new(error))
+    })?;
+    Ok(())
+}
 
 fn verify_endpoints_for_generation(
     inner: &ManagerInner,
@@ -4976,15 +5476,9 @@ fn reconcile_startup_state(
     Ok(())
 }
 
-fn build_snapshot(
-    store: &SqliteStateStore,
-    volumes: &BTreeMap<MappingId, BoundVolume>,
-    sequence: u64,
-    active_job_mapping_id: Option<MappingId>,
-    queue_order: Vec<MappingId>,
-    scheduling_paused: bool,
-    clock: &dyn Clock,
-) -> Result<StatusSnapshot, ManagerError> {
+fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapshot, ManagerError> {
+    let store = &guard.store;
+    let scheduling_paused = guard.scheduling_paused;
     let mappings = store.list_mappings()?;
     let mut views = Vec::with_capacity(mappings.len());
 
@@ -4992,8 +5486,10 @@ fn build_snapshot(
         let fingerprint = m
             .active_generation_id
             .as_ref()
-            .and_then(|gid| store.get_generation(gid).ok().flatten())
-            .map(|g| g.fingerprint);
+            .map(|gid| store.get_generation(gid))
+            .transpose()?
+            .flatten()
+            .map(|generation| generation.fingerprint);
         let open_cases = store.list_open_recovery_cases(&m.id)?;
         // Bounded O(1) lookup (`LIMIT 1`) — never reloads all historical runs on snapshot rebuild.
         let latest_run = store.get_latest_run_for_mapping(&m.id)?;
@@ -5029,7 +5525,7 @@ fn build_snapshot(
         };
 
         let display_name = m.collection.display_name().to_string();
-        let observed_volume = volumes.get(&m.id);
+        let observed_volume = guard.volumes.get(&m.id);
         let mounted = observed_volume.and_then(BoundVolume::mounted);
         let volume_name = mounted
             .map(|volume| volume.display_name.clone())
@@ -5083,6 +5579,20 @@ fn build_snapshot(
             open_recovery_cases: open_cases.len() as u64,
         };
 
+        let schedule = guard.schedules.get(&m.id).filter(|schedule| {
+            !scheduling_paused
+                && m.scheduling_enabled
+                && m.state.readiness() == Readiness::Ready
+                && m.state.intent == Intent::Enabled
+                && m.state.execution == Execution::Idle
+                && m.active_generation_id.as_ref() == Some(&schedule.generation)
+                && !guard.storage_blocked_mappings.contains(&m.id)
+        });
+        let retry_at = schedule.and_then(|schedule| schedule.retry_at);
+        let next_poll_at = schedule
+            .filter(|_| retry_at.is_none())
+            .map(|schedule| schedule.next_poll(m.schedule_interval_secs));
+
         views.push(MappingStatusSnapshot {
             id: m.id,
             display_name,
@@ -5100,6 +5610,8 @@ fn build_snapshot(
             intent: m.state.intent,
             scheduling_enabled: m.scheduling_enabled,
             schedule_interval_secs: m.schedule_interval_secs,
+            next_poll_at,
+            retry_at,
             active_generation_id: m.active_generation_id,
             active_generation_fingerprint: fingerprint,
             last_run_id: m.last_run_id,
@@ -5118,12 +5630,17 @@ fn build_snapshot(
     }
 
     Ok(StatusSnapshot {
-        sequence,
+        sequence: guard.snapshot_seq,
         generated_at: clock.now_rfc3339(),
-        active_job_mapping_id,
-        queue_order,
+        active_job_mapping_id: guard.active_run.as_ref().map(|run| run.mapping_id.clone()),
+        queue_order: guard
+            .job_queue
+            .iter()
+            .map(|job| job.mapping_id.clone())
+            .collect(),
         scheduling_paused,
         mappings: views,
+        folder_sizes: guard.folder_sizes.values().cloned().collect(),
     })
 }
 
@@ -5143,22 +5660,7 @@ fn publish_snapshot(
 ) -> Result<Arc<StatusSnapshot>, ManagerError> {
     guard.snapshot_seq += 1;
     guard.last_space_snapshot = inner.clock.now_utc();
-    let active = guard.active_run.as_ref().map(|a| a.mapping_id.clone());
-    let queue_order: Vec<MappingId> = guard
-        .job_queue
-        .iter()
-        .map(|j| j.mapping_id.clone())
-        .collect();
-    let scheduling_paused = guard.scheduling_paused;
-    let snap = Arc::new(build_snapshot(
-        &guard.store,
-        &guard.volumes,
-        guard.snapshot_seq,
-        active,
-        queue_order,
-        scheduling_paused,
-        inner.clock.as_ref(),
-    )?);
+    let snap = Arc::new(build_snapshot(guard, inner.clock.as_ref())?);
     guard.latest_snapshot = Arc::clone(&snap);
     inner.event_bus.publish_snapshot(Arc::clone(&snap));
     inner
@@ -5171,6 +5673,135 @@ fn publish_snapshot(
         eprintln!("Warning: failed to publish Finder status.json: {err}");
     }
     Ok(snap)
+}
+
+fn drive_mapping_paths(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+) -> (RemoteEndpoint, String) {
+    let remote = drive.account.remote_name.clone();
+    let recovery = format!("{remote}:Recovery/{}", collection.folder_id);
+    (
+        RemoteEndpoint::DriveRemote {
+            remote,
+            path: collection.display_path.clone(),
+        },
+        recovery,
+    )
+}
+
+fn drive_mapping_configuration_matches(
+    drive: &LockedDrive<'_>,
+    mapping: &MappingRecord,
+    frozen_root: &str,
+) -> Result<(), ManagerError> {
+    let (endpoint, recovery) = drive_mapping_paths(drive, &mapping.collection);
+    let (kind, value) = endpoint.to_db_cols();
+    if drive.account.remote_root_folder_id != frozen_root
+        || mapping.remote_endpoint_kind != kind
+        || mapping.remote_endpoint_value != value
+        || mapping.cloud_recovery_path != recovery
+        || mapping.collection.ancestor_ids.is_empty()
+    {
+        return Err(ManagerError::PreflightRejected {
+            cause: "The saved Drive account, collection or recovery path has changed.".into(),
+            next_step: "Review the account and collection selected for this mapping.".into(),
+        });
+    }
+    Ok(())
+}
+
+fn drive_recovery_directory(
+    drive: &LockedDrive<'_>,
+    mapping: &MappingRecord,
+    create: bool,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<String, ManagerError> {
+    validate_drive_folder_id(&mapping.collection.folder_id).map_err(drive_error)?;
+    validate_safe_path_id("device_id", mapping.device_id.as_str())?;
+    let mut parent = String::new();
+    for name in [
+        "Recovery",
+        mapping.collection.folder_id.as_str(),
+        mapping.device_id.as_str(),
+    ] {
+        let path = if parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent}/{name}")
+        };
+        let inspect = || -> Result<bool, ManagerError> {
+            let entries = drive
+                .request
+                .list_entries(&parent, false, &drive.runner)
+                .map_err(|err| drive_error(err.into()))?;
+            let mut matches = entries
+                .iter()
+                .filter(|entry| entry.name.eq_ignore_ascii_case(name));
+            match (matches.next(), matches.next()) {
+                (None, _) => Ok(false),
+                (Some(entry), None)
+                    if entry.name == name
+                        && entry.path == name
+                        && entry.is_dir
+                        && entry.id.as_ref().is_none_or(|id| {
+                            id != &mapping.collection.folder_id
+                                && !mapping.collection.ancestor_ids.contains(id)
+                        }) =>
+                {
+                    Ok(true)
+                }
+                _ => Err(ManagerError::PreflightRejected {
+                    cause: format!(
+                        "The Drive recovery folder `{path}` is ambiguous or overlaps a synced folder."
+                    ),
+                    next_step: "Review the Recovery folder under the shared parent.".into(),
+                }),
+            }
+        };
+        let mut present = inspect()?;
+        if !present && create && !is_cancelled() {
+            drive
+                .request
+                .mkdir(&path, &drive.runner)
+                .map_err(|err| drive_error(err.into()))?;
+            present = inspect()?;
+        }
+        if !present {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!("The Drive recovery folder `{path}` is unavailable."),
+                next_step: "Check access to the Recovery folder under the shared parent.".into(),
+            });
+        }
+        parent = path;
+    }
+    Ok(parent)
+}
+
+fn validate_mapping_collections(
+    existing: &[MappingRecord],
+    account_id: &AccountId,
+    collection: &CloudCollection,
+    device_id: &DeviceId,
+    drive: bool,
+) -> Result<(), ManagerError> {
+    let candidate = DeviceCloudCollection {
+        device_id: device_id.clone(),
+        collection: collection.clone(),
+    };
+    let mut account_collections = vec![candidate.clone()];
+    for mapping in existing {
+        let assignment = DeviceCloudCollection {
+            device_id: mapping.device_id.clone(),
+            collection: mapping.collection.clone(),
+        };
+        if &mapping.account_id == account_id {
+            account_collections.push(assignment);
+        } else if drive && mapping.remote_endpoint_kind == "drive_remote" {
+            validate_cloud_collection_identity_pair(&candidate, &assignment)?;
+        }
+    }
+    validate_cloud_collections(&account_collections).map_err(ManagerError::ValidationList)
 }
 
 struct InitPreflightOutput {
@@ -5210,15 +5841,18 @@ fn run_init_preflight_unlocked(
         inner.finder_writer.dir(),
     )?;
 
-    let cloud_assignments: Vec<DeviceCloudCollection> = all_mappings
+    let other_mappings: Vec<_> = all_mappings
         .iter()
-        .filter(|m| m.account_id == mapping.account_id)
-        .map(|m| DeviceCloudCollection {
-            device_id: m.device_id.clone(),
-            collection: m.collection.clone(),
-        })
+        .filter(|other| other.id != mapping.id)
+        .cloned()
         .collect();
-    validate_cloud_collections(&cloud_assignments).map_err(ManagerError::ValidationList)?;
+    validate_mapping_collections(
+        &other_mappings,
+        &mapping.account_id,
+        &mapping.collection,
+        &mapping.device_id,
+        mapping.remote_endpoint_kind == "drive_remote",
+    )?;
 
     let effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
 
@@ -5308,11 +5942,68 @@ fn run_init_preflight_unlocked(
             )?;
             (dir, engine_meta)
         }
-        RemoteEndpoint::DriveRemote { .. } | RemoteEndpoint::OtherRemote { .. } => {
+        RemoteEndpoint::DriveRemote { .. } => {
+            let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+            let drive = inner
+                .accounts
+                .locked_drive(&account.id, &control)
+                .map_err(drive_error)?;
+            drive_mapping_configuration_matches(&drive, mapping, &account.remote_root_folder_id)?;
+            drive
+                .verify_collection(&mapping.collection)
+                .map_err(drive_error)?;
+            let local_inv =
+                inspect_local_endpoint(&canonical_local, &mapping.collection, &effective_filters)?;
+            let (remote, marker) =
+                inspect_drive_endpoint(&drive, &mapping.collection, &effective_filters)?;
+            if let Some(cause) = remote.name_findings.first() {
+                return Err(ManagerError::PreflightRejected {
+                    cause: cause.clone(),
+                    next_step: remote.first_name_finding_next_step.unwrap_or_default(),
+                });
+            }
+            let remote_inv = EndpointInventory {
+                root: remote.root,
+                classification: remote.classification,
+                item_count: remote.all_items_count,
+                has_valid_marker: remote.has_valid_marker,
+            };
+            let direction =
+                decide_init_direction(&mapping.id, &local_inv, &remote_inv, expected_direction)?;
+            let engine_meta = inner.launcher.engine_metadata()?;
+            if is_cancelled() {
+                return Ok(None);
+            }
+
+            verify_local_disk()?;
+            writable_directory_space(&canonical_local)?;
+            fs::create_dir_all(&mapping.local_recovery_root).map_err(|err| ManagerError::Io {
+                cause: format!("Failed to create local recovery directory: {err}"),
+                next_step: "Verify permissions on the recovery drive and retry.".into(),
+            })?;
+            verify_recovery_root(inner.volume_probe.as_ref(), &mapping.local_recovery_root)?;
+            let recovery = drive_recovery_directory(&drive, mapping, true, is_cancelled)?;
+            if is_cancelled() {
+                return Ok(None);
+            }
+            // Check path-addressed identity again before touching the endpoints.
+            drive
+                .verify_collection(&mapping.collection)
+                .map_err(drive_error)?;
+            establish_drive_marker(
+                &drive,
+                &mapping.collection,
+                &local_inv,
+                marker,
+                &recovery,
+                is_cancelled,
+            )?;
+            (direction, engine_meta)
+        }
+        RemoteEndpoint::OtherRemote { .. } => {
             return Err(ManagerError::PreflightRejected {
-                cause: "Google Drive first sync is not connected in this build yet.".to_string(),
-                next_step: "Use a local test folder account until Drive OAuth wiring lands."
-                    .to_string(),
+                cause: "This remote does not support first sync.".into(),
+                next_step: "Choose a supported Drive account.".into(),
             });
         }
     };
@@ -5983,6 +6674,7 @@ fn claim_and_prepare_locked(
         path1: generation.config.path1.clone(),
         path2: remote_ep.to_path2(),
         config_path: account.config_path,
+        password_command: None,
         workdir: generation.workdir_path.clone(),
         filters_file: generation.filters_file_path.clone(),
         check_filename: ACCESS_MARKER_FILENAME.to_string(),
@@ -6153,6 +6845,9 @@ fn abort_endpoint_check_failed_locked(
     let now = inner.clock.now_rfc3339();
     let (outcome_kind, run_outcome) = match event {
         Some(ObservedEvent::VolumeLost) => ("volume_mismatch", RunOutcome::VolumeMismatch),
+        Some(ObservedEvent::AuthenticationFailed) => {
+            ("authentication_failure", RunOutcome::AuthenticationFailure)
+        }
         Some(_) => ("endpoint_mismatch", RunOutcome::EndpointMismatch),
         None => ("preflight_failed", RunOutcome::RetryableFailure),
     };
@@ -6320,25 +7015,44 @@ fn launch_cancellation(guard: &SharedState, run_id: &RunId) -> Option<bool> {
     }
 }
 
-fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
+fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
     let volume = observe_binding(inner.volume_probe.as_ref(), &prepared.mapping.local_binding);
-    if let Err((event, err)) =
-        verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)
-    {
-        let mut guard = inner.state.lock().unwrap();
-        if let Some(forced) = launch_cancellation(&guard, &prepared.run.id) {
-            abort_before_spawn_locked(inner, &mut guard, prepared.run, forced);
-        } else {
-            abort_endpoint_check_failed_locked(
-                inner,
-                &mut guard,
-                prepared.run,
-                event,
-                *err,
-                volume,
-            );
+    let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+    let open_drive = || -> Result<Option<LockedDrive<'_>>, EndpointCheckError> {
+        verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)?;
+        if prepared.mapping.remote_endpoint_kind != "drive_remote" {
+            return Ok(None);
         }
-        return;
+        inner
+            .accounts
+            .locked_drive(&prepared.mapping.account_id, &control)
+            .map(Some)
+            .map_err(drive_endpoint_error)
+    };
+    // Drive may refresh its token during bisync, so keep the account lock
+    // through the child exit and terminal bookkeeping.
+    let drive = match open_drive() {
+        Ok(drive) => drive,
+        Err((event, err)) => {
+            let mut guard = inner.state.lock().unwrap();
+            if let Some(forced) = launch_cancellation(&guard, &prepared.run.id) {
+                abort_before_spawn_locked(inner, &mut guard, prepared.run, forced);
+            } else {
+                abort_endpoint_check_failed_locked(
+                    inner,
+                    &mut guard,
+                    prepared.run,
+                    event,
+                    *err,
+                    volume,
+                );
+            }
+            return;
+        }
+    };
+    if let Some(drive) = &drive {
+        prepared.plan.config_path = drive.account.config_path.clone();
+        prepared.plan.password_command = drive.request.password_command().cloned();
     }
 
     // Qualify engine and construct the request outside the state mutex.
@@ -6434,7 +7148,13 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, prepared: PreparedRun) {
     };
     let verification =
         verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)
-            .and_then(|()| verify_backups().map_err(|err| (None, Box::new(err))));
+            .and_then(|()| verify_backups().map_err(|err| (None, Box::new(err))))
+            .and_then(|()| {
+                if let Some(drive) = &drive {
+                    verify_drive_generation(drive, &prepared.mapping, &prepared.generation)?;
+                }
+                Ok(())
+            });
     let mut run = prepared.run;
     let launched = {
         let mut guard = inner.state.lock().unwrap();

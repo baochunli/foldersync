@@ -34,7 +34,7 @@ pub use log_parser::{
     parse_log_line, parse_log_stream, strip_ansi_codes,
 };
 pub use lsjson::{
-    DuplicateDirFinding, LsJsonEntry, LsJsonError, LsJsonRequest, ResolvedComponent,
+    DuplicateDirFinding, LsJsonEntry, LsJsonError, LsJsonRequest, RemoteSize, ResolvedComponent,
     ResolvedRemotePath, find_duplicate_dir_names, list_dirs_with_runner, parse_lsjson_entries,
     resolve_folder_path_with_runner, verify_expected_folder_identity_with_runner,
 };
@@ -43,10 +43,10 @@ pub use outcome::{
     classify_run_outcome,
 };
 pub use process::{
-    BoundedLineBuffer, CapturedOutput, ChildIdentity, ExitStatusInfo, FakeProcessRunner,
-    FakeRunScript, OutputLimits, OutputLine, ProcessError, ProcessRunner, ProcessSpec,
-    ProcessStartTime, RealProcessRunner, RunHandle, RunOutput, SpawnOptions, StopHandle,
-    StreamKind, minimal_isolated_env, read_process_start_time,
+    BoundedLineBuffer, CapturedOutput, ChildIdentity, ControlledProcessRunner, ExitStatusInfo,
+    FakeProcessRunner, FakeRunScript, OutputLimits, OutputLine, ProcessControl, ProcessError,
+    ProcessRunner, ProcessSpec, ProcessStartTime, RealProcessRunner, RunHandle, RunOutput,
+    SpawnOptions, StopHandle, StreamKind, minimal_isolated_env, read_process_start_time,
 };
 pub use qualification::{
     EngineIdentity, PlatformPin, QualificationError, QualificationManifest, host_platform_key,

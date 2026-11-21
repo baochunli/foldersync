@@ -34,12 +34,15 @@ impl Schedule {
         }
     }
 
+    pub fn next_poll(&self, interval_secs: u64) -> DateTime<Utc> {
+        self.last_finished + TimeDelta::seconds(interval_secs.clamp(60, 86_400) as i64)
+    }
+
     pub fn due(&self, now: DateTime<Utc>, interval_secs: u64) -> bool {
         if let Some(retry_at) = self.retry_at {
             return now >= retry_at;
         }
-        let interval = TimeDelta::seconds(interval_secs.clamp(60, 86_400) as i64);
-        now >= self.last_finished + interval
+        now >= self.next_poll(interval_secs)
             || (now >= self.last_finished + COOLDOWN
                 && self.hint_at.is_some_and(|hint| now >= hint + QUIET))
     }

@@ -16,10 +16,12 @@ use thiserror::Error;
 
 use crate::{
     config::stderr_indicates_auth_failure,
-    process::{ProcessError, ProcessRunner, ProcessSpec, SpawnOptions, minimal_isolated_env},
+    process::{
+        ProcessError, ProcessRunner, ProcessSpec, RunOutput, SpawnOptions, minimal_isolated_env,
+    },
     qualification::{
         EngineIdentity, QualificationError, QualificationManifest,
-        verify_binary_integrity_with_manifest,
+        verify_binary_identity_with_manifest, verify_executable_metadata,
     },
     request::{PasswordCommand, RequestError, validate_remote_name_str, validate_remote_path_str},
 };
@@ -141,15 +143,15 @@ pub enum LsJsonError {
         expected_ancestors: Vec<String>,
         actual_ancestors: Vec<String>,
     },
-    #[error("failed to parse rclone lsjson output: {reason}")]
+    #[error("failed to parse the rclone response: {reason}")]
     ParseJson { reason: String },
-    #[error("rclone lsjson failed (code={code:?}, signal={signal:?}): {detail}")]
+    #[error("rclone remote command failed (code={code:?}, signal={signal:?}): {detail}")]
     CommandFailed {
         code: Option<i32>,
         signal: Option<i32>,
         detail: String,
     },
-    #[error("process error while running lsjson: {0}")]
+    #[error("process error during the remote command: {0}")]
     Process(#[from] ProcessError),
 }
 
@@ -198,10 +200,8 @@ impl LsJsonRequest {
         self.password_command.as_ref()
     }
 
-    /// Builds the `rclone lsjson --dirs-only` argv for `subpath` (`""` for remote root).
-    pub fn to_args(&self, subpath: &str) -> Result<Vec<OsString>, LsJsonError> {
+    fn target(&self, subpath: &str) -> Result<OsString, LsJsonError> {
         if !subpath.is_empty() {
-            // Allow absolute paths only for local-backend test remotes (e.g. `mylocal:/tmp/tree`).
             if self.is_drive {
                 validate_remote_path_str(subpath)?;
             } else if subpath.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) {
@@ -211,43 +211,199 @@ impl LsJsonRequest {
                 }));
             }
         }
-        let target = format!("{}:{subpath}", self.remote_name);
-        let mut args = vec![
-            OsString::from("lsjson"),
-            OsString::from("--max-depth"),
-            OsString::from("1"),
-            OsString::from("--dirs-only"),
-            OsString::from(target),
-            OsString::from("--config"),
-            self.config_path.as_os_str().to_os_string(),
-        ];
-        if let Some(pw) = &self.password_command {
-            args.push(OsString::from("--password-command"));
-            args.push(OsString::from(pw.to_rclone_space_sep_list()));
-        }
-        args.push(OsString::from("--ask-password=false"));
-        if self.is_drive {
-            args.push(OsString::from("--drive-skip-gdocs"));
-            args.push(OsString::from("--drive-skip-shortcuts"));
-        }
-        Ok(args)
+        Ok(format!("{}:{subpath}", self.remote_name).into())
     }
 
-    fn build_verified_spec(
+    fn with_config_args(&self, mut args: Vec<OsString>) -> Vec<OsString> {
+        args.push("--config".into());
+        args.push(self.config_path.as_os_str().into());
+        if let Some(pw) = &self.password_command {
+            args.push("--password-command".into());
+            args.push(pw.to_rclone_space_sep_list().into());
+        }
+        args.push("--ask-password=false".into());
+        if self.is_drive {
+            args.push("--drive-skip-gdocs".into());
+            args.push("--drive-skip-shortcuts".into());
+        }
+        args
+    }
+
+    /// Builds the `rclone lsjson --dirs-only` argv for `subpath` (`""` for remote root).
+    pub fn to_args(&self, subpath: &str) -> Result<Vec<OsString>, LsJsonError> {
+        Ok(self.with_config_args(vec![
+            "lsjson".into(),
+            "--max-depth".into(),
+            "1".into(),
+            "--dirs-only".into(),
+            self.target(subpath)?,
+        ]))
+    }
+
+    fn run(
+        &self,
+        args: Vec<OsString>,
+        manifest: &QualificationManifest,
+        runner: &dyn ProcessRunner,
+    ) -> Result<RunOutput, LsJsonError> {
+        verify_binary_identity_with_manifest(&self.engine, manifest)?;
+        verify_executable_metadata(&self.engine)?;
+        // The real runner verifies the executable digest at the spawn boundary.
+        let spec = ProcessSpec {
+            program: self.engine.path().to_path_buf(),
+            args,
+            current_dir: None,
+            env: minimal_isolated_env(self.config_path.parent()),
+            expected_binary_sha256: Some(self.engine.sha256().to_string()),
+        };
+        let output = runner.spawn(&spec, SpawnOptions::default())?.wait()?;
+        if !output.exit_status.is_success() {
+            let detail = output.output.stderr_text().trim().to_owned();
+            if stderr_indicates_auth_failure(&detail) {
+                return Err(LsJsonError::AuthenticationRequired { reason: detail });
+            }
+            return Err(LsJsonError::CommandFailed {
+                code: output.exit_status.code,
+                signal: output.exit_status.signal,
+                detail,
+            });
+        }
+        Ok(output)
+    }
+
+    fn run_command(
+        &self,
+        args: Vec<OsString>,
+        runner: &dyn ProcessRunner,
+    ) -> Result<RunOutput, LsJsonError> {
+        self.run(
+            self.with_config_args(args),
+            &QualificationManifest::embedded()?,
+            runner,
+        )
+    }
+
+    /// Lists files and directories for initialization inventory or a sibling-name check.
+    pub fn list_entries(
         &self,
         subpath: &str,
-        manifest: &QualificationManifest,
-    ) -> Result<ProcessSpec, LsJsonError> {
-        verify_binary_integrity_with_manifest(&self.engine, manifest)?;
-        let account_dir = self.config_path.parent();
-        Ok(ProcessSpec {
-            program: self.engine.path().to_path_buf(),
-            args: self.to_args(subpath)?,
-            current_dir: None,
-            env: minimal_isolated_env(account_dir),
-            expected_binary_sha256: Some(self.engine.sha256().to_string()),
+        recursive: bool,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        let mut args = vec!["lsjson".into(), self.target(subpath)?];
+        if recursive {
+            args.push("--recursive".into());
+        } else {
+            args.extend(["--max-depth".into(), "1".into()]);
+        }
+        let output = self.run_command(args, runner)?;
+        parse_lsjson_entries(&complete_stdout(&output)?)
+    }
+
+    /// Counts supported objects without retrieving file contents.
+    pub fn size(
+        &self,
+        subpath: &str,
+        runner: &dyn ProcessRunner,
+    ) -> Result<RemoteSize, LsJsonError> {
+        let output = self.run_command(
+            vec![
+                "size".into(),
+                self.target(subpath)?,
+                "--json".into(),
+                "--exclude".into(),
+                "/RCLONE_TEST".into(),
+            ],
+            runner,
+        )?;
+        serde_json::from_str(&complete_stdout(&output)?).map_err(|err| LsJsonError::ParseJson {
+            reason: err.to_string(),
         })
     }
+
+    pub fn mkdir(&self, subpath: &str, runner: &dyn ProcessRunner) -> Result<(), LsJsonError> {
+        self.run_command(
+            vec!["mkdir".into(), self.target(subpath)?, "--retries=1".into()],
+            runner,
+        )?;
+        Ok(())
+    }
+
+    pub fn fetch_marker(
+        &self,
+        marker: &str,
+        destination: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<(), LsJsonError> {
+        self.run_command(
+            vec![
+                "copyto".into(),
+                self.target(marker)?,
+                destination.as_os_str().into(),
+                "--max-transfer=4Ki".into(),
+                "--cutoff-mode=hard".into(),
+                "--retries=1".into(),
+            ],
+            runner,
+        )?;
+        Ok(())
+    }
+
+    pub fn stage_marker(
+        &self,
+        local_marker: &Path,
+        staging_path: &str,
+        runner: &dyn ProcessRunner,
+    ) -> Result<(), LsJsonError> {
+        self.run_command(
+            vec![
+                "copyto".into(),
+                local_marker.as_os_str().into(),
+                self.target(staging_path)?,
+                "--ignore-existing".into(),
+                "--retries=1".into(),
+            ],
+            runner,
+        )?;
+        Ok(())
+    }
+
+    pub fn publish_staged_marker(
+        &self,
+        staging_path: &str,
+        final_path: &str,
+        runner: &dyn ProcessRunner,
+    ) -> Result<(), LsJsonError> {
+        // A same-remote Drive Move updates the staged object's ID only. If another
+        // client creates the final name concurrently, the caller checks for ambiguity.
+        self.run_command(
+            vec![
+                "moveto".into(),
+                self.target(staging_path)?,
+                self.target(final_path)?,
+                "--ignore-existing".into(),
+                "--retries=1".into(),
+            ],
+            runner,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct RemoteSize {
+    pub count: u64,
+    pub bytes: u64,
+    pub sizeless: u64,
+}
+
+fn complete_stdout(output: &RunOutput) -> Result<String, LsJsonError> {
+    if output.output.dropped_lines != 0 || output.output.truncated_lines != 0 {
+        return Err(LsJsonError::ParseJson {
+            reason: "rclone output exceeded the capture limit".to_string(),
+        });
+    }
+    Ok(output.output.stdout_text())
 }
 
 /// Parses raw `rclone lsjson` stdout JSON into typed [`LsJsonEntry`] records.
@@ -298,25 +454,8 @@ pub(crate) fn list_dirs_with_manifest(
     manifest: &QualificationManifest,
     runner: &dyn ProcessRunner,
 ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
-    let spec = req.build_verified_spec(subpath, manifest)?;
-    let handle = runner.spawn(&spec, SpawnOptions::default())?;
-    let run_out = handle.wait()?;
-    if !run_out.exit_status.is_success() {
-        let stderr = run_out.output.stderr_text();
-        let stdout = run_out.output.stdout_text();
-        let combined = if stderr.is_empty() { stdout } else { stderr };
-        if stderr_indicates_auth_failure(&combined) {
-            return Err(LsJsonError::AuthenticationRequired {
-                reason: combined.trim().to_string(),
-            });
-        }
-        return Err(LsJsonError::CommandFailed {
-            code: run_out.exit_status.code,
-            signal: run_out.exit_status.signal,
-            detail: combined.trim().to_string(),
-        });
-    }
-    parse_lsjson_entries(&run_out.output.stdout_text())
+    let output = req.run(req.to_args(subpath)?, manifest, runner)?;
+    parse_lsjson_entries(&complete_stdout(&output)?)
 }
 
 /// Resolves every component of `relative_path` (e.g. `Data/Research`) using
@@ -365,6 +504,11 @@ pub(crate) fn resolve_folder_path_with_manifest(
                 });
             }
             [single] => {
+                if single.path != segment {
+                    return Err(LsJsonError::ParseJson {
+                        reason: format!("unexpected path in the listing for `{current_path}`"),
+                    });
+                }
                 let folder_id = single
                     .id
                     .as_deref()
