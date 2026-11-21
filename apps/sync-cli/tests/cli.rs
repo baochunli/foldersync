@@ -37,6 +37,12 @@ fn prints_help() {
     assert!(help.contains("run-once"));
     assert!(help.contains("pause"));
     assert!(help.contains("resume"));
+    assert!(help.contains("credential-helper"));
+    assert!(help.contains("account add-drive"));
+    assert!(help.contains("account import"));
+    assert!(help.contains("account list"));
+    assert!(help.contains("account check"));
+    assert!(help.contains("remote resolve"));
 }
 
 #[test]
@@ -427,4 +433,91 @@ fn cli_run_once_fails_when_terminal_db_commit_fails_and_never_reuses_old_success
         !String::from_utf8_lossy(&out.stdout).contains("Run completed"),
         "failed run-once must not print 'Run completed'"
     );
+}
+
+#[test]
+fn account_and_remote_commands_require_state_dir_and_list_empty_without_touching_keychain() {
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+
+    // Every account/remote subcommand must reject missing --state-dir.
+    for args in [
+        &["account", "list"][..],
+        &["account", "check", "--account", "a1"][..],
+        &[
+            "account",
+            "import",
+            "--from",
+            "/tmp/src.conf",
+            "--remote",
+            "demo",
+        ][..],
+        &[
+            "account",
+            "add-drive",
+            "--id",
+            "d1",
+            "--root-folder-id",
+            "0ARoot",
+            "--client-id",
+            "cid",
+        ][..],
+        &["remote", "resolve", "Data/Research", "--account", "a1"][..],
+    ] {
+        let out = cli_cmd(tmp.path()).args(args).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "expected failure without --state-dir for {args:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--state-dir"),
+            "stderr for {args:?} should mention --state-dir: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // `account list --state-dir <dir> --json` succeeds on a clean state dir without touching Keychain.
+    let out = cli_cmd(tmp.path())
+        .args([
+            "account",
+            "list",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "account list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed, serde_json::json!([]));
+
+    // `account import` must refuse $HOME/.config/rclone/rclone.conf without --allow-global-config
+    // (before touching Keychain or creating account files).
+    let global_cfg = tmp.path().join(".config/rclone/rclone.conf");
+    fs::create_dir_all(global_cfg.parent().unwrap()).unwrap();
+    fs::write(&global_cfg, "[demo]\ntype = local\n").unwrap();
+    let refused = cli_cmd(tmp.path())
+        .args([
+            "account",
+            "import",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--from",
+            global_cfg.to_str().unwrap(),
+            "--remote",
+            "demo",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("global rclone configuration") || stderr.contains("--allow-global-config"),
+        "expected global-config refusal message, got: {stderr}"
+    );
+    assert!(!state_dir.join("accounts/demo").exists());
 }

@@ -1,23 +1,71 @@
 use std::{
-    env,
+    env, fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
     time::Duration,
 };
 
-use sync_core::{MappingId, Readiness, RunId, RunOutcome};
+use rclone_adapter::{ProcessRunner, RealProcessRunner};
+use sync_core::{AccountId, MappingId, Readiness, RunId, RunOutcome};
 use sync_manager::{
-    AddMappingCommand, InitializeCommand, ManagerConfig, ManagerError, MappingStatusSnapshot,
-    SyncManager,
+    AccountError, AccountService, AccountServiceConfig, AddDriveAccountRequest, AddMappingCommand,
+    ImportAccountRequest, InitializeCommand, ManagerConfig, ManagerError, MappingStatusSnapshot,
+    PasswordCommandFactory, SecretStore, SecretStoreError, SecretString, SyncManager,
+    SystemSecretStore, run_credential_helper,
 };
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 const LOCAL_FIXTURE_ACCOUNT_ID: &str = "local-fixture";
+const EXIT_AUTH_REQUIRED: u8 = 3;
+
+struct CliRuntime {
+    secret_store: Arc<dyn SecretStore>,
+    process_runner: Arc<dyn ProcessRunner>,
+    rclone_binary_override: Option<PathBuf>,
+    password_command_factory: Option<PasswordCommandFactory>,
+    echo_auth_url_to_process_stdout: bool,
+}
+
+impl CliRuntime {
+    fn production() -> Self {
+        Self {
+            secret_store: Arc::new(SystemSecretStore),
+            process_runner: Arc::new(RealProcessRunner),
+            rclone_binary_override: None,
+            password_command_factory: None,
+            echo_auth_url_to_process_stdout: true,
+        }
+    }
+
+    fn account_service(&self, state_dir: Option<PathBuf>) -> Result<AccountService, CliError> {
+        let state_dir = require_state_dir(state_dir)?;
+        let mut cfg = AccountServiceConfig::with_state_dir(state_dir);
+        cfg.secret_store = Arc::clone(&self.secret_store);
+        cfg.process_runner = Arc::clone(&self.process_runner);
+        cfg.rclone_binary_override = self.rclone_binary_override.clone();
+        cfg.password_command_factory = self.password_command_factory.clone();
+        Ok(AccountService::new(cfg)?)
+    }
+}
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
+    let rt = CliRuntime::production();
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    dispatch(&rt, &raw_args, &mut stdout, &mut stderr)
+}
+
+fn dispatch(
+    rt: &CliRuntime,
+    raw_args: &[String],
+    out: &mut dyn Write,
+    err_out: &mut dyn Write,
+) -> ExitCode {
     if raw_args.is_empty() {
-        print_version();
+        let _ = print_version(out);
         return ExitCode::SUCCESS;
     }
 
@@ -32,7 +80,11 @@ fn main() -> ExitCode {
                     prefix_flags.push(val.clone());
                     idx += 2;
                 } else {
-                    eprintln!("Missing value for {}.\nRun sync-cli --help.", raw_args[idx]);
+                    let _ = writeln!(
+                        err_out,
+                        "Missing value for {}.\nRun sync-cli --help.",
+                        raw_args[idx]
+                    );
                     return ExitCode::from(2);
                 }
             }
@@ -40,7 +92,7 @@ fn main() -> ExitCode {
         }
     }
     let Some(cmd) = raw_args.get(idx).map(String::as_str) else {
-        eprintln!("Invalid arguments. Run sync-cli --help.");
+        let _ = writeln!(err_out, "Invalid arguments. Run sync-cli --help.");
         return ExitCode::from(2);
     };
     let mut rest = prefix_flags;
@@ -48,39 +100,70 @@ fn main() -> ExitCode {
 
     match cmd {
         "version" | "--version" | "-V" if rest.is_empty() => {
-            print_version();
+            let _ = print_version(out);
             ExitCode::SUCCESS
         }
         "--help" | "-h" | "help" if rest.is_empty() => {
-            print_help();
+            let _ = print_help(out);
             ExitCode::SUCCESS
         }
-        "status" => run_cmd(cmd_status(&rest)),
-        "add-mapping" => run_cmd(cmd_add_mapping(&rest)),
-        "init" => run_cmd(cmd_init(&rest)),
-        "run-once" => run_cmd(cmd_run_once(&rest)),
-        "pause" => run_cmd(cmd_pause(&rest)),
-        "resume" => run_cmd(cmd_resume(&rest)),
+        "status" => run_cmd(cmd_status(&rest, out), err_out),
+        "add-mapping" => run_cmd(cmd_add_mapping(&rest, out), err_out),
+        "init" => run_cmd(cmd_init(&rest, out), err_out),
+        "run-once" => run_cmd(cmd_run_once(&rest, out), err_out),
+        "pause" => run_cmd(cmd_pause(&rest, out), err_out),
+        "resume" => run_cmd(cmd_resume(&rest, out), err_out),
+        "credential-helper" => run_cmd(cmd_credential_helper(rt, &rest, out), err_out),
+        "account" => run_cmd(cmd_account(rt, &rest, out), err_out),
+        "remote" => run_cmd(cmd_remote(rt, &rest, out), err_out),
         _ => {
-            eprintln!("Invalid arguments. Run sync-cli --help.");
+            let _ = writeln!(err_out, "Invalid arguments. Run sync-cli --help.");
             ExitCode::from(2)
         }
     }
 }
 
-fn run_cmd(res: Result<(), CliError>) -> ExitCode {
+fn run_cmd(res: Result<(), CliError>, err_out: &mut dyn Write) -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliError::Usage(msg)) => {
-            eprintln!("{msg}\nRun sync-cli --help.");
+            let _ = writeln!(err_out, "{msg}\nRun sync-cli --help.");
             ExitCode::from(2)
         }
+        Err(CliError::AuthRequired(msg)) => {
+            let _ = writeln!(err_out, "authentication_required: {msg}");
+            ExitCode::from(EXIT_AUTH_REQUIRED)
+        }
         Err(CliError::Manager(err)) => {
-            eprintln!("Error: {}\nNext step: {}", err.cause(), err.next_step());
+            let _ = writeln!(
+                err_out,
+                "Error: {}\nNext step: {}",
+                err.cause(),
+                err.next_step()
+            );
             ExitCode::from(1)
         }
+        Err(CliError::Account(err)) => {
+            if matches!(*err, AccountError::AuthenticationRequired { .. }) {
+                let _ = writeln!(
+                    err_out,
+                    "authentication_required: {}\nNext step: {}",
+                    err.cause(),
+                    err.next_step()
+                );
+                ExitCode::from(EXIT_AUTH_REQUIRED)
+            } else {
+                let _ = writeln!(
+                    err_out,
+                    "Error: {}\nNext step: {}",
+                    err.cause(),
+                    err.next_step()
+                );
+                ExitCode::from(1)
+            }
+        }
         Err(CliError::Failed(msg)) => {
-            eprintln!("Error: {msg}");
+            let _ = writeln!(err_out, "Error: {msg}");
             ExitCode::from(1)
         }
     }
@@ -89,29 +172,44 @@ fn run_cmd(res: Result<(), CliError>) -> ExitCode {
 #[derive(Debug)]
 enum CliError {
     Usage(String),
-    Manager(ManagerError),
+    AuthRequired(String),
+    Manager(Box<ManagerError>),
+    Account(Box<AccountError>),
     Failed(String),
 }
 
 impl From<ManagerError> for CliError {
     fn from(value: ManagerError) -> Self {
-        Self::Manager(value)
+        Self::Manager(Box::new(value))
     }
 }
 
-fn print_version() {
-    println!("FolderSync {}", env!("CARGO_PKG_VERSION"));
+impl From<AccountError> for CliError {
+    fn from(value: AccountError) -> Self {
+        Self::Account(Box::new(value))
+    }
 }
 
-fn print_help() {
-    println!(
+impl From<io::Error> for CliError {
+    fn from(value: io::Error) -> Self {
+        Self::Failed(format!("I/O error: {value}"))
+    }
+}
+
+fn print_version(out: &mut dyn Write) -> io::Result<()> {
+    writeln!(out, "FolderSync {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn print_help(out: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        out,
         "\
 Usage: sync-cli <command> [options]
 
 Commands:
-  version                                 Print FolderSync version
-  status --state-dir <dir> [--json]       Show current mapping status snapshot
-  add-mapping --state-dir <dir> [options] Add a local-to-local fixture mapping
+  version                                      Print FolderSync version
+  status --state-dir <dir> [--json]            Show current mapping status snapshot
+  add-mapping --state-dir <dir> [options]      Add a local-to-local fixture mapping
     --id <mapping-id>
     --local-dir <path>
     --remote-dir <path>
@@ -119,32 +217,57 @@ Commands:
     [--remote-recovery-dir <path>]
     [--collection <path>]
     [--max-delete-percent <1-100>]
-  init <mapping> --state-dir <dir>        Initialize a mapping (local-to-local)
-  run-once <mapping> --state-dir <dir>    Run one manual synchronization pass
-  pause <mapping> --state-dir <dir>       Persist pause intent for a mapping
-  resume <mapping> --state-dir <dir>      Clear pause intent for a mapping
+  init <mapping> --state-dir <dir>             Initialize a mapping (local-to-local)
+  run-once <mapping> --state-dir <dir>         Run one manual synchronization pass
+  pause <mapping> --state-dir <dir>            Persist pause intent for a mapping
+  resume <mapping> --state-dir <dir>           Clear pause intent for a mapping
+
+  credential-helper --account <id>             Print account rclone config passphrase on stdout
+  account add-drive --state-dir <dir> [opts]   Create encrypted Drive config and authorize
+    --id <account-id>
+    --root-folder-id <drive-folder-id>
+    --client-id <oauth-client-id>
+    (--client-secret-file <path> | --client-secret-stdin | env FOLDERSYNC_OAUTH_CLIENT_SECRET)
+    [--display-name <name>]
+    [--remote <name>]                          (default: household)
+    [--scope <scope>]                          (default: drive)
+  account import --state-dir <dir> [opts]      Import ONE remote into encrypted app config
+    --from <rclone-config-file>
+    --remote <source-remote-name>
+    [--id <account-id>]
+    [--as <target-remote-name>]
+    [--display-name <name>]
+    [--root-folder-id <id>]
+    [--allow-global-config]
+  account list --state-dir <dir> [--json]      List configured accounts
+  account check --state-dir <dir> [opts]       Verify encrypted config and lsjson parent root
+    --account <id> (or positional <id>) [--json]
+  remote resolve <path> --state-dir <dir>      Resolve cloud folder component IDs via lsjson
+    --account <id> [--expected-id <folder-id>] [--json]
 
 Options:
-  --state-dir <dir>                       Required state directory for fixture commands
-  --finder-dir <dir>                      Override Finder status.json directory
-  --help, -h                              Show this help message
-  --version, -V                           Print version"
-    );
+  --state-dir <dir>                            Required state directory for all stateful commands
+  --finder-dir <dir>                           Override Finder status.json directory
+  --help, -h                                   Show this help message
+  --version, -V                                Print version"
+    )
+}
+
+fn require_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    match state_dir {
+        Some(dir) if !dir.as_os_str().is_empty() => Ok(dir),
+        _ => Err(CliError::Usage(
+            "Missing required non-empty --state-dir <dir> (sync-cli never uses the default application state directory)."
+                .to_string(),
+        )),
+    }
 }
 
 fn open_manager(
     state_dir: Option<PathBuf>,
     finder_dir: Option<PathBuf>,
 ) -> Result<SyncManager, CliError> {
-    let state_dir = match state_dir {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => {
-            return Err(CliError::Usage(
-                "Missing required non-empty --state-dir <dir> (fixture CLI never uses the default application state directory)."
-                    .to_string(),
-            ));
-        }
-    };
+    let state_dir = require_state_dir(state_dir)?;
     let mut cfg = ManagerConfig::with_state_dir(state_dir);
     cfg.finder_status_dir = finder_dir;
     Ok(SyncManager::open(cfg)?)
@@ -157,7 +280,463 @@ fn take_value<'a>(args: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a
         .ok_or_else(|| CliError::Usage(format!("Missing value for {flag}.")))
 }
 
-fn cmd_status(args: &[String]) -> Result<(), CliError> {
+fn split_subcommand(args: &[String]) -> Result<(String, Vec<String>), CliError> {
+    let mut leading = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" | "--finder-dir" => {
+                let flag = args[i].as_str();
+                leading.push(args[i].clone());
+                let val = take_value(args, &mut i, flag)?;
+                leading.push(val.to_string());
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let Some(sub) = args.get(i) else {
+        return Err(CliError::Usage("Missing subcommand.".to_string()));
+    };
+    let mut rest = leading;
+    rest.extend_from_slice(&args[i + 1..]);
+    Ok((sub.clone(), rest))
+}
+
+fn cmd_credential_helper(
+    rt: &CliRuntime,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let mut account_id: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--account" => {
+                account_id = Some(take_value(args, &mut i, "--account")?.to_string());
+            }
+            other => return Err(CliError::Usage(format!("Unknown argument `{other}`."))),
+        }
+        i += 1;
+    }
+    let account_id = account_id
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CliError::Usage("Missing required --account <id>.".to_string()))?;
+
+    run_credential_helper(rt.secret_store.as_ref(), &account_id, out).map_err(|err| match err {
+        SecretStoreError::AuthenticationRequired { reason } => CliError::AuthRequired(reason),
+        SecretStoreError::InvalidAccountId(id) => {
+            CliError::Usage(format!("Invalid account identifier `{id}`."))
+        }
+        SecretStoreError::NotFound { account_id } => {
+            CliError::Failed(format!("No credential stored for account `{account_id}`."))
+        }
+        SecretStoreError::Backend { reason } => CliError::Failed(reason),
+    })
+}
+
+fn cmd_account(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+    let (sub, rest) = split_subcommand(args)?;
+    match sub.as_str() {
+        "add-drive" => cmd_account_add_drive(rt, &rest, out),
+        "import" => cmd_account_import(rt, &rest, out),
+        "list" => cmd_account_list(rt, &rest, out),
+        "check" => cmd_account_check(rt, &rest, out),
+        other => Err(CliError::Usage(format!(
+            "Unknown account subcommand `{other}` (expected add-drive, import, list, or check)."
+        ))),
+    }
+}
+
+fn read_client_secret(
+    secret_file: Option<&Path>,
+    from_stdin: bool,
+) -> Result<SecretString, CliError> {
+    let raw = if let Some(path) = secret_file {
+        fs::read_to_string(path).map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to read OAuth client secret file `{}`: {err}",
+                path.display()
+            ))
+        })?
+    } else if from_stdin {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf).map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to read OAuth client secret from stdin: {err}"
+            ))
+        })?;
+        buf
+    } else if let Ok(val) = env::var("FOLDERSYNC_OAUTH_CLIENT_SECRET") {
+        val
+    } else {
+        return Err(CliError::Usage(
+            "Missing OAuth client secret: pass --client-secret-file <path>, --client-secret-stdin, or set FOLDERSYNC_OAUTH_CLIENT_SECRET."
+                .to_string(),
+        ));
+    };
+
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(CliError::Usage(
+            "OAuth client secret must not be empty.".to_string(),
+        ));
+    }
+    Ok(SecretString::new(trimmed))
+}
+
+fn cmd_account_add_drive(
+    rt: &CliRuntime,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let mut state_dir = None;
+    let mut id: Option<String> = None;
+    let mut display_name: Option<String> = None;
+    let mut remote_name: Option<String> = None;
+    let mut root_folder_id: Option<String> = None;
+    let mut client_id: Option<String> = None;
+    let mut client_secret_file: Option<PathBuf> = None;
+    let mut client_secret_stdin = false;
+    let mut scope: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(take_value(args, &mut i, "--state-dir")?))
+            }
+            "--id" => id = Some(take_value(args, &mut i, "--id")?.to_string()),
+            "--display-name" => {
+                display_name = Some(take_value(args, &mut i, "--display-name")?.to_string())
+            }
+            "--remote" => remote_name = Some(take_value(args, &mut i, "--remote")?.to_string()),
+            "--root-folder-id" => {
+                root_folder_id = Some(take_value(args, &mut i, "--root-folder-id")?.to_string())
+            }
+            "--client-id" => client_id = Some(take_value(args, &mut i, "--client-id")?.to_string()),
+            "--client-secret-file" => {
+                client_secret_file = Some(PathBuf::from(take_value(
+                    args,
+                    &mut i,
+                    "--client-secret-file",
+                )?))
+            }
+            "--client-secret-stdin" => client_secret_stdin = true,
+            "--scope" => scope = Some(take_value(args, &mut i, "--scope")?.to_string()),
+            other => return Err(CliError::Usage(format!("Unknown argument `{other}`."))),
+        }
+        i += 1;
+    }
+
+    let svc = rt.account_service(state_dir)?;
+    let id =
+        id.ok_or_else(|| CliError::Usage("Missing required --id <account-id>.".to_string()))?;
+    let root_folder_id = root_folder_id.ok_or_else(|| {
+        CliError::Usage("Missing required --root-folder-id <drive-folder-id>.".to_string())
+    })?;
+    let client_id = client_id.ok_or_else(|| {
+        CliError::Usage("Missing required --client-id <oauth-client-id>.".to_string())
+    })?;
+    let client_secret = read_client_secret(client_secret_file.as_deref(), client_secret_stdin)?;
+
+    let captured_urls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let captured_cb = Arc::clone(&captured_urls);
+    let echo_stdout = rt.echo_auth_url_to_process_stdout;
+    let result = svc.add_drive_account(
+        AddDriveAccountRequest {
+            id: AccountId::new(id.clone()),
+            display_name: display_name.unwrap_or_else(|| id.clone()),
+            remote_name: remote_name.unwrap_or_else(|| "household".to_string()),
+            root_folder_id,
+            client_id,
+            client_secret,
+            scope: scope.unwrap_or_else(|| "drive".to_string()),
+            run_oauth_flow: true,
+        },
+        Some(Box::new(move |url| {
+            if echo_stdout {
+                let _ = writeln!(
+                    io::stdout(),
+                    "Open this URL in your browser to authorize Google Drive:\n{url}"
+                );
+                let _ = io::stdout().flush();
+            }
+            captured_cb.lock().unwrap().push(url.to_string());
+        })),
+    )?;
+
+    let surfaced_url = result
+        .auth_url
+        .clone()
+        .or_else(|| captured_urls.lock().ok().and_then(|v| v.first().cloned()));
+    if let Some(url) = surfaced_url {
+        writeln!(out, "Authorization URL: {url}")?;
+    }
+    writeln!(
+        out,
+        "Added Drive account `{}` (remote `{}:`, root `{}`): auth_status={}.",
+        result.account.id,
+        result.account.remote_name,
+        result.account.remote_root_folder_id,
+        result.account.auth_status
+    )?;
+    Ok(())
+}
+
+fn cmd_account_import(
+    rt: &CliRuntime,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let mut state_dir = None;
+    let mut from_path: Option<PathBuf> = None;
+    let mut remote: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut target_remote: Option<String> = None;
+    let mut display_name: Option<String> = None;
+    let mut root_folder_id: Option<String> = None;
+    let mut allow_global = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(take_value(args, &mut i, "--state-dir")?))
+            }
+            "--from" => from_path = Some(PathBuf::from(take_value(args, &mut i, "--from")?)),
+            "--remote" => remote = Some(take_value(args, &mut i, "--remote")?.to_string()),
+            "--id" => id = Some(take_value(args, &mut i, "--id")?.to_string()),
+            "--as" => target_remote = Some(take_value(args, &mut i, "--as")?.to_string()),
+            "--display-name" => {
+                display_name = Some(take_value(args, &mut i, "--display-name")?.to_string())
+            }
+            "--root-folder-id" => {
+                root_folder_id = Some(take_value(args, &mut i, "--root-folder-id")?.to_string())
+            }
+            "--allow-global-config" => allow_global = true,
+            other => return Err(CliError::Usage(format!("Unknown argument `{other}`."))),
+        }
+        i += 1;
+    }
+
+    let svc = rt.account_service(state_dir)?;
+    let source_config_path =
+        from_path.ok_or_else(|| CliError::Usage("Missing required --from <file>.".to_string()))?;
+    let source_remote_name =
+        remote.ok_or_else(|| CliError::Usage("Missing required --remote <name>.".to_string()))?;
+    let account_id = id.unwrap_or_else(|| source_remote_name.clone());
+    let target_remote_name = target_remote.unwrap_or_else(|| source_remote_name.clone());
+
+    let account = svc.import_account(ImportAccountRequest {
+        id: AccountId::new(account_id.clone()),
+        display_name: display_name.unwrap_or_else(|| account_id.clone()),
+        source_config_path,
+        source_remote_name,
+        target_remote_name,
+        root_folder_id,
+        allow_global_default_source: allow_global,
+    })?;
+
+    writeln!(
+        out,
+        "Imported account `{}` (type={}, remote `{}:`, encrypted config `{}`).",
+        account.id,
+        account.kind,
+        account.remote_name,
+        account.config_path.display()
+    )?;
+    Ok(())
+}
+
+fn cmd_account_list(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+    let mut state_dir = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(take_value(args, &mut i, "--state-dir")?))
+            }
+            "--json" => json = true,
+            other => return Err(CliError::Usage(format!("Unknown argument `{other}`."))),
+        }
+        i += 1;
+    }
+
+    let svc = rt.account_service(state_dir)?;
+    let accounts = svc.list_accounts()?;
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&accounts).expect("AccountRecord serializes")
+        )?;
+    } else if accounts.is_empty() {
+        writeln!(out, "No accounts configured.")?;
+    } else {
+        for acct in &accounts {
+            writeln!(
+                out,
+                "{} | {} | {}: | root={} | {}",
+                acct.id, acct.kind, acct.remote_name, acct.remote_root_folder_id, acct.auth_status
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_account_check(
+    rt: &CliRuntime,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let mut state_dir = None;
+    let mut account_id: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(take_value(args, &mut i, "--state-dir")?))
+            }
+            "--account" => {
+                account_id = Some(take_value(args, &mut i, "--account")?.to_string());
+            }
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return Err(CliError::Usage(format!("Unknown argument `{other}`.")));
+            }
+            positional => {
+                if account_id.is_some() {
+                    return Err(CliError::Usage(format!(
+                        "Unexpected extra argument `{positional}`."
+                    )));
+                }
+                account_id = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let svc = rt.account_service(state_dir)?;
+    let account_id = account_id
+        .ok_or_else(|| CliError::Usage("Missing required --account <id>.".to_string()))?;
+    let report = svc.check_account(&AccountId::new(account_id))?;
+
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&report).expect("AccountCheckReport serializes")
+        )?;
+    } else {
+        writeln!(
+            out,
+            "Account `{}` ({}, `{}:`) verified: {} parent folder(s).",
+            report.account.id,
+            report.account.kind,
+            report.account.remote_name,
+            report.parent_directories.len()
+        )?;
+        for dir in &report.parent_directories {
+            let id_str = dir.id.as_deref().unwrap_or("(no backend ID)");
+            writeln!(out, "  {} | id={}", dir.name, id_str)?;
+        }
+        for dup in &report.duplicate_directories {
+            writeln!(
+                out,
+                "  WARNING: duplicate parent folder `{}` (IDs: {:?})",
+                dup.name, dup.matching_ids
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_remote(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
+    let (sub, rest) = split_subcommand(args)?;
+    match sub.as_str() {
+        "resolve" => cmd_remote_resolve(rt, &rest, out),
+        other => Err(CliError::Usage(format!(
+            "Unknown remote subcommand `{other}` (expected resolve)."
+        ))),
+    }
+}
+
+fn cmd_remote_resolve(
+    rt: &CliRuntime,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let mut state_dir = None;
+    let mut account_id: Option<String> = None;
+    let mut path_arg: Option<String> = None;
+    let mut expected_id: Option<String> = None;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(take_value(args, &mut i, "--state-dir")?))
+            }
+            "--account" => {
+                account_id = Some(take_value(args, &mut i, "--account")?.to_string());
+            }
+            "--expected-id" => {
+                expected_id = Some(take_value(args, &mut i, "--expected-id")?.to_string());
+            }
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return Err(CliError::Usage(format!("Unknown argument `{other}`.")));
+            }
+            positional => {
+                if path_arg.is_some() {
+                    return Err(CliError::Usage(format!(
+                        "Unexpected extra argument `{positional}`."
+                    )));
+                }
+                path_arg = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let svc = rt.account_service(state_dir)?;
+    let account_id = account_id
+        .ok_or_else(|| CliError::Usage("Missing required --account <id>.".to_string()))?;
+    let path_arg =
+        path_arg.ok_or_else(|| CliError::Usage("Missing required <path> argument.".to_string()))?;
+
+    let resolved = if let Some(exp_id) = expected_id {
+        let collection = sync_core::CloudCollection {
+            display_path: path_arg,
+            folder_id: exp_id,
+            ancestor_ids: Vec::new(),
+        };
+        svc.verify_collection_identity(&AccountId::new(account_id), &collection)?
+    } else {
+        svc.resolve_remote_path(&AccountId::new(account_id), &path_arg)?
+    };
+
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&resolved).expect("ResolvedRemotePath serializes")
+        )?;
+    } else {
+        writeln!(out, "{}:{}", resolved.remote, resolved.display_path)?;
+        for comp in &resolved.components {
+            let id_str = comp.folder_id.as_deref().unwrap_or("(no backend ID)");
+            writeln!(out, "  {} -> {}", comp.path, id_str)?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_status(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let mut state_dir = None;
     let mut finder_dir = None;
     let mut json = false;
@@ -179,25 +758,27 @@ fn cmd_status(args: &[String]) -> Result<(), CliError> {
     let mgr = open_manager(state_dir, finder_dir)?;
     let snap = mgr.snapshot();
     if json {
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(snap.as_ref()).expect("StatusSnapshot serializes")
-        );
+        )?;
     } else if snap.mappings.is_empty() {
-        println!("No mappings configured.");
+        writeln!(out, "No mappings configured.")?;
     } else {
         for m in &snap.mappings {
-            println!(
+            writeln!(
+                out,
                 "{} | {:?} | {:?} | {:?} | {}",
                 m.id, m.readiness, m.execution, m.intent, m.status_text
-            );
+            )?;
         }
     }
     mgr.shutdown()?;
     Ok(())
 }
 
-fn cmd_add_mapping(args: &[String]) -> Result<(), CliError> {
+fn cmd_add_mapping(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let mut state_dir = None;
     let mut finder_dir = None;
     let mut id: Option<String> = None;
@@ -279,7 +860,7 @@ fn cmd_add_mapping(args: &[String]) -> Result<(), CliError> {
     }
     let ack = mgr.add_mapping(cmd)?;
     if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id.as_str() == id) {
-        println!("Added mapping `{}` ({}).", m.id, m.status_text);
+        writeln!(out, "Added mapping `{}` ({}).", m.id, m.status_text)?;
     }
     mgr.shutdown()?;
     Ok(())
@@ -394,7 +975,7 @@ fn verify_new_run_succeeded(
     }
 }
 
-fn cmd_init(args: &[String]) -> Result<(), CliError> {
+fn cmd_init(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
     let mapping_id = MappingId::new(id.clone());
     let mgr = open_manager(state_dir, finder_dir)?;
@@ -415,7 +996,7 @@ fn cmd_init(args: &[String]) -> Result<(), CliError> {
 
     match verification {
         Ok(()) => {
-            println!("Initialized `{}`: {}", mapping.id, mapping.status_text);
+            writeln!(out, "Initialized `{}`: {}", mapping.id, mapping.status_text)?;
             Ok(())
         }
         Err(msg) => Err(CliError::Failed(format!(
@@ -425,7 +1006,7 @@ fn cmd_init(args: &[String]) -> Result<(), CliError> {
     }
 }
 
-fn cmd_run_once(args: &[String]) -> Result<(), CliError> {
+fn cmd_run_once(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
     let mapping_id = MappingId::new(id.clone());
     let mgr = open_manager(state_dir, finder_dir)?;
@@ -443,33 +1024,34 @@ fn cmd_run_once(args: &[String]) -> Result<(), CliError> {
 
     match verification {
         Ok(()) => {
-            println!(
+            writeln!(
+                out,
                 "Run completed for `{}`: {}",
                 mapping.id, mapping.status_text
-            );
+            )?;
             Ok(())
         }
         Err(msg) => Err(CliError::Failed(msg)),
     }
 }
 
-fn cmd_pause(args: &[String]) -> Result<(), CliError> {
+fn cmd_pause(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
     let mgr = open_manager(state_dir, finder_dir)?;
     let ack = mgr.pause(id.clone())?;
     if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id.as_str() == id) {
-        println!("Paused `{}`: {}", m.id, m.status_text);
+        writeln!(out, "Paused `{}`: {}", m.id, m.status_text)?;
     }
     mgr.shutdown()?;
     Ok(())
 }
 
-fn cmd_resume(args: &[String]) -> Result<(), CliError> {
+fn cmd_resume(args: &[String], out: &mut dyn Write) -> Result<(), CliError> {
     let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
     let mgr = open_manager(state_dir, finder_dir)?;
     let ack = mgr.resume(id.clone())?;
     if let Some(m) = ack.snapshot.mappings.iter().find(|m| m.id.as_str() == id) {
-        println!("Resumed `{}`: {}", m.id, m.status_text);
+        writeln!(out, "Resumed `{}`: {}", m.id, m.status_text)?;
     }
     mgr.shutdown()?;
     Ok(())
@@ -478,6 +1060,27 @@ fn cmd_resume(args: &[String]) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use rclone_adapter::{
+        FakeProcessRunner, FakeRunScript, OutputLine, PasswordCommand, StreamKind,
+        pinned_binary_path,
+    };
+    use sync_manager::InMemorySecretStore;
+    use tempfile::TempDir;
+
+    fn run_args(rt: &CliRuntime, args: &[&str]) -> (ExitCode, String, String) {
+        let vec_args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(rt, &vec_args, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
 
     #[test]
     fn default_remote_recovery_dir_is_disjoint_sibling() {
@@ -504,5 +1107,287 @@ mod tests {
             Readiness::RecoveryRequired,
             Some(RunOutcome::CriticalFailure)
         ));
+    }
+
+    #[test]
+    fn credential_helper_uses_fake_store_and_exits_3_when_locked() {
+        let store = Arc::new(InMemorySecretStore::new());
+        store
+            .set_secret("drive-1", &SecretString::new("fake-secret-42"))
+            .unwrap();
+        let rt = CliRuntime {
+            secret_store: Arc::clone(&store) as Arc<dyn SecretStore>,
+            process_runner: Arc::new(FakeProcessRunner::new()),
+            rclone_binary_override: None,
+            password_command_factory: None,
+            echo_auth_url_to_process_stdout: false,
+        };
+
+        let (code, stdout, stderr) = run_args(&rt, &["credential-helper", "--account", "drive-1"]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(stdout, "fake-secret-42\n");
+        assert!(stderr.is_empty());
+
+        store.set_locked(true);
+        let (code2, stdout2, stderr2) =
+            run_args(&rt, &["credential-helper", "--account", "drive-1"]);
+        assert_eq!(code2, ExitCode::from(EXIT_AUTH_REQUIRED));
+        assert!(stdout2.is_empty());
+        assert!(stderr2.contains("authentication_required"));
+        assert!(!stderr2.contains("fake-secret-42"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_account_import_list_check_and_resolve_work_with_fake_store_and_pinned_rclone() {
+        if pinned_binary_path().is_none() {
+            eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let tree = tmp.path().join("parent-tree");
+        fs::create_dir_all(tree.join("Data/Research")).unwrap();
+
+        let src_cfg = tmp.path().join("chosen/source.conf");
+        fs::create_dir_all(src_cfg.parent().unwrap()).unwrap();
+        let src_bytes = b"[src_local]\ntype = local\n\n[other_secret]\ntype = drive\nclient_secret = do-not-copy\n";
+        fs::write(&src_cfg, src_bytes).unwrap();
+
+        let store = Arc::new(InMemorySecretStore::new());
+        let helper_dir = tmp.path().join("helpers");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let store_for_cb = Arc::clone(&store);
+        let factory: PasswordCommandFactory = Arc::new(move |id: &AccountId| {
+            let secret = store_for_cb
+                .get_secret(id.as_str())
+                .map_err(AccountError::from)?;
+            let sec_file = helper_dir.join(format!("{}.sec", id.as_str()));
+            fs::write(&sec_file, secret.expose().as_bytes()).unwrap();
+            fs::set_permissions(&sec_file, fs::Permissions::from_mode(0o600)).unwrap();
+            let bin = helper_dir.join(format!("helper-{}", id.as_str()));
+            fs::write(&bin, format!("#!/bin/sh\ncat \"{}\"\n", sec_file.display())).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+            Ok(
+                PasswordCommand::new(bin, vec!["--account".to_string(), id.as_str().to_string()])
+                    .unwrap(),
+            )
+        });
+
+        let rt = CliRuntime {
+            secret_store: Arc::clone(&store) as Arc<dyn SecretStore>,
+            process_runner: Arc::new(RealProcessRunner),
+            rclone_binary_override: None,
+            password_command_factory: Some(factory),
+            echo_auth_url_to_process_stdout: false,
+        };
+
+        let sd = state_dir.to_str().unwrap();
+        let (code, stdout, stderr) = run_args(
+            &rt,
+            &[
+                "account",
+                "import",
+                "--state-dir",
+                sd,
+                "--from",
+                src_cfg.to_str().unwrap(),
+                "--remote",
+                "src_local",
+                "--id",
+                "local-1",
+                "--as",
+                "household",
+                "--root-folder-id",
+                tree.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "stderr={stderr}");
+        assert!(stdout.contains("Imported account `local-1`"));
+        assert_eq!(fs::read(&src_cfg).unwrap(), src_bytes);
+
+        let (code, list_json, stderr) =
+            run_args(&rt, &["account", "list", "--state-dir", sd, "--json"]);
+        assert_eq!(code, ExitCode::SUCCESS, "stderr={stderr}");
+        let parsed: serde_json::Value = serde_json::from_str(&list_json).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["id"], "local-1");
+
+        let (code, check_out, stderr) = run_args(
+            &rt,
+            &[
+                "account",
+                "check",
+                "--state-dir",
+                sd,
+                "--account",
+                "local-1",
+            ],
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "stderr={stderr}");
+        assert!(check_out.contains("verified: 1 parent folder(s)"));
+        assert!(check_out.contains("Data"));
+
+        let (code, res_out, stderr) = run_args(
+            &rt,
+            &[
+                "remote",
+                "resolve",
+                "Data/Research",
+                "--state-dir",
+                sd,
+                "--account",
+                "local-1",
+                "--json",
+            ],
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "stderr={stderr}");
+        let resolved: serde_json::Value = serde_json::from_str(&res_out).unwrap();
+        assert_eq!(resolved["components"].as_array().unwrap().len(), 2);
+        assert_eq!(resolved["components"][1]["name"], "Research");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_account_add_drive_encrypts_config_prints_auth_url_and_never_leaks_secrets() {
+        use rclone_adapter::{ProcessError, ProcessSpec, RunHandle, SpawnOptions};
+
+        /// Runs real pinned rclone for local config encryption/check commands,
+        /// and serves a recorded fixture for `config reconnect` so no Google
+        /// network call or browser launch ever occurs.
+        struct HybridDriveAuthRunner {
+            fake_reconnect: FakeProcessRunner,
+            recorded_argvs: std::sync::Mutex<Vec<Vec<String>>>,
+        }
+
+        impl ProcessRunner for HybridDriveAuthRunner {
+            fn spawn(
+                &self,
+                spec: &ProcessSpec,
+                options: SpawnOptions,
+            ) -> Result<RunHandle, ProcessError> {
+                let argv: Vec<String> = spec
+                    .args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                let is_reconnect = argv.first().map(String::as_str) == Some("config")
+                    && argv.get(1).map(String::as_str) == Some("reconnect");
+                self.recorded_argvs.lock().unwrap().push(argv);
+                if is_reconnect {
+                    self.fake_reconnect.spawn(spec, options)
+                } else {
+                    RealProcessRunner.spawn(spec, options)
+                }
+            }
+        }
+
+        if pinned_binary_path().is_none() {
+            eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let secret_file = tmp.path().join("oauth-secret.txt");
+        let oauth_secret = "GOCSPX-super-secret-oauth-value";
+        fs::write(&secret_file, oauth_secret).unwrap();
+        fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let store = Arc::new(InMemorySecretStore::new());
+        let helper_dir = tmp.path().join("helpers");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let store_for_cb = Arc::clone(&store);
+        let factory: PasswordCommandFactory = Arc::new(move |id: &AccountId| {
+            let secret = store_for_cb
+                .get_secret(id.as_str())
+                .map_err(AccountError::from)?;
+            let sec_file = helper_dir.join(format!("{}.sec", id.as_str()));
+            fs::write(&sec_file, secret.expose().as_bytes()).unwrap();
+            fs::set_permissions(&sec_file, fs::Permissions::from_mode(0o600)).unwrap();
+            let bin = helper_dir.join(format!("helper-{}", id.as_str()));
+            fs::write(&bin, format!("#!/bin/sh\ncat \"{}\"\n", sec_file.display())).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+            Ok(
+                PasswordCommand::new(bin, vec!["--account".to_string(), id.as_str().to_string()])
+                    .unwrap(),
+            )
+        });
+
+        let fake_reconnect = FakeProcessRunner::new();
+        fake_reconnect.push_run(FakeRunScript {
+            lines: vec![
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: "NOTICE: If your browser doesn't open automatically go to the following link: http://127.0.0.1:53682/auth?state=cliAddDriveTest".to_string(),
+                    truncated: false,
+                },
+                OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: "NOTICE: Got code".to_string(),
+                    truncated: false,
+                },
+            ],
+            ..Default::default()
+        });
+        let runner = Arc::new(HybridDriveAuthRunner {
+            fake_reconnect,
+            recorded_argvs: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let rt = CliRuntime {
+            secret_store: Arc::clone(&store) as Arc<dyn SecretStore>,
+            process_runner: Arc::clone(&runner) as Arc<dyn ProcessRunner>,
+            rclone_binary_override: None,
+            password_command_factory: Some(factory),
+            echo_auth_url_to_process_stdout: false,
+        };
+
+        let (code, stdout, stderr) = run_args(
+            &rt,
+            &[
+                "account",
+                "add-drive",
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--id",
+                "drive-1",
+                "--root-folder-id",
+                "0AParentId",
+                "--client-id",
+                "123.apps.googleusercontent.com",
+                "--client-secret-file",
+                secret_file.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "stderr={stderr}");
+        assert!(
+            stdout.contains("Authorization URL: http://127.0.0.1:53682/auth?state=cliAddDriveTest"),
+            "expected auth URL in stdout, got: {stdout}"
+        );
+        assert!(stdout.contains("auth_status=ready"));
+
+        let stored_passphrase = store.get_secret("drive-1").unwrap();
+        // Neither OAuth secret nor config passphrase may appear in stdout, stderr, argv, or plaintext config.
+        for secret in [oauth_secret, stored_passphrase.expose()] {
+            assert!(!stdout.contains(secret));
+            assert!(!stderr.contains(secret));
+            for argv in runner.recorded_argvs.lock().unwrap().iter() {
+                assert!(
+                    !argv.iter().any(|a| a.contains(secret)),
+                    "secret leaked in argv: {argv:?}"
+                );
+            }
+        }
+        let cfg_path = state_dir.join("accounts/drive-1/rclone.conf");
+        let on_disk = fs::read_to_string(&cfg_path).unwrap();
+        assert!(rclone_adapter::is_encrypted_config_content(&on_disk));
+        assert!(!on_disk.contains(oauth_secret));
+        assert!(!on_disk.contains(stored_passphrase.expose()));
+        let mode = fs::symlink_metadata(&cfg_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
