@@ -222,8 +222,6 @@ impl FinderStatusWriter {
             .iter()
             .filter(|m| m.readiness != Readiness::Unconfigured)
             .map(|m| {
-                let canonical =
-                    fs::canonicalize(&m.local_root).unwrap_or_else(|_| m.local_root.clone());
                 let state = derive_finder_state_with_pause(m, snapshot.scheduling_paused);
                 let label = if snapshot.scheduling_paused
                     && m.readiness == Readiness::Ready
@@ -238,7 +236,7 @@ impl FinderStatusWriter {
                 };
                 FinderMappingSnapshot {
                     id: m.id.as_str().to_string(),
-                    root_path: canonical.to_string_lossy().into_owned(),
+                    root_path: m.local_root.to_string_lossy().into_owned(),
                     state,
                     label,
                     last_run_summary: m.last_run_summary.clone(),

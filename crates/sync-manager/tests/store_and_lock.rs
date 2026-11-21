@@ -155,7 +155,7 @@ fn pause_and_resume_intent_survive_restart() {
         let m = &ack.snapshot.mappings[0];
         assert_eq!(m.intent, Intent::Paused);
         assert_eq!(m.readiness, Readiness::Ready);
-        assert!(!m.scheduling_enabled);
+        assert!(m.scheduling_enabled);
 
         // RunNow must be rejected while paused.
         assert!(mgr.run_now("research").is_err());
@@ -171,7 +171,8 @@ fn pause_and_resume_intent_survive_restart() {
         assert_eq!(snap.mappings[0].readiness, Readiness::Ready);
         assert!(mgr.run_now("research").is_err());
 
-        // Resume persists Intent::Enabled across restart without spawning (scheduling disabled).
+        // Resume clears the mapping's pause while the global hold prevents automatic runs.
+        mgr.set_scheduling_paused(true).unwrap();
         let ack = mgr.resume("research").unwrap();
         assert_eq!(ack.snapshot.mappings[0].intent, Intent::Enabled);
         assert_eq!(ack.snapshot.mappings[0].execution, Execution::Idle);

@@ -1,7 +1,12 @@
 use std::{
+    collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -106,6 +111,23 @@ fn a_missing_recovery_destination_refuses_a_run() {
     assert!(!fixture.path("recovery").exists());
 }
 
+#[test]
+fn verified_initialization_enables_scheduling_and_global_pause_survives_restart() {
+    let fixture = Fixture::new();
+    let manager = SyncManager::open(fixture.config()).unwrap();
+    fixture.initialize(&manager, fixture.command());
+    assert!(manager.snapshot().mappings[0].scheduling_enabled);
+    manager.set_scheduling_paused(true).unwrap();
+    manager.shutdown().unwrap();
+
+    let reopened = SyncManager::open(fixture.config()).unwrap();
+    assert!(reopened.snapshot().scheduling_paused);
+    fixture.launcher.push_script(FakeLaunchScript::default());
+    reopened.run_now("notes").unwrap();
+    reopened.wait_until_idle(Duration::from_secs(15)).unwrap();
+    assert_eq!(fixture.launcher.launched_plans().len(), 2);
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Mount {
     Connected,
@@ -113,12 +135,18 @@ enum Mount {
     WrongDisk,
     Renamed,
     LowSpace,
+    Inaccessible,
 }
+
+type StalledProbe = (mpsc::Sender<()>, mpsc::Receiver<()>);
 
 struct FakeVolumeProbe {
     mount: Mutex<Mount>,
     original: PathBuf,
     renamed: PathBuf,
+    stall: Mutex<Option<StalledProbe>>,
+    recovery: PathBuf,
+    recovery_low: AtomicBool,
 }
 
 impl FakeVolumeProbe {
@@ -152,9 +180,18 @@ impl FakeVolumeProbe {
 impl VolumeProbe for FakeVolumeProbe {
     fn probe(&self, path: &Path) -> io::Result<MountedVolume> {
         let mount = *self.mount.lock().unwrap();
+        if path == self.recovery && self.recovery_low.load(Ordering::Relaxed) {
+            return Ok(self.volume(Mount::LowSpace));
+        }
         if path.starts_with(&self.original) {
+            let stall = self.stall.lock().unwrap().take();
+            if let Some((entered, release)) = stall {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(20)).unwrap();
+            }
             match mount {
                 Mount::Missing => return Err(io::ErrorKind::NotFound.into()),
+                Mount::Inaccessible => return Err(io::ErrorKind::PermissionDenied.into()),
                 Mount::Renamed => return OsVolumeProbe.probe(path),
                 _ => return Ok(self.volume(mount)),
             }
@@ -173,10 +210,20 @@ impl VolumeProbe for FakeVolumeProbe {
 }
 
 fn open_with_fixture_disk(fixture: &Fixture) -> (SyncManager, Arc<FakeVolumeProbe>) {
+    open_with_fixture_disk_config(fixture, fixture.config())
+}
+
+fn open_with_fixture_disk_config(
+    fixture: &Fixture,
+    config: ManagerConfig,
+) -> (SyncManager, Arc<FakeVolumeProbe>) {
     let probe = Arc::new(FakeVolumeProbe {
         mount: Mutex::new(Mount::Connected),
         original: fixture.path("WorkSSD"),
         renamed: fixture.path("RenamedSSD"),
+        stall: Mutex::new(None),
+        recovery: fixture.path("recovery"),
+        recovery_low: AtomicBool::new(false),
     });
     fs::create_dir(&probe.original).unwrap();
     fs::rename(fixture.path("local"), probe.original.join("notes")).unwrap();
@@ -195,7 +242,7 @@ fn open_with_fixture_disk(fixture: &Fixture) -> (SyncManager, Arc<FakeVolumeProb
         mount_path: probe.original.clone(),
         relative_dir: PathBuf::from("notes"),
     };
-    let manager = SyncManager::open_with_volume_probe(fixture.config(), probe.clone()).unwrap();
+    let manager = SyncManager::open_with_volume_probe(config, probe.clone()).unwrap();
     fixture.initialize(&manager, command);
     (manager, probe)
 }
@@ -420,4 +467,181 @@ fn missing_private_binding_marker_refuses_a_run_without_recreating_it() {
     );
     assert_eq!(fixture.launcher.launched_plans().len(), 1);
     assert!(!marker.exists());
+}
+
+#[test]
+fn stalled_volume_probe_leaves_snapshot_and_stop_responsive() {
+    let fixture = Fixture::new();
+    let (manager, probe) = open_with_fixture_disk(&fixture);
+    let (running, running_rx) = mpsc::channel();
+    fixture.launcher.push_script(FakeLaunchScript {
+        wait_for_stop: true,
+        on_wait: Some(Arc::new(move || running.send(()).unwrap())),
+        ..Default::default()
+    });
+    manager.run_now("notes").unwrap();
+    running_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    *probe.stall.lock().unwrap() = Some((entered, release_rx));
+    entered_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    std::thread::scope(|scope| {
+        let (done, done_rx) = mpsc::channel();
+        let manager = &manager;
+        scope.spawn(move || {
+            let snapshot = manager.snapshot();
+            let result = manager.stop_run("notes");
+            let _ = done.send((snapshot, result));
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        let (snapshot, stop) = result.expect("the stalled probe held the manager mutex");
+        assert_eq!(snapshot.mappings[0].execution, Execution::Running);
+        stop.unwrap();
+    });
+    manager.wait_until_idle(Duration::from_secs(15)).unwrap();
+}
+
+#[test]
+fn filter_migration_initializes_a_fresh_generation_and_preserves_the_old_one() {
+    let fixture = Fixture::new();
+    let manager = SyncManager::open(fixture.config()).unwrap();
+    fixture.initialize(&manager, fixture.command());
+    let id = MappingId::new("notes");
+    let old_id = manager.snapshot().mappings[0]
+        .active_generation_id
+        .clone()
+        .unwrap();
+    let old = manager.get_generation(&old_id).unwrap().unwrap();
+    let old_filters = fs::read(&old.filters_file_path).unwrap();
+    fs::write(old.workdir_path.join("listing"), "preserve this baseline").unwrap();
+    fs::write(fixture.path("local/archive.tmp"), "keep excluded file").unwrap();
+
+    let preview = manager
+        .propose_filter_change(&id, ["/archive.tmp".to_owned()].into())
+        .unwrap();
+    assert_eq!(preview.previous_generation_id(), &old_id);
+    assert_eq!(preview.added_exclusions(), &["/archive.tmp"]);
+    assert!(preview.preflight().direction.is_ok());
+
+    fixture.launcher.push_script(FakeLaunchScript::default());
+    manager.apply_filter_change(preview.clone()).unwrap();
+    let finished = manager.wait_until_idle(Duration::from_secs(15)).unwrap();
+    let new_id = finished.mappings[0].active_generation_id.as_ref().unwrap();
+    assert_ne!(new_id, &old_id);
+    let new = manager.get_generation(new_id).unwrap().unwrap();
+    assert_eq!(new.generation_number, old.generation_number + 1);
+    assert_eq!(fs::read(&old.filters_file_path).unwrap(), old_filters);
+    assert_eq!(
+        fs::read_to_string(old.workdir_path.join("listing")).unwrap(),
+        "preserve this baseline"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path("local/archive.tmp")).unwrap(),
+        "keep excluded file"
+    );
+    assert!(
+        fs::read_to_string(&new.filters_file_path)
+            .unwrap()
+            .contains("- /archive.tmp")
+    );
+    let launches = fixture.launcher.launched_plans();
+    assert_eq!(launches[1].workdir, new.workdir_path);
+    assert!(matches!(
+        launches[1].mode,
+        rclone_adapter::RunMode::Initialize(_)
+    ));
+    assert!(manager.apply_filter_change(preview).is_err());
+}
+
+#[test]
+fn non_missing_probe_errors_explain_why_the_disk_is_inaccessible() {
+    let fixture = Fixture::new();
+    let (manager, probe) = open_with_fixture_disk(&fixture);
+    probe.set(Mount::Inaccessible);
+    let err = manager.run_now("notes").unwrap_err();
+    assert!(err.cause().contains("Can’t access"));
+    let snapshot = manager.snapshot();
+    assert_eq!(snapshot.mappings[0].readiness, Readiness::VolumeUnavailable);
+    assert!(snapshot.mappings[0].status_text.contains("Can’t access"));
+}
+
+#[test]
+fn recovery_capacity_comes_from_the_volume_probe() {
+    let fixture = Fixture::new();
+    let (manager, probe) = open_with_fixture_disk(&fixture);
+    probe.recovery_low.store(true, Ordering::Relaxed);
+    let err = manager.run_now("notes").unwrap_err();
+    assert!(err.cause().contains("100 MiB"));
+    assert!(err.cause().contains("recovery destination"));
+    assert_eq!(fixture.launcher.launched_plans().len(), 1);
+}
+
+#[test]
+fn space_only_updates_notify_ui_without_rewriting_finder_status() {
+    let fixture = Fixture::new();
+    let now: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+    let clock = Arc::new(sync_manager::FixedClock::new(now));
+    let notifier = Arc::new(sync_manager::RecordingFinderNotifier::default());
+    let mut config = fixture.config();
+    config.clock = clock.clone();
+    config.finder_notifier = notifier.clone();
+    config.finder_heartbeat_interval = None;
+    let (manager, probe) = open_with_fixture_disk_config(&fixture, config);
+    notifier.clear();
+
+    let old = manager.snapshot();
+    probe.set(Mount::LowSpace);
+    clock.set(now + chrono::TimeDelta::seconds(31));
+    let new = wait_for_snapshot(&manager, |snap| {
+        snap.mappings[0]
+            .volume_space
+            .is_some_and(|space| space.free_bytes == 99 * 1024 * 1024)
+    });
+    assert_eq!(new.sequence, old.sequence + 1);
+    assert_eq!(new.mappings[0].readiness, Readiness::Ready);
+    assert!(notifier.posted_notifications().is_empty());
+}
+
+#[test]
+fn filter_migration_rechecks_inventory_and_holds_when_both_sides_have_data() {
+    let fixture = Fixture::new();
+    let manager = SyncManager::open(fixture.config()).unwrap();
+    fixture.initialize(&manager, fixture.command());
+    let id = MappingId::new("notes");
+    let old = manager.snapshot().mappings[0]
+        .active_generation_id
+        .clone()
+        .unwrap();
+    let generation = manager.get_generation(&old).unwrap().unwrap();
+    let extra = BTreeSet::from(["/archive/".to_owned()]);
+    let preview = manager.propose_filter_change(&id, extra.clone()).unwrap();
+    assert!(preview.preflight().direction.is_ok());
+
+    fs::write(fixture.path("remote/independent.txt"), "other data").unwrap();
+    let blocked = manager.propose_filter_change(&id, extra).unwrap();
+    assert!(
+        blocked
+            .preflight()
+            .direction
+            .as_ref()
+            .unwrap_err()
+            .contains("already contain data")
+    );
+    assert!(manager.apply_filter_change(blocked).is_err());
+    assert_eq!(
+        manager.snapshot().mappings[0].active_generation_id.as_ref(),
+        Some(&old)
+    );
+
+    manager.apply_filter_change(preview).unwrap();
+    let snapshot = manager.wait_until_idle(Duration::from_secs(15)).unwrap();
+    assert!(!snapshot.mappings[0].scheduling_enabled);
+    assert_eq!(
+        snapshot.mappings[0].readiness,
+        Readiness::NeedsInitialization
+    );
+    assert!(generation.workdir_path.is_dir());
+    assert_eq!(fixture.launcher.launched_plans().len(), 1);
 }

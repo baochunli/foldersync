@@ -10,6 +10,7 @@ pub mod init;
 pub mod launcher;
 pub mod manager;
 pub mod platform;
+mod scheduler;
 pub mod secrets;
 pub mod snapshot;
 pub mod store;
@@ -40,14 +41,15 @@ pub use launcher::{
 };
 pub use manager::{
     AddMappingCommand, CommandAcceptance, CommandOutcome, ControlledShutdownOutcome,
-    FinderActionDispatch, InitializeCommand, ManagerCommand, ManagerConfig, PreflightPreview,
-    RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide, RecoveryReport, RemoteEndpoint,
-    SyncManager,
+    FilterChangePreview, FinderActionDispatch, InitializeCommand, ManagerCommand, ManagerConfig,
+    PreflightPreview, RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide, RecoveryReport,
+    RemoteEndpoint, SyncManager,
 };
 pub use platform::{
     FakeProcessInspector, LiveProcessInfo, MountedVolume, OsProcessInspector, OsVolumeProbe,
     ProcessInspector, ProcessProbeResult, StateLock, VolumeProbe, resolve_state_dir,
 };
+pub use scheduler::LocalChangeWatcher;
 #[cfg(target_os = "macos")]
 pub use secrets::KeychainSecretStore;
 pub use secrets::{
