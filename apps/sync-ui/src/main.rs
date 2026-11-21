@@ -18,7 +18,11 @@ fn main() -> impl std::process::Termination {
             title: "FolderSync".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             app_id: "com.example.syncui".to_owned(),
-            size: (480, 640),
+            size: (1080, 740),
+            #[cfg(target_os = "macos")]
+            activation_policy: platform::ActivationPolicy::Accessory,
+            #[cfg(target_os = "macos")]
+            keep_alive_on_close: true,
             ..Default::default()
         },
     )

@@ -4,5 +4,30 @@
   "version": "1.0.0",
   "build": 1,
   "rust": ".",
-  "root": "App"
+  "root": "App",
+  "theme": "theme.json",
+  "macos": {
+    "activationPolicy": "accessory"
+  },
+  "window": {
+    "defaultVisible": false,
+    "defaultSize": {
+      "width": 1080,
+      "height": 740
+    },
+    "minSize": {
+      "width": 860,
+      "height": 580
+    },
+    "titleBar": {
+      "style": "hidden",
+      "height": 38
+    },
+    "closeOnPress": false,
+    "backdrop": "sidebar"
+  },
+  "capabilities": {
+    "application": true,
+    "openUrl": true
+  }
 }

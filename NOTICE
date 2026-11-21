@@ -6,5 +6,9 @@ Third-party project notices
   https://github.com/longbridge/nsh/blob/v0.6.1/LICENSE-APACHE
 - rclone, MIT License
   https://github.com/rclone/rclone/blob/v1.76.0/COPYING
+- Paper Mono v1.000, SIL Open Font License 1.1
+  https://github.com/paper-design/paper-mono/releases/download/v1.000/paper-mono-v1.000.zip
+  (archive SHA-256: 8642652985dc87bf4cfd07c89942899e611c3c774fc25284c0dd4fe86a993a13;
+  full license text in apps/sync-ui/assets/fonts/OFL.txt)
 
 Include the applicable license texts and notices with distributed packages.
