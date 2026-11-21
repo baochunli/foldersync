@@ -219,8 +219,16 @@ pub fn activity_view(ctrl: AppController) -> impl IntoElement {
                         .text_color(p.fg),
                 );
             if let Some((label, dest)) = ev.link.clone() {
-                row = row.child(link_button(label, 12.0, move || {
-                    c_link.navigate(dest.clone());
+                row = row.child(link_button(label, 12.0, move || match dest.clone() {
+                    ScreenRoute::RunInspection { mapping_id, run_id } => {
+                        c_link.open_run_inspection(mapping_id, run_id);
+                    }
+                    ScreenRoute::Recovery(mapping_id) => {
+                        c_link.open_recovery(mapping_id);
+                    }
+                    other => {
+                        c_link.navigate(other);
+                    }
                 }));
             }
             row
@@ -398,7 +406,7 @@ pub fn run_inspection_view(
         let log_copy = log_text.clone();
         let is_copied = copied_log.get();
 
-        let log_path_opt = insp.log_path.clone();
+        let log_path_opt = insp.log_exists.then(|| insp.log_path.clone()).flatten();
         let c_reveal = ctrl.clone();
         let reveal_btn = match log_path_opt {
             Some(lp) => app_button(
@@ -416,7 +424,7 @@ pub fn run_inspection_view(
                 true,
                 true,
                 None,
-                Some("No separate log file on disk for this run"),
+                Some("No log file on disk for this run"),
                 || {},
             ),
         };

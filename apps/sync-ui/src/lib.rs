@@ -29,14 +29,14 @@ use crate::contract::{
     should_show_window_at_launch,
 };
 use crate::demo::DemoSource;
-use crate::manager_source::{ManagerSource, ManagerSourceConfig, UiUpdate};
+use crate::manager_source::{ManagerSource, ManagerSourceConfig, UiControlEvent};
 use crate::screens::{
     AppController, accounts::accounts_view, activity::activity_view, activity::run_inspection_view,
     attention::attention_view, attention::recovery_view, detail::detail_view,
     overview::overview_view, preferences::preferences_view, sidebar::sidebar_view,
     wizard::wizard_view,
 };
-use crate::system_actions::RealMacOsSystemActions;
+use crate::system_actions::execute_system_action_on_main_thread;
 use crate::theme::{BtnKind, Palette, TRAY_ATTENTION_ICON, TRAY_ICON, app_button, status_pill};
 
 /// Bundled crate assets (`PaperMono-Regular.ttf`, tray template SVGs, Welcome illustration).
@@ -47,11 +47,31 @@ fn native(registry: &mut Registry) {
     registry.assets(CRATE_ASSETS).register::<App>();
 }
 
-/// Returns `true` only when in-memory demo mode is explicitly requested via
-/// `FOLDERSYNC_DEMO=1` or `--demo`.
+/// Returns `true` when in-memory demo mode is explicitly requested via
+/// `FOLDERSYNC_DEMO=1` or `--demo`, OR when running in a headless test binary
+/// without an explicit isolated `FOLDERSYNC_STATE_DIR` (HIGH #15).
 pub fn is_demo_mode_requested() -> bool {
-    std::env::var("FOLDERSYNC_DEMO").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    if std::env::var("FOLDERSYNC_DEMO").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         || std::env::args().any(|a| a == "--demo")
+    {
+        return true;
+    }
+    // Never default a bare headless test open to the real user's ~/Library/Application Support/FolderSync.
+    let explicit_state_dir =
+        std::env::var_os("FOLDERSYNC_STATE_DIR").is_some_and(|v| !v.is_empty());
+    if !explicit_state_dir {
+        if cfg!(test) {
+            return true;
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(name) = exe.file_name().and_then(|n| n.to_str())
+            && name.starts_with("nsh-app-")
+            && !name.ends_with("-macos-host")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Marshals a UI state update onto the main thread using NSH's documented
@@ -71,10 +91,7 @@ pub fn App() -> impl IntoElement {
         let demo = Rc::new(DemoSource::default());
         (AppController::new_demo(demo), None)
     } else {
-        let mgr = Rc::new(ManagerSource::spawn(
-            ManagerSourceConfig::default(),
-            Arc::new(RealMacOsSystemActions),
-        ));
+        let mgr = Rc::new(ManagerSource::spawn_for_app(ManagerSourceConfig::default()));
         (AppController::new_manager(Rc::clone(&mgr)), Some(mgr))
     };
 
@@ -94,46 +111,66 @@ pub fn App() -> impl IntoElement {
         main_window().focus();
     }
 
-    // Subscribe to real manager updates off the NSH thread and marshal every update
-    // onto the main thread via `run_on_main_thread`.
+    // Consume coalesced latest snapshots & control events off the NSH thread via
+    // `blocking` and marshal every update onto the main thread via `run_on_main_thread` (HIGH #8, #14).
     if let Some(mgr) = manager_for_updates {
-        let rx = mgr.updates_receiver();
+        let slot = mgr.ui_slot();
+        let mgr_for_sys = Rc::clone(&mgr);
         let c_updates = ctrl.clone();
         let mut checked_initial_launch_visibility = false;
         let task = spawn(async move {
             loop {
-                let rx_clone = Arc::clone(&rx);
-                let recv_res = blocking(move || rx_clone.lock().unwrap().recv()).await;
-                let Ok(Ok(update)) = recv_res else {
+                let slot_clone = Arc::clone(&slot);
+                let recv_res = blocking(move || slot_clone.wait_for_batch()).await;
+                let Ok(Some((latest_snap, events))) = recv_res else {
                     break;
                 };
-                // Marshal onto the main thread before mutating signals or window state.
-                let Ok(update) = run_on_main_thread(move || update).await else {
+                // Marshal onto the main thread before mutating signals or invoking NSH desktop APIs.
+                let Ok((latest_snap, events)) =
+                    run_on_main_thread(move || (latest_snap, events)).await
+                else {
                     break;
                 };
-                match update {
-                    UiUpdate::Snapshot(snap) => {
-                        if !checked_initial_launch_visibility {
-                            checked_initial_launch_visibility = true;
-                            if should_show_window_at_launch(&snap, launched_at_login) {
-                                main_window().show();
-                                main_window().focus();
-                            }
+                if let Some(snap) = latest_snap {
+                    if !checked_initial_launch_visibility {
+                        checked_initial_launch_visibility = true;
+                        if should_show_window_at_launch(&snap, launched_at_login) {
+                            main_window().show();
+                            main_window().focus();
                         }
-                        c_updates.apply_snapshot(*snap);
                     }
-                    UiUpdate::Navigate(route) => {
-                        c_updates.navigate(route);
+                    c_updates.apply_snapshot(*snap);
+                }
+                let mut quit_now = false;
+                for ev in events {
+                    match ev {
+                        UiControlEvent::Navigate(route) => {
+                            c_updates.navigate(route);
+                        }
+                        UiControlEvent::ShowWindowAndNavigate(route) => {
+                            c_updates.navigate(route);
+                            main_window().show();
+                            main_window().focus();
+                        }
+                        UiControlEvent::SystemAction {
+                            request_id,
+                            request,
+                        } => {
+                            let mgr_reply = Rc::clone(&mgr_for_sys);
+                            spawn(async move {
+                                let outcome = execute_system_action_on_main_thread(request).await;
+                                mgr_reply.complete_system_action(request_id, outcome);
+                            });
+                        }
+                        UiControlEvent::QuitReady(_outcome) => {
+                            nsh_core::element::desktop::quit();
+                            quit_now = true;
+                            break;
+                        }
                     }
-                    UiUpdate::ShowWindowAndNavigate(route) => {
-                        c_updates.navigate(route);
-                        main_window().show();
-                        main_window().focus();
-                    }
-                    UiUpdate::QuitReady(_outcome) => {
-                        nsh_core::element::desktop::quit();
-                        break;
-                    }
+                }
+                if quit_now {
+                    break;
                 }
             }
         });

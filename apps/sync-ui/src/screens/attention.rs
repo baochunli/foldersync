@@ -52,6 +52,15 @@ pub fn attention_view(ctrl: AppController) -> impl IntoElement {
 }
 
 fn latest_run_id_for(snap: &UiSnapshot, mid: &MappingId) -> RunId {
+    if let Some(m) = snap.mapping(mid)
+        && let Some(first) = m.recent_runs.first()
+    {
+        return first.run_id.clone();
+    }
+    RunId::new(format!("run-{mid}-latest"))
+}
+
+fn conflict_run_id_for(snap: &UiSnapshot, mid: &MappingId) -> RunId {
     if let Some(m) = snap.mapping(mid) {
         if let Some(unrev) = &m.unreviewed_conflicts {
             return unrev.run_id.clone();
@@ -235,6 +244,7 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                         }
                     })
                     .unwrap_or_else(|| name.clone());
+                let can_open_cloud = !is_cloud_val || target_path.starts_with("https://");
                 actions = actions
                     .child(app_button(
                         "Check again",
@@ -253,12 +263,15 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                         },
                         BtnKind::Default,
                         true,
-                        false,
+                        !can_open_cloud,
                         None,
-                        None,
+                        (!can_open_cloud)
+                            .then_some("Cloud web link is not available for this account"),
                         move || {
                             if is_cloud_val {
-                                c_open.send(UiCommand::OpenCloudUrl(target_path.clone()));
+                                if target_path.starts_with("https://") {
+                                    c_open.send(UiCommand::OpenCloudUrl(target_path.clone()));
+                                }
                             } else {
                                 c_open.send(UiCommand::RevealPath(target_path.clone()));
                             }
@@ -387,7 +400,7 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                 let c_rev = ctrl.clone();
                 let id_rev = mid.clone();
                 let id_run = mid.clone();
-                let rid = latest_run_id_for(snap, mid);
+                let rid = conflict_run_id_for(snap, mid);
                 let local_p = snap
                     .mapping(mid)
                     .map(|m| m.local_path.clone())
@@ -396,6 +409,7 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                     .mapping(mid)
                     .map(|m| m.cloud_path.clone())
                     .unwrap_or_default();
+                let has_cloud_url = cloud_p.starts_with("https://");
                 actions = actions
                     .child(app_button(
                         "Reveal in Finder",
@@ -412,11 +426,14 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                         "Open cloud folder",
                         BtnKind::Default,
                         true,
-                        false,
+                        !has_cloud_url,
                         None,
-                        None,
+                        (!has_cloud_url)
+                            .then_some("Cloud web link is not available for this account"),
                         move || {
-                            c_cloud.send(UiCommand::OpenCloudUrl(cloud_p.clone()));
+                            if cloud_p.starts_with("https://") {
+                                c_cloud.send(UiCommand::OpenCloudUrl(cloud_p.clone()));
+                            }
                         },
                     ))
                     .child(
@@ -537,7 +554,12 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             )
         };
 
-        let proc_check = if ambiguous {
+        let inspected_ok = checklist.is_some_and(|rc| rc.inspected);
+        let identities_ok = checklist.is_some_and(|rc| rc.identities_verified);
+
+        let proc_check = if !inspected_ok {
+            check_line(IconKind::Sync, p.run, "Checking earlier sync processes…")
+        } else if ambiguous {
             check_line(
                 IconKind::Alert,
                 p.attn,
@@ -554,14 +576,10 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                 p.err,
                 "An earlier sync process is still running for this mapping.",
             )
-        } else if checklist.is_some() || recovery_info.is_some() {
+        } else if orphan_alive == Some(false) {
             check_line(IconKind::Check, p.ok, "No earlier sync process is running.")
         } else {
-            check_line(
-                IconKind::Dash,
-                p.muted,
-                "Earlier sync process: Not checked yet.",
-            )
+            check_line(IconKind::Alert, p.attn, "Earlier sync process: checking…")
         };
 
         let vol_snap = snap.volumes.iter().find(|v| v.identity == m.volume_id);
@@ -581,22 +599,20 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             None => check_line(
                 IconKind::Dash,
                 p.muted,
-                &format!("{}: Not checked yet.", m.volume_name),
+                &format!("{}: Checking…", m.volume_name),
             ),
         };
 
-        let identity_check = if m.state.readiness() == Readiness::EndpointChanged {
-            check_line(
-                IconKind::Octagon,
-                p.err,
-                "Folder identity changed since setup; review before resuming.",
-            )
-        } else {
-            check_line(
-                IconKind::Dash,
-                p.muted,
-                "Local and cloud folder identities: Not checked yet (verified when you resume).",
-            )
+        let identity_check = match checklist {
+            None => check_line(
+                IconKind::Sync,
+                p.run,
+                "Checking local and destination folder identities…",
+            ),
+            Some(rc) if rc.identities_verified => {
+                check_line(IconKind::Check, p.ok, &rc.identity_check_detail)
+            }
+            Some(rc) => check_line(IconKind::Octagon, p.err, &rc.identity_check_detail),
         };
 
         let copies_list = checklist
@@ -789,12 +805,21 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                     )),
                 );
         } else {
+            let can_resume =
+                inspected_ok && identities_ok && orphan_alive == Some(false) && !ambiguous;
+            let can_keep_paused = inspected_ok && orphan_alive == Some(false) && !ambiguous;
             body = body
                 .child(
-                    text("A normal run can continue from here. It checks both sides again and keeps recovery copies as usual.")
-                        .text_size(px(13.0))
-                        .text_color(p.fg)
-                        .pt(px(8.0)),
+                    text(if can_resume {
+                        "A normal run can continue from here. It checks both sides again and keeps recovery copies as usual."
+                    } else if !inspected_ok {
+                        "Checking earlier sync processes and folder identities before enabling resume…"
+                    } else {
+                        "Confirm folder identities match setup before resuming normal sync."
+                    })
+                    .text_size(px(13.0))
+                    .text_color(p.fg)
+                    .pt(px(8.0)),
                 )
                 .child(
                     view()
@@ -806,9 +831,11 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                                 "Run normally and resume",
                                 BtnKind::Primary,
                                 false,
-                                false,
+                                !can_resume,
                                 None,
-                                None,
+                                (!can_resume).then_some(
+                                    "Waiting for inspection and folder identity verification",
+                                ),
                                 move || {
                                     c_run.send(UiCommand::CompleteRecovery {
                                         mapping_id: id_run.clone(),
@@ -824,9 +851,10 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                                 "Keep paused",
                                 BtnKind::Default,
                                 false,
-                                false,
+                                !can_keep_paused,
                                 None,
-                                None,
+                                (!can_keep_paused)
+                                    .then_some("Waiting for recovery inspection to finish"),
                                 move || {
                                     c_keep.send(UiCommand::CompleteRecovery {
                                         mapping_id: id_keep.clone(),

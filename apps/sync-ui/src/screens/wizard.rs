@@ -357,9 +357,8 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
     }
 
     let c_new = ctrl.clone();
-    let c_pick_remote = ctrl.clone();
     let is_demo = snap.is_demo_mode;
-    let mut folder_footer = view()
+    let folder_footer = view()
         .flex_row()
         .items_center()
         .flex_wrap()
@@ -371,50 +370,24 @@ fn render_step_folder(ctrl: AppController, snap: &UiSnapshot) -> View {
                 "New folder in Data…",
                 BtnKind::Default,
                 true,
-                false,
+                !is_demo,
                 Some(IconKind::Plus),
-                None,
+                (!is_demo).then_some(
+                    "Creating new folders inside Data is not available in this build yet",
+                ),
                 move || {
-                    c_new.send(UiCommand::WizardCreateNewFolder(String::new()));
+                    if is_demo {
+                        c_new.send(UiCommand::WizardCreateNewFolder(String::new()));
+                    }
                 },
             )
             .test_id("wizard-new-folder-btn"),
+        )
+        .child(
+            text("Only folders directly inside Data are offered, so collections never overlap.")
+                .text_size(px(11.5))
+                .text_color(p.muted),
         );
-    if !is_demo {
-        folder_footer = folder_footer.child(
-            app_button(
-                "Choose remote folder…",
-                BtnKind::Default,
-                true,
-                false,
-                Some(IconKind::Folder),
-                None,
-                move || {
-                    let c = c_pick_remote.clone();
-                    let answer = pick_paths(
-                        OpenDialog::folders()
-                            .title("Choose remote folder")
-                            .button_label("Choose"),
-                    );
-                    spawn(async move {
-                        if let Ok(Some(paths)) = answer.await
-                            && let Some(first) = paths.first()
-                        {
-                            c.send(UiCommand::WizardSetRemotePath(
-                                first.to_string_lossy().into_owned(),
-                            ));
-                        }
-                    });
-                },
-            )
-            .test_id("wizard-choose-remote-btn"),
-        );
-    }
-    folder_footer = folder_footer.child(
-        text("Only folders directly inside Data are offered, so collections never overlap.")
-            .text_size(px(11.5))
-            .text_color(p.muted),
-    );
 
     let folder_table_card = card()
         .flex_1()
@@ -1659,13 +1632,47 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         ),
     };
 
-    let mut progress_card = card()
-        .child(check_row(
+    let preflight_done = snap.is_demo_mode || draft.first_sync_preflight_done;
+    let markers_ready = snap.is_demo_mode || draft.first_sync_markers_ready;
+    let preflight_row = if preflight_done {
+        check_row(
             IconKind::Check,
             p.ok,
             "Checked account, folders and volume again",
-        ))
-        .child(check_row(IconKind::Check, p.ok, "Marker files in place"));
+        )
+    } else if draft.first_sync_error.is_some() {
+        check_row(
+            IconKind::Octagon,
+            p.err,
+            "Account, folder, and volume check failed",
+        )
+    } else {
+        check_row(
+            IconKind::Sync,
+            p.run,
+            "Checking account, folders and volume again…",
+        )
+    };
+    let marker_row = if markers_ready {
+        check_row(IconKind::Check, p.ok, "Marker files in place")
+    } else if draft.first_sync_error.is_some() {
+        check_row(IconKind::Dash, p.muted, "Marker files not verified")
+    } else {
+        check_row(IconKind::Dash, p.muted, "Verifying marker files")
+    };
+
+    let mut progress_card = card().child(preflight_row).child(marker_row);
+
+    let finish_mode_done = if snap.is_demo_mode {
+        "Automatic sync is now on"
+    } else {
+        "First sync finished. Use Sync now to run manual syncs."
+    };
+    let finish_mode_pending = if snap.is_demo_mode {
+        "Turn on automatic sync"
+    } else {
+        "Ready for manual sync"
+    };
 
     if let Some(err) = &draft.first_sync_error {
         progress_card = progress_card.child(check_row(IconKind::Octagon, p.err, err));
@@ -1677,8 +1684,15 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                 &format!("{verb} finished"),
             ))
             .child(check_row(IconKind::Check, p.ok, "Checked the result"))
-            .child(check_row(IconKind::Check, p.ok, "Automatic sync is now on"));
+            .child(check_row(IconKind::Check, p.ok, finish_mode_done));
     } else {
+        let active_line = if draft.first_sync_stopping {
+            format!("Stopping first sync… · elapsed {elapsed}")
+        } else if !preflight_done {
+            format!("Checking folders before syncing… · elapsed {elapsed}")
+        } else {
+            in_flight_line
+        };
         progress_card = progress_card
             .child(
                 view()
@@ -1694,7 +1708,7 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                             .flex_col()
                             .gap(px(6.0))
                             .child(
-                                text(in_flight_line)
+                                text(active_line)
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(p.fg)
@@ -1712,9 +1726,10 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                     ),
             )
             .child(check_row(IconKind::Dash, p.muted, "Check the result"))
-            .child(check_row(IconKind::Dash, p.muted, "Turn on automatic sync"));
+            .child(check_row(IconKind::Dash, p.muted, finish_mode_pending));
     }
 
+    let c_back_review = ctrl.clone();
     let mut footer_btns = view()
         .flex_row()
         .flex_wrap()
@@ -1729,6 +1744,18 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             None,
             move || c_done.navigate(ScreenRoute::Overview),
         ));
+
+    if draft.first_sync_error.is_some() {
+        footer_btns = footer_btns.child(app_button(
+            "Back to Review",
+            BtnKind::Primary,
+            true,
+            false,
+            None,
+            None,
+            move || c_back_review.send(UiCommand::WizardSetStep(WizardStep::Review)),
+        ));
+    }
 
     if draft.first_sync_completed
         && let Some(mid) = draft.first_sync_mapping_id.clone()
@@ -1777,15 +1804,16 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             ),
     );
 
-    if !draft.first_sync_completed {
+    if !draft.first_sync_completed && draft.first_sync_error.is_none() {
+        let stopping = draft.first_sync_stopping;
         header_row = header_row.child(
             app_button(
-                "Stop",
+                if stopping { "Stopping…" } else { "Stop" },
                 BtnKind::Default,
                 false,
-                false,
+                stopping,
                 Some(IconKind::Stop),
-                None,
+                stopping.then_some("Waiting for the active first sync to stop"),
                 move || c_stop.send(UiCommand::WizardStopFirstSync),
             )
             .test_id("wizard-stop-first-sync-btn"),

@@ -7,7 +7,7 @@ use std::{
     sync::Mutex,
 };
 
-use nsh_core::{desktop::LaunchAtLoginError, notifications::Notification, prelude::*};
+use nsh_core::{desktop::LaunchAtLoginError, notifications::Notification};
 
 /// Result of toggling "Open at login".
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,81 @@ pub trait SystemActions: Send + Sync {
     fn notify(&self, id: &str, title: &str, body: &str) -> Result<bool, String>;
 }
 
+/// Request dispatched from the manager worker thread to the NSH main thread
+/// so platform desktop APIs run strictly on the main reactive thread (HIGH #8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemActionRequest {
+    RevealPath(PathBuf),
+    OpenUrl(String),
+    SetLaunchAtLogin(bool),
+    Notify {
+        id: String,
+        title: String,
+        body: String,
+    },
+}
+
+/// Real outcome returned from the NSH main thread back to the manager worker (HIGH #8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemActionOutcome {
+    RevealPath(Result<(), String>),
+    OpenUrl(Result<(), String>),
+    SetLaunchAtLogin(Result<LaunchAtLoginOutcome, String>),
+    Notify(Result<bool, String>),
+}
+
+/// Executes one real macOS system action strictly on the NSH main thread (inside
+/// `App()`'s async runtime) and returns the actual result — never panics off-thread
+/// and never invents a fake launch-at-login outcome (HIGH #8).
+pub async fn execute_system_action_on_main_thread(req: SystemActionRequest) -> SystemActionOutcome {
+    match req {
+        SystemActionRequest::RevealPath(path) => {
+            if !path.exists() {
+                return SystemActionOutcome::RevealPath(Err(format!(
+                    "Folder or file `{}` does not exist on this Mac right now.",
+                    path.display()
+                )));
+            }
+            match nsh_core::prelude::reveal_path(path).await {
+                Ok(()) => SystemActionOutcome::RevealPath(Ok(())),
+                Err(err) => SystemActionOutcome::RevealPath(Err(format!(
+                    "Could not reveal item in Finder: {err}."
+                ))),
+            }
+        }
+        SystemActionRequest::OpenUrl(url) => match validate_open_url(&url) {
+            Ok(safe) => {
+                if nsh_core::prelude::open_url(safe.to_owned()).await {
+                    SystemActionOutcome::OpenUrl(Ok(()))
+                } else {
+                    SystemActionOutcome::OpenUrl(Err(format!("Could not open URL `{safe}`.")))
+                }
+            }
+            Err(err) => SystemActionOutcome::OpenUrl(Err(err)),
+        },
+        SystemActionRequest::SetLaunchAtLogin(enabled) => {
+            match nsh_core::element::desktop::set_launch_at_login(enabled).await {
+                Ok(()) => SystemActionOutcome::SetLaunchAtLogin(Ok(if enabled {
+                    LaunchAtLoginOutcome::Enabled
+                } else {
+                    LaunchAtLoginOutcome::Disabled
+                })),
+                Err(LaunchAtLoginError::Unavailable) => {
+                    SystemActionOutcome::SetLaunchAtLogin(Ok(LaunchAtLoginOutcome::Unavailable))
+                }
+                Err(err) => SystemActionOutcome::SetLaunchAtLogin(Err(format!(
+                    "Could not update Open at login: {err}."
+                ))),
+            }
+        }
+        SystemActionRequest::Notify { id, title, body } => {
+            let notif = Notification::new(id, title, body);
+            let delivered = nsh_core::prelude::show_notification(notif).await;
+            SystemActionOutcome::Notify(Ok(delivered))
+        }
+    }
+}
+
 /// Validates that `url` uses an explicit safe scheme before handing it to macOS.
 pub fn validate_open_url(url: &str) -> Result<&str, String> {
     let trimmed = url.trim();
@@ -49,74 +124,6 @@ pub fn validate_open_url(url: &str) -> Result<&str, String> {
         Err(format!(
             "Refused to open unsupported URL scheme: `{trimmed}`."
         ))
-    }
-}
-
-/// Real macOS implementation using NSH 0.6.1's documented desktop/core APIs.
-///
-/// Must only be constructed in a real interactive app run (never in tests or
-/// `FOLDERSYNC_DEMO=1`).
-#[derive(Debug, Default)]
-pub struct RealMacOsSystemActions;
-
-impl SystemActions for RealMacOsSystemActions {
-    fn reveal_path(&self, path: &Path) -> Result<(), String> {
-        if !path.exists() {
-            return Err(format!(
-                "Folder `{}` does not exist on this Mac right now.",
-                path.display()
-            ));
-        }
-        let target = path.to_path_buf();
-        drop(run_on_main_thread(move || {
-            spawn(async move {
-                let _ = nsh_core::prelude::reveal_path(target).await;
-            });
-        }));
-        Ok(())
-    }
-
-    fn open_url(&self, url: &str) -> Result<(), String> {
-        let safe = validate_open_url(url)?.to_owned();
-        drop(run_on_main_thread(move || {
-            spawn(async move {
-                let _ = nsh_core::prelude::open_url(safe).await;
-            });
-        }));
-        Ok(())
-    }
-
-    fn set_launch_at_login(&self, enabled: bool) -> Result<LaunchAtLoginOutcome, String> {
-        drop(run_on_main_thread(move || {
-            spawn(async move {
-                match nsh_core::element::desktop::set_launch_at_login(enabled).await {
-                    Ok(()) => {}
-                    Err(LaunchAtLoginError::Unavailable) => {
-                        eprintln!(
-                            "foldersync: launch at login is unavailable in unpackaged builds"
-                        );
-                    }
-                    Err(err) => {
-                        eprintln!("foldersync: launch at login update failed: {err}");
-                    }
-                }
-            });
-        }));
-        Ok(if enabled {
-            LaunchAtLoginOutcome::PendingApproval
-        } else {
-            LaunchAtLoginOutcome::Disabled
-        })
-    }
-
-    fn notify(&self, id: &str, title: &str, body: &str) -> Result<bool, String> {
-        let notif = Notification::new(id, title, body);
-        drop(run_on_main_thread(move || {
-            spawn(async move {
-                let _ = nsh_core::prelude::show_notification(notif).await;
-            });
-        }));
-        Ok(true)
     }
 }
 

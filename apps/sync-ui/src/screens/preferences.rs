@@ -170,12 +170,31 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                     view().into_element()
                 }),
         )
-        .child(app_switch(
-            prefs.notifications_enabled,
-            "Notifications",
-            "Notify when a mapping needs attention or completes with conflicts (works in a signed app bundle).",
-            move |next| c_notif.send(UiCommand::SetNotifications(next)),
-        ))
+        .child(if snap.is_demo_mode {
+            app_switch(
+                prefs.notifications_enabled,
+                "Notifications",
+                "Notify when a mapping needs attention or completes with conflicts (works in a signed app bundle).",
+                move |next| c_notif.send(UiCommand::SetNotifications(next)),
+            )
+            .into_element()
+        } else {
+            view()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    text("Notifications · not connected yet in this build")
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.muted),
+                )
+                .child(
+                    text("Desktop notifications are not connected to sync events in this build yet.")
+                        .text_size(px(12.0))
+                        .text_color(p.muted),
+                )
+                .into_element()
+        })
         .child(
             view()
                 .flex_row()
@@ -223,81 +242,90 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
         );
 
     let limited = prefs.bandwidth_limit_mb_s.is_some();
-    let bandwidth_card = card().child(card_title("Bandwidth")).child(
-        radio_group()
-            .accessibility_label("Bandwidth")
-            .flex_col()
-            .gap(px(10.0))
-            .child(
-                radio()
-                    .checked(!limited)
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .cursor_pointer()
-                    .focus_visible(focus_ring)
-                    .on_change(move |checked: &bool| {
-                        if *checked {
-                            c_bw_none.send(UiCommand::SetBandwidthLimit(None));
-                        }
-                    })
-                    .child(radio_dot(!limited))
-                    .child(text("No limit").text_size(px(13.0)).text_color(p.fg)),
-            )
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        radio()
-                            .checked(limited)
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .cursor_pointer()
-                            .focus_visible(focus_ring)
-                            .on_change(move |checked: &bool| {
-                                if *checked {
-                                    let val = bw_input
-                                        .get_untracked()
-                                        .parse::<u32>()
-                                        .unwrap_or(20)
-                                        .max(1);
-                                    c_bw_lim.send(UiCommand::SetBandwidthLimit(Some(val)));
-                                }
-                            })
-                            .child(radio_dot(limited))
-                            .child(text("Limit to").text_size(px(13.0)).text_color(p.fg)),
-                    )
-                    .child(
-                        input()
-                            .w(px(64.0))
-                            .min_h(px(28.0))
-                            .px(px(8.0))
-                            .py(px(3.0))
-                            .rounded(px(7.0))
-                            .bg(p.bg)
-                            .border_1()
-                            .border_color(p.border)
-                            .focus(focus_ring)
-                            .focus_visible(focus_ring)
-                            .text_size(px(12.5))
-                            .text_color(p.fg)
-                            .label("Megabytes per second")
-                            .value(move || bw_input.get())
-                            .on_change(move |s: &str| {
-                                bw_input.set(s.to_owned());
-                                if let Ok(v) = s.trim().parse::<u32>()
-                                    && v > 0
-                                {
-                                    c_bw_edit.send(UiCommand::SetBandwidthLimit(Some(v)));
-                                }
-                            }),
-                    )
-                    .child(text("MB/s").text_size(px(13.0)).text_color(p.fg)),
-            ),
-    );
+    let bandwidth_card = if snap.is_demo_mode {
+        card().child(card_title("Bandwidth")).child(
+            radio_group()
+                .accessibility_label("Bandwidth")
+                .flex_col()
+                .gap(px(10.0))
+                .child(
+                    radio()
+                        .checked(!limited)
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .cursor_pointer()
+                        .focus_visible(focus_ring)
+                        .on_change(move |checked: &bool| {
+                            if *checked {
+                                c_bw_none.send(UiCommand::SetBandwidthLimit(None));
+                            }
+                        })
+                        .child(radio_dot(!limited))
+                        .child(text("No limit").text_size(px(13.0)).text_color(p.fg)),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            radio()
+                                .checked(limited)
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.0))
+                                .cursor_pointer()
+                                .focus_visible(focus_ring)
+                                .on_change(move |checked: &bool| {
+                                    if *checked {
+                                        let val = bw_input
+                                            .get_untracked()
+                                            .parse::<u32>()
+                                            .unwrap_or(20)
+                                            .max(1);
+                                        c_bw_lim.send(UiCommand::SetBandwidthLimit(Some(val)));
+                                    }
+                                })
+                                .child(radio_dot(limited))
+                                .child(text("Limit to").text_size(px(13.0)).text_color(p.fg)),
+                        )
+                        .child(
+                            input()
+                                .w(px(64.0))
+                                .min_h(px(28.0))
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(7.0))
+                                .bg(p.bg)
+                                .border_1()
+                                .border_color(p.border)
+                                .focus(focus_ring)
+                                .focus_visible(focus_ring)
+                                .text_size(px(12.5))
+                                .text_color(p.fg)
+                                .label("Megabytes per second")
+                                .value(move || bw_input.get())
+                                .on_change(move |s: &str| {
+                                    bw_input.set(s.to_owned());
+                                    if let Ok(v) = s.trim().parse::<u32>()
+                                        && v > 0
+                                    {
+                                        c_bw_edit.send(UiCommand::SetBandwidthLimit(Some(v)));
+                                    }
+                                }),
+                        )
+                        .child(text("MB/s").text_size(px(13.0)).text_color(p.fg)),
+                ),
+        )
+    } else {
+        let _ = (c_bw_none, c_bw_lim, c_bw_edit, bw_input);
+        card().child(card_title("Bandwidth")).child(
+            text("Bandwidth limits are not connected to sync runs in this build yet.")
+                .text_size(px(12.5))
+                .text_color(p.muted),
+        )
+    };
 
     view()
         .flex_col()

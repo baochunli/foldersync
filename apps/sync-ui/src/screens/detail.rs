@@ -136,6 +136,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     };
 
     let cloud_more = m.cloud_path.clone();
+    let has_cloud_url = cloud_more.starts_with("https://");
     let more_btn = app_button(
         "More ▾",
         BtnKind::Default,
@@ -155,9 +156,13 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 MenuItem::new("Reveal in Finder").on_select(move || {
                     c_rev.send(UiCommand::RevealPath(lp.clone()));
                 }),
-                MenuItem::new("Open cloud folder").on_select(move || {
-                    c_open.send(UiCommand::OpenCloudUrl(cp.clone()));
-                }),
+                MenuItem::new("Open cloud folder")
+                    .disabled(!has_cloud_url)
+                    .on_select(move || {
+                        if cp.starts_with("https://") {
+                            c_open.send(UiCommand::OpenCloudUrl(cp.clone()));
+                        }
+                    }),
                 MenuItem::separator(),
                 MenuItem::new("Remove mapping…").on_select(move || {
                     c_rm.confirm_remove_mapping(id_rm.clone(), nm_rm.clone());
@@ -316,11 +321,14 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     "Open cloud folder",
                     BtnKind::Default,
                     true,
-                    false,
+                    !cp_open.starts_with("https://"),
                     None,
-                    None,
+                    (!cp_open.starts_with("https://"))
+                        .then_some("Cloud web link is not available for this account"),
                     move || {
-                        c_loc_open.send(UiCommand::OpenCloudUrl(cp_open.clone()));
+                        if cp_open.starts_with("https://") {
+                            c_loc_open.send(UiCommand::OpenCloudUrl(cp_open.clone()));
+                        }
                     },
                 )),
         );
@@ -518,13 +526,18 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             }
         });
 
+    let local_changes_copy = if snap.is_demo_mode {
+        "Also start a run shortly after files change here"
+    } else {
+        "Manual sync only in this build (automatic scheduling is not enabled yet)"
+    };
     let schedule_card = card()
         .flex_1()
         .child(card_title("Schedule"))
         .child(kv_row("Check schedule", sched_select.into_element()))
         .child(kv_row(
             "Local changes",
-            text("Also start a run shortly after files change here")
+            text(local_changes_copy)
                 .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),

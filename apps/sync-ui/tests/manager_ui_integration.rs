@@ -11,9 +11,12 @@ use std::{
 };
 
 use nsh_app_sync_ui::{
-    contract::{ScreenRoute, UiCommand, UiSnapshot},
-    manager_source::{ManagerSource, ManagerSourceConfig, UiUpdate},
-    system_actions::{RecordedSystemAction, RecordingSystemActions},
+    contract::{ReviewScenario, RunPhase, ScreenRoute, UiCommand, UiSnapshot, WizardStep},
+    manager_source::{ManagerSource, ManagerSourceConfig, UiControlEvent},
+    system_actions::{
+        LaunchAtLoginOutcome, RecordedSystemAction, RecordingSystemActions, SystemActionOutcome,
+        SystemActionRequest,
+    },
 };
 use rclone_adapter::{ExitStatusInfo, OutputLine, StreamKind};
 use sync_core::{Execution, Intent, MappingId, Readiness, RunOutcome};
@@ -35,7 +38,6 @@ fn wait_for_snapshot(
     mut pred: impl FnMut(&UiSnapshot) -> bool,
 ) -> UiSnapshot {
     let deadline = Instant::now() + timeout;
-    let rx = mgr.updates_receiver();
     loop {
         let current = mgr.snapshot();
         if pred(&current) {
@@ -54,31 +56,32 @@ fn wait_for_snapshot(
                 current.active_run
             );
         }
-        let step = rem.min(Duration::from_millis(50));
-        let _ = rx.lock().unwrap().recv_timeout(step);
+        std::thread::sleep(rem.min(Duration::from_millis(15)));
     }
 }
 
-fn drain_updates_until(
+fn drain_control_until(
     mgr: &ManagerSource,
     timeout: Duration,
-    mut pred: impl FnMut(&UiUpdate) -> bool,
-) -> Option<UiUpdate> {
-    let deadline = Instant::now() + timeout;
-    let rx = mgr.updates_receiver();
-    loop {
-        let rem = deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
-            return None;
-        }
-        if let Ok(upd) = rx
-            .lock()
-            .unwrap()
-            .recv_timeout(rem.min(Duration::from_millis(50)))
-            && pred(&upd)
-        {
-            return Some(upd);
-        }
+    pred: impl Fn(&UiControlEvent) -> bool,
+) -> Option<UiControlEvent> {
+    mgr.ui_slot().wait_for_control_timeout(timeout, pred)
+}
+
+fn test_mgr_config(
+    state_dir: PathBuf,
+    finder_dir: PathBuf,
+    launcher: Arc<dyn sync_manager::BisyncLauncher>,
+    notifier: Arc<dyn sync_manager::FinderNotifier>,
+) -> ManagerSourceConfig {
+    ManagerSourceConfig {
+        state_dir: Some(state_dir),
+        finder_status_dir: Some(finder_dir),
+        launcher: Some(launcher),
+        finder_notifier: Some(notifier),
+        finder_heartbeat_interval: None,
+        shutdown_timeout: Duration::from_secs(5),
+        finder_poll_interval: None,
     }
 }
 
@@ -146,14 +149,12 @@ fn manager_source_add_init_sync_now_real_pinned_rclone() {
     let sys = Arc::new(RecordingSystemActions::new());
     let notifier = Arc::new(RecordingFinderNotifier::new());
     let mgr = ManagerSource::spawn(
-        ManagerSourceConfig {
-            state_dir: Some(state_dir),
-            finder_status_dir: Some(finder_dir.clone()),
-            launcher: Some(Arc::new(RealBisyncLauncher::new(Some(rclone_bin)))),
-            finder_notifier: Some(notifier.clone()),
-            shutdown_timeout: Duration::from_secs(5),
-            finder_poll_interval: None,
-        },
+        test_mgr_config(
+            state_dir,
+            finder_dir.clone(),
+            Arc::new(RealBisyncLauncher::new(Some(rclone_bin))),
+            notifier.clone(),
+        ),
         sys.clone(),
     );
 
@@ -232,14 +233,12 @@ fn pause_survives_restart_and_conflict_ack_preserves_outcome() {
     let mid: MappingId;
     {
         let mgr = ManagerSource::spawn(
-            ManagerSourceConfig {
-                state_dir: Some(state_dir.clone()),
-                finder_status_dir: Some(finder_dir.clone()),
-                launcher: Some(launcher.clone()),
-                finder_notifier: Some(Arc::new(RecordingFinderNotifier::new())),
-                shutdown_timeout: Duration::from_secs(5),
-                finder_poll_interval: None,
-            },
+            test_mgr_config(
+                state_dir.clone(),
+                finder_dir.clone(),
+                launcher.clone(),
+                Arc::new(RecordingFinderNotifier::new()),
+            ),
             sys.clone(),
         );
         wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.is_demo_mode);
@@ -279,14 +278,12 @@ fn pause_survives_restart_and_conflict_ack_preserves_outcome() {
 
     // Reopen fresh ManagerSource on same state dir -> Pause & unreviewed conflicts survive restart.
     let mgr2 = ManagerSource::spawn(
-        ManagerSourceConfig {
-            state_dir: Some(state_dir),
-            finder_status_dir: Some(finder_dir),
-            launcher: Some(launcher),
-            finder_notifier: Some(Arc::new(RecordingFinderNotifier::new())),
-            shutdown_timeout: Duration::from_secs(5),
-            finder_poll_interval: None,
-        },
+        test_mgr_config(
+            state_dir,
+            finder_dir,
+            launcher,
+            Arc::new(RecordingFinderNotifier::new()),
+        ),
         sys,
     );
     let reopened = wait_for_snapshot(&mgr2, Duration::from_secs(5), |s| s.mapping(&mid).is_some());
@@ -336,14 +333,12 @@ fn recovery_inspection_lists_copies_and_refuses_live_folder() {
     });
 
     let mgr = ManagerSource::spawn(
-        ManagerSourceConfig {
-            state_dir: Some(state_dir),
-            finder_status_dir: Some(finder_dir),
-            launcher: Some(launcher),
-            finder_notifier: Some(Arc::new(RecordingFinderNotifier::new())),
-            shutdown_timeout: Duration::from_secs(5),
-            finder_poll_interval: None,
-        },
+        test_mgr_config(
+            state_dir,
+            finder_dir,
+            launcher,
+            Arc::new(RecordingFinderNotifier::new()),
+        ),
         Arc::new(RecordingSystemActions::new()),
     );
     wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.is_demo_mode);
@@ -452,14 +447,12 @@ fn finder_action_files_system_actions_recording_and_controlled_shutdown() {
 
     let sys = Arc::new(RecordingSystemActions::new());
     let mgr = ManagerSource::spawn(
-        ManagerSourceConfig {
-            state_dir: Some(state_dir),
-            finder_status_dir: Some(finder_dir.clone()),
-            launcher: Some(launcher),
-            finder_notifier: Some(Arc::new(RecordingFinderNotifier::new())),
-            shutdown_timeout: Duration::from_secs(5),
-            finder_poll_interval: None,
-        },
+        test_mgr_config(
+            state_dir,
+            finder_dir.clone(),
+            launcher,
+            Arc::new(RecordingFinderNotifier::new()),
+        ),
         sys.clone(),
     );
     wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.is_demo_mode);
@@ -533,8 +526,11 @@ fn finder_action_files_system_actions_recording_and_controlled_shutdown() {
     .unwrap();
     mgr.poll_finder_actions();
 
-    let nav = drain_updates_until(&mgr, Duration::from_secs(5), |u| {
-        matches!(u, UiUpdate::ShowWindowAndNavigate(ScreenRoute::Overview))
+    let nav = drain_control_until(&mgr, Duration::from_secs(5), |u| {
+        matches!(
+            u,
+            UiControlEvent::ShowWindowAndNavigate(ScreenRoute::Overview)
+        )
     });
     assert!(
         nav.is_some(),
@@ -549,12 +545,286 @@ fn finder_action_files_system_actions_recording_and_controlled_shutdown() {
             .is_some_and(|m| m.state.execution == Execution::Running)
     });
     mgr.request_controlled_shutdown();
-    let quit_upd = drain_updates_until(&mgr, Duration::from_secs(5), |u| {
-        matches!(u, UiUpdate::QuitReady(ControlledShutdownOutcome::Clean))
+    let quit_upd = drain_control_until(&mgr, Duration::from_secs(5), |u| {
+        matches!(
+            u,
+            UiControlEvent::QuitReady(ControlledShutdownOutcome::Clean)
+        )
     });
     assert!(
         quit_upd.is_some(),
         "controlled shutdown must stop active run cleanly and emit QuitReady"
+    );
+    mgr.shutdown();
+}
+
+#[test]
+fn wizard_saves_edits_exclusions_persists_accounts_and_invalidates_confirmation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    let remote_parent_2 = tmp.path().join("remote-parent-2");
+    let remote_folder_2 = remote_parent_2.join("Projects");
+    let local_folder_2 = tmp.path().join("local/Projects2");
+    let local_recovery_2 = tmp.path().join("recovery/Projects2");
+    fs::create_dir_all(&remote_folder_2).unwrap();
+    fs::create_dir_all(&local_folder_2).unwrap();
+    fs::create_dir_all(&local_recovery_2).unwrap();
+    fs::write(remote_folder.join("doc.txt"), "hello\n").unwrap();
+
+    let launcher = Arc::new(FakeBisyncLauncher::new());
+    launcher.push_script(FakeLaunchScript::default());
+
+    // 1. Register TWO local fixture accounts -> restart -> parent paths persist and wizard opens on Account (HIGH #3).
+    {
+        let mgr = ManagerSource::spawn(
+            test_mgr_config(
+                state_dir.clone(),
+                finder_dir.clone(),
+                launcher.clone(),
+                Arc::new(RecordingFinderNotifier::new()),
+            ),
+            Arc::new(RecordingSystemActions::new()),
+        );
+        wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.is_demo_mode);
+        mgr.dispatch(UiCommand::AddLocalFixtureAccount {
+            id: "acct-1".to_owned(),
+            display_name: "Account One".to_owned(),
+            parent_dir: remote_parent.to_string_lossy().into_owned(),
+        });
+        mgr.dispatch(UiCommand::AddLocalFixtureAccount {
+            id: "acct-2".to_owned(),
+            display_name: "Account Two".to_owned(),
+            parent_dir: remote_parent_2.to_string_lossy().into_owned(),
+        });
+        wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.accounts.len() == 2);
+        mgr.shutdown();
+    }
+
+    let mgr = ManagerSource::spawn(
+        test_mgr_config(
+            state_dir,
+            finder_dir,
+            launcher.clone(),
+            Arc::new(RecordingFinderNotifier::new()),
+        ),
+        Arc::new(RecordingSystemActions::new()),
+    );
+    let reopened = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.accounts.len() == 2);
+    assert!(
+        !reopened.cloud_catalog.is_empty(),
+        "persisted account parent path must populate catalog after restart (HIGH #3)"
+    );
+    mgr.dispatch(UiCommand::WizardReset);
+    let reset_snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.step == WizardStep::Account
+    });
+    assert_eq!(reset_snap.wizard.step, WizardStep::Account);
+
+    // 2. Save draft 1 with custom pattern `*.bak`.
+    mgr.dispatch(UiCommand::WizardSelectAccount(sync_core::AccountId::new(
+        "acct-1",
+    )));
+    mgr.dispatch(UiCommand::WizardSelectFolder("Projects".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetLocalPath(
+        local_folder.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardAddPattern("*.bak".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetLocalRecoveryPath(
+        local_recovery.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardSaveDraft);
+    let after_draft1 = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.mappings.len() == 1 && s.mappings[0].state.readiness() == Readiness::Unconfigured
+    });
+    let draft1_id = after_draft1.mappings[0].id.clone();
+
+    // 3. New draft for same folder name on acct-2 gets a UNIQUE ID (never overwrites draft 1) and clean exclusions (HIGH #1, #3).
+    mgr.dispatch(UiCommand::WizardReset);
+    mgr.dispatch(UiCommand::WizardSelectAccount(sync_core::AccountId::new(
+        "acct-2",
+    )));
+    mgr.dispatch(UiCommand::WizardSelectFolder("Projects".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetLocalPath(
+        local_folder_2.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardSetLocalRecoveryPath(
+        local_recovery_2.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardSaveDraft);
+    let after_draft2 = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.mappings.len() == 2);
+    assert!(
+        after_draft2.wizard.custom_patterns.is_empty(),
+        "new draft must not inherit previous wizard exclusions (HIGH #1)"
+    );
+    let draft2_id = after_draft2
+        .mappings
+        .iter()
+        .find(|m| m.id != draft1_id)
+        .unwrap()
+        .id
+        .clone();
+    assert_ne!(draft1_id, draft2_id);
+
+    // 4. Resume draft 1 -> confirms `*.bak` restored -> add `*.log` -> confirm -> mutate disk -> Start invalidates confirmation (HIGH #1)!
+    mgr.dispatch(UiCommand::ResumeDraft(draft1_id.clone()));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.editing_mapping_id.as_ref() == Some(&draft1_id)
+            && s.wizard.custom_patterns.contains(&"*.bak".to_owned())
+    });
+    mgr.dispatch(UiCommand::WizardAddPattern("*.log".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.no_other_sync_confirmed
+    });
+
+    // Mutate remote inventory AFTER user confirmed -> Start MUST invalidate confirmation!
+    fs::write(remote_folder.join("extra.txt"), "new file after review\n").unwrap();
+    mgr.dispatch(UiCommand::WizardStartFirstSync);
+    let invalidated = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        !s.wizard.no_other_sync_confirmed && s.action_error.is_some()
+    });
+    assert_eq!(
+        invalidated.wizard.review_scenario,
+        ReviewScenario::CloudToLocal
+    );
+
+    // Re-confirm and start -> edited `*.log` exclusion MUST be persisted in the initialized mapping!
+    mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    mgr.dispatch(UiCommand::WizardStartFirstSync);
+    let ready = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.mapping(&draft1_id)
+            .is_some_and(|m| m.state.readiness() == Readiness::Ready)
+    });
+    let m1 = ready.mapping(&draft1_id).unwrap();
+    assert!(
+        m1.custom_exclusions.contains(&"*.bak".to_owned())
+            && m1.custom_exclusions.contains(&"*.log".to_owned()),
+        "Start must save reviewed exclusions before initialization, got {:?}",
+        m1.custom_exclusions
+    );
+    mgr.shutdown();
+}
+
+#[test]
+fn channel_system_actions_live_transfer_progress_and_recovery_identity_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    fs::write(remote_folder.join("big.bin"), "payload\n").unwrap();
+
+    let launcher = Arc::new(FakeBisyncLauncher::new());
+    // Init succeeds
+    launcher.push_script(FakeLaunchScript::default());
+    // Run 2 emits live rclone JSON stats while waiting for stop -> Activity must show TransferringKnown (HIGH #14)!
+    launcher.push_script(FakeLaunchScript {
+        lines: vec![OutputLine {
+            stream: StreamKind::Stderr,
+            text: r#"{"level":"info","msg":"Transferred: 512 / 1024","stats":{"bytes":512,"totalBytes":1024,"transfers":1,"checks":2}}"#.to_owned(),
+            truncated: false,
+        }],
+        wait_for_stop: true,
+        exit_status_on_stop: Some(ExitStatusInfo {
+            code: Some(130),
+            signal: None,
+        }),
+        ..Default::default()
+    });
+
+    // Use `spawn_for_app` (channel-based main-thread system actions, NEVER panics off-thread, HIGH #8)!
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        launcher,
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.is_demo_mode);
+
+    // Dispatch SetOpenAtLogin -> verify SystemActionRequest arrives over channel and real outcome applies!
+    mgr.dispatch(UiCommand::SetOpenAtLogin(true));
+    let ev = drain_control_until(&mgr, Duration::from_secs(5), |u| {
+        matches!(
+            u,
+            UiControlEvent::SystemAction {
+                request: SystemActionRequest::SetLaunchAtLogin(true),
+                ..
+            }
+        )
+    })
+    .expect("must dispatch SetLaunchAtLogin over channel to main thread");
+    if let UiControlEvent::SystemAction { request_id, .. } = ev {
+        mgr.complete_system_action(
+            request_id,
+            SystemActionOutcome::SetLaunchAtLogin(Ok(LaunchAtLoginOutcome::Unavailable)),
+        );
+    }
+    let after_login = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.status_notice
+            .as_deref()
+            .is_some_and(|n| n.contains("packaged"))
+    });
+    assert!(!after_login.preferences.open_at_login);
+
+    // Initialize mapping via wizard.
+    drive_wizard_init(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let ready = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.mappings.iter().any(|m| {
+            m.state.readiness() == Readiness::Ready && m.state.execution == Execution::Idle
+        })
+    });
+    assert!(ready.wizard.first_sync_preflight_done);
+    assert!(ready.wizard.first_sync_markers_ready);
+    let mid = ready.mappings[0].id.clone();
+
+    // Start Run 2 -> observe live RunPhase::TransferringKnown (50%) on Activity (HIGH #14)!
+    mgr.dispatch(UiCommand::SyncNow(mid.clone()));
+    let transferring = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        matches!(
+            s.active_run.as_ref().map(|r| &r.phase),
+            Some(RunPhase::TransferringKnown { percent: 50, .. })
+        )
+    });
+    assert!(transferring.active_run.is_some());
+
+    // Stop Run 2 -> Interrupted -> RecoveryRequired -> InspectRecovery verifies real identities (HIGH #9)!
+    mgr.dispatch(UiCommand::StopRun(mid.clone()));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.mapping(&mid)
+            .is_some_and(|m| m.state.readiness() == Readiness::RecoveryRequired)
+    });
+    mgr.dispatch(UiCommand::InspectRecovery(mid.clone()));
+    let rec_ok = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.recovery_checklist.as_ref().is_some_and(|rc| rc.inspected)
+    });
+    assert!(
+        rec_ok
+            .recovery_checklist
+            .as_ref()
+            .unwrap()
+            .identities_verified,
+        "InspectRecovery must report verified identities when markers match"
+    );
+
+    // Remove local RCLONE_TEST marker -> InspectRecovery MUST report identities_verified == false!
+    fs::remove_file(local_folder.join("RCLONE_TEST")).unwrap();
+    mgr.dispatch(UiCommand::InspectRecovery(mid.clone()));
+    let rec_bad = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.recovery_checklist
+            .as_ref()
+            .is_some_and(|rc| rc.inspected && !rc.identities_verified)
+    });
+    assert!(
+        !rec_bad
+            .recovery_checklist
+            .as_ref()
+            .unwrap()
+            .identities_verified
     );
     mgr.shutdown();
 }

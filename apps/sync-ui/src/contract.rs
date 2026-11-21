@@ -235,6 +235,8 @@ pub struct InspectedRunSnapshot {
     pub result_label: String,
     pub log_lines: Vec<String>,
     pub log_path: Option<String>,
+    /// True only when the run's `output.ndjson` actually exists on disk (HIGH #9).
+    pub log_exists: bool,
     pub recovery_copies: Vec<RecoveryCopyItem>,
     pub copy_notice: Option<String>,
 }
@@ -253,6 +255,10 @@ pub struct RecoveryChecklistData {
     pub next_step: String,
     pub latest_run_id: Option<RunId>,
     pub recovery_copies: Vec<RecoveryCopyItem>,
+    /// True only after endpoint roots and access markers were verified during inspection (HIGH #9).
+    pub identities_verified: bool,
+    /// Human-readable result of the identity check.
+    pub identity_check_detail: String,
 }
 
 /// Immutable snapshot of one mapping for UI rendering.
@@ -341,12 +347,18 @@ impl MappingSnapshot {
         let readiness = state.readiness();
         let execution = state.execution;
         let intent = state.intent;
-        let core_text = status_text(
+        let mut core_text = status_text(
             state,
             &self.display_name,
             &self.volume_name,
             self.last_run.as_ref(),
         );
+        // Never promise automatic retry when automatic scheduling is off (HIGH #4).
+        if self.next_check_label == "Manual runs only"
+            && core_text == "Last run failed — will retry"
+        {
+            core_text = "Last run failed — retry manually".to_owned();
+        }
         let actions = available_actions(state);
 
         let paused_suffix = if intent == Intent::Paused
@@ -1005,7 +1017,15 @@ pub struct WizardDraft {
     /// re-derives the scenario from demo data.
     pub blocked_populated_pair: Option<(String, String)>,
     pub no_other_sync_confirmed: bool,
+    /// Fingerprint of the reviewed paths, exclusions, inventory, and direction when confirmed (HIGH #1).
+    pub reviewed_fingerprint: Option<String>,
     pub first_sync_mapping_id: Option<MappingId>,
+    /// True only after the manager actually reports preflight passed / run started (HIGH #4).
+    pub first_sync_preflight_done: bool,
+    /// True only after the manager actually reports markers in place / run started (HIGH #4).
+    pub first_sync_markers_ready: bool,
+    /// True while waiting for Stop on the active first sync run to finish (HIGH #4).
+    pub first_sync_stopping: bool,
     pub first_sync_percent: u8,
     pub first_sync_elapsed_secs: u64,
     pub first_sync_completed: bool,

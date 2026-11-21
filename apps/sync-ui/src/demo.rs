@@ -453,6 +453,14 @@ impl DemoSource {
                         next_step: "Review the run log and recovery copies, then choose Run normally and resume or Keep paused.".to_owned(),
                         latest_run_id: Some(latest_run_id),
                         recovery_copies,
+                        identities_verified: m.state.readiness() != Readiness::EndpointChanged,
+                        identity_check_detail: if m.state.readiness() == Readiness::EndpointChanged
+                        {
+                            "Folder identity changed since setup; review before resuming."
+                                .to_owned()
+                        } else {
+                            "Local and cloud folders match setup.".to_owned()
+                        },
                     });
                 }
             }
@@ -1549,6 +1557,7 @@ fn build_demo_inspected_run(m: &MappingSnapshot, run_id: &RunId) -> InspectedRun
         result_label,
         log_lines,
         log_path: None,
+        log_exists: false,
         recovery_copies: demo_recovery_copies_for(&m.id, run_id),
         copy_notice: None,
     }
@@ -1944,7 +1953,11 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         found_name_issues: Vec::new(),
         blocked_populated_pair: None,
         no_other_sync_confirmed: false,
+        reviewed_fingerprint: None,
         first_sync_mapping_id: None,
+        first_sync_preflight_done: true,
+        first_sync_markers_ready: true,
+        first_sync_stopping: false,
         first_sync_percent: 33,
         first_sync_elapsed_secs: 21 * 60 + 40,
         first_sync_completed: false,

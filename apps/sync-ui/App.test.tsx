@@ -249,13 +249,14 @@ test("Activity Stop targets the displayed mapping, ⌘R targets only selected Ma
   expect(archiveText).toContain("1Zx…m9T");
   expect(archiveText).toContain("changed since setup");
 
-  // Detail for Teaching routes "Start recovery…" to the honest snapshot-derived Recovery checklist (#9, #13)
+  // Detail for Teaching routes "Start recovery…" to the inspected Recovery checklist (#9, #13)
   await app.press("id:nav-overview");
   await app.press("id:open-detail-teaching");
   await app.press("text:Start recovery…");
   const recText = app.texts().join("\n");
   expect(recText).toContain("Recover “Teaching”");
-  expect(recText).toContain("Not checked yet");
+  expect(recText).toContain("No earlier sync process is running.");
+  expect(recText).toContain("Local and cloud folders match setup.");
   expect(recText).toContain("Last run was interrupted at 09:14");
   expect(recText).not.toContain("log ends during uploads");
 });
