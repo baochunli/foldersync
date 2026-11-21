@@ -4,8 +4,18 @@ FolderSync is a desktop prototype for syncing selected Google Drive folders
 with local directories. Each folder can have a different local destination,
 including an external disk.
 
-**Status** — prototype, not for real data. The desktop app opens a placeholder
-window. The CLI prints its version and help.
+**Status** — prototype, not for real data. The desktop NSH app renders all
+approved screens against an in-memory demo source (no real sync manager,
+rclone execution, or filesystem writes yet). The CLI prints its version and
+help.
+
+## Desktop interface (`apps/sync-ui`)
+
+The GUI uses NSH 0.6.1 with macOS system sans-serif typography and bundled
+[Paper Mono](https://github.com/paper-design/paper-mono) (`OFL-1.1`, see
+`NOTICE` and `apps/sync-ui/assets/fonts/OFL.txt`) for paths, IDs, and logs.
+Use the sidebar demo switcher to inspect all mapping states, Welcome states,
+and scheduling holds in memory.
 
 ## Development
 

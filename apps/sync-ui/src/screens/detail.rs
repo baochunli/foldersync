@@ -1,0 +1,644 @@
+//! Mapping detail screen (`ui-spec.md` §5.3).
+//!
+//! Note per approved spec header & brief: "Change subfolders…" is hidden in Group 3
+//! (controlled migration built in Group 4).
+
+use nsh_base::{
+    SelectItem, SelectValue, select, table, table_body, table_cell, table_head, table_header,
+    table_row,
+};
+use nsh_core::{
+    element::desktop::{MenuItem, popup_menu},
+    prelude::*,
+};
+use sync_core::{DEFAULT_MAX_DELETE_PERCENT, MappingId};
+
+use crate::contract::{IconKind, MappingSnapshot, ScreenRoute, UiCommand, UiSnapshot};
+use crate::screens::AppController;
+use crate::theme::{
+    BtnKind, Palette, app_button, card, card_title, focus_ring, icon, link_button, mono_text,
+    page_title, section_label, status_pill,
+};
+
+/// Renders the Mapping detail view for `mapping_id`.
+pub fn detail_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoElement {
+    dynamic(move || {
+        let snap = ctrl.snapshot.get();
+        let Some(m) = snap.mapping(&mapping_id).cloned() else {
+            return view()
+                .flex_col()
+                .gap(px(10.0))
+                .child(link_button("‹ Overview", 12.5, {
+                    let c = ctrl.clone();
+                    move || c.navigate(ScreenRoute::Overview)
+                }))
+                .child(page_title("Mapping not found"))
+                .into_element();
+        };
+        render_detail(ctrl.clone(), &snap, &m).into_element()
+    })
+}
+
+fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) -> View {
+    let p = Palette::current();
+    let pres = m.presented_status(snap.active_run.as_ref());
+
+    let ctrl_back = ctrl.clone();
+    let ctrl_sync = ctrl.clone();
+    let ctrl_pause = ctrl.clone();
+    let ctrl_more = ctrl.clone();
+    let ctrl_step = ctrl.clone();
+    let id_sync = m.id.clone();
+    let id_pause = m.id.clone();
+    let id_more = m.id.clone();
+    let id_step = m.id.clone();
+    let name_more = m.display_name.clone();
+    let local_more = m.local_path.clone();
+
+    let mut status_row = view().flex_row().items_center().gap(px(8.0)).flex_wrap();
+    if let Some(pill_label) = &pres.pill_label {
+        status_row = status_row.child(status_pill(pres.icon, pill_label.clone(), pres.pill_tone));
+    }
+    status_row = status_row.child(
+        text(pres.status_line.clone())
+            .text_size(px(13.0))
+            .text_color(p.fg),
+    );
+    if let Some(link) = pres.secondary_link {
+        let ctrl_l = ctrl.clone();
+        status_row = status_row.child(link_button(link.label(), 12.5, move || {
+            ctrl_l.navigate(ScreenRoute::Attention);
+        }));
+    }
+
+    let primary_action = if pres.show_stop {
+        app_button(
+            "Stop",
+            BtnKind::Default,
+            false,
+            false,
+            Some(IconKind::Stop),
+            None,
+            move || ctrl_sync.send(UiCommand::StopRun(id_sync.clone())),
+        )
+    } else {
+        app_button(
+            "Sync now",
+            BtnKind::Default,
+            false,
+            !pres.sync_now_enabled,
+            Some(IconKind::Play),
+            pres.sync_now_tooltip,
+            move || ctrl_sync.send(UiCommand::SyncNow(id_sync.clone())),
+        )
+    };
+
+    let pause_resume_action = if pres.show_resume {
+        app_button(
+            "Resume",
+            BtnKind::Default,
+            false,
+            false,
+            Some(IconKind::Play),
+            None,
+            move || ctrl_pause.send(UiCommand::ResumeMapping(id_pause.clone())),
+        )
+    } else {
+        app_button(
+            "Pause",
+            BtnKind::Default,
+            false,
+            false,
+            Some(IconKind::Pause),
+            None,
+            move || ctrl_pause.send(UiCommand::PauseMapping(id_pause.clone())),
+        )
+    };
+
+    let more_btn = app_button(
+        "More ▾",
+        BtnKind::Default,
+        false,
+        false,
+        None,
+        None,
+        move || {
+            let c_rm = ctrl_more.clone();
+            let id_rm = id_more.clone();
+            let nm_rm = name_more.clone();
+            let lp = local_more.clone();
+            drop(popup_menu(vec![
+                MenuItem::new("Reveal in Finder").on_select(move || {
+                    drop(reveal_path(lp.clone()));
+                }),
+                MenuItem::new("Open cloud folder").on_select(move || {
+                    drop(open_url("https://drive.google.com"));
+                }),
+                MenuItem::separator(),
+                MenuItem::new("Remove mapping…").on_select(move || {
+                    c_rm.confirm_remove_mapping(id_rm.clone(), nm_rm.clone());
+                }),
+            ]));
+        },
+    )
+    .test_id("detail-more-btn");
+
+    // Locations card
+    let lp_reveal = m.local_path.clone();
+    let locations_card = card()
+        .flex_1()
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(icon(IconKind::Swap, 16.0, p.muted))
+                .child(card_title("Locations")),
+        )
+        .child(kv_row(
+            "Cloud folder",
+            mono_text(m.cloud_path.clone(), 11.5, p.fg).into_element(),
+        ))
+        .child(kv_row(
+            "Cloud folder ID",
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(mono_text(m.cloud_folder_id.clone(), 11.5, p.fg))
+                .child(
+                    text("· matches setup")
+                        .text_size(px(12.0))
+                        .text_color(p.muted),
+                )
+                .into_element(),
+        ))
+        .child(kv_row(
+            "Account",
+            text(format!("{} · {}", m.account_id, m.account_email))
+                .text_size(px(12.5))
+                .text_color(p.fg)
+                .into_element(),
+        ))
+        .child(kv_row(
+            "Local folder",
+            mono_text(m.local_path.clone(), 11.5, p.fg).into_element(),
+        ))
+        .child(kv_row(
+            "Volume",
+            text(format!("{} · APFS · identity matches setup", m.volume_name))
+                .text_size(px(12.5))
+                .text_color(p.fg)
+                .into_element(),
+        ))
+        .child(
+            view()
+                .flex_row()
+                .gap(px(8.0))
+                .pt(px(4.0))
+                .child(app_button(
+                    "Reveal in Finder",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || {
+                        drop(reveal_path(lp_reveal.clone()));
+                    },
+                ))
+                .child(app_button(
+                    "Open cloud folder",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || {
+                        drop(open_url("https://drive.google.com"));
+                    },
+                )),
+        );
+
+    // Included subfolders card — "Change subfolders…" intentionally HIDDEN in Group 3 per brief!
+    let mut subfolders_card = card()
+        .flex_1()
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(icon(IconKind::Folder, 16.0, p.muted))
+                .child(card_title("Included subfolders")),
+        )
+        .child(
+            text(format!(
+                "{} of {} subfolders · about {} of {}",
+                m.included_subfolders,
+                m.total_subfolders,
+                m.included_size_label,
+                m.total_size_label
+            ))
+            .text_size(px(13.0))
+            .text_color(p.fg)
+            .tabular_nums(),
+        );
+    if !m.excluded_subfolders.is_empty() {
+        let excluded_list = m
+            .excluded_subfolders
+            .iter()
+            .map(|(path, sz)| format!("{path} ({sz})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        subfolders_card = subfolders_card.child(
+            view()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(4.0))
+                .child(text("Not synced:").text_size(px(12.0)).text_color(p.muted))
+                .child(mono_text(excluded_list, 11.5, p.muted)),
+        );
+    } else {
+        subfolders_card = subfolders_card.child(
+            text("All subfolders in this folder are included.")
+                .text_size(px(12.0))
+                .text_color(p.muted),
+        );
+    }
+
+    // Recent runs table card
+    let mut runs_body = table_body().flex_col().w_full();
+    for run in &m.recent_runs {
+        let ctrl_show = ctrl.clone();
+        runs_body = runs_body.child(
+            table_row()
+                .w_full()
+                .items_center()
+                .gap(px(10.0))
+                .py(px(8.0))
+                .border_t_1()
+                .border_color(p.hair)
+                .child(
+                    table_cell().w(px(110.0)).child(
+                        text(run.started_label.clone())
+                            .text_size(px(12.5))
+                            .text_color(p.fg)
+                            .tabular_nums(),
+                    ),
+                )
+                .child(
+                    table_cell().w(px(72.0)).child(
+                        text(run.duration_label.clone())
+                            .text_size(px(12.5))
+                            .text_color(p.fg)
+                            .tabular_nums(),
+                    ),
+                )
+                .child(
+                    table_cell()
+                        .flex_1()
+                        .child(view().flex_row().child(status_pill(
+                            run.result_icon,
+                            run.result_label.clone(),
+                            run.result_tone,
+                        ))),
+                )
+                .child(
+                    table_cell().flex_1().child(
+                        text(run.changes_label.clone())
+                            .text_size(px(12.5))
+                            .text_color(p.muted)
+                            .tabular_nums(),
+                    ),
+                )
+                .child(table_cell().w(px(90.0)).items_end().child(app_button(
+                    "Show run",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || ctrl_show.navigate(ScreenRoute::Activity),
+                ))),
+        );
+    }
+
+    let recent_runs_card = card()
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(icon(IconKind::Pulse, 16.0, p.muted))
+                .child(card_title("Recent runs")),
+        )
+        .child(
+            table()
+                .accessibility_label("Recent runs")
+                .w_full()
+                .child(
+                    table_header().child(
+                        table_row()
+                            .w_full()
+                            .gap(px(10.0))
+                            .pb(px(6.0))
+                            .child(table_head().w(px(110.0)).child(section_label("Started")))
+                            .child(table_head().w(px(72.0)).child(section_label("Duration")))
+                            .child(table_head().flex_1().child(section_label("Result")))
+                            .child(table_head().flex_1().child(section_label("Changes")))
+                            .child(table_head().w(px(90.0))),
+                    ),
+                )
+                .child(runs_body),
+        );
+
+    // Schedule & Protection card
+    let ctrl_sched = ctrl.clone();
+    let id_sched = m.id.clone();
+    let current_sched_val = m.schedule_minutes.to_string();
+    let sched_label = format!("Every {} minutes", m.schedule_minutes);
+    let sched_select = select()
+        .accessibility_label("Schedule interval")
+        .items(vec![
+            SelectItem::new("5", "Every 5 minutes"),
+            SelectItem::new("15", "Every 15 minutes"),
+            SelectItem::new("30", "Every 30 minutes"),
+            SelectItem::new("60", "Every 60 minutes"),
+        ])
+        .value(SelectValue::from(current_sched_val))
+        .trigger(
+            view()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .min_w(px(150.0))
+                .min_h(px(28.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded(px(7.0))
+                .bg(p.bg)
+                .border_1()
+                .border_color(p.border)
+                .cursor_pointer()
+                .focus_visible(focus_ring)
+                .child(text(sched_label).text_size(px(12.5)).text_color(p.fg))
+                .child(text("▾").text_size(px(11.0)).text_color(p.muted)),
+        )
+        .popup_style(move |s| {
+            s.bg(p.card)
+                .border_1()
+                .border_color(p.border)
+                .rounded(px(8.0))
+                .p(px(4.0))
+        })
+        .on_change(move |val: &Option<SharedString>| {
+            if let Some(val) = val
+                && let Ok(mins) = val.parse::<u32>()
+            {
+                ctrl_sched.send(UiCommand::SetScheduleInterval {
+                    mapping_id: id_sched.clone(),
+                    minutes: mins,
+                });
+            }
+        });
+
+    let schedule_card = card()
+        .flex_1()
+        .child(card_title("Schedule"))
+        .child(kv_row("Check schedule", sched_select.into_element()))
+        .child(kv_row(
+            "Local changes",
+            text("Also start a run shortly after files change here")
+                .text_size(px(12.5))
+                .text_color(p.fg)
+                .into_element(),
+        ))
+        .child(kv_row(
+            "Next check",
+            text(m.next_check_label.clone())
+                .text_size(px(12.5))
+                .text_color(p.fg)
+                .into_element(),
+        ))
+        .child(
+            text("Changes made in the cloud are found only by a run.")
+                .text_size(px(12.0))
+                .text_color(p.muted),
+        )
+        .child(view().pt(px(6.0)).child(section_label("Protection")))
+        .child(kv_row(
+            "Deletion limit",
+            text(format!(
+                "{DEFAULT_MAX_DELETE_PERCENT}% of tracked files. A run that would delete more stops for review."
+            ))
+            .text_size(px(12.5))
+            .text_color(p.fg)
+            .into_element(),
+        ))
+        .child(kv_row(
+            "Conflicts",
+            text("Keep both versions")
+                .text_size(px(12.5))
+                .text_color(p.fg)
+                .into_element(),
+        ))
+        .child(kv_row(
+            "Recovery copies",
+            text("Keep recovery copies (never pruned automatically)")
+                .text_size(px(12.5))
+                .text_color(p.fg)
+                .into_element(),
+        ));
+
+    // Recovery locations & Supported files card
+    let rec_local = m.local_recovery_path.clone();
+    let symlink_line = if let Some(sym) = m.found_symlinks.first() {
+        format!(
+            "Symbolic links are not followed. {} found and excluded: {sym}",
+            m.found_symlinks.len()
+        )
+    } else {
+        "Symbolic links are not followed.".to_owned()
+    };
+    let exclusions_summary = if m.custom_exclusions.is_empty() {
+        "macOS metadata and temporary files".to_owned()
+    } else {
+        format!(
+            "macOS metadata and temporary files, plus {}",
+            m.custom_exclusions.join(", ")
+        )
+    };
+
+    let recovery_card = card()
+        .flex_1()
+        .child(card_title("Recovery locations"))
+        .child(kv_row(
+            "On this Mac",
+            view()
+                .flex_col()
+                .gap(px(2.0))
+                .child(mono_text(m.local_recovery_path.clone(), 11.5, p.fg))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            text(m.local_recovery_size_label.clone())
+                                .text_size(px(12.0))
+                                .text_color(p.muted),
+                        )
+                        .child(text("·").text_size(px(12.0)).text_color(p.muted))
+                        .child(link_button("Reveal", 12.0, move || {
+                            drop(reveal_path(rec_local.clone()));
+                        })),
+                )
+                .into_element(),
+        ))
+        .child(kv_row(
+            "In the cloud",
+            view()
+                .flex_col()
+                .gap(px(2.0))
+                .child(mono_text(m.cloud_recovery_path.clone(), 11.5, p.fg))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            text("Size not measured")
+                                .text_size(px(12.0))
+                                .text_color(p.muted),
+                        )
+                        .child(text("·").text_size(px(12.0)).text_color(p.muted))
+                        .child(link_button("Open", 12.0, move || {
+                            drop(open_url("https://drive.google.com"));
+                        })),
+                )
+                .into_element(),
+        ))
+        .child(
+            text(
+                "Earlier versions kept when a run overwrote or removed a file. Not a full backup.",
+            )
+            .text_size(px(12.0))
+            .text_color(p.muted),
+        )
+        .child(view().pt(px(6.0)).child(section_label("Supported files")))
+        .child(policy_bullet("Ordinary files are synced."))
+        .child(policy_bullet(
+            "Google Docs, Sheets, Slides and Drive shortcuts are skipped.",
+        ))
+        .child(policy_bullet(&symlink_line))
+        .child(policy_bullet("Empty folders are not copied yet."))
+        .child(policy_bullet(
+            "Finder tags, extended attributes and permissions are not kept.",
+        ))
+        .child(policy_bullet(
+            "Names that clash by case or Unicode form stop the run for review.",
+        ))
+        .child(
+            text(format!("Exclusions: {exclusions_summary}"))
+                .text_size(px(12.0))
+                .text_color(p.muted)
+                .pt(px(4.0)),
+        );
+
+    view()
+        .flex_col()
+        .w_full()
+        .gap(px(14.0))
+        .child(link_button("‹ Overview", 12.5, move || {
+            ctrl_back.navigate(ScreenRoute::Overview);
+        }))
+        .child(
+            view()
+                .flex_row()
+                .items_end()
+                .justify_between()
+                .gap(px(10.0))
+                .flex_wrap()
+                .child(
+                    view()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .flex_1()
+                        .child(page_title(m.display_name.clone()))
+                        .child(status_row),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(primary_action)
+                        .child(pause_resume_action)
+                        .child(more_btn)
+                        .child(
+                            app_button(
+                                "Step state (demo)",
+                                BtnKind::Ghost,
+                                true,
+                                false,
+                                None,
+                                Some("Cycle this mapping through demo states"),
+                                move || {
+                                    ctrl_step.send(UiCommand::DemoStepMappingState(id_step.clone()))
+                                },
+                            )
+                            .test_id("detail-step-state-btn"),
+                        ),
+                ),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap(px(14.0))
+                .w_full()
+                .child(locations_card)
+                .child(subfolders_card),
+        )
+        .child(recent_runs_card)
+        .child(
+            view()
+                .flex_row()
+                .gap(px(14.0))
+                .w_full()
+                .child(schedule_card)
+                .child(recovery_card),
+        )
+}
+
+fn kv_row(label: &str, value: AnyElement) -> View {
+    let p = Palette::current();
+    view()
+        .flex_row()
+        .items_start()
+        .gap(px(12.0))
+        .py(px(2.0))
+        .child(
+            text(label.to_owned())
+                .w(px(130.0))
+                .flex_none()
+                .text_size(px(12.5))
+                .text_color(p.muted),
+        )
+        .child(view().flex_1().child(value))
+}
+
+fn policy_bullet(line: &str) -> View {
+    let p = Palette::current();
+    view()
+        .flex_row()
+        .items_start()
+        .gap(px(6.0))
+        .child(text("•").text_size(px(12.0)).text_color(p.muted))
+        .child(
+            text(line.to_owned())
+                .flex_1()
+                .text_size(px(12.0))
+                .text_color(p.fg),
+        )
+}
