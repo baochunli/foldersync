@@ -1,12 +1,15 @@
 //! Local-to-local integration tests exercising the pinned rclone executable.
 //!
 //! All tests run inside fresh temporary directories with an explicit throwaway
-//! `--config` file and skip cleanly when the pinned binary is absent.
+//! `--config` file, isolated environment (`env_clear`), and launch-boundary
+//! SHA-256 verification, and skip cleanly when the pinned binary is absent.
 
 use std::{
     collections::BTreeMap,
-    fs,
+    env,
+    fs::{self, File},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc,
@@ -16,9 +19,9 @@ use std::{
 };
 
 use rclone_adapter::{
-    BackupDir2, BisyncRequest, EngineIdentity, InitPreference, Outcome, Path2, ProcessRunner,
-    QualificationManifest, RealProcessRunner, RunMode, SpawnOptions, classify_outcome,
-    parse_log_stream, pinned_binary_path, qualify_binary, sha256_file,
+    BackupDir2, BisyncRequest, EngineIdentity, InitPreference, LaunchError, Outcome, Path2,
+    QualificationError, QualificationManifest, RealProcessRunner, RunMode, SpawnOptions,
+    classify_run_outcome, pinned_binary_path, qualify_binary, sha256_file,
 };
 use sha2::{Digest, Sha256};
 
@@ -151,19 +154,11 @@ fn qualified_pinned_engine(test_name: &str) -> Option<EngineIdentity> {
 
 fn run_bisync(req: &BisyncRequest) -> (Outcome, rclone_adapter::RunOutput) {
     let runner = RealProcessRunner;
-    let handle = runner
-        .spawn(&req.to_process_spec(), SpawnOptions::default())
-        .expect("spawn should succeed");
+    let handle = req
+        .spawn(&runner, SpawnOptions::default())
+        .expect("verified spawn should succeed");
     let run_out = handle.wait().expect("wait should succeed");
-    let stderr_lines: Vec<&str> = run_out
-        .output
-        .lines
-        .iter()
-        .filter(|l| l.stream == rclone_adapter::StreamKind::Stderr)
-        .map(|l| l.text.as_str())
-        .collect();
-    let events = parse_log_stream(stderr_lines);
-    let outcome = classify_outcome(run_out.exit_status, &events, run_out.stop_requested);
+    let outcome = classify_run_outcome(&run_out);
     (outcome, run_out)
 }
 
@@ -374,16 +369,22 @@ fn propagates_add_edit_delete_both_directions_and_captures_backups() {
 }
 
 #[test]
-fn preserves_both_versions_on_same_file_conflict_and_reports_conflict_outcome() {
+fn preserves_both_versions_on_same_file_conflict_and_reports_exact_conflict_paths() {
     let Some(engine) = qualified_pinned_engine(
-        "preserves_both_versions_on_same_file_conflict_and_reports_conflict_outcome",
+        "preserves_both_versions_on_same_file_conflict_and_reports_exact_conflict_paths",
     ) else {
         return;
     };
 
     let mut ws = TempWorkspace::new("conflict");
+    // Exercise a filename containing ` - ` (conflict path parser boundary) alongside a benign
+    // filename containing `must run --resync` (prefix-only diagnostic parser boundary).
+    let conflict_rel = "notes/draft - final.txt";
+    let benign_rel = "notes/must run --resync.txt";
     let v0 = b"shared-initial-document-v0";
-    write_file(&ws.path1, "notes.txt", v0);
+    let benign_v0 = b"benign-v0";
+    write_file(&ws.path1, conflict_rel, v0);
+    write_file(&ws.path1, benign_rel, benign_v0);
     ws.record_truth("v0", v0);
 
     let (init_req, _, _) =
@@ -395,28 +396,50 @@ fn preserves_both_versions_on_same_file_conflict_and_reports_conflict_outcome() 
 
     let v1_p1 = b"path1-concurrent-edit-unique-payload-11111";
     let v1_p2 = b"path2-concurrent-edit-unique-payload-22222-extra";
+    let benign_v1 = b"benign-updated-on-path1";
     let hash_p1 = ws.record_truth("v1_p1", v1_p1);
     let hash_p2 = ws.record_truth("v1_p2", v1_p2);
-    write_file(&ws.path1, "notes.txt", v1_p1);
-    write_file(&ws.path2, "notes.txt", v1_p2);
+    let hash_benign = ws.record_truth("benign_v1", benign_v1);
+    write_file(&ws.path1, conflict_rel, v1_p1);
+    write_file(&ws.path2, conflict_rel, v1_p2);
+    write_file(&ws.path1, benign_rel, benign_v1);
 
     let (conflict_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
     let (outcome, _) = run_bisync(&conflict_req);
     let Outcome::SuccessWithConflicts { paths } = outcome else {
         panic!("expected SuccessWithConflicts, got {outcome:?}");
     };
-    assert!(
-        paths.len() >= 2,
-        "expected both conflict copies reported, got {paths:?}"
+    let expected_c1 = ws
+        .path1
+        .join("notes/draft - final.txt.conflict1")
+        .to_string_lossy()
+        .into_owned();
+    let expected_c2 = ws
+        .path2
+        .join("notes/draft - final.txt.conflict2")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        paths,
+        vec![expected_c1, expected_c2],
+        "reported conflict paths must match exact filenames containing ' - '"
     );
 
-    // Verify both versions exist on BOTH path1 and path2 by content hash.
+    // Verify both conflict versions and the benign file exist on BOTH path1 and path2 by hash.
     let h1 = tree_hashes(&ws.path1);
     let h2 = tree_hashes(&ws.path2);
     assert_eq!(h1, h2);
-    let values: Vec<&String> = h1.values().collect();
-    assert!(values.contains(&&hash_p1), "path1 version lost: {h1:?}");
-    assert!(values.contains(&&hash_p2), "path2 version lost: {h1:?}");
+    assert_eq!(
+        h1.get("notes/draft - final.txt.conflict1"),
+        Some(&hash_p1),
+        "path1 version mismatch: {h1:?}"
+    );
+    assert_eq!(
+        h1.get("notes/draft - final.txt.conflict2"),
+        Some(&hash_p2),
+        "path2 version mismatch: {h1:?}"
+    );
+    assert_eq!(h1.get(benign_rel), Some(&hash_benign));
 
     // Second cycle must keep both preserved conflict copies intact.
     let (cycle2, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
@@ -539,10 +562,10 @@ fn sigint_interrupts_larger_run_and_records_subsequent_recovery_behavior() {
 
     let (large_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
     let runner = RealProcessRunner;
-    let (tx, rx) = mpsc::channel();
-    let handle = runner
+    let (tx, rx) = mpsc::sync_channel(1024);
+    let handle = large_req
         .spawn(
-            &large_req.to_process_spec(),
+            &runner,
             SpawnOptions {
                 limits: Default::default(),
                 line_observer: Some(tx),
@@ -571,15 +594,7 @@ fn sigint_interrupts_larger_run_and_records_subsequent_recovery_behavior() {
     );
 
     let run_out = waiter.join().unwrap();
-    let stderr_lines: Vec<&str> = run_out
-        .output
-        .lines
-        .iter()
-        .filter(|l| l.stream == rclone_adapter::StreamKind::Stderr)
-        .map(|l| l.text.as_str())
-        .collect();
-    let events = parse_log_stream(stderr_lines);
-    let outcome = classify_outcome(run_out.exit_status, &events, run_out.stop_requested);
+    let outcome = classify_run_outcome(&run_out);
     let elapsed = started_at.elapsed().unwrap_or_default();
 
     eprintln!(
@@ -597,7 +612,7 @@ fn sigint_interrupts_larger_run_and_records_subsequent_recovery_behavior() {
         "expected Outcome::Interrupted {{ needs_recovery: true, .. }}, got {outcome:?}"
     );
 
-    // Next run with normal `--resilient --recover` should recover and finish propagating all 350 files.
+    // Next run with normal `--resilient --recover` should recover and finish propagating all 400 files.
     let (next_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
     let (next_outcome, next_out) = run_bisync(&next_req);
     eprintln!(
@@ -616,4 +631,165 @@ fn sigint_interrupts_larger_run_and_records_subsequent_recovery_behavior() {
     let (verify_outcome, _) = run_bisync(&verify_req);
     assert_eq!(verify_outcome, Outcome::Success);
     assert_trees_match_truth(&ws, &truth);
+}
+
+#[test]
+fn env_isolation_subproc_helper() {
+    if env::var("FOLDERSYNC_IT_SUBPROC").as_deref() != Ok("env_isolation") {
+        return;
+    }
+    assert_eq!(env::var("RCLONE_FORCE").as_deref(), Ok("true"));
+    assert_eq!(env::var("RCLONE_RESYNC").as_deref(), Ok("true"));
+
+    let engine = qualified_pinned_engine("env_isolation_subproc_helper")
+        .expect("parent already checked binary presence");
+
+    // 1. Fresh uninitialized workdir with RunMode::Normal MUST fail with requires_resync=true,
+    // proving parent RCLONE_RESYNC=true never reached rclone.
+    let mut ws = TempWorkspace::new("env-isolation");
+    let mut truth = BTreeMap::new();
+    for i in 0..10 {
+        let rel = format!("doc_{i:02}.txt");
+        let payload = format!("isolated-env-content-{i:02}");
+        truth.insert(rel.clone(), ws.record_truth(&rel, payload.as_bytes()));
+        write_file(&ws.path1, &rel, payload.as_bytes());
+    }
+    let (normal_uninit, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
+    let (uninit_outcome, _) = run_bisync(&normal_uninit);
+    assert!(
+        matches!(
+            uninit_outcome,
+            Outcome::Critical {
+                requires_resync: true,
+                ..
+            }
+        ),
+        "RCLONE_RESYNC=true in parent env must not trigger resync; got {uninit_outcome:?}"
+    );
+    assert!(
+        tree_hashes(&ws.path2).is_empty(),
+        "path2 must remain empty after blocked uninitialized normal run"
+    );
+
+    // 2. Initialize legitimately, then delete 4 of 10 files (40% > 10%). Normal run MUST abort
+    // with DeletionGuardAborted, proving parent RCLONE_FORCE=true never reached rclone.
+    let (init_req, _, _) =
+        ws.build_request(&engine, RunMode::Initialize(InitPreference::Path1), 10);
+    let (init_outcome, _) = run_bisync(&init_req);
+    assert_eq!(init_outcome, Outcome::Success);
+    assert_trees_match_truth(&ws, &truth);
+
+    for i in 0..4 {
+        fs::remove_file(ws.path1.join(format!("doc_{i:02}.txt"))).unwrap();
+    }
+    let (del_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
+    let (del_outcome, _) = run_bisync(&del_req);
+    assert!(
+        matches!(del_outcome, Outcome::DeletionGuardAborted { .. }),
+        "RCLONE_FORCE=true in parent env must not bypass --max-delete; got {del_outcome:?}"
+    );
+    assert_eq!(tree_hashes(&ws.path2), truth);
+}
+
+#[test]
+fn parent_rclone_force_and_resync_env_cannot_bypass_guards() {
+    if qualified_pinned_engine("parent_rclone_force_and_resync_env_cannot_bypass_guards").is_none()
+    {
+        return;
+    }
+
+    let mut cmd = Command::new(env::current_exe().unwrap());
+    cmd.args(["--exact", "env_isolation_subproc_helper", "--nocapture"])
+        .env("FOLDERSYNC_IT_SUBPROC", "env_isolation")
+        .env("RCLONE_FORCE", "true")
+        .env("RCLONE_RESYNC", "true")
+        .stdin(Stdio::null());
+    if let Some(override_bin) = env::var_os("FOLDERSYNC_RCLONE") {
+        cmd.env("FOLDERSYNC_RCLONE", override_bin);
+    }
+    let output = cmd.output().expect("subprocess should run");
+    assert!(
+        output.status.success(),
+        "env isolation subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn refuses_launch_when_pinned_binary_is_replaced_after_qualification() {
+    let Some(real_path) = pinned_binary_path() else {
+        eprintln!(
+            "Skipping refuses_launch_when_pinned_binary_is_replaced_after_qualification: pinned rclone binary is absent; run scripts/fetch-rclone.sh"
+        );
+        return;
+    };
+
+    let mut ws = TempWorkspace::new("replace-after-qual");
+    let copied_bin = ws.root.join("rclone-copy");
+    fs::copy(&real_path, &copied_bin).unwrap();
+
+    let manifest = QualificationManifest::embedded().unwrap();
+    let engine = qualify_binary(&copied_bin, &manifest).unwrap();
+    let (req, _, _) = ws.build_request(&engine, RunMode::Initialize(InitPreference::Path1), 10);
+
+    // Replace the copied binary AFTER qualification succeeded.
+    fs::write(&copied_bin, b"replaced binary bytes after qualification").unwrap();
+    let err = req
+        .spawn(&RealProcessRunner, SpawnOptions::default())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LaunchError::Qualification(QualificationError::Sha256Mismatch { .. })
+        ),
+        "expected Sha256Mismatch at launch boundary, got {err:?}"
+    );
+}
+
+#[test]
+fn demonstrates_same_size_same_mtime_edit_is_missed_by_size_modtime_compare() {
+    let Some(engine) = qualified_pinned_engine(
+        "demonstrates_same_size_same_mtime_edit_is_missed_by_size_modtime_compare",
+    ) else {
+        return;
+    };
+
+    let mut ws = TempWorkspace::new("same-size-same-mtime");
+    let original = b"AAAA-1111";
+    let mutated = b"BBBB-2222";
+    assert_eq!(original.len(), mutated.len());
+    write_file(&ws.path1, "fixed.txt", original);
+
+    let (init_req, _, _) =
+        ws.build_request(&engine, RunMode::Initialize(InitPreference::Path1), 10);
+    let (init_outcome, _) = run_bisync(&init_req);
+    assert_eq!(init_outcome, Outcome::Success);
+    assert_eq!(fs::read(ws.path2.join("fixed.txt")).unwrap(), original);
+
+    // Mutate content in place while preserving BOTH file size and modification timestamp (§10).
+    let p1_file = ws.path1.join("fixed.txt");
+    let orig_mtime = fs::metadata(&p1_file).unwrap().modified().unwrap();
+    fs::write(&p1_file, mutated).unwrap();
+    File::options()
+        .write(true)
+        .open(&p1_file)
+        .unwrap()
+        .set_modified(orig_mtime)
+        .unwrap();
+
+    // Under `--compare size,modtime`, rclone does not select the file for transfer.
+    let (sync_req, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
+    let (sync_outcome, _) = run_bisync(&sync_req);
+    assert_eq!(sync_outcome, Outcome::Success);
+    assert_eq!(
+        fs::read(&p1_file).unwrap(),
+        mutated,
+        "path1 retains the in-place same-size/same-mtime edit"
+    );
+    assert_eq!(
+        fs::read(ws.path2.join("fixed.txt")).unwrap(),
+        original,
+        "known §10 limitation: --compare size,modtime does not detect a change preserving both size and mtime"
+    );
 }
