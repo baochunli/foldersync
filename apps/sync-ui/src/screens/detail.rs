@@ -177,30 +177,22 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     let c_loc_rev = ctrl.clone();
     let c_loc_open = ctrl.clone();
 
-    let cloud_changed = m.state.readiness() == Readiness::EndpointChanged
-        && !matches!(
-            m.modifier,
+    let endpoint_change = if m.state.readiness() == Readiness::EndpointChanged {
+        match &m.modifier {
             StatusModifier::EndpointChange {
-                is_cloud: false,
-                ..
-            }
-        );
-    let (cloud_id_note, cloud_id_note_color) = if cloud_changed {
-        ("· changed since setup", p.attn)
+                is_cloud,
+                expected_id,
+                found_id,
+            } => Some((*is_cloud, expected_id.clone(), found_id.clone())),
+            _ => Some((true, m.cloud_folder_id.clone(), "Unknown".to_owned())),
+        }
     } else {
-        ("· matches setup", p.muted)
+        None
     };
 
     let vol_snap = snap.volumes.iter().find(|v| v.identity == m.volume_id);
     let vol_fs = vol_snap.map(|v| v.filesystem.as_str()).unwrap_or("Unknown");
-    let local_changed = m.state.readiness() == Readiness::EndpointChanged
-        && matches!(
-            m.modifier,
-            StatusModifier::EndpointChange {
-                is_cloud: false,
-                ..
-            }
-        );
+    let local_changed = matches!(endpoint_change, Some((false, _, _)));
     let vol_status_note = if vol_snap.is_some_and(|v| !v.connected)
         || m.state.readiness() == Readiness::VolumeUnavailable
     {
@@ -211,7 +203,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         "identity matches setup"
     };
 
-    let locations_card = card()
+    let mut locations_card = card()
         .flex_1()
         .child(
             view()
@@ -224,8 +216,31 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         .child(kv_row(
             "Cloud folder",
             mono_text(m.cloud_path.clone(), 11.5, p.fg).into_element(),
-        ))
-        .child(kv_row(
+        ));
+
+    if let Some((true, expected_id, found_id)) = &endpoint_change {
+        locations_card = locations_card
+            .child(kv_row(
+                "At setup",
+                mono_text(expected_id.clone(), 11.5, p.fg).into_element(),
+            ))
+            .child(kv_row(
+                "Found now",
+                view()
+                    .flex_row()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(6.0))
+                    .child(mono_text(found_id.clone(), 11.5, p.attn))
+                    .child(
+                        text("· changed since setup")
+                            .text_size(px(12.0))
+                            .text_color(p.attn),
+                    )
+                    .into_element(),
+            ));
+    } else {
+        locations_card = locations_card.child(kv_row(
             "Cloud folder ID",
             view()
                 .flex_row()
@@ -233,12 +248,15 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .gap(px(6.0))
                 .child(mono_text(m.cloud_folder_id.clone(), 11.5, p.fg))
                 .child(
-                    text(cloud_id_note)
+                    text("· matches setup")
                         .text_size(px(12.0))
-                        .text_color(cloud_id_note_color),
+                        .text_color(p.muted),
                 )
                 .into_element(),
-        ))
+        ));
+    }
+
+    locations_card = locations_card
         .child(kv_row(
             "Account",
             text(format!("{} · {}", m.account_id, m.account_email))
@@ -249,7 +267,32 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         .child(kv_row(
             "Local folder",
             mono_text(m.local_path.clone(), 11.5, p.fg).into_element(),
-        ))
+        ));
+
+    if let Some((false, expected_id, found_id)) = &endpoint_change {
+        locations_card = locations_card
+            .child(kv_row(
+                "At setup",
+                mono_text(expected_id.clone(), 11.5, p.fg).into_element(),
+            ))
+            .child(kv_row(
+                "Found now",
+                view()
+                    .flex_row()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(6.0))
+                    .child(mono_text(found_id.clone(), 11.5, p.attn))
+                    .child(
+                        text("· changed since setup")
+                            .text_size(px(12.0))
+                            .text_color(p.attn),
+                    )
+                    .into_element(),
+            ));
+    }
+
+    locations_card = locations_card
         .child(kv_row(
             "Volume",
             text(format!("{} · {vol_fs} · {vol_status_note}", m.volume_name))

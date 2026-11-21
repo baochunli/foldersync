@@ -462,12 +462,14 @@ impl DemoSource {
                     snap.device_id
                 );
                 snap.wizard.no_other_sync_confirmed = false;
+                rederive_wizard_scenario(&mut snap);
                 sync_wizard_volume_from_path(&mut snap);
                 recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSetLocalPath(path) => {
                 snap.wizard.local_path = path;
                 snap.wizard.no_other_sync_confirmed = false;
+                rederive_wizard_scenario(&mut snap);
                 sync_wizard_volume_from_path(&mut snap);
                 recompute_wizard_checks(&mut snap);
             }
@@ -507,6 +509,14 @@ impl DemoSource {
             }
             UiCommand::WizardSetReviewScenario(scenario) => {
                 snap.wizard.review_scenario = scenario;
+                if scenario == ReviewScenario::BothPopulated {
+                    snap.wizard.blocked_populated_pair = Some((
+                        snap.wizard.selected_folder.clone(),
+                        normalize_path(&snap.wizard.local_path),
+                    ));
+                } else {
+                    snap.wizard.blocked_populated_pair = None;
+                }
                 snap.wizard.no_other_sync_confirmed = false;
                 recompute_wizard_checks(&mut snap);
             }
@@ -719,6 +729,38 @@ fn resolve_volume_for_path<'a>(
     volumes
         .iter()
         .find(|v| v.identity.kind == VolumeKind::Internal)
+}
+
+fn rederive_wizard_scenario(snap: &mut UiSnapshot) {
+    let norm = normalize_path(&snap.wizard.local_path);
+    let pair = (snap.wizard.selected_folder.clone(), norm.clone());
+    let still_blocked_pair = snap.wizard.blocked_populated_pair.as_ref() == Some(&pair);
+    let local_has_files = still_blocked_pair
+        || snap
+            .mappings
+            .iter()
+            .filter(|m| !m.is_variant_showcase)
+            .any(|m| paths_overlap(&norm, &m.local_path));
+    let cloud_has_files = snap
+        .cloud_catalog
+        .iter()
+        .find(|c| c.name == snap.wizard.selected_folder)
+        .is_none_or(|c| c.size_gb.is_none_or(|gb| gb > 0.0));
+
+    if snap.wizard.review_scenario == ReviewScenario::BothPopulated {
+        if still_blocked_pair || (local_has_files && cloud_has_files) {
+            snap.wizard.review_scenario = ReviewScenario::BothPopulated;
+        } else {
+            snap.wizard.blocked_populated_pair = None;
+            snap.wizard.review_scenario = if cloud_has_files {
+                ReviewScenario::CloudToLocal
+            } else {
+                ReviewScenario::BothEmpty
+            };
+        }
+    } else if local_has_files && cloud_has_files {
+        snap.wizard.review_scenario = ReviewScenario::BothPopulated;
+    }
 }
 
 fn sync_wizard_volume_from_path(snap: &mut UiSnapshot) {
@@ -1059,6 +1101,7 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         cloud_recovery_path: "household:Recovery/projects/studio-mac".to_owned(),
         recovery_checks: Vec::new(),
         review_scenario: ReviewScenario::CloudToLocal,
+        blocked_populated_pair: None,
         no_other_sync_confirmed: false,
         first_sync_percent: 33,
         first_sync_elapsed_secs: 21 * 60 + 40,

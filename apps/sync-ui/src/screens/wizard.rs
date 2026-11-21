@@ -655,19 +655,18 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft) -> View {
                         .text_color(p.muted),
                 )
                 .child(
-                    app_button(
-                        "Valid folder",
-                        BtnKind::Ghost,
-                        true,
-                        false,
-                        None,
-                        None,
+                    app_button("Valid folder", BtnKind::Ghost, true, false, None, None, {
+                        let replacement = if draft.review_scenario == ReviewScenario::BothPopulated
+                            && draft.local_path == "/Volumes/WorkSSD/Projects"
+                        {
+                            "/Volumes/WorkSSD/Projects-New".to_owned()
+                        } else {
+                            "/Volumes/WorkSSD/Projects".to_owned()
+                        };
                         move || {
-                            c_good.send(UiCommand::WizardSetLocalPath(
-                                "/Volumes/WorkSSD/Projects".to_owned(),
-                            ));
-                        },
-                    )
+                            c_good.send(UiCommand::WizardSetLocalPath(replacement.clone()));
+                        }
+                    })
                     .test_id("wizard-demo-valid-folder"),
                 )
                 .child(

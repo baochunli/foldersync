@@ -239,14 +239,55 @@ test("Activity Stop targets the displayed mapping, ⌘R targets only selected Ma
   await app.press("id:open-detail-research");
   expect(app.shows("id:detail-force-stop-btn")).toBe(true);
 
-  // Detail for Archive shows cloud folder ID changed since setup (not hardcoded "matches setup") (#8)
+  // Detail for Archive shows setup ID and found ID on separate explicitly labeled rows (#8)
   await app.press("id:nav-overview");
   await app.press("id:open-detail-archive");
-  expect(app.texts().join("\n")).toContain("changed since setup");
+  const archiveText = app.texts().join("\n");
+  expect(archiveText).toContain("At setup");
+  expect(archiveText).toContain("1Ar…k2P");
+  expect(archiveText).toContain("Found now");
+  expect(archiveText).toContain("1Zx…m9T");
+  expect(archiveText).toContain("changed since setup");
 
-  // Detail for Teaching routes "Start recovery…" to the Recovery checklist (#13)
+  // Detail for Teaching routes "Start recovery…" to the honest snapshot-derived Recovery checklist (#9, #13)
   await app.press("id:nav-overview");
   await app.press("id:open-detail-teaching");
   await app.press("text:Start recovery…");
-  expect(app.texts()).toContain("Recover “Teaching”");
+  const recText = app.texts().join("\n");
+  expect(recText).toContain("Recover “Teaching”");
+  expect(recText).toContain("Not checked yet");
+  expect(recText).toContain("Last run was interrupted at 09:14");
+  expect(recText).not.toContain("log ends during uploads");
+});
+
+test("Both populated block recovers when choosing a valid replacement folder and reaches Review with fresh consent (round 2 #1)", async () => {
+  const app = await open(".", DESKTOP);
+
+  await app.press("id:add-mapping-btn");
+  await app.press("id:wizard-step-6");
+  expect(app.texts()).toContain("Review “Projects”");
+
+  // Trigger BothPopulated block -> no Start button
+  await app.press("id:review-variant-both-populated");
+  expect(app.texts()).toContain("Both sides already contain files");
+  expect(app.shows("id:wizard-start-first-sync-btn")).toBe(false);
+
+  // Choose another folder… -> Location still blocked until destination changes
+  await app.press("text:Choose another folder…");
+  expect(app.texts()).toContain("Where should Projects live?");
+  expect(app.enabled("id:wizard-continue-btn")).toBe(false);
+  expect(app.enabled("id:wizard-step-6")).toBe(false);
+
+  // Pick a valid replacement folder -> re-derives scenario, enables Continue & Review pill
+  await app.press("id:wizard-demo-valid-folder");
+  expect(app.texts()).toContain("/Volumes/WorkSSD/Projects-New");
+  expect(app.enabled("id:wizard-continue-btn")).toBe(true);
+  expect(app.enabled("id:wizard-step-6")).toBe(true);
+
+  // Reach Review with fresh (unchecked) consent
+  await app.press("id:wizard-step-6");
+  expect(app.texts()).toContain("Review “Projects”");
+  expect(app.texts()).toContain("First sync: download from the cloud");
+  expect(app.shows("id:wizard-start-first-sync-btn")).toBe(true);
+  expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
 });

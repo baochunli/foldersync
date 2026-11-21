@@ -902,6 +902,10 @@ pub struct WizardDraft {
     pub cloud_recovery_path: String,
     pub recovery_checks: Vec<LocationCheck>,
     pub review_scenario: ReviewScenario,
+    /// When `BothPopulated` is triggered in the demo, remembers the `(folder, normalized_local_path)`
+    /// pair that was blocked so Start stays blocked for that pair while a different valid destination
+    /// re-derives the scenario from demo data.
+    pub blocked_populated_pair: Option<(String, String)>,
     pub no_other_sync_confirmed: bool,
     pub first_sync_percent: u8,
     pub first_sync_elapsed_secs: u64,

@@ -429,15 +429,21 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                 .into_element();
         };
 
-        let (cause_kind, copies_count, ambiguous) = match &m.modifier {
+        let recovery_info = match &m.modifier {
             StatusModifier::RecoveryCause {
                 kind,
+                detail,
                 recovery_copies_count,
                 ambiguous_ownership,
-                ..
-            } => (*kind, *recovery_copies_count, *ambiguous_ownership),
-            _ => (RecoveryCauseKind::Interrupted, 3, false),
+            } => Some((
+                *kind,
+                detail.clone(),
+                *recovery_copies_count,
+                *ambiguous_ownership,
+            )),
+            _ => None,
         };
+        let ambiguous = recovery_info.as_ref().is_some_and(|(_, _, _, amb)| *amb);
 
         let c_back = ctrl.clone();
         let c_log = ctrl.clone();
@@ -446,9 +452,8 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
         let id_run = m.id.clone();
         let id_keep = m.id.clone();
 
-        // Derive every checklist item strictly from snapshot state (never claim unchecked items passed).
-        let is_paused = m.state.intent == Intent::Paused;
-        let hold_check = if is_paused {
+        // Render each checklist item as verified, failed, or unknown strictly from snapshot fields.
+        let hold_check = if m.state.intent == Intent::Paused {
             check_line(
                 IconKind::Check,
                 p.ok,
@@ -465,56 +470,86 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             )
         };
 
-        let proc_check = if ambiguous {
-            check_line(
-                IconKind::Octagon,
-                p.err,
-                "Process ownership is uncertain — cannot confirm whether an earlier sync process still holds the lock.",
-            )
-        } else if cause_kind == RecoveryCauseKind::EarlierSyncRunning {
-            check_line(
+        let proc_check = match &recovery_info {
+            Some((_, _, _, true)) => check_line(
+                IconKind::Alert,
+                p.attn,
+                "Earlier sync process: unknown — can't confirm whether a process still holds the lock.",
+            ),
+            Some((RecoveryCauseKind::EarlierSyncRunning, _, _, false)) => check_line(
                 IconKind::Octagon,
                 p.err,
                 "An earlier sync process is still running for this mapping.",
+            ),
+            Some((_, _, _, false)) => check_line(
+                IconKind::Check,
+                p.ok,
+                "No earlier sync process is running (per snapshot).",
+            ),
+            None => check_line(
+                IconKind::Dash,
+                p.muted,
+                "Earlier sync process: Not checked yet.",
+            ),
+        };
+
+        let vol_snap = snap.volumes.iter().find(|v| v.identity == m.volume_id);
+        let volume_check = match vol_snap {
+            Some(v) if v.connected && m.state.readiness() != Readiness::VolumeUnavailable => {
+                check_line(
+                    IconKind::Check,
+                    p.ok,
+                    &format!("{} is connected.", m.volume_name),
+                )
+            }
+            Some(_) => check_line(
+                IconKind::Octagon,
+                p.err,
+                &format!("{} is not connected right now.", m.volume_name),
+            ),
+            None => check_line(
+                IconKind::Dash,
+                p.muted,
+                &format!("{}: Not checked yet.", m.volume_name),
+            ),
+        };
+
+        // Recovery snapshots carry no re-verified folder identity result unless EndpointChanged is active.
+        let identity_check = if m.state.readiness() == Readiness::EndpointChanged {
+            check_line(
+                IconKind::Octagon,
+                p.err,
+                "Folder identity changed since setup; review before resuming.",
             )
         } else {
             check_line(
-                IconKind::Check,
-                p.ok,
-                "No sync process from the interrupted run is running (per snapshot).",
+                IconKind::Dash,
+                p.muted,
+                "Local and cloud folder identities: Not checked yet.",
             )
         };
 
-        let vol_connected = snap
-            .volumes
-            .iter()
-            .find(|v| v.identity == m.volume_id)
-            .is_some_and(|v| v.connected);
-        let endpoint_ok = vol_connected && m.state.readiness() != Readiness::EndpointChanged;
-        let endpoint_check = if endpoint_ok {
-            check_line(
-                IconKind::Check,
-                p.ok,
-                "Volume is connected and recorded folder identities match setup (per snapshot).",
-            )
-        } else if !vol_connected {
-            check_line(
-                IconKind::Alert,
-                p.attn,
-                &format!("{} is not connected right now.", m.volume_name),
-            )
-        } else {
-            check_line(
-                IconKind::Alert,
-                p.attn,
-                "Folder identity changed since setup; review before resuming.",
-            )
+        let evidence_line = match &recovery_info {
+            Some((_, detail, copies, _)) => {
+                let copies_part = match copies {
+                    0 => "No recovery copies recorded.".to_owned(),
+                    1 => "1 recovery copy was kept.".to_owned(),
+                    n => format!("{n} recovery copies were kept."),
+                };
+                if detail.trim().is_empty() {
+                    copies_part
+                } else {
+                    format!("{detail}. {copies_part}")
+                }
+            }
+            None => "Run details are not available in this snapshot.".to_owned(),
         };
 
         let mut body = card()
             .child(hold_check)
             .child(proc_check)
-            .child(endpoint_check)
+            .child(volume_check)
+            .child(identity_check)
             .child(
                 view()
                     .flex_row()
@@ -530,12 +565,10 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                             .items_start()
                             .gap(px(4.0))
                             .child(
-                                text(format!(
-                                    "The run log ends during uploads. {copies_count} recovery copies were kept."
-                                ))
-                                .w_full()
-                                .text_size(px(12.5))
-                                .text_color(p.fg),
+                                text(evidence_line)
+                                    .w_full()
+                                    .text_size(px(12.5))
+                                    .text_color(p.fg),
                             )
                             .child(link_button("Show run log", 12.5, move || {
                                 c_log.navigate(ScreenRoute::Activity);
