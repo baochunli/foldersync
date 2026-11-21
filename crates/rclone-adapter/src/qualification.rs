@@ -1,5 +1,4 @@
-//! Version and binary-integrity qualification against
-//! `packaging/qualification-manifest.toml`.
+//! Version and binary-integrity qualification for workspace and sealed bundled engines.
 
 use std::{
     collections::BTreeMap,
@@ -7,6 +6,7 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -19,6 +19,8 @@ use crate::process::{
 };
 
 const EMBEDDED_MANIFEST_TOML: &str = include_str!("../../../packaging/qualification-manifest.toml");
+const BUNDLE_HELPER: &str = "Contents/Helpers/rclone";
+const BUNDLE_MANIFEST: &str = "Contents/Resources/rclone-manifest.json";
 static PROBE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Verified identity of the pinned rclone executable, stored with each run.
@@ -31,6 +33,7 @@ pub struct EngineIdentity {
     sha256: String,
     path: PathBuf,
     platform: String,
+    bundled: bool,
 }
 
 impl EngineIdentity {
@@ -50,6 +53,11 @@ impl EngineIdentity {
         &self.platform
     }
 
+    pub(crate) fn has_qualified_digest(&self, pin: &PlatformPin) -> bool {
+        // Only bundle qualification can establish an identity from a sealed digest.
+        self.bundled || self.sha256 == pin.binary_sha256
+    }
+
     #[cfg(test)]
     pub(crate) fn for_unit_test(
         version: impl Into<String>,
@@ -62,6 +70,7 @@ impl EngineIdentity {
             sha256: sha256.into(),
             path: path.into(),
             platform: platform.into(),
+            bundled: false,
         }
     }
 }
@@ -84,6 +93,12 @@ pub struct QualificationManifest {
 /// Failures encountered while qualifying an rclone binary.
 #[derive(Debug, Error)]
 pub enum QualificationError {
+    #[error("failed to locate the current executable: {0}")]
+    CurrentExecutable(#[source] std::io::Error),
+    #[error("missing, invalid, or symlinked app bundle path: {0}")]
+    InvalidBundlePath(PathBuf),
+    #[error("code signature verification failed for app bundle {path}: {reason}")]
+    BundleSignature { path: PathBuf, reason: String },
     #[error("failed to read qualification manifest at {path}: {source}")]
     ReadManifest {
         path: PathBuf,
@@ -92,6 +107,8 @@ pub enum QualificationError {
     },
     #[error("invalid qualification manifest: {0}")]
     InvalidManifest(String),
+    #[error("invalid bundled rclone manifest at {path}: {reason}")]
+    InvalidBundleManifest { path: PathBuf, reason: String },
     #[error("unsupported host platform for pinned rclone: {os}-{arch}")]
     UnsupportedPlatform { os: String, arch: String },
     #[error("missing platform pin `{platform}` in qualification manifest")]
@@ -146,6 +163,16 @@ struct RawRcloneSection {
     version: String,
     #[serde(flatten)]
     platforms: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Deserialize)]
+struct BundledManifest {
+    version: String,
+    platform: String,
+    bundle_relative_path: String,
+    upstream_manifest_sha256: String,
+    upstream_archive_sha256: String,
+    bundled_sha256: String,
 }
 
 fn is_valid_sha256_hex(value: &str) -> bool {
@@ -310,7 +337,7 @@ impl ProbeTempDir {
             match fs::create_dir(&dir) {
                 Ok(()) => {
                     let config_path = dir.join("rclone.conf");
-                    if let Err(err) = File::create(&config_path) {
+                    if let Err(err) = File::create_new(&config_path) {
                         let _ = fs::remove_dir_all(&dir);
                         return Err(QualificationError::ProbeTempDir(err));
                     }
@@ -334,9 +361,8 @@ impl Drop for ProbeTempDir {
 }
 
 /// Re-hashes the binary referenced by `identity` on disk and confirms its
-/// version, platform, executable metadata, and SHA-256 still match the host
-/// platform's pin in the checked-in qualification manifest (replacement
-/// detection at the launch boundary, §19).
+/// executable metadata and SHA-256 still match the identity established at
+/// qualification. Also checks the identity against the host version and platform pins.
 pub fn verify_binary_integrity(identity: &EngineIdentity) -> Result<(), QualificationError> {
     let manifest = QualificationManifest::embedded()?;
     verify_binary_integrity_with_manifest(identity, &manifest)
@@ -359,16 +385,23 @@ pub(crate) fn verify_binary_integrity_with_manifest(
             actual: identity.version.clone(),
         });
     }
-    if identity.sha256 != pin.binary_sha256 {
+    if !identity.has_qualified_digest(pin) {
         return Err(QualificationError::Sha256Mismatch {
             path: identity.path.clone(),
             expected: pin.binary_sha256.clone(),
             actual: identity.sha256.clone(),
         });
     }
+    verify_executable_digest(identity)
+}
 
-    let meta = fs::metadata(&identity.path)
-        .map_err(|_| QualificationError::BinaryNotFound(identity.path.clone()))?;
+fn verify_executable_digest(identity: &EngineIdentity) -> Result<(), QualificationError> {
+    let meta = if identity.bundled {
+        bundle_file_metadata(&identity.path)?
+    } else {
+        fs::metadata(&identity.path)
+            .map_err(|_| QualificationError::BinaryNotFound(identity.path.clone()))?
+    };
     if !meta.is_file() {
         return Err(QualificationError::BinaryNotFound(identity.path.clone()));
     }
@@ -381,10 +414,10 @@ pub(crate) fn verify_binary_integrity_with_manifest(
     }
 
     let actual_sha256 = sha256_file(&identity.path)?;
-    if actual_sha256 != pin.binary_sha256 {
+    if actual_sha256 != identity.sha256 {
         return Err(QualificationError::Sha256Mismatch {
             path: identity.path.clone(),
-            expected: pin.binary_sha256.clone(),
+            expected: identity.sha256.clone(),
             actual: actual_sha256,
         });
     }
@@ -409,37 +442,29 @@ pub(crate) fn qualify_binary_with_runner(
     let canonical = binary_path
         .canonicalize()
         .map_err(|_| QualificationError::BinaryNotFound(binary_path.to_path_buf()))?;
-    let meta = fs::metadata(&canonical)
-        .map_err(|_| QualificationError::BinaryNotFound(canonical.clone()))?;
-    if !meta.is_file() {
-        return Err(QualificationError::BinaryNotFound(canonical));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o111 == 0 {
-            return Err(QualificationError::NotExecutable(canonical));
-        }
-    }
-
     let (platform, pin) = manifest.host_platform_pin()?;
+    let identity = EngineIdentity {
+        version: manifest.rclone_version.clone(),
+        sha256: pin.binary_sha256.clone(),
+        path: canonical,
+        platform: platform.to_owned(),
+        bundled: false,
+    };
+    probe_version(identity, runner)
+}
 
+fn probe_version(
+    identity: EngineIdentity,
+    runner: &dyn ProcessRunner,
+) -> Result<EngineIdentity, QualificationError> {
     // Compute and verify SHA-256 BEFORE executing the binary so a replaced binary is never run.
-    let actual_sha256 = sha256_file(&canonical)?;
-    if actual_sha256 != pin.binary_sha256 {
-        return Err(QualificationError::Sha256Mismatch {
-            path: canonical,
-            expected: pin.binary_sha256.clone(),
-            actual: actual_sha256,
-        });
-    }
+    verify_executable_digest(&identity)?;
 
     // Always isolate startup and pass an explicit throwaway --config so rclone never probes
     // or creates ~/.config/rclone during the version probe.
     let probe_tmp = ProbeTempDir::create()?;
     let spec = ProcessSpec {
-        program: canonical.clone(),
+        program: identity.path.clone(),
         args: vec![
             OsString::from("version"),
             OsString::from("--config"),
@@ -448,51 +473,204 @@ pub(crate) fn qualify_binary_with_runner(
         ],
         current_dir: None,
         env: minimal_isolated_env(Some(&probe_tmp.dir)),
-        expected_binary_sha256: Some(pin.binary_sha256.clone()),
+        expected_binary_sha256: Some(identity.sha256.clone()),
     };
     let handle = runner
         .spawn(&spec, SpawnOptions::default())
         .map_err(|source| QualificationError::SpawnVersion {
-            path: canonical.clone(),
+            path: identity.path.clone(),
             source,
         })?;
     let run_out = handle
         .wait()
         .map_err(|source| QualificationError::SpawnVersion {
-            path: canonical.clone(),
+            path: identity.path.clone(),
             source,
         })?;
     if !run_out.exit_status.is_success() {
         return Err(QualificationError::VersionCommandFailed {
-            path: canonical,
+            path: identity.path,
             code: run_out.exit_status.code,
             signal: run_out.exit_status.signal,
         });
     }
 
     let actual_version = parse_rclone_version(&run_out.output.stdout_text())?;
-    if actual_version != manifest.rclone_version {
+    if actual_version != identity.version {
         return Err(QualificationError::VersionMismatch {
-            expected: manifest.rclone_version.clone(),
+            expected: identity.version,
             actual: actual_version,
         });
     }
 
-    Ok(EngineIdentity {
-        version: actual_version,
-        sha256: actual_sha256,
-        path: canonical,
-        platform: platform.to_string(),
-    })
+    Ok(identity)
 }
 
-/// Resolves and qualifies the workspace/overridden pinned rclone binary against
-/// the embedded qualification manifest.
+/// Qualifies the running macOS app bundle's helper, or resolves and qualifies
+/// the workspace's pinned rclone when running outside a bundle.
+///
+/// Call at startup and retain the returned identity for subsequent launches.
+/// Each launch re-hashes the helper against the digest established here. A
+/// bundle error is final. `Ok(None)` means the workspace binary is absent.
 pub fn qualify_pinned_binary() -> Result<Option<EngineIdentity>, QualificationError> {
-    let Some(path) = crate::pinned_binary_path() else {
-        return Ok(None);
+    #[cfg(target_os = "macos")]
+    let executable = Some(std::env::current_exe().map_err(QualificationError::CurrentExecutable)?);
+    #[cfg(not(target_os = "macos"))]
+    let executable = None::<PathBuf>;
+
+    qualify_engine_at(
+        executable.as_deref(),
+        crate::pinned_binary_path,
+        verify_bundle_signature,
+        &QualificationManifest::embedded()?,
+        &RealProcessRunner,
+    )
+}
+
+fn qualify_engine_at(
+    executable: Option<&Path>,
+    development_binary: impl FnOnce() -> Option<PathBuf>,
+    verify_bundle: impl FnOnce(&Path) -> Result<(), QualificationError>,
+    manifest: &QualificationManifest,
+    runner: &dyn ProcessRunner,
+) -> Result<Option<EngineIdentity>, QualificationError> {
+    if let Some(executable) = executable
+        && let Some(bundle) = app_bundle(executable)?
+    {
+        let helper = bundle.join(BUNDLE_HELPER);
+        let manifest_path = bundle.join(BUNDLE_MANIFEST);
+        bundle_file_metadata(&helper)?;
+        bundle_file_metadata(&manifest_path)?;
+        verify_bundle(bundle)?;
+        let identity = bundled_identity(helper, &manifest_path, manifest)?;
+        return probe_version(identity, runner).map(Some);
+    }
+    development_binary()
+        .map(|path| qualify_binary_with_runner(&path, manifest, runner))
+        .transpose()
+}
+
+fn app_bundle(executable: &Path) -> Result<Option<&Path>, QualificationError> {
+    fn bundle_root(executable: &Path) -> Option<&Path> {
+        let macos = executable.parent()?;
+        let contents = macos.parent()?;
+        let bundle = contents.parent()?;
+        (macos.file_name()?.eq_ignore_ascii_case("MacOS")
+            && contents.file_name()?.eq_ignore_ascii_case("Contents")
+            && bundle.extension()?.eq_ignore_ascii_case("app"))
+        .then_some(bundle)
+    }
+
+    if let Some(bundle) = bundle_root(executable) {
+        bundle_file_metadata(executable)?;
+        return Ok(Some(bundle));
+    }
+    // macOS can return a launch path containing symlinks. An alias into an
+    // app must fail closed rather than appear to be a workspace executable.
+    let physical_path = executable
+        .canonicalize()
+        .map_err(QualificationError::CurrentExecutable)?;
+    if bundle_root(&physical_path).is_some() {
+        return Err(QualificationError::InvalidBundlePath(
+            executable.to_path_buf(),
+        ));
+    }
+    Ok(None)
+}
+
+fn bundle_file_metadata(path: &Path) -> Result<fs::Metadata, QualificationError> {
+    let invalid = |path: &Path| QualificationError::InvalidBundlePath(path.to_path_buf());
+    if !path.is_absolute() {
+        return Err(invalid(path));
+    }
+    let ancestors: Vec<_> = path.ancestors().skip(1).collect();
+    for parent in ancestors.into_iter().rev() {
+        // symlink_metadata does not follow the component being inspected.
+        if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.is_dir()) {
+            return Err(invalid(parent));
+        }
+    }
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .ok_or_else(|| invalid(path))
+}
+
+fn verify_bundle_signature(bundle: &Path) -> Result<(), QualificationError> {
+    let error = |reason: String| QualificationError::BundleSignature {
+        path: bundle.to_path_buf(),
+        reason,
     };
-    qualify_binary(&path).map(Some)
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(bundle)
+        .env_clear()
+        .output()
+        .map_err(|err| error(err.to_string()))?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        return Err(error(format!("{}: {}", output.status, diagnostic.trim())));
+    }
+    Ok(())
+}
+
+fn bundled_identity(
+    helper: PathBuf,
+    manifest_path: &Path,
+    manifest: &QualificationManifest,
+) -> Result<EngineIdentity, QualificationError> {
+    let (platform, pin) = manifest.host_platform_pin()?;
+    let text =
+        fs::read_to_string(manifest_path).map_err(|source| QualificationError::ReadManifest {
+            path: manifest_path.to_path_buf(),
+            source,
+        })?;
+    let invalid = |reason: String| QualificationError::InvalidBundleManifest {
+        path: manifest_path.to_path_buf(),
+        reason,
+    };
+    let bundled: BundledManifest =
+        serde_json::from_str(&text).map_err(|err| invalid(err.to_string()))?;
+    for (field, actual, expected) in [
+        (
+            "version",
+            bundled.version.as_str(),
+            manifest.rclone_version(),
+        ),
+        ("platform", bundled.platform.as_str(), platform),
+        (
+            "bundle_relative_path",
+            bundled.bundle_relative_path.as_str(),
+            BUNDLE_HELPER,
+        ),
+        (
+            "upstream_manifest_sha256",
+            bundled.upstream_manifest_sha256.as_str(),
+            pin.binary_sha256.as_str(),
+        ),
+        (
+            "upstream_archive_sha256",
+            bundled.upstream_archive_sha256.as_str(),
+            pin.archive_sha256.as_str(),
+        ),
+    ] {
+        if actual != expected {
+            return Err(invalid(format!("{field} must match {expected}")));
+        }
+    }
+    if !is_valid_sha256_hex(&bundled.bundled_sha256) {
+        return Err(invalid(
+            "bundled_sha256 must be 64 lowercase hex characters".into(),
+        ));
+    }
+
+    Ok(EngineIdentity {
+        version: bundled.version,
+        sha256: bundled.bundled_sha256,
+        path: helper,
+        platform: bundled.platform,
+        bundled: true,
+    })
 }
 
 #[cfg(test)]
@@ -514,6 +692,269 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    struct BundleFixture {
+        dir: PathBuf,
+        app: PathBuf,
+        executable: PathBuf,
+        helper: PathBuf,
+        manifest_path: PathBuf,
+        manifest: QualificationManifest,
+    }
+
+    #[cfg(unix)]
+    impl BundleFixture {
+        fn new(label: &str) -> Self {
+            let dir = unique_temp_dir(label).canonicalize().unwrap();
+            let app = dir.join("FolderSync.app");
+            let executable = app.join("Contents/MacOS/FolderSync");
+            let helper = app.join("Contents/Helpers/rclone");
+            let manifest_path = app.join("Contents/Resources/rclone-manifest.json");
+            for file in [&executable, &helper, &manifest_path] {
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+            }
+            fs::write(&executable, b"app executable").unwrap();
+            fs::write(&helper, b"signed helper bytes").unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+            let fixture = Self {
+                dir,
+                app,
+                executable,
+                helper,
+                manifest_path,
+                manifest: QualificationManifest::embedded().unwrap(),
+            };
+            fixture.write_manifest(&fixture.bundle_manifest());
+            fixture
+        }
+
+        fn bundle_manifest(&self) -> serde_json::Value {
+            let (platform, pin) = self.manifest.host_platform_pin().unwrap();
+            serde_json::json!({
+                "version": self.manifest.rclone_version(),
+                "platform": platform,
+                "bundle_relative_path": "Contents/Helpers/rclone",
+                "upstream_manifest_sha256": pin.binary_sha256,
+                "upstream_archive_sha256": pin.archive_sha256,
+                "bundled_sha256": sha256_file(&self.helper).unwrap(),
+            })
+        }
+
+        fn write_manifest(&self, manifest: &serde_json::Value) {
+            fs::write(&self.manifest_path, manifest.to_string()).unwrap();
+        }
+
+        fn qualify(
+            &self,
+            runner: &dyn ProcessRunner,
+        ) -> Result<Option<EngineIdentity>, QualificationError> {
+            qualify_engine_at(
+                Some(&self.executable),
+                || None,
+                |bundle| {
+                    assert_eq!(bundle, self.app);
+                    Ok(())
+                },
+                &self.manifest,
+                runner,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for BundleFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn version_runner() -> FakeProcessRunner {
+        let runner = FakeProcessRunner::new();
+        runner.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stdout,
+                text: format!("rclone v{}", crate::PINNED_RCLONE_VERSION),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        runner
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_wins_over_development_and_uses_its_signed_digest() {
+        let fixture = BundleFixture::new("bundle-priority");
+        let runner = version_runner();
+        let verified = std::cell::Cell::new(false);
+        let identity = qualify_engine_at(
+            Some(&fixture.executable),
+            || panic!("a bundle must not consult development resolution"),
+            |bundle| {
+                assert_eq!(bundle, fixture.app);
+                assert!(!verified.replace(true));
+                assert!(runner.spawned_specs().is_empty());
+                Ok(())
+            },
+            &fixture.manifest,
+            &runner,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(verified.get());
+        assert_eq!(identity.path(), fixture.helper);
+        assert_eq!(identity.sha256(), sha256_file(&fixture.helper).unwrap());
+        let specs = runner.spawned_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].program, fixture.helper);
+        assert_eq!(
+            specs[0].expected_binary_sha256.as_deref(),
+            Some(identity.sha256())
+        );
+        verify_binary_integrity(&identity).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_failed_bundle_signature_before_probing_helper() {
+        let fixture = BundleFixture::new("bundle-signature");
+        let runner = FakeProcessRunner::new();
+        let result = qualify_engine_at(
+            Some(&fixture.executable),
+            || None,
+            |_| {
+                Err(QualificationError::InvalidManifest(
+                    "signature failed".into(),
+                ))
+            },
+            &fixture.manifest,
+            &runner,
+        );
+        assert!(matches!(
+            result,
+            Err(QualificationError::InvalidManifest(_))
+        ));
+        assert!(runner.spawned_specs().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_bundle_manifest_mismatches_before_probing_helper() {
+        let fixture = BundleFixture::new("bundle-manifest");
+        let runner = FakeProcessRunner::new();
+        for (field, wrong) in [
+            ("version", "0.0.1"),
+            ("platform", "unknown"),
+            ("bundle_relative_path", "Contents/MacOS/FolderSync"),
+            ("upstream_manifest_sha256", &"0".repeat(64)),
+            ("upstream_archive_sha256", &"0".repeat(64)),
+            ("bundled_sha256", "malformed"),
+        ] {
+            let mut manifest = fixture.bundle_manifest();
+            manifest[field] = wrong.into();
+            fixture.write_manifest(&manifest);
+            assert!(fixture.qualify(&runner).is_err(), "accepted {field}");
+        }
+        assert!(runner.spawned_specs().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_bundle_helper_replacement_at_startup_and_launch() {
+        let fixture = BundleFixture::new("bundle-replacement");
+        let identity = fixture.qualify(&version_runner()).unwrap().unwrap();
+        let at = |name: &str| fixture.dir.join(name);
+        let request = crate::BisyncRequest::builder()
+            .engine(identity)
+            .mode(crate::RunMode::Normal)
+            .path1(at("path1"))
+            .path2(crate::Path2::LocalDir(at("path2")))
+            .config_path(at("rclone.conf"))
+            .workdir(at("workdir"))
+            .filters_file(at("filters.txt"))
+            .backup_dir1(at("backup1"))
+            .backup_dir2(crate::BackupDir2::LocalDir(at("backup2")))
+            .build()
+            .unwrap();
+
+        fs::write(&fixture.helper, b"replacement helper bytes").unwrap();
+        let runner = FakeProcessRunner::new();
+        assert!(matches!(
+            fixture.qualify(&runner),
+            Err(QualificationError::Sha256Mismatch { .. })
+        ));
+        assert!(runner.spawned_specs().is_empty());
+
+        fixture.write_manifest(&fixture.bundle_manifest());
+        assert!(matches!(
+            request.spawn(&runner, SpawnOptions::default()),
+            Err(crate::LaunchError::Qualification(
+                QualificationError::Sha256Mismatch { .. }
+            ))
+        ));
+        assert!(runner.spawned_specs().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_missing_bundle_helper_without_development_fallback() {
+        let fixture = BundleFixture::new("bundle-missing");
+        fs::remove_file(&fixture.helper).unwrap();
+        let runner = FakeProcessRunner::new();
+        assert!(fixture.qualify(&runner).is_err());
+        assert!(runner.spawned_specs().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinks_to_the_bundle_or_its_engine_files() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = BundleFixture::new("bundle-symlink");
+        let runner = FakeProcessRunner::new();
+        for file in [&fixture.executable, &fixture.helper, &fixture.manifest_path] {
+            let moved = file.with_extension("moved");
+            fs::rename(file, &moved).unwrap();
+            symlink(&moved, file).unwrap();
+            assert!(fixture.qualify(&runner).is_err(), "followed {file:?}");
+            fs::remove_file(file).unwrap();
+            fs::rename(moved, file).unwrap();
+        }
+        let alias = fixture.dir.join("alias");
+        symlink(&fixture.app, &alias).unwrap();
+        fixture.executable = alias.join("Contents/MacOS/FolderSync");
+        assert!(fixture.qualify(&runner).is_err());
+        assert!(runner.spawned_specs().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a local ad hoc package built by packaging/build-app.sh"]
+    fn qualifies_ad_hoc_packaged_helper() {
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/package/FolderSync.app")
+            .canonicalize()
+            .expect("build the ad hoc package as described in docs/release.md");
+        let manifest = QualificationManifest::embedded().unwrap();
+        let identity = qualify_engine_at(
+            Some(&bundle.join("Contents/MacOS/FolderSync")),
+            || panic!("a packaged app must not use the workspace binary"),
+            verify_bundle_signature,
+            &manifest,
+            &RealProcessRunner,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(identity.path(), bundle.join(BUNDLE_HELPER));
+        assert_eq!(identity.version(), manifest.rclone_version());
+        assert_ne!(
+            identity.sha256(),
+            manifest.host_platform_pin().unwrap().1.binary_sha256
+        );
+        verify_binary_integrity(&identity).unwrap();
     }
 
     #[test]
@@ -676,7 +1117,7 @@ mod tests {
             return;
         };
         let manifest = QualificationManifest::embedded().unwrap();
-        let identity = qualify_binary(&path).unwrap();
+        let identity = qualify_pinned_binary().unwrap().unwrap();
         assert_eq!(identity.version(), crate::PINNED_RCLONE_VERSION);
         assert_eq!(identity.path(), path);
         assert_eq!(identity.platform(), host_platform_key().unwrap());
