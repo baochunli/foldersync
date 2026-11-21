@@ -2,6 +2,11 @@
 //! path-ID/containment validation, exclusive OS file locking (`flock`), and
 //! live process identity inspection.
 
+mod volume;
+
+pub(crate) use volume::space_and_writability;
+pub use volume::{DiskSpaceInfo, MountedVolume, OsVolumeProbe, VolumeProbe, disk_space_for_path};
+
 use std::{
     collections::HashMap,
     env,

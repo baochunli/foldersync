@@ -14,6 +14,8 @@ use sync_core::{
     RunOutcome, VolumeKind,
 };
 
+use crate::platform::DiskSpaceInfo;
+
 /// Default capacity of the bounded in-memory event ring buffer.
 pub const DEFAULT_EVENT_BUFFER_CAPACITY: usize = 512;
 
@@ -42,6 +44,11 @@ pub struct MappingStatusSnapshot {
     pub volume_kind: VolumeKind,
     #[serde(default)]
     pub volume_stable_id: String,
+    /// Capacity of the matching mounted volume, if it is currently visible.
+    #[serde(default)]
+    pub volume_space: Option<DiskSpaceInfo>,
+    #[serde(default)]
+    pub volume_filesystem: Option<String>,
     pub readiness: Readiness,
     pub execution: Execution,
     pub intent: Intent,

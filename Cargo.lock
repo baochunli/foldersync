@@ -4119,6 +4119,7 @@ name = "sync-manager"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "core-foundation-sys",
  "directories",
  "libc",
  "rclone-adapter",
