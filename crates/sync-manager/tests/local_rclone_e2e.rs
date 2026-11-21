@@ -17,7 +17,7 @@ use sync_manager::{
 use tempfile::TempDir;
 
 struct RealFixture {
-    _tmp: TempDir,
+    temp: TempDir,
     state_dir: PathBuf,
     local_dir: PathBuf,
     remote_dir: PathBuf,
@@ -38,7 +38,7 @@ impl RealFixture {
         fs::create_dir_all(&local_recovery).unwrap();
         fs::create_dir_all(&remote_recovery).unwrap();
         Self {
-            _tmp: tmp,
+            temp: tmp,
             state_dir,
             local_dir,
             remote_dir,
@@ -147,7 +147,7 @@ fn upload_initialization_propagates_files_and_persists_generation_and_run_artifa
     let snap = mgr.wait_until_idle(Duration::from_secs(30)).unwrap();
     assert_eq!(snap.mappings[0].readiness, Readiness::Ready);
     assert_eq!(snap.mappings[0].execution, Execution::Idle);
-    assert!(!snap.mappings[0].scheduling_enabled);
+    assert!(snap.mappings[0].scheduling_enabled);
     assert!(snap.mappings[0].active_generation_fingerprint.is_some());
 
     // Verify files propagated with exact hashes and recognizable RCLONE_TEST marker created on both sides.
@@ -167,11 +167,100 @@ fn upload_initialization_propagates_files_and_persists_generation_and_run_artifa
     // Run artifacts exist under runs/<run-id>/.
     let runs = mgr.list_runs(&MappingId::new("research")).unwrap();
     assert_eq!(runs.len(), 1);
-    assert!(runs[0].run_dir.join("argv.json").is_file());
+    let expected = rclone_adapter::qualify_pinned_binary().unwrap().unwrap();
+    assert_eq!(runs[0].engine_version.as_deref(), Some(expected.version()));
+    assert_eq!(runs[0].engine_sha256.as_deref(), Some(expected.sha256()));
+    assert_eq!(
+        runs[0].engine_platform.as_deref(),
+        Some(expected.platform())
+    );
+    let argv: serde_json::Value =
+        serde_json::from_slice(&fs::read(runs[0].run_dir.join("argv.json")).unwrap()).unwrap();
+    assert_eq!(
+        argv["engine"]["executable"],
+        expected.path().to_string_lossy().as_ref()
+    );
     assert!(runs[0].run_dir.join("output.ndjson").is_file());
     assert!(runs[0].run_dir.join("outcome.json").is_file());
 
     mgr.shutdown().unwrap();
+}
+
+#[test]
+fn changing_filters_initializes_with_a_fresh_workdir_and_keeps_excluded_files() {
+    if !require_pinned_rclone(
+        "changing_filters_initializes_with_a_fresh_workdir_and_keeps_excluded_files",
+    ) {
+        return;
+    }
+    let fx = RealFixture::new();
+    write_rel(&fx.local_dir, "notes.txt", b"included");
+    write_rel(&fx.local_dir, "archive/old.txt", b"preserved");
+    let manager = fx.open_manager();
+    manager
+        .register_local_fixture_account("local-1", "Local fixture")
+        .unwrap();
+    manager.add_mapping(fx.add_mapping_cmd()).unwrap();
+    let id = MappingId::new("research");
+    manager
+        .initialize(InitializeCommand {
+            mapping_id: id.clone(),
+            expected_direction: None,
+        })
+        .unwrap();
+    let original = manager.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let generation = manager
+        .get_generation(original.mappings[0].active_generation_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    let original_listing_hashes = tree_hashes(&generation.workdir_path);
+    assert!(!original_listing_hashes.is_empty());
+
+    let selection = std::collections::BTreeSet::from(["/archive/".to_owned()]);
+    assert!(
+        manager
+            .propose_filter_change(&id, selection.clone())
+            .unwrap()
+            .preflight()
+            .direction
+            .is_err()
+    );
+    let preserved = fx.temp.path().join("preserved-remote");
+    fs::create_dir(&preserved).unwrap();
+    for path in ["notes.txt", "archive"] {
+        fs::rename(fx.remote_dir.join(path), preserved.join(path)).unwrap();
+    }
+
+    let preview = manager.propose_filter_change(&id, selection).unwrap();
+    assert_eq!(preview.preflight().direction, Ok(InitPreference::Path1));
+    manager.apply_filter_change(preview).unwrap();
+    let migrated = manager.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let active = migrated.mappings[0].active_generation_id.as_ref().unwrap();
+    assert_ne!(active, &generation.id);
+    assert!(migrated.mappings[0].scheduling_enabled);
+    assert_eq!(
+        tree_hashes(&generation.workdir_path),
+        original_listing_hashes
+    );
+    assert_eq!(
+        fs::read(fx.local_dir.join("archive/old.txt")).unwrap(),
+        b"preserved"
+    );
+    assert_eq!(
+        fs::read(preserved.join("archive/old.txt")).unwrap(),
+        b"preserved"
+    );
+    assert_eq!(
+        fs::read(fx.remote_dir.join("notes.txt")).unwrap(),
+        b"included"
+    );
+    assert!(!fx.remote_dir.join("archive/old.txt").exists());
+    let runs = manager.list_runs(&id).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert!(
+        runs.iter()
+            .any(|run| &run.generation_id == active && run.mode == "init_path1")
+    );
 }
 
 #[test]

@@ -28,7 +28,7 @@ as three separate dimensions:
 | --- | --- |
 | `CloseWindow` | No mapping state change; manager continues running. |
 | `Pause` | Sets `Intent::Paused`; cancels a `Queued` run to `Idle` but lets a `Running` or `Stopping` run finish. |
-| `Resume` | Sets `Intent::Enabled`; transitions `Idle` to `Queued` (`ScheduleRun`) only when `Readiness::Ready` (while automatic scheduling is disabled in Group 3, `sync-manager` keeps `Execution::Idle`). |
+| `Resume` | Sets `Intent::Enabled` and requests an automatic check when the mapping is eligible. |
 | `RunNow` | Transitions `Idle` to `Queued` (`ScheduleRun`) only when `Ready` and `Enabled`. |
 | `StopRun` | Moves `Running` to `Stopping` (`RequestGracefulStop`) or `Queued` to `Idle`. |
 | `ForceStop` | Moves `Running` or `Stopping` to `Execution::Interrupted` and `Readiness::RecoveryRequired` (`ForceTerminateChild`). |
@@ -169,11 +169,11 @@ the real application directory.
    job slot, inserts a `runs` row (`status = "starting"`,
    `last_verified_phase = "pre_spawn"`) with workdir and per-run
    `backup_dir1`/`backup_dir2` recovery paths, and qualifies the rclone engine
-   and `BisyncRequest`. Immediately before spawn—holding the manager state
-   mutex across the final stop/force-stop/shutdown check, volume and endpoint
-   checks, child spawn, and child identity commit—it aborts if stopped or if
-   the disk identity, roots, markers, recovery destinations, or capacity fail
-   preflight.
+   and `BisyncRequest`. Volume identity, roots, markers, recovery destinations,
+   and capacity are checked outside the manager mutex before request preparation
+   and again immediately before launch. The worker then checks the active run
+   identity and cancellation under the mutex and holds it through spawn and
+   the child identity commit.
 2. **Post-spawn child identity:** Immediately after spawn, `sync-manager`
    commits `child_pid`, OS process start time (`proc_pidinfo(PROC_PIDTBSDINFO)`
    on macOS, `/proc/<pid>/stat` on Linux), executable path (`proc_pidpath` /
@@ -229,12 +229,14 @@ filesystem UUID, Linux needs a unique kernel mount ID and binds it to the
 current boot, so remounting or restarting requires review. Earlier
 device-number bindings need setup review before another run.
 
-- A missing disk displays **Waiting for <volume>**. A replacement at the same
+- A missing disk displays **Waiting for <volume>**. Permission and inspection
+  errors display **Can’t access <volume>** with the cause. A replacement at the same
   mount displays **A different disk named <volume> is connected**. Mounting
   the expected UUID at a new location requires endpoint review. FolderSync
   keeps the saved path until the user reviews setup.
 - The manager rechecks mounts every three seconds, including while rclone
-  runs. It records a disk loss before requesting a graceful stop. If a child
+  runs. It probes outside the state mutex and compares the current binding and
+  generation before applying the result. It records a disk loss before requesting a graceful stop. If a child
   was running when the loss was detected, the run enters recovery even if
   rclone reports success. The manager preserves the workdir and logs.
   Reconnect revalidates the saved roots and markers. Manual pause and recovery
@@ -247,7 +249,9 @@ device-number bindings need setup review before another run.
   A directory containing only the recognized access marker can still sync.
 - Manager snapshots provide `volume_space` (available and total bytes) and
   `volume_filesystem` for the observed matching volume. These fields are
-  absent when the disk identity cannot be verified.
+  absent when the disk identity cannot be verified. Capacity-only updates
+  reach manager subscribers at most once every 30 seconds and skip the Finder
+  status write. Finder still receives readiness updates and its heartbeat.
 
 The free-space floor is a preflight check. Transfers or recovery copies can
 need more space. A disk can also disconnect after the launch check or between
@@ -266,15 +270,64 @@ See the [physical unplug qualification](qualification.md#2-physical-external-dis
   and creates new markers strictly with `create_new` (`O_EXCL`, never
   truncating); refuses both-populated trees with the §9 message; freezes the
   `ConfigGeneration` and its SHA-256 fingerprint; runs rclone through
-  `rclone-adapter`; and marks the mapping `Ready` on success while keeping
-  automatic scheduling disabled (scheduling lands in Group 4).
+  `rclone-adapter`; and marks the mapping `Ready` and eligible for scheduling
+  after verified success.
 - **Run once (`RunNow` / `sync-cli run-once <mapping> --state-dir <dir>`):**
   Rechecks the bound volume, saved roots, markers, recovery destinations, and
   available space before launch, starts a validated normal bisync run with per-run backup
   directories, feeds the classified `rclone-adapter` outcome into `sync-core`,
   commits atomically, and updates both `StatusSnapshot` and Finder
-  `status.json` (reporting `"Last run failed — retry manually"` rather than
-  `"will retry"` while scheduling is disabled).
+  `status.json`. A manual request moves the mapping to the front of the queue
+  and lets the current job finish.
+
+## Automatic scheduling
+
+The manager schedules verified mappings when they are Ready and Enabled. Active
+mappings default to a five-minute scan interval. For large archival mappings,
+start with the 15-minute archive preset and increase to 30 or 60 minutes if scans
+take a significant part of the interval. The interval is configurable from one
+minute to 24 hours.
+
+FSEvents on macOS and inotify on Linux supply local change hints. The manager
+waits for two quiet seconds after the latest hint and at least 30 seconds after the
+last run. It queues each mapping once. Signals received during a run can trigger
+one follow-up. Routine interval scans find changes on the other endpoint.
+Wake and network-interface changes prompt a fresh check through the same queue.
+
+Only engine outcomes classified as retryable enter backoff. The next attempt is
+due in 30 to 36 seconds at first, doubling the base delay up to a 30-minute
+maximum with jitter. The manager restores retry timing from classified run
+history on restart. Readiness holds block runs until their checks pass.
+
+Global **Pause scheduling** survives restart, holds automatic work, and leaves
+**Sync now** available for enabled mappings. Per-mapping **Pause** survives
+restart and reconnect and also blocks **Sync now** for that mapping. Neither
+pause stops the active job. SQLite schema 3 enables scheduling for existing
+generations with a recorded successful initialization.
+
+## Changing exclusions
+
+Preview a filter change to see the added and removed exclusions, both endpoint
+inventories, and the proposed first-sync direction. Confirming an eligible
+preview retires the old baseline from normal runs and repeats preflight using
+the proposed filters. Each attempt that reaches initialization gets its own
+generation, frozen filter file, and empty bisync work directory. Prior work
+directories remain available for inspection. Files newly excluded from sync
+stay in place.
+
+The initializer supports upload to an empty destination, download to an empty
+local folder, and two empty folders. If both folders contain data, review and
+preserve both copies before consolidating to one side or using a fresh empty
+destination. If contents changed after a preview and preflight can no longer
+initialize safely, scheduling remains off until the new setup succeeds.
+
+## Runtime engine
+
+The manager uses the adapter's bundle-aware qualification. Packaged macOS apps
+use their sealed helper. Development resolves the pinned engine from `.tools`.
+The manager keeps the qualified identity for its lifetime and the adapter
+checks the executable again at launch. Each launched run records the engine
+version, digest, and platform in SQLite and the executable path in `argv.json`.
 
 ## CLI companion (`sync-cli`)
 
@@ -293,5 +346,5 @@ non-zero on any failure outcome (including retryable failures):
 ## Remaining verification TODO
 
 Physical removable-volume behavior still needs the owner-run unplug matrix.
-Real Google Drive initialization and automatic scheduling require their own
-integration and qualification.
+Real Google Drive initialization, packaged helper validation, and live host
+sleep and network transitions still need qualification.
