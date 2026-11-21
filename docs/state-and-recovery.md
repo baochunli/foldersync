@@ -100,7 +100,8 @@ the real application directory.
     refusing symlinked handoff directories or symlinked parent paths. Reflects
     global scheduling pause (`paused` / `"Scheduling paused"`) and refreshes
     `generated_at` on a periodic heartbeat well under the 300-second TTL while
-    running. After every successful `status.json` write, `sync-manager` invokes
+    running. Idle worker wakeups preserve the next refresh deadline. After
+    every successful `status.json` write, `sync-manager` invokes
     an injectable `FinderNotifier` (`NoopFinderNotifier` by default in
     `ManagerConfig::with_state_dir` so tests never post live notifications;
     `DarwinFinderNotifier` in the real interactive desktop app; tests inject

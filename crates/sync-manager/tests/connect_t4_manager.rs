@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rclone_adapter::{ExitStatusInfo, OutputLine, StreamKind};
@@ -1340,8 +1340,12 @@ fn finder_atomic_claim_and_pause_payload_and_heartbeat() {
 
     // 2. Periodic heartbeat rewrites status.json while idle (HIGH #12).
     let before_count = notifier.posted_notifications().len();
-    thread::sleep(Duration::from_millis(160));
-    let after_count = notifier.posted_notifications().len();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after_count = before_count;
+    while after_count == before_count && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+        after_count = notifier.posted_notifications().len();
+    }
     assert!(
         after_count > before_count,
         "idle heartbeat must periodically rewrite Finder status.json (before={before_count}, after={after_count})"
@@ -1376,6 +1380,39 @@ fn finder_atomic_claim_and_pause_payload_and_heartbeat() {
     mgr.wait_until_idle(Duration::from_secs(5)).unwrap();
     assert_eq!(launcher.launched_plans().len(), 2);
     mgr.shutdown().unwrap();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn idle_finder_heartbeat_survives_frequent_worker_wakeups() {
+    let fx = Fx::new();
+    let notifier = Arc::new(RecordingFinderNotifier::new());
+    let mut cfg = ManagerConfig::with_state_dir(&fx.state_dir);
+    cfg.finder_notifier = notifier.clone();
+    cfg.finder_heartbeat_interval = Some(Duration::from_millis(150));
+    let mgr = SyncManager::open(cfg).unwrap();
+
+    let (before_count, during_count) = thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                mgr.notify_worker_for_test();
+                let before_count = notifier.posted_notifications().len();
+                let deadline = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
+                    mgr.notify_worker_for_test();
+                }
+                (before_count, notifier.posted_notifications().len())
+            })
+            .join()
+            .unwrap()
+    });
+
+    mgr.shutdown().unwrap();
+    assert!(
+        during_count > before_count,
+        "idle Finder heartbeat must run during worker wakeups (before={before_count}, during={during_count})"
+    );
 }
 
 #[test]

@@ -1081,6 +1081,13 @@ impl SyncManager {
         self.inner.finder_writer.dir()
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn notify_worker_for_test(&self) {
+        let _guard = self.inner.state.lock().unwrap();
+        self.inner.worker_cv.notify_all();
+    }
+
     /// Registers a local-fixture account backed by an isolated throwaway empty
     /// `rclone.conf` inside `<state_dir>/accounts/<id>/rclone.conf` (`0600`).
     pub fn register_local_fixture_account(
@@ -4474,6 +4481,7 @@ enum DequeueOutcome {
 }
 
 fn worker_loop(inner: Arc<ManagerInner>) {
+    let mut last_heartbeat = Instant::now();
     loop {
         // Atomic dequeue -> eligibility recheck -> pre-spawn DB row -> active_run claim
         // all under ONE mutex acquisition (HIGH #5).
@@ -4481,10 +4489,12 @@ fn worker_loop(inner: Arc<ManagerInner>) {
             let mut guard = inner.state.lock().unwrap();
             while !guard.shutdown && guard.job_queue.is_empty() {
                 if let Some(heartbeat) = inner.finder_heartbeat_interval {
-                    let (next_guard, wait_res) =
-                        inner.worker_cv.wait_timeout(guard, heartbeat).unwrap();
-                    guard = next_guard;
-                    if wait_res.timed_out() && !guard.shutdown && guard.job_queue.is_empty() {
+                    let remaining = heartbeat.saturating_sub(last_heartbeat.elapsed());
+                    guard = inner.worker_cv.wait_timeout(guard, remaining).unwrap().0;
+                    if !guard.shutdown
+                        && guard.job_queue.is_empty()
+                        && last_heartbeat.elapsed() >= heartbeat
+                    {
                         // Refresh Finder status.json generated_at periodically so idle running
                         // apps never trip the 5-minute TTL (HIGH #12).
                         let mut refreshed = (*guard.latest_snapshot).clone();
@@ -4494,6 +4504,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                         if let Err(err) = inner.finder_writer.write_snapshot(&refreshed) {
                             eprintln!("Warning: failed Finder heartbeat status.json write: {err}");
                         }
+                        last_heartbeat = Instant::now();
                     }
                 } else {
                     guard = inner.worker_cv.wait(guard).unwrap();
