@@ -214,6 +214,8 @@ impl LsJsonRequest {
         let target = format!("{}:{subpath}", self.remote_name);
         let mut args = vec![
             OsString::from("lsjson"),
+            OsString::from("--max-depth"),
+            OsString::from("1"),
             OsString::from("--dirs-only"),
             OsString::from(target),
             OsString::from("--config"),
@@ -613,8 +615,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(argv0[0], "lsjson");
-        assert_eq!(argv0[1], "--dirs-only");
-        assert_eq!(argv0[2], "household:");
+        assert_eq!(argv0[1], "--max-depth");
+        assert_eq!(argv0[2], "1");
+        assert_eq!(argv0[3], "--dirs-only");
+        assert_eq!(argv0[4], "household:");
         assert!(argv0.contains(&"--drive-skip-gdocs".to_string()));
         assert!(argv0.contains(&"--drive-skip-shortcuts".to_string()));
         assert!(argv0.contains(&"--ask-password=false".to_string()));
@@ -624,7 +628,7 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(argv1[2], "household:Data");
+        assert_eq!(argv1[4], "household:Data");
 
         let _ = fs::remove_dir_all(&tmp);
     }

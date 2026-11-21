@@ -1345,9 +1345,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         /// Runs real pinned rclone for local config encryption/check commands,
-        /// serves recorded fixtures for `config reconnect` so no Google network
-        /// call or browser launch ever occurs, and simulates a saved OAuth token
-        /// in `config dump` once `simulate_saved_token` is enabled.
+        /// serves recorded fixtures for `config reconnect`, `config redacted`,
+        /// and `lsjson` so no Google network call or browser launch ever occurs.
         struct HybridDriveAuthRunner {
             fake_reconnect: FakeProcessRunner,
             simulate_saved_token: AtomicBool,
@@ -1367,22 +1366,40 @@ mod tests {
                     .collect();
                 let is_reconnect = argv.first().map(String::as_str) == Some("config")
                     && argv.get(1).map(String::as_str) == Some("reconnect");
-                let is_dump = argv.first().map(String::as_str) == Some("config")
-                    && argv.get(1).map(String::as_str) == Some("dump");
+                let is_redacted = argv.first().map(String::as_str) == Some("config")
+                    && argv.get(1).map(String::as_str) == Some("redacted");
+                let is_lsjson = argv.first().map(String::as_str) == Some("lsjson");
+                assert!(
+                    !(argv.first().map(String::as_str) == Some("config")
+                        && argv.get(1).map(String::as_str) == Some("dump")),
+                    "CLI must never invoke `config dump`: {argv:?}"
+                );
                 self.recorded_argvs.lock().unwrap().push(argv);
                 if is_reconnect {
                     self.fake_reconnect.spawn(spec, options)
-                } else if is_dump && self.simulate_saved_token.load(Ordering::SeqCst) {
-                    let fake_dump = FakeProcessRunner::new();
-                    fake_dump.push_run(FakeRunScript {
+                } else if is_redacted && self.simulate_saved_token.load(Ordering::SeqCst) {
+                    let fake_redacted = FakeProcessRunner::new();
+                    fake_redacted.push_run(FakeRunScript {
                         lines: vec![OutputLine {
                             stream: StreamKind::Stdout,
-                            text: r#"{"household":{"type":"drive","scope":"drive","root_folder_id":"0AParentId","token":"{\"access_token\":\"ya29.fake-access-token\",\"refresh_token\":\"1//fake-refresh-token\"}"}}"#.to_string(),
+                            text: "[household]\ntype = drive\nclient_id = XXX\nclient_secret = XXX\nscope = drive\nroot_folder_id = XXX\ntoken = XXX\n".to_string(),
                             truncated: false,
                         }],
                         ..Default::default()
                     });
-                    fake_dump.spawn(spec, options)
+                    fake_redacted.spawn(spec, options)
+                } else if is_lsjson && self.simulate_saved_token.load(Ordering::SeqCst) {
+                    let fake_ls = FakeProcessRunner::new();
+                    fake_ls.push_run(FakeRunScript {
+                        lines: vec![OutputLine {
+                            stream: StreamKind::Stdout,
+                            text: r#"[{"Path":"Data","Name":"Data","ID":"1Data","IsDir":true}]"#
+                                .to_string(),
+                            truncated: false,
+                        }],
+                        ..Default::default()
+                    });
+                    fake_ls.spawn(spec, options)
                 } else {
                     RealProcessRunner.spawn(spec, options)
                 }
@@ -1556,5 +1573,142 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_never_leaks_config_stdout_canaries_on_nonzero_or_signaled_child() {
+        use rclone_adapter::{ExitStatusInfo, ProcessError, ProcessSpec, RunHandle, SpawnOptions};
+        use sync_core::{AccountId, DeviceId};
+        use sync_manager::{AccountRecord, DeviceRecord, SqliteStateStore, scoped_credential_key};
+
+        if pinned_binary_path().is_none() {
+            eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+            return;
+        }
+
+        struct CanaryFailRunner {
+            exit_status: ExitStatusInfo,
+            canary: String,
+        }
+
+        impl ProcessRunner for CanaryFailRunner {
+            fn spawn(
+                &self,
+                spec: &ProcessSpec,
+                options: SpawnOptions,
+            ) -> Result<RunHandle, ProcessError> {
+                let argv: Vec<String> = spec
+                    .args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    !(argv.first().map(String::as_str) == Some("config")
+                        && argv.get(1).map(String::as_str) == Some("dump")),
+                    "CLI must never run config dump: {argv:?}"
+                );
+                let fake = FakeProcessRunner::new();
+                if argv.first().map(String::as_str) == Some("config")
+                    && argv.get(1).map(String::as_str) == Some("redacted")
+                {
+                    fake.push_run(FakeRunScript {
+                        lines: vec![OutputLine {
+                            stream: StreamKind::Stdout,
+                            text: format!("[household]\ntoken = {}\n", self.canary),
+                            truncated: false,
+                        }],
+                        exit_status: self.exit_status,
+                        ..Default::default()
+                    });
+                } else {
+                    // `config reconnect` and `config encryption check` succeed.
+                    fake.push_run(FakeRunScript::default());
+                }
+                fake.spawn(spec, options)
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let acct_dir = state_dir.join("accounts/canary-1");
+        fs::create_dir_all(&acct_dir).unwrap();
+        let cfg_path = acct_dir.join("rclone.conf");
+        fs::write(&cfg_path, "RCLONE_ENCRYPT_V0:\nFakeCipher==\n").unwrap();
+        fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let db = SqliteStateStore::open(&state_dir.join("state.sqlite")).unwrap();
+        let dev = db
+            .ensure_device(&DeviceRecord {
+                id: DeviceId::new("device-canary-cli"),
+                name: "cli".to_string(),
+                created_at: "2026-11-20T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        db.upsert_account(&AccountRecord {
+            id: AccountId::new("canary-1"),
+            display_name: "Canary".to_string(),
+            kind: "drive".to_string(),
+            remote_name: "household".to_string(),
+            remote_root_folder_id: "0ARoot".to_string(),
+            config_path: cfg_path,
+            auth_status: "authentication_required".to_string(),
+            created_at: "2026-11-20T00:00:00Z".to_string(),
+            updated_at: "2026-11-20T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        drop(db);
+
+        let store = Arc::new(InMemorySecretStore::new());
+        let cred_key = scoped_credential_key(dev.id.as_str(), "canary-1").unwrap();
+        store
+            .create_secret(&cred_key, &SecretString::new("canary-pw"))
+            .unwrap();
+
+        let helper_bin = tmp.path().join("fake-helper");
+        fs::write(&helper_bin, "#!/bin/sh\necho canary-pw\n").unwrap();
+        fs::set_permissions(&helper_bin, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let canary = "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K";
+        for exit_status in [
+            ExitStatusInfo {
+                code: Some(1),
+                signal: None,
+            },
+            ExitStatusInfo {
+                code: None,
+                signal: Some(9),
+            },
+        ] {
+            let helper_c = helper_bin.clone();
+            let factory: PasswordCommandFactory =
+                Arc::new(move |_| Ok(PasswordCommand::new(helper_c.clone(), vec![]).unwrap()));
+            let rt = CliRuntime {
+                secret_store: Arc::clone(&store) as Arc<dyn SecretStore>,
+                process_runner: Arc::new(CanaryFailRunner {
+                    exit_status,
+                    canary: canary.to_string(),
+                }),
+                rclone_binary_override: None,
+                password_command_factory: Some(factory),
+                echo_auth_url_to_process_stdout: false,
+            };
+            let (code, stdout, stderr) = run_args(
+                &rt,
+                &[
+                    "account",
+                    "reconnect",
+                    "--state-dir",
+                    state_dir.to_str().unwrap(),
+                    "--account",
+                    "canary-1",
+                ],
+            );
+            assert_ne!(code, ExitCode::SUCCESS);
+            assert!(
+                !stdout.contains(canary) && !stderr.contains(canary),
+                "CLI leaked child stdout canary! stdout={stdout} stderr={stderr}"
+            );
+        }
     }
 }

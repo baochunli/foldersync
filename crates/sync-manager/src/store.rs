@@ -366,10 +366,11 @@ pub struct SqliteStateStore {
 }
 
 impl SqliteStateStore {
-    /// Opens or creates `db_path`, refuses symlinks (`O_NOFOLLOW`), enforces
-    /// `0600` private permissions, and runs forward-only migrations.
+    /// Opens or creates `db_path` directly with `SQLITE_OPEN_NOFOLLOW` (no raw
+    /// pre-open), sets `0600` private permissions on first creation via the
+    /// checked path, and runs forward-only migrations.
     pub fn open(db_path: &Path) -> Result<Self, ManagerError> {
-        if let Some(parent) = db_path.parent() {
+        let checked_path = if let Some(parent) = db_path.parent() {
             if let Ok(meta) = std::fs::symlink_metadata(parent)
                 && meta.file_type().is_symlink()
             {
@@ -388,62 +389,64 @@ impl SqliteStateStore {
                 let sidecar = PathBuf::from(format!("{}{suffix}", checked.display()));
                 reject_symlinks_under_root("state_sqlite_sidecar", parent, &sidecar)?;
             }
-        }
+            checked
+        } else {
+            db_path.to_path_buf()
+        };
 
-        // Pre-open/create with O_NOFOLLOW before SQLite touches the path so
-        // symlinks cannot be followed to an outside target.
-        {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.create(true).read(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-                opts.mode(0o600);
-                opts.custom_flags(libc::O_NOFOLLOW);
-                let file = opts.open(db_path).map_err(|err| {
-                    if err.raw_os_error() == Some(libc::ELOOP) {
-                        return ManagerError::PreflightRejected {
-                            cause: format!(
-                                "Refused to follow symbolic link at SQLite DB `{}`.",
-                                db_path.display()
-                            ),
-                            next_step:
-                                "Remove the unexpected symbolic link inside the state directory."
-                                    .to_string(),
-                        };
-                    }
-                    storage_err(
-                        &format!("Failed to open SQLite DB `{}`", db_path.display()),
-                        err,
-                    )
-                })?;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(|err| ManagerError::Io {
+        let existed_before = match std::fs::symlink_metadata(&checked_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(ManagerError::PreflightRejected {
                         cause: format!(
-                            "Failed to set private 0600 permissions on `{}`: {err}.",
-                            db_path.display()
+                            "Refused to follow symbolic link at SQLite DB `{}`.",
+                            checked_path.display()
                         ),
-                        next_step: "Verify ownership inside the state directory.".to_string(),
-                    })?;
+                        next_step:
+                            "Remove the unexpected symbolic link inside the state directory."
+                                .to_string(),
+                    });
+                }
+                true
             }
-            #[cfg(not(unix))]
-            {
-                let _ = opts.open(db_path).map_err(|err| {
-                    storage_err(
-                        &format!("Failed to open SQLite DB `{}`", db_path.display()),
-                        err,
-                    )
-                })?;
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(storage_err(
+                    &format!("Failed to inspect SQLite DB `{}`", checked_path.display()),
+                    err,
+                ));
             }
-        }
+        };
 
-        let conn = Connection::open(db_path).map_err(|e| {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(&checked_path, flags).map_err(|e| {
+            if std::fs::symlink_metadata(&checked_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Refused to follow symbolic link at SQLite DB `{}`.",
+                        checked_path.display()
+                    ),
+                    next_step: "Remove the unexpected symbolic link inside the state directory."
+                        .to_string(),
+                };
+            }
             storage_err(
-                &format!("Failed to open SQLite DB `{}`", db_path.display()),
+                &format!("Failed to open SQLite DB `{}`", checked_path.display()),
                 e,
             )
         })?;
-        set_private_file_permissions(db_path)?;
+
+        if !existed_before {
+            if let Some(parent) = checked_path.parent() {
+                reject_symlinks_under_root("state_sqlite", parent, &checked_path)?;
+            }
+            set_private_file_permissions(&checked_path)?;
+        }
 
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -455,10 +458,9 @@ impl SqliteStateStore {
 
         let mut store = Self {
             conn,
-            path: db_path.to_path_buf(),
+            path: checked_path,
         };
         store.run_migrations()?;
-        set_private_file_permissions(db_path)?;
         Ok(store)
     }
 
@@ -639,6 +641,34 @@ impl SqliteStateStore {
             )
             .optional()
             .map_err(|e| storage_err("Failed to query account", e))
+    }
+
+    pub fn list_accounts(&self) -> Result<Vec<AccountRecord>, ManagerError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, display_name, kind, remote_name, remote_root_folder_id,
+                        config_path, auth_status, created_at, updated_at
+                 FROM accounts ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| storage_err("Failed to prepare account listing query", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AccountRecord {
+                    id: AccountId::new(row.get::<_, String>(0)?),
+                    display_name: row.get(1)?,
+                    kind: row.get(2)?,
+                    remote_name: row.get(3)?,
+                    remote_root_folder_id: row.get(4)?,
+                    config_path: PathBuf::from(row.get::<_, String>(5)?),
+                    auth_status: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| storage_err("Failed to query accounts", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| storage_err("Failed to collect account rows", e))
     }
 
     pub fn insert_mapping(&self, m: &MappingRecord) -> Result<(), ManagerError> {

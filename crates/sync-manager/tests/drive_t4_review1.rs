@@ -147,11 +147,11 @@ fn startup_cleans_leftover_temp_and_rclone_backup_files_in_account_dir() {
     let acct_dir = state_dir.join("accounts/drive-a");
     fs::create_dir_all(&acct_dir).unwrap();
 
-    let leftover_tmp = acct_dir.join(".rclone.conf.setup.99999.0");
-    let leftover_bak = acct_dir.join("rclone.conf.987654321");
+    let leftover_tmp = acct_dir.join(".foldersync-setup-tmp-deadbeef.conf");
+    let rclone_old_bak = acct_dir.join("rclone.conf.old987654321");
     let real_cfg = acct_dir.join("rclone.conf");
     fs::write(&leftover_tmp, b"[household]\nclient_secret = leaked\n").unwrap();
-    fs::write(&leftover_bak, b"[household]\nclient_secret = backup\n").unwrap();
+    fs::write(&rclone_old_bak, b"RCLONE_ENCRYPT_V0:\nEncryptedBackup==\n").unwrap();
     fs::write(
         &real_cfg,
         b"# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nCipher==\n",
@@ -165,11 +165,11 @@ fn startup_cleans_leftover_temp_and_rclone_backup_files_in_account_dir() {
 
     assert!(
         !leftover_tmp.exists(),
-        "leftover setup temp file must be removed on startup"
+        "leftover FolderSync setup temp file must be removed on startup"
     );
     assert!(
-        !leftover_bak.exists(),
-        "leftover rclone backup file must be removed on startup"
+        rclone_old_bak.exists(),
+        "rclone's own .old* encrypted backup must be preserved on startup"
     );
     assert!(
         real_cfg.exists(),
@@ -361,10 +361,10 @@ fn drive_auth_without_saved_token_is_not_ready_and_can_resume() {
     let helper_factory =
         helper_factory_for_store(&tmp.path().join("helpers"), Arc::clone(&secret_store));
 
-    // Hybrid runner: real pinned rclone for config encryption/check/dump, fake for reconnect.
+    // Hybrid runner: real pinned rclone for config encryption/check/redacted, fake for reconnect & lsjson.
     struct MockReconnectRunner {
         fake_reconnect: FakeProcessRunner,
-        dump_override: std::sync::Mutex<Option<String>>,
+        redacted_override: std::sync::Mutex<Option<String>>,
     }
     impl rclone_adapter::ProcessRunner for MockReconnectRunner {
         fn spawn(
@@ -383,14 +383,27 @@ fn drive_auth_without_saved_token_is_not_ready_and_can_resume() {
                 return self.fake_reconnect.spawn(spec, options);
             }
             if args.first().map(String::as_str) == Some("config")
-                && args.get(1).map(String::as_str) == Some("dump")
-                && let Some(json) = self.dump_override.lock().unwrap().clone()
+                && args.get(1).map(String::as_str) == Some("redacted")
+                && let Some(ini) = self.redacted_override.lock().unwrap().clone()
             {
                 let f = FakeProcessRunner::new();
                 f.push_run(FakeRunScript {
                     lines: vec![OutputLine {
                         stream: StreamKind::Stdout,
-                        text: json,
+                        text: ini,
+                        truncated: false,
+                    }],
+                    ..Default::default()
+                });
+                return f.spawn(spec, options);
+            }
+            if args.first().map(String::as_str) == Some("lsjson") {
+                let f = FakeProcessRunner::new();
+                f.push_run(FakeRunScript {
+                    lines: vec![OutputLine {
+                        stream: StreamKind::Stdout,
+                        text: r#"[{"Path":"Data","Name":"Data","ID":"1Data","IsDir":true}]"#
+                            .to_string(),
                         truncated: false,
                     }],
                     ..Default::default()
@@ -411,7 +424,7 @@ fn drive_auth_without_saved_token_is_not_ready_and_can_resume() {
         }],
         ..Default::default()
     });
-    // Attempt 2: reconnect succeeds and config dump now contains a token!
+    // Attempt 2: reconnect succeeds and config redacted now shows token = XXX!
     fake_reconnect.push_run(FakeRunScript {
         lines: vec![OutputLine {
             stream: StreamKind::Stderr,
@@ -423,7 +436,7 @@ fn drive_auth_without_saved_token_is_not_ready_and_can_resume() {
 
     let runner = Arc::new(MockReconnectRunner {
         fake_reconnect,
-        dump_override: std::sync::Mutex::new(None),
+        redacted_override: std::sync::Mutex::new(None),
     });
 
     let mut cfg = AccountServiceConfig::with_state_dir(&state_dir);
@@ -433,7 +446,7 @@ fn drive_auth_without_saved_token_is_not_ready_and_can_resume() {
     cfg.password_command_factory = Some(helper_factory);
     let svc = AccountService::new(cfg).unwrap();
 
-    // Attempt 1: real config dump has NO token -> MUST fail with AuthenticationRequired!
+    // Attempt 1: real config redacted has NO token -> MUST fail with AuthenticationRequired!
     let err = svc
         .add_drive_account(
             AddDriveAccountRequest {
@@ -460,10 +473,8 @@ fn drive_auth_without_saved_token_is_not_ready_and_can_resume() {
     assert_eq!(rec1.auth_status, "authentication_required");
 
     // Attempt 2: simulate rclone saving a token and resume via reconnect_drive_account!
-    *runner.dump_override.lock().unwrap() = Some(
-        r#"{"household":{"type":"drive","root_folder_id":"0ASharedParent","token":"{\"access_token\":\"ya29.fake\",\"refresh_token\":\"1//fake\"}"}}"#
-            .to_string(),
-    );
+    *runner.redacted_override.lock().unwrap() =
+        Some("[household]\ntype = drive\nroot_folder_id = XXX\ntoken = XXX\n".to_string());
     let res = svc
         .reconnect_drive_account(&AccountId::new("drive-retry"), None)
         .unwrap();
@@ -496,7 +507,6 @@ type = drive
 client_id = cid
 client_secret = csec
 root_folder_id = OldWrongRoot
-shared_with_me = true
 token = {\"access_token\":\"tok\",\"refresh_token\":\"ref\"}
 ",
     )

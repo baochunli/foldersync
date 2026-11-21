@@ -18,10 +18,10 @@ pub use auth::{
 };
 pub use config::{
     AccountConfigLock, ConfigError, DriveRemoteConfigSpec, ImportRemoteSpec, ImportedRemoteInfo,
-    ParsedIniSection, RCLONE_ENCRYPT_HEADER, RemoteConfigSummary,
-    cleanup_account_temp_and_backup_files, create_drive_remote_config,
+    ParsedIniSection, RCLONE_ENCRYPT_HEADER, RemoteConfigSummary, SETUP_TEMP_PREFIX,
+    check_config_recovery_state, cleanup_account_setup_temp_files, create_drive_remote_config,
     create_drive_remote_config_locked, encrypted_remote_has_token,
-    enforce_private_config_permissions, extract_single_remote_section,
+    enforce_private_config_permissions, extract_single_remote_section, find_rclone_config_backups,
     import_single_remote_into_encrypted_config, import_single_remote_into_encrypted_config_locked,
     init_encrypted_config, init_encrypted_config_locked, is_encrypted_config_content,
     is_global_default_rclone_config, list_encrypted_config_remotes, verify_encrypted_config,

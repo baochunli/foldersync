@@ -344,15 +344,21 @@ fn drive_import_overrides_root_folder_id_strips_shared_with_me_and_rejects_missi
 type = drive
 client_id = cid
 client_secret = csec
+scope = drive
+root_folder_id = OldWrongRoot
+token = {\"access_token\":\"tok\",\"refresh_token\":\"ref\"}
+
+[shared_drive]
+type = drive
+client_id = cid
+client_secret = csec
 root_folder_id = OldWrongRoot
 shared_with_me = true
-token = {\"access_token\":\"tok\",\"refresh_token\":\"ref\"}
 
 [no_root_drive]
 type = drive
 client_id = cid
 client_secret = csec
-shared_with_me = true
 ";
     fs::write(&src_cfg, src_bytes).unwrap();
 
@@ -360,7 +366,7 @@ shared_with_me = true
     fs::create_dir_all(&helper_dir).unwrap();
     let pw_cmd = make_test_password_helper(&helper_dir, "drive-import-pw");
 
-    // 1. Importing `my_drive` with requested shared-parent ID overrides root_folder_id and strips shared_with_me.
+    // 1. Clean allowlisted Drive remote overrides root_folder_id and passes `config redacted`.
     let target_cfg = ws.path("state/accounts/d1/rclone.conf");
     let imported = import_single_remote_into_encrypted_config(
         &engine,
@@ -386,14 +392,32 @@ shared_with_me = true
     let summaries =
         list_encrypted_config_remotes(&engine, &RealProcessRunner, &target_cfg, &pw_cmd).unwrap();
     assert_eq!(summaries.len(), 1);
-    assert_eq!(
-        summaries[0].root_folder_id.as_deref(),
-        Some("0ARequestedSharedParent")
-    );
+    assert!(summaries[0].has_root_folder_id);
     assert!(!summaries[0].shared_with_me);
     assert!(summaries[0].has_token);
 
-    // 2. Importing a Drive remote with NO root_folder_id anywhere must be rejected.
+    // 2. Drive remote containing `shared_with_me` must be rejected by the allowlist.
+    let shared_err = import_single_remote_into_encrypted_config(
+        &engine,
+        &RealProcessRunner,
+        &ImportRemoteSpec {
+            source_config_path: src_cfg.clone(),
+            source_remote_name: "shared_drive".to_string(),
+            target_remote_name: "household".to_string(),
+            target_config_path: ws.path("state/accounts/d_shared/rclone.conf"),
+            lock_path: ws.path("state/accounts/d_shared/config.lock"),
+            password_command: pw_cmd.clone(),
+            override_root_folder_id: Some("0ARequestedSharedParent".to_string()),
+            allow_global_default_source: false,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        shared_err,
+        ConfigError::UnsupportedDriveImportOption { .. }
+    ));
+
+    // 3. Importing a Drive remote with NO root_folder_id anywhere must be rejected.
     let err = import_single_remote_into_encrypted_config(
         &engine,
         &RealProcessRunner,

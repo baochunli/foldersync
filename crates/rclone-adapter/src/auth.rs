@@ -17,9 +17,10 @@ use thiserror::Error;
 
 use crate::{
     config::{
-        AccountConfigLock, ConfigError, cleanup_account_temp_and_backup_files,
-        encrypted_remote_has_token_with_manifest, enforce_private_config_permissions,
-        is_encrypted_config_content, stderr_indicates_auth_failure,
+        AccountConfigLock, ConfigError, check_config_recovery_state,
+        cleanup_account_setup_temp_files, encrypted_remote_has_token_with_manifest,
+        enforce_private_config_permissions, is_encrypted_config_content,
+        stderr_indicates_auth_failure,
     },
     log_parser::strip_ansi_codes,
     process::{
@@ -254,6 +255,7 @@ pub(crate) fn run_drive_auth_with_manifest_locked(
     runner: &dyn ProcessRunner,
     on_auth_url: Option<AuthUrlCallback>,
 ) -> Result<DriveAuthOutcome, DriveAuthError> {
+    check_config_recovery_state(req.config_path())?;
     enforce_private_config_permissions(req.config_path())?;
     let spec = req.build_verified_spec(manifest)?;
 
@@ -284,27 +286,32 @@ pub(crate) fn run_drive_auth_with_manifest_locked(
     let run_out = handle.wait()?;
     let observed_url = observer_thread.join().unwrap_or(None);
 
-    // Always re-enforce 0600 permissions and remove any leftover backup/temp files.
+    // Clean ONLY FolderSync setup temp files; NEVER delete rclone.conf.old* backups.
+    if let Some(acct_dir) = req.config_path().parent() {
+        let _ = cleanup_account_setup_temp_files(acct_dir);
+    }
+    // If rclone failed mid-save leaving `rclone.conf` missing and `rclone.conf.old*`
+    // present, report RecoveryNeeded immediately without touching any files.
+    check_config_recovery_state(req.config_path())?;
     if req.config_path().exists() {
         enforce_private_config_permissions(req.config_path())?;
     }
-    if let Some(acct_dir) = req.config_path().parent() {
-        let _ = cleanup_account_temp_and_backup_files(acct_dir);
-    }
 
     if !run_out.exit_status.is_success() {
+        // Never include child stdout in config/auth errors.
         let stderr = run_out.output.stderr_text();
-        let stdout = run_out.output.stdout_text();
-        let combined = if stderr.is_empty() { stdout } else { stderr };
-        if stderr_indicates_auth_failure(&combined) {
-            return Err(DriveAuthError::AuthenticationRequired {
-                reason: combined.trim().to_string(),
-            });
+        let detail = if stderr.trim().is_empty() {
+            "rclone `config reconnect` exited without stderr".to_string()
+        } else {
+            stderr.trim().to_string()
+        };
+        if stderr_indicates_auth_failure(&detail) {
+            return Err(DriveAuthError::AuthenticationRequired { reason: detail });
         }
         return Err(DriveAuthError::AuthorizationFailed {
             code: run_out.exit_status.code,
             signal: run_out.exit_status.signal,
-            detail: combined.trim().to_string(),
+            detail,
         });
     }
 
@@ -319,7 +326,8 @@ pub(crate) fn run_drive_auth_with_manifest_locked(
         }));
     }
 
-    // Confirm rclone actually persisted an OAuth token (presence only; never log token).
+    // Confirm rclone actually persisted an OAuth token via `config redacted`
+    // (presence only; never runs `config dump` and never logs tokens).
     let has_token = encrypted_remote_has_token_with_manifest(
         req.engine(),
         manifest,
@@ -452,7 +460,7 @@ mod tests {
             DriveAuthRequest::new(engine, cfg.clone(), lock_path.clone(), "household", pw).unwrap();
         let lock = AccountConfigLock::acquire(&lock_path).unwrap();
 
-        // Case 1: reconnect exits 0, encryption check passes, config dump has token -> Ok.
+        // Case 1: reconnect exits 0, encryption check passes, config redacted has token -> Ok.
         let runner_ok = FakeProcessRunner::new();
         runner_ok.push_run(FakeRunScript {
             lines: vec![
@@ -471,11 +479,11 @@ mod tests {
         });
         // config encryption check
         runner_ok.push_run(FakeRunScript::default());
-        // config dump with saved token
+        // config redacted with saved token
         runner_ok.push_run(FakeRunScript {
             lines: vec![OutputLine {
                 stream: StreamKind::Stdout,
-                text: r#"{"household":{"type":"drive","root_folder_id":"0ARoot","token":"{\"access_token\":\"tok\",\"refresh_token\":\"ref\"}"}}"#.to_string(),
+                text: "[household]\ntype = drive\nroot_folder_id = XXX\ntoken = XXX\n### Double check the config for sensitive info before posting publicly\n".to_string(),
                 truncated: false,
             }],
             ..Default::default()
@@ -515,6 +523,13 @@ mod tests {
         assert_eq!(argv0[2], "household:");
         assert!(argv0.contains(&"--ask-password=false".to_string()));
         assert!(argv0.contains(&"--auto-confirm".to_string()));
+        let argv2: Vec<String> = specs[2]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv2[0], "config");
+        assert_eq!(argv2[1], "redacted");
 
         // Case 2: reconnect exits 0 WITHOUT saving a token -> TokenNotSaved!
         let runner_no_token = FakeProcessRunner::new();
@@ -523,7 +538,7 @@ mod tests {
         runner_no_token.push_run(FakeRunScript {
             lines: vec![OutputLine {
                 stream: StreamKind::Stdout,
-                text: r#"{"household":{"type":"drive","root_folder_id":"0ARoot"}}"#.to_string(),
+                text: "[household]\ntype = drive\nroot_folder_id = XXX\n".to_string(),
                 truncated: false,
             }],
             ..Default::default()
