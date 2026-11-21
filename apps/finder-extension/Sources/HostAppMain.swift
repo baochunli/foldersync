@@ -2,8 +2,13 @@ import Cocoa
 import FinderSync
 import os.log
 
-final class HostAppDelegate: NSObject, NSApplicationDelegate {
-    private let logger = Logger(subsystem: "dev.foldersync.app", category: "host")
+/// Throwaway mock host app for the Finder Sync feasibility spike.
+///
+/// Unlike the future v1 Rust manager (which will validate, dispatch manager
+/// commands, and record runs), this mock host only validates incoming action
+/// JSON files against the v1 action contract, logs them, and deletes them.
+final class MockHostAppDelegate: NSObject, NSApplicationDelegate {
+    private let logger = Logger(subsystem: "dev.foldersync.app", category: "mock-host")
     private let sharedDirectoryURL: URL
     private let actionsDirectoryURL: URL
     private let actionRequestedNotification: String
@@ -19,7 +24,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let enabled = FIFinderSyncController.isExtensionEnabled
-        record("HOST_READY extension_enabled=\(enabled) shared_dir=\(sharedDirectoryURL.path)")
+        record("MOCK_HOST_READY extension_enabled=\(enabled) shared_dir=\(sharedDirectoryURL.path)")
 
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let observer = Unmanaged.passUnretained(self).toOpaque()
@@ -28,7 +33,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate {
             observer,
             { _, observerPtr, _, _, _ in
                 guard let observerPtr else { return }
-                let delegate = Unmanaged<HostAppDelegate>.fromOpaque(observerPtr).takeUnretainedValue()
+                let delegate = Unmanaged<MockHostAppDelegate>.fromOpaque(observerPtr).takeUnretainedValue()
                 DispatchQueue.main.async {
                     delegate.drainPendingActions()
                 }
@@ -41,6 +46,8 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate {
         drainPendingActions()
     }
 
+    /// Mock-only drain: validates against the v1 action contract, logs, and deletes
+    /// each queued action file without executing any sync operation.
     private func drainPendingActions() {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
@@ -53,8 +60,10 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate {
 
         for fileURL in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where fileURL.pathExtension == "json" {
             if let data = try? Data(contentsOf: fileURL),
-               let req = try? JSONDecoder().decode(ActionRequest.self, from: data) {
-                record("ACTION_RECEIVED action=\(req.action.rawValue) mapping_id=\(req.mappingId ?? "none") id=\(req.id)")
+               let req = SnapshotEvaluator.decodeValidActionRequest(data: data) {
+                record("MOCK_ACTION_RECEIVED action=\(req.action.rawValue) mapping_id=\(req.mappingId ?? "none") id=\(req.id)")
+            } else {
+                record("MOCK_ACTION_REJECTED file=\(fileURL.lastPathComponent)")
             }
             try? fm.removeItem(at: fileURL)
         }
@@ -94,16 +103,21 @@ struct FolderSyncHostMain {
             return
         }
 
-        let sharedDirPath = (info["FolderSyncSharedDir"] as? String)
-            ?? FileManager.default.temporaryDirectory.appendingPathComponent("foldersync-finder-shared").path
+        let sharedDirURL: URL
+        if let configured = info["FolderSyncSharedDir"] as? String, !configured.isEmpty {
+            sharedDirURL = URL(fileURLWithPath: configured, isDirectory: true)
+        } else {
+            sharedDirURL = SnapshotEvaluator.defaultSpikeSharedDirectoryURL()
+        }
+
         let actionNotif = (info["FolderSyncDarwinActionNotification"] as? String)
             ?? "dev.foldersync.finder.action-requested"
         let actionLogPath = ProcessInfo.processInfo.environment["FOLDERSYNC_HOST_LOG"]
 
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        let delegate = HostAppDelegate(
-            sharedDirectoryURL: URL(fileURLWithPath: sharedDirPath, isDirectory: true),
+        let delegate = MockHostAppDelegate(
+            sharedDirectoryURL: sharedDirURL,
             actionRequestedNotification: actionNotif,
             actionLogPath: actionLogPath
         )

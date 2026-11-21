@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build FolderSync's macOS Finder Sync extension (.appex) and a minimal throwaway
-# host app bundle using Xcode Command Line Tools only (swiftc + codesign + plutil).
+# mock host app bundle using Xcode Command Line Tools only (swiftc + codesign + plutil).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -22,9 +22,9 @@ Usage: $(basename "$0") [options]
 Options:
   --out <dir>         Output directory for the built .app and .appex
                       (default: <repo>/target/finder-extension)
-  --shared-dir <dir>  Override the shared snapshot/action directory for local
-                      development or temp-dir verification (never touches
-                      ~/Library/Application Support/FolderSync).
+  --shared-dir <dir>  Disposable shared snapshot/action directory used by BOTH
+                      the extension and the mock host app
+                      (default: <out>/spike-shared; never touches real app state)
   --bundle-id <id>    Host bundle identifier (default: dev.foldersync.app;
                       extension uses <id>.finder-extension)
   --sign <identity>   codesign identity (default: "-" for ad hoc signing)
@@ -60,9 +60,17 @@ EXT_BUNDLE_ID="${HOST_BUNDLE_ID}.finder-extension"
 
 mkdir -p "$OUT_DIR"
 
+CREATED_DEFAULT_SHARED=0
+if [[ -z "$SHARED_DIR" ]]; then
+  SHARED_DIR="${OUT_DIR}/spike-shared"
+  CREATED_DEFAULT_SHARED=1
+fi
+mkdir -p "$SHARED_DIR"
+REAL_SHARED_DIR="$(cd "$SHARED_DIR" && pwd -P)"
+
+TEST_BIN="${OUT_DIR}/SnapshotModelTests"
 if [[ "$RUN_TESTS" -eq 1 ]]; then
   echo "==> Running SnapshotModelTests"
-  TEST_BIN="${OUT_DIR}/SnapshotModelTests"
   swiftc -parse-as-library \
     -target "$TARGET" -sdk "$SDK_PATH" \
     "${SCRIPT_DIR}/Sources/SnapshotModel.swift" \
@@ -87,7 +95,7 @@ swiftc -parse-as-library -application-extension \
   "${SCRIPT_DIR}/Sources/BadgeRenderer.swift" \
   "${SCRIPT_DIR}/Sources/FinderSyncExtension.swift"
 
-echo "==> Compiling throwaway host app (${TARGET})"
+echo "==> Compiling throwaway mock host app (${TARGET})"
 swiftc -parse-as-library \
   -target "$TARGET" -sdk "$SDK_PATH" \
   -framework Cocoa -framework FinderSync -framework Foundation \
@@ -101,16 +109,20 @@ cp "${SCRIPT_DIR}/HostInfo.plist" "${APP_BUNDLE}/Contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "$HOST_BUNDLE_ID" "${APP_BUNDLE}/Contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "$EXT_BUNDLE_ID" "${APPEX_BUNDLE}/Contents/Info.plist"
 plutil -replace FolderSyncHostBundleIdentifier -string "$HOST_BUNDLE_ID" "${APPEX_BUNDLE}/Contents/Info.plist"
+plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${APPEX_BUNDLE}/Contents/Info.plist"
+plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${APP_BUNDLE}/Contents/Info.plist"
 
+# Scope the spike extension strictly to the disposable SHARED_DIR (both raw and
+# symlink-resolved paths so /var -> /private/var matches cleanly).
 ENTITLEMENTS_PATH="${OUT_DIR}/FinderExtension.generated.entitlements"
-if [[ -n "$SHARED_DIR" ]]; then
-  # Resolve symlinks (e.g. /var -> /private/var) so the sandbox exception matches both forms.
-  mkdir -p "$SHARED_DIR"
-  REAL_SHARED_DIR="$(cd "$SHARED_DIR" && pwd -P)"
-  plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${APPEX_BUNDLE}/Contents/Info.plist"
-  plutil -replace FolderSyncSharedDir -string "$REAL_SHARED_DIR" "${APP_BUNDLE}/Contents/Info.plist"
+if [[ "${SHARED_DIR%/}" == "${REAL_SHARED_DIR%/}" ]]; then
+  EXCEPTION_ENTRIES="        <string>${REAL_SHARED_DIR%/}/</string>"
+else
+  EXCEPTION_ENTRIES="        <string>${SHARED_DIR%/}/</string>
+        <string>${REAL_SHARED_DIR%/}/</string>"
+fi
 
-  cat > "$ENTITLEMENTS_PATH" <<EOF
+cat > "$ENTITLEMENTS_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -119,16 +131,13 @@ if [[ -n "$SHARED_DIR" ]]; then
     <true/>
     <key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
     <array>
-        <string>${SHARED_DIR%/}/</string>
-        <string>${REAL_SHARED_DIR%/}/</string>
+${EXCEPTION_ENTRIES}
     </array>
 </dict>
 </plist>
 EOF
-else
-  cp "${SCRIPT_DIR}/FinderExtension.entitlements" "$ENTITLEMENTS_PATH"
-fi
 
+plutil -lint "${SCRIPT_DIR}/FinderExtension.entitlements" >/dev/null
 plutil -lint "${APPEX_BUNDLE}/Contents/Info.plist" >/dev/null
 plutil -lint "${APP_BUNDLE}/Contents/Info.plist" >/dev/null
 plutil -lint "$ENTITLEMENTS_PATH" >/dev/null
@@ -140,15 +149,24 @@ codesign --verify --deep --strict "$APP_BUNDLE"
 
 echo ""
 echo "Built and signed successfully:"
-echo "  Host app:  ${APP_BUNDLE}"
-echo "  Extension: ${APPEX_BUNDLE}"
-echo "  Bundle ID: ${EXT_BUNDLE_ID}"
+echo "  Mock host app: ${APP_BUNDLE}"
+echo "  Extension:     ${APPEX_BUNDLE}"
+echo "  Bundle ID:     ${EXT_BUNDLE_ID}"
+echo "  Shared dir:    ${REAL_SHARED_DIR}"
 echo ""
 echo "Local dev registration (temp folder verification only):"
 echo "  pluginkit -a \"${APPEX_BUNDLE}\""
 echo "  pluginkit -e use -i \"${EXT_BUNDLE_ID}\""
 echo ""
-echo "Cleanup when done:"
+echo "Cleanup when done (stops mock host, unregisters extension, removes spike artifacts only):"
+echo "  osascript -e 'tell application id \"${HOST_BUNDLE_ID}\" to quit' 2>/dev/null || true"
 echo "  pluginkit -e ignore -i \"${EXT_BUNDLE_ID}\""
 echo "  pluginkit -r \"${APPEX_BUNDLE}\""
-echo "  rm -rf \"${OUT_DIR}\""
+CLEANUP_TARGETS="\"${APP_BUNDLE}\" \"${ENTITLEMENTS_PATH}\""
+if [[ "$RUN_TESTS" -eq 1 ]]; then
+  CLEANUP_TARGETS="${CLEANUP_TARGETS} \"${TEST_BIN}\""
+fi
+if [[ "$CREATED_DEFAULT_SHARED" -eq 1 ]]; then
+  CLEANUP_TARGETS="${CLEANUP_TARGETS} \"${SHARED_DIR}\""
+fi
+echo "  rm -rf ${CLEANUP_TARGETS}"

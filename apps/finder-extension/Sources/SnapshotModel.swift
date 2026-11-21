@@ -97,6 +97,11 @@ public struct StatusSnapshot: Codable, Equatable {
     }
 }
 
+public enum SnapshotReadResult: Equatable {
+    case valid(StatusSnapshot)
+    case failed(reason: String)
+}
+
 public enum SnapshotEvaluation: Equatable {
     case fresh(StatusSnapshot)
     case stale(StatusSnapshot?, reason: String)
@@ -114,6 +119,20 @@ public enum ActionKind: String, Codable, Equatable {
     case pause = "pause"
     case openApp = "open_app"
     case showLastRun = "show_last_run"
+
+    /// Only `open_app` may omit `mapping_id`; all other actions require a mapping.
+    public var requiresMapping: Bool {
+        switch self {
+        case .syncNow, .pause, .showLastRun:
+            return true
+        case .openApp:
+            return false
+        }
+    }
+}
+
+public enum ActionValidationError: Error, Equatable {
+    case invalidActionRequest
 }
 
 public struct ActionRequest: Codable, Equatable {
@@ -137,6 +156,19 @@ public struct ActionRequest: Codable, Equatable {
         self.mappingId = mappingId
     }
 
+    public var isValid: Bool {
+        guard version == snapshotSchemaVersion else {
+            return false
+        }
+        if action.requiresMapping {
+            guard let mappingId,
+                  !mappingId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return false
+            }
+        }
+        return true
+    }
+
     enum CodingKeys: String, CodingKey {
         case version
         case id
@@ -147,6 +179,13 @@ public struct ActionRequest: Codable, Equatable {
 }
 
 public enum SnapshotEvaluator {
+    /// Disposable default shared directory used by both the spike extension and
+    /// throwaway mock host when `FolderSyncSharedDir` is not set in Info.plist.
+    public static func defaultSpikeSharedDirectoryURL() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("foldersync-finder-spike-shared", isDirectory: true)
+    }
+
     public static func formatISO8601(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
@@ -185,18 +224,40 @@ public enum SnapshotEvaluator {
         guard let snapshot else {
             return .stale(nil, reason: "Status unavailable")
         }
-        guard hostAppRunning else {
-            return .stale(snapshot, reason: "FolderSync is not running")
+        return evaluate(
+            readResult: .valid(snapshot),
+            lastKnownSnapshot: snapshot,
+            now: now,
+            hostAppRunning: hostAppRunning
+        )
+    }
+
+    /// Evaluates the latest snapshot read outcome. When reading or decoding fails,
+    /// always returns `.stale` while preserving `lastKnownSnapshot` solely so
+    /// previously known mapping roots display the stale badge.
+    public static func evaluate(
+        readResult: SnapshotReadResult,
+        lastKnownSnapshot: StatusSnapshot?,
+        now: Date,
+        hostAppRunning: Bool
+    ) -> SnapshotEvaluation {
+        switch readResult {
+        case .failed(let reason):
+            return .stale(lastKnownSnapshot, reason: reason)
+        case .valid(let snapshot):
+            guard hostAppRunning else {
+                return .stale(snapshot, reason: "FolderSync is not running")
+            }
+            guard let generatedDate = parseISO8601(snapshot.generatedAt) else {
+                return .stale(snapshot, reason: "Status timestamp is invalid")
+            }
+            let maxAge = TimeInterval(max(1, snapshot.staleAfterSeconds ?? defaultStaleAfterSeconds))
+            let age = now.timeIntervalSince(generatedDate)
+            if age > maxAge {
+                return .stale(snapshot, reason: "Status is outdated")
+            }
+            return .fresh(snapshot)
         }
-        guard let generatedDate = parseISO8601(snapshot.generatedAt) else {
-            return .stale(snapshot, reason: "Status timestamp is invalid")
-        }
-        let maxAge = TimeInterval(max(1, snapshot.staleAfterSeconds ?? defaultStaleAfterSeconds))
-        let age = now.timeIntervalSince(generatedDate)
-        if age > maxAge {
-            return .stale(snapshot, reason: "Status is outdated")
-        }
-        return .fresh(snapshot)
     }
 
     public static func canonicalPath(_ path: String) -> String {
@@ -251,10 +312,21 @@ public enum SnapshotEvaluator {
         }
     }
 
+    public static func decodeValidActionRequest(data: Data) -> ActionRequest? {
+        guard let request = try? JSONDecoder().decode(ActionRequest.self, from: data),
+              request.isValid else {
+            return nil
+        }
+        return request
+    }
+
     public static func writeActionRequest(
         _ request: ActionRequest,
         toDirectory directory: URL
     ) throws -> URL {
+        guard request.isValid else {
+            throw ActionValidationError.invalidActionRequest
+        }
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
         let encoder = JSONEncoder()

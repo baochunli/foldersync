@@ -14,7 +14,8 @@ final class FolderSyncFinderExtension: FIFinderSync {
     private let snapshotUpdatedNotification: String
     private let actionRequestedNotification: String
 
-    private var cachedSnapshot: StatusSnapshot?
+    private var lastReadResult: SnapshotReadResult = .failed(reason: "Status unavailable")
+    private var lastKnownSnapshot: StatusSnapshot?
     private var lastEvaluation: SnapshotEvaluation = .stale(nil, reason: "Status unavailable")
     private var currentDirectoryURLs: Set<URL> = []
     private var observedRootURLs: Set<URL> = []
@@ -24,9 +25,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
         let info = Bundle.main.infoDictionary ?? [:]
         let configuredSharedDir = (info["FolderSyncSharedDir"] as? String) ?? ""
         if configuredSharedDir.isEmpty {
-            let realHome = Self.realUserHomePath()
-            self.sharedDirectoryURL = URL(fileURLWithPath: realHome)
-                .appendingPathComponent("Library/Application Support/FolderSync/finder", isDirectory: true)
+            self.sharedDirectoryURL = SnapshotEvaluator.defaultSpikeSharedDirectoryURL()
         } else {
             self.sharedDirectoryURL = URL(fileURLWithPath: configuredSharedDir, isDirectory: true)
         }
@@ -66,13 +65,6 @@ final class FolderSyncFinderExtension: FIFinderSync {
     }
 
     // MARK: - Setup
-
-    private static func realUserHomePath() -> String {
-        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
-            return String(cString: dir)
-        }
-        return NSHomeDirectory()
-    }
 
     private static func derivedHostBundleIdentifier() -> String {
         guard let extId = Bundle.main.bundleIdentifier else {
@@ -129,37 +121,61 @@ final class FolderSyncFinderExtension: FIFinderSync {
         !NSRunningApplication.runningApplications(withBundleIdentifier: hostBundleIdentifier).isEmpty
     }
 
-    private func reloadSnapshotAndRefresh(updateDirectoryURLs: Bool) {
-        let loaded: StatusSnapshot?
+    private func readSnapshotFromDisk() -> SnapshotReadResult {
+        let data: Data
         do {
-            let data = try Data(contentsOf: snapshotFileURL)
-            loaded = SnapshotEvaluator.decode(data: data)
-            if loaded == nil {
-                logger.warning("Snapshot JSON invalid or unsupported version at \(self.snapshotFileURL.path, privacy: .public)")
-            }
+            data = try Data(contentsOf: snapshotFileURL)
         } catch {
-            loaded = nil
             logger.notice("Snapshot unreadable at \(self.snapshotFileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return .failed(reason: "Status unavailable")
         }
+        guard let decoded = SnapshotEvaluator.decode(data: data) else {
+            logger.warning("Snapshot JSON invalid or unsupported version at \(self.snapshotFileURL.path, privacy: .public)")
+            return .failed(reason: "Status unavailable (invalid snapshot)")
+        }
+        return .valid(decoded)
+    }
+
+    private func evaluateCurrentState() -> SnapshotEvaluation {
+        stateLock.lock()
+        let readResult = lastReadResult
+        let knownSnapshot = lastKnownSnapshot
+        stateLock.unlock()
+
+        return SnapshotEvaluator.evaluate(
+            readResult: readResult,
+            lastKnownSnapshot: knownSnapshot,
+            now: Date(),
+            hostAppRunning: isHostAppRunning()
+        )
+    }
+
+    private func reloadSnapshotAndRefresh(updateDirectoryURLs: Bool) {
+        let readResult = readSnapshotFromDisk()
+
+        stateLock.lock()
+        lastReadResult = readResult
+        if case .valid(let loaded) = readResult {
+            lastKnownSnapshot = loaded
+        }
+        let knownSnapshot = lastKnownSnapshot
+        let previousDirectoryURLs = currentDirectoryURLs
+        let existingObserved = observedRootURLs
+        stateLock.unlock()
 
         let evaluation = SnapshotEvaluator.evaluate(
-            snapshot: loaded ?? cachedSnapshot,
+            readResult: readResult,
+            lastKnownSnapshot: knownSnapshot,
             now: Date(),
             hostAppRunning: isHostAppRunning()
         )
 
         stateLock.lock()
-        if let loaded {
-            cachedSnapshot = loaded
-        }
         lastEvaluation = evaluation
-        let snapshotForRoots = evaluation.snapshot
-        let previousDirectoryURLs = currentDirectoryURLs
-        let existingObserved = observedRootURLs
         stateLock.unlock()
 
         let controller = FIFinderSyncController.default()
-        if updateDirectoryURLs, let snapshotForRoots {
+        if updateDirectoryURLs, let snapshotForRoots = evaluation.snapshot {
             // Do not probe arbitrary user paths with FileManager inside the app sandbox;
             // Finder resolves directoryURLs directly in the host process.
             let newRootURLs = Set(snapshotForRoots.mappings.map {
@@ -193,16 +209,7 @@ final class FolderSyncFinderExtension: FIFinderSync {
     }
 
     override func requestBadgeIdentifier(for url: URL) {
-        // Re-evaluate freshness cheaply so stale status surfaces promptly.
-        stateLock.lock()
-        let snapshot = cachedSnapshot
-        stateLock.unlock()
-
-        let evaluation = SnapshotEvaluator.evaluate(
-            snapshot: snapshot,
-            now: Date(),
-            hostAppRunning: isHostAppRunning()
-        )
+        let evaluation = evaluateCurrentState()
 
         stateLock.lock()
         lastEvaluation = evaluation
@@ -228,15 +235,25 @@ final class FolderSyncFinderExtension: FIFinderSync {
         let controller = FIFinderSyncController.default()
         let targetURL = controller.selectedItemURLs()?.first ?? controller.targetedURL()
 
+        // Re-read snapshot on menu open so deleted/corrupt files surface immediately.
+        let readResult = readSnapshotFromDisk()
         stateLock.lock()
-        let snapshot = cachedSnapshot
+        lastReadResult = readResult
+        if case .valid(let loaded) = readResult {
+            lastKnownSnapshot = loaded
+        }
+        let knownSnapshot = lastKnownSnapshot
         stateLock.unlock()
 
         let evaluation = SnapshotEvaluator.evaluate(
-            snapshot: snapshot,
+            readResult: readResult,
+            lastKnownSnapshot: knownSnapshot,
             now: Date(),
             hostAppRunning: isHostAppRunning()
         )
+        stateLock.lock()
+        lastEvaluation = evaluation
+        stateLock.unlock()
 
         let mapping: MappingSnapshot?
         if let targetURL, let snap = evaluation.snapshot {
@@ -246,6 +263,9 @@ final class FolderSyncFinderExtension: FIFinderSync {
         }
 
         let menu = NSMenu(title: "FolderSync")
+        // Disable AppKit auto-enablement so explicit `isEnabled` flags are respected
+        // (including toolbar clicks outside watched folders).
+        menu.autoenablesItems = false
 
         // Always communicate status in plain text, not color alone.
         let statusTitle: String
@@ -318,6 +338,11 @@ final class FolderSyncFinderExtension: FIFinderSync {
             action: action,
             mappingId: mappingId
         )
+
+        guard request.isValid else {
+            logger.warning("Refused to dispatch invalid action=\(action.rawValue, privacy: .public) without required mapping_id")
+            return
+        }
 
         do {
             let written = try SnapshotEvaluator.writeActionRequest(request, toDirectory: actionsDirectoryURL)
