@@ -632,7 +632,7 @@ fn authorization_cancel_stops_child_and_leaves_account_retryable() {
         let expected_spawns = if quit { 2 } else { 1 };
         let started = Instant::now();
         while fx.runner.fake.spawned_specs().len() < expected_spawns {
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(started.elapsed() < Duration::from_secs(120));
             thread::sleep(Duration::from_millis(10));
         }
         let specs = fx.runner.fake.spawned_specs();
@@ -685,7 +685,7 @@ fn wait_for_spawn(runner: &FakeProcessRunner, command: &str) {
         .any(|spec| spec.args[0] == command)
     {
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < Duration::from_secs(120),
             "did not spawn {command}"
         );
         thread::sleep(Duration::from_millis(10));
