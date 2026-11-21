@@ -70,7 +70,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         let ctrl_l = ctrl.clone();
         let id_rec = m.id.clone();
         status_row = status_row.child(link_button(link.label(), 12.5, move || match link {
-            StatusLink::StartRecovery => ctrl_l.navigate(ScreenRoute::Recovery(id_rec.clone())),
+            StatusLink::StartRecovery => ctrl_l.open_recovery(id_rec.clone()),
             StatusLink::ShowConflicts | StatusLink::Reconnect | StatusLink::ReviewEndpoint => {
                 ctrl_l.navigate(ScreenRoute::Attention)
             }
@@ -153,14 +153,10 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             let cp = cloud_more.clone();
             drop(popup_menu(vec![
                 MenuItem::new("Reveal in Finder").on_select(move || {
-                    c_rev.send(UiCommand::DemoAction(format!(
-                        "Simulated Reveal in Finder for {lp} (demo mode)"
-                    )));
+                    c_rev.send(UiCommand::RevealPath(lp.clone()));
                 }),
                 MenuItem::new("Open cloud folder").on_select(move || {
-                    c_open.send(UiCommand::DemoAction(format!(
-                        "Simulated Open cloud folder for {cp} (demo mode)"
-                    )));
+                    c_open.send(UiCommand::OpenCloudUrl(cp.clone()));
                 }),
                 MenuItem::separator(),
                 MenuItem::new("Remove mapping…").on_select(move || {
@@ -313,9 +309,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     None,
                     None,
                     move || {
-                        c_loc_rev.send(UiCommand::DemoAction(format!(
-                            "Simulated Reveal in Finder for {lp_reveal} (demo mode)"
-                        )));
+                        c_loc_rev.send(UiCommand::RevealPath(lp_reveal.clone()));
                     },
                 ))
                 .child(app_button(
@@ -326,9 +320,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     None,
                     None,
                     move || {
-                        c_loc_open.send(UiCommand::DemoAction(format!(
-                            "Simulated Open cloud folder for {cp_open} (demo mode)"
-                        )));
+                        c_loc_open.send(UiCommand::OpenCloudUrl(cp_open.clone()));
                     },
                 )),
         );
@@ -383,6 +375,9 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     let mut runs_body = table_body().flex_col().w_full();
     for run in &m.recent_runs {
         let ctrl_show = ctrl.clone();
+        let mid_show = m.id.clone();
+        let rid_show = run.run_id.clone();
+        let btn_tid = format!("show-run-{}", run.run_id);
         runs_body = runs_body.child(
             table_row()
                 .w_full()
@@ -424,15 +419,22 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                             .tabular_nums(),
                     ),
                 )
-                .child(table_cell().w(px(90.0)).items_end().child(app_button(
-                    "Show run",
-                    BtnKind::Default,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || ctrl_show.navigate(ScreenRoute::Activity),
-                ))),
+                .child(
+                    table_cell().w(px(90.0)).items_end().child(
+                        app_button(
+                            "Show run",
+                            BtnKind::Default,
+                            true,
+                            false,
+                            None,
+                            None,
+                            move || {
+                                ctrl_show.open_run_inspection(mid_show.clone(), rid_show.clone())
+                            },
+                        )
+                        .test_id(&btn_tid),
+                    ),
+                ),
         );
     }
 
@@ -607,9 +609,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                         )
                         .child(text("·").text_size(px(12.0)).text_color(p.muted))
                         .child(link_button("Reveal", 12.0, move || {
-                            c_rec_rev.send(UiCommand::DemoAction(format!(
-                                "Simulated Reveal in Finder for {rec_local} (demo mode)"
-                            )));
+                            c_rec_rev.send(UiCommand::RevealPath(rec_local.clone()));
                         })),
                 )
                 .into_element(),
@@ -632,9 +632,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                         )
                         .child(text("·").text_size(px(12.0)).text_color(p.muted))
                         .child(link_button("Open", 12.0, move || {
-                            c_rec_open.send(UiCommand::DemoAction(format!(
-                                "Simulated Open cloud recovery folder {rec_cloud} (demo mode)"
-                            )));
+                            c_rec_open.send(UiCommand::OpenCloudUrl(rec_cloud.clone()));
                         })),
                 )
                 .into_element(),
@@ -702,15 +700,16 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                         .child(page_title(m.display_name.clone()))
                         .child(status_row),
                 )
-                .child(
-                    view()
+                .child({
+                    let mut bar = view()
                         .flex_row()
                         .items_center()
                         .gap(px(8.0))
                         .child(primary_action)
                         .child(pause_resume_action)
-                        .child(more_btn)
-                        .child(
+                        .child(more_btn);
+                    if snap.is_demo_mode {
+                        bar = bar.child(
                             app_button(
                                 "Step state (demo)",
                                 BtnKind::Ghost,
@@ -723,8 +722,10 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                                 },
                             )
                             .test_id("detail-step-state-btn"),
-                        ),
-                ),
+                        );
+                    }
+                    bar
+                }),
         )
         .child(
             view()

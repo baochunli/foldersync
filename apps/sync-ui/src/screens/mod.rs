@@ -1,4 +1,6 @@
-//! Screen views and shared UI controller bridging signals to `DemoSource`.
+//! Screen views and shared UI controller bridging NSH signals to either the
+//! real background-threaded [`ManagerSource`] (default) or the in-memory
+//! [`DemoSource`] (`FOLDERSYNC_DEMO=1` / `--demo`).
 
 pub mod accounts;
 pub mod activity;
@@ -14,13 +16,23 @@ use std::rc::Rc;
 
 use nsh_base::alert_dialog;
 use nsh_core::prelude::*;
-use sync_core::MappingId;
+use sync_core::{MappingId, RunId};
 
 use crate::contract::{ScreenRoute, UiCommand, UiSnapshot};
 use crate::demo::DemoSource;
+use crate::manager_source::ManagerSource;
+
+/// Active backend backing the FolderSync desktop UI.
+#[derive(Clone)]
+pub enum AppDataSource {
+    /// Real `sync-manager` running on a dedicated worker thread (default).
+    Manager(Rc<ManagerSource>),
+    /// Pure in-memory demo source (`FOLDERSYNC_DEMO=1` or `--demo`).
+    Demo(Rc<DemoSource>),
+}
 
 /// Lightweight handle passed into every screen to read snapshots, dispatch
-/// `UiCommand`s to the in-memory demo source, and switch routes.
+/// `UiCommand`s, and switch routes.
 #[derive(Clone)]
 pub struct AppController {
     pub snapshot: Signal<UiSnapshot>,
@@ -28,22 +40,52 @@ pub struct AppController {
     /// 1 Hz elapsed-second counter read only by active-run elapsed labels so
     /// unrelated views, inputs, and buttons never rebuild on timer ticks.
     pub elapsed_offset: Signal<u64>,
-    pub demo: Rc<DemoSource>,
+    /// True while controlled shutdown is waiting for an active run to finish stopping.
+    pub quitting: Signal<bool>,
+    pub source: AppDataSource,
 }
 
 impl AppController {
-    /// Creates a new controller backed by the given `DemoSource`.
-    pub fn new(demo: Rc<DemoSource>) -> Self {
+    /// Creates a controller backed by the real `ManagerSource`.
+    pub fn new_manager(manager: Rc<ManagerSource>) -> Self {
+        let initial = manager.snapshot();
+        Self {
+            snapshot: signal(initial),
+            route: signal(ScreenRoute::Overview),
+            elapsed_offset: signal(0),
+            quitting: signal(false),
+            source: AppDataSource::Manager(manager),
+        }
+    }
+
+    /// Creates a controller backed by the in-memory `DemoSource`.
+    pub fn new_demo(demo: Rc<DemoSource>) -> Self {
         let initial = demo.snapshot();
         Self {
             snapshot: signal(initial),
             route: signal(ScreenRoute::Overview),
             elapsed_offset: signal(0),
-            demo,
+            quitting: signal(false),
+            source: AppDataSource::Demo(demo),
         }
     }
 
-    /// Dispatches a `UiCommand` to the demo source and updates the reactive snapshot.
+    /// Backwards-compatible constructor for demo tests.
+    pub fn new(demo: Rc<DemoSource>) -> Self {
+        Self::new_demo(demo)
+    }
+
+    /// Applies an immutable snapshot on the main thread and announces attention changes.
+    pub fn apply_snapshot(&self, next: UiSnapshot) {
+        let prev_attn = self.snapshot.with_untracked(|s| s.attention_badge_count());
+        let next_attn = next.attention_badge_count();
+        self.snapshot.set(next);
+        if next_attn > prev_attn {
+            announce_for_accessibility(format!("{next_attn} items need attention."));
+        }
+    }
+
+    /// Dispatches a `UiCommand` without blocking the NSH thread.
     pub fn send(&self, cmd: UiCommand) {
         let reset_elapsed = matches!(
             cmd,
@@ -53,15 +95,17 @@ impl AppController {
                 | UiCommand::StopRun(_)
                 | UiCommand::ForceStopRun(_)
         );
-        let prev_attn = self.snapshot.with_untracked(|s| s.attention_badge_count());
-        let next = self.demo.dispatch(cmd);
-        let next_attn = next.attention_badge_count();
         if reset_elapsed {
             self.elapsed_offset.set(0);
         }
-        self.snapshot.set(next);
-        if next_attn > prev_attn {
-            announce_for_accessibility(format!("{next_attn} items need attention."));
+        match &self.source {
+            AppDataSource::Manager(mgr) => {
+                mgr.dispatch(cmd);
+            }
+            AppDataSource::Demo(demo) => {
+                let next = demo.dispatch(cmd);
+                self.apply_snapshot(next);
+            }
         }
     }
 
@@ -70,10 +114,25 @@ impl AppController {
         self.route.set(route);
     }
 
-    /// Opens the Add-mapping wizard (resets to a fresh draft when needed).
+    /// Opens the Add-mapping wizard (resets to a fresh draft).
     pub fn open_wizard(&self) {
         self.send(UiCommand::WizardReset);
         self.navigate(ScreenRoute::AddMapping);
+    }
+
+    /// Loads run-specific log and recovery copies and opens the Run Inspection view (§12, #9).
+    pub fn open_run_inspection(&self, mapping_id: MappingId, run_id: RunId) {
+        self.send(UiCommand::InspectRun {
+            mapping_id: mapping_id.clone(),
+            run_id: run_id.clone(),
+        });
+        self.navigate(ScreenRoute::RunInspection { mapping_id, run_id });
+    }
+
+    /// Inspects recovery evidence and opens the guided Recovery checklist (§5.6, #9).
+    pub fn open_recovery(&self, mapping_id: MappingId) {
+        self.send(UiCommand::InspectRecovery(mapping_id.clone()));
+        self.navigate(ScreenRoute::Recovery(mapping_id));
     }
 
     /// Shows the native `NSAlert` confirmation before removing a mapping (§5.3).
@@ -121,6 +180,9 @@ impl AppController {
 
     /// Single controlled-stop quit handler used by tray Quit, ⌘Q, and system quit (§5.9).
     pub fn request_controlled_quit(&self) {
+        if self.quitting.get_untracked() {
+            return;
+        }
         let snap = self.snapshot.get_untracked();
         if let Some(run) = snap.active_run {
             let ctrl = self.clone();
@@ -137,8 +199,7 @@ impl AppController {
             spawn(async move {
                 match answer.await {
                     Ok(res) if res.action.as_deref() == Some("quit") => {
-                        ctrl.send(UiCommand::RequestControlledQuit);
-                        nsh_core::element::desktop::quit();
+                        ctrl.begin_shutdown();
                     }
                     _ => {
                         nsh_core::element::desktop::cancel_quit_request();
@@ -146,8 +207,23 @@ impl AppController {
                 }
             });
         } else {
-            self.send(UiCommand::RequestControlledQuit);
-            nsh_core::element::desktop::quit();
+            self.begin_shutdown();
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        self.quitting.set(true);
+        match &self.source {
+            AppDataSource::Manager(mgr) => {
+                // Worker thread stops scheduling, gracefully stops any active run,
+                // waits up to the bounded timeout, persists Interrupted/RecoveryRequired
+                // on timeout, and sends `UiUpdate::QuitReady` to terminate cleanly.
+                mgr.request_controlled_shutdown();
+            }
+            AppDataSource::Demo(_) => {
+                self.send(UiCommand::RequestControlledQuit);
+                nsh_core::element::desktop::quit();
+            }
         }
     }
 }

@@ -1,12 +1,12 @@
 //! Attention screen (ordered cards with Cause / What FolderSync did / Next)
 //! and the guided Start recovery checklist (`ui-spec.md` §5.6).
 
-use nsh_core::prelude::*;
-use sync_core::{Intent, MappingId, Readiness};
+use nsh_core::{file_dialog::OpenDialog, prelude::*};
+use sync_core::{Intent, MappingId, Readiness, RunId};
 
 use crate::contract::{
     AttentionItem, AttentionKind, IconKind, RecoveryCauseKind, ScreenRoute, StatusModifier,
-    UiCommand,
+    UiCommand, UiSnapshot,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -44,14 +44,26 @@ pub fn attention_view(ctrl: AppController) -> impl IntoElement {
         );
 
         for item in &snap.attention_items {
-            root = root.child(attention_card(ctrl.clone(), item));
+            root = root.child(attention_card(ctrl.clone(), &snap, item));
         }
 
         root.into_element()
     })
 }
 
-fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
+fn latest_run_id_for(snap: &UiSnapshot, mid: &MappingId) -> RunId {
+    if let Some(m) = snap.mapping(mid) {
+        if let Some(unrev) = &m.unreviewed_conflicts {
+            return unrev.run_id.clone();
+        }
+        if let Some(first) = m.recent_runs.first() {
+            return first.run_id.clone();
+        }
+    }
+    RunId::new(format!("run-{mid}-latest"))
+}
+
+fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) -> View {
     let p = Palette::current();
     let accent_border = if item.is_error_accent {
         p.err_bd
@@ -92,6 +104,12 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
         ..
     } = &item.kind
     {
+        let folder_label = item
+            .mapping_id
+            .as_ref()
+            .and_then(|id| snap.mapping(id))
+            .map(|m| m.cloud_path.clone())
+            .unwrap_or_else(|| "Folder".to_owned());
         c = c.child(
             view()
                 .flex_col()
@@ -108,7 +126,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                                 .text_color(p.muted),
                         )
                         .child(mono_text(
-                            format!("Data/Archive · ID {expected_id}"),
+                            format!("{folder_label} · ID {expected_id}"),
                             11.5,
                             p.fg,
                         )),
@@ -124,7 +142,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                                 .text_color(p.muted),
                         )
                         .child(mono_text(
-                            format!("Data/Archive · ID {found_id}"),
+                            format!("{folder_label} · ID {found_id}"),
                             11.5,
                             p.fg,
                         )),
@@ -206,8 +224,17 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                 let id1 = mid.clone();
                 let id2 = mid.clone();
                 let nm = name.clone();
-                let nm_open = name.clone();
                 let is_cloud_val = *is_cloud;
+                let target_path = snap
+                    .mapping(mid)
+                    .map(|m| {
+                        if is_cloud_val {
+                            m.cloud_path.clone()
+                        } else {
+                            m.local_path.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| name.clone());
                 actions = actions
                     .child(app_button(
                         "Check again",
@@ -230,12 +257,11 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                         None,
                         None,
                         move || {
-                            let label = if is_cloud_val {
-                                format!("Simulated Open cloud folder for {nm_open} (demo mode)")
+                            if is_cloud_val {
+                                c_open.send(UiCommand::OpenCloudUrl(target_path.clone()));
                             } else {
-                                format!("Simulated Reveal in Finder for {nm_open} (demo mode)")
-                            };
-                            c_open.send(UiCommand::DemoAction(label));
+                                c_open.send(UiCommand::RevealPath(target_path.clone()));
+                            }
                         },
                     ))
                     .child(app_button(
@@ -253,40 +279,61 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
             if let Some(mid) = &item.mapping_id {
                 let c1 = ctrl.clone();
                 let c2 = ctrl.clone();
+                let c3 = ctrl.clone();
                 let id = mid.clone();
+                let rid = latest_run_id_for(snap, mid);
                 match cause_kind {
                     RecoveryCauseKind::Interrupted => {
+                        let id_run = mid.clone();
+                        let rid_run = rid.clone();
+                        let id_copies = mid.clone();
+                        let rid_copies = rid;
                         actions = actions
-                            .child(app_button(
-                                "Start recovery…",
-                                BtnKind::Primary,
-                                true,
-                                false,
-                                None,
-                                None,
-                                move || c1.navigate(ScreenRoute::Recovery(id.clone())),
-                            ))
-                            .child(app_button(
-                                "Show run",
-                                BtnKind::Default,
-                                true,
-                                false,
-                                None,
-                                None,
-                                move || c2.navigate(ScreenRoute::Activity),
-                            ))
-                            .child(app_button(
-                                "Show recovery copies",
-                                BtnKind::Default,
-                                true,
-                                true,
-                                None,
-                                Some("Available when connected to the sync manager"),
-                                || {},
-                            ));
+                            .child(
+                                app_button(
+                                    "Start recovery…",
+                                    BtnKind::Primary,
+                                    true,
+                                    false,
+                                    None,
+                                    None,
+                                    move || c1.open_recovery(id.clone()),
+                                )
+                                .test_id(&format!("start-recovery-{mid}")),
+                            )
+                            .child(
+                                app_button(
+                                    "Show run",
+                                    BtnKind::Default,
+                                    true,
+                                    false,
+                                    None,
+                                    None,
+                                    move || c2.open_run_inspection(id_run.clone(), rid_run.clone()),
+                                )
+                                .test_id(&format!("attn-show-run-{mid}")),
+                            )
+                            .child(
+                                app_button(
+                                    "Show recovery copies",
+                                    BtnKind::Default,
+                                    true,
+                                    false,
+                                    None,
+                                    None,
+                                    move || {
+                                        c3.open_run_inspection(
+                                            id_copies.clone(),
+                                            rid_copies.clone(),
+                                        )
+                                    },
+                                )
+                                .test_id(&format!("attn-show-recovery-copies-{mid}")),
+                            );
                     }
                     RecoveryCauseKind::DeletionLimit => {
                         let id_chk = mid.clone();
+                        let id_run = mid.clone();
                         actions = actions
                             .child(app_button(
                                 "Show run",
@@ -295,7 +342,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                                 false,
                                 None,
                                 None,
-                                move || c2.navigate(ScreenRoute::Activity),
+                                move || c2.open_run_inspection(id_run.clone(), rid.clone()),
                             ))
                             .child(app_button(
                                 "Check again",
@@ -308,6 +355,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                             ));
                     }
                     RecoveryCauseKind::EarlierSyncRunning => {
+                        let id_run = mid.clone();
                         actions = actions
                             .child(app_button(
                                 "Stop it",
@@ -325,7 +373,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                                 false,
                                 None,
                                 None,
-                                move || c2.navigate(ScreenRoute::Activity),
+                                move || c2.open_run_inspection(id_run.clone(), rid.clone()),
                             ));
                     }
                 }
@@ -338,8 +386,16 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                 let c_run = ctrl.clone();
                 let c_rev = ctrl.clone();
                 let id_rev = mid.clone();
-                let nm_f = item.mapping_name.clone().unwrap_or_else(|| mid.to_string());
-                let nm_c = nm_f.clone();
+                let id_run = mid.clone();
+                let rid = latest_run_id_for(snap, mid);
+                let local_p = snap
+                    .mapping(mid)
+                    .map(|m| m.local_path.clone())
+                    .unwrap_or_default();
+                let cloud_p = snap
+                    .mapping(mid)
+                    .map(|m| m.cloud_path.clone())
+                    .unwrap_or_default();
                 actions = actions
                     .child(app_button(
                         "Reveal in Finder",
@@ -349,9 +405,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                         None,
                         None,
                         move || {
-                            c_finder.send(UiCommand::DemoAction(format!(
-                                "Simulated Reveal in Finder for {nm_f} conflicts (demo mode)"
-                            )));
+                            c_finder.send(UiCommand::RevealPath(local_p.clone()));
                         },
                     ))
                     .child(app_button(
@@ -362,20 +416,21 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                         None,
                         None,
                         move || {
-                            c_cloud.send(UiCommand::DemoAction(format!(
-                                "Simulated Open cloud folder for {nm_c} (demo mode)"
-                            )));
+                            c_cloud.send(UiCommand::OpenCloudUrl(cloud_p.clone()));
                         },
                     ))
-                    .child(app_button(
-                        "Show run",
-                        BtnKind::Default,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || c_run.navigate(ScreenRoute::Activity),
-                    ))
+                    .child(
+                        app_button(
+                            "Show run",
+                            BtnKind::Default,
+                            true,
+                            false,
+                            None,
+                            None,
+                            move || c_run.open_run_inspection(id_run.clone(), rid.clone()),
+                        )
+                        .test_id(&format!("attn-show-run-{mid}")),
+                    )
                     .child(
                         app_button(
                             "Mark as reviewed",
@@ -401,9 +456,7 @@ fn attention_card(ctrl: AppController, item: &AttentionItem) -> View {
                 None,
                 None,
                 move || {
-                    c_rec.send(UiCommand::DemoAction(format!(
-                        "Simulated Reveal in Finder for {rp} (demo mode)"
-                    )));
+                    c_rec.send(UiCommand::RevealPath(rp.clone()));
                 },
             ));
         }
@@ -429,6 +482,11 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                 .into_element();
         };
 
+        let checklist = snap
+            .recovery_checklist
+            .as_ref()
+            .filter(|rc| rc.mapping_id == mapping_id);
+
         let recovery_info = match &m.modifier {
             StatusModifier::RecoveryCause {
                 kind,
@@ -443,16 +501,25 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             )),
             _ => None,
         };
-        let ambiguous = recovery_info.as_ref().is_some_and(|(_, _, _, amb)| *amb);
+        let ambiguous = checklist
+            .map(|rc| rc.has_ambiguous_case)
+            .unwrap_or_else(|| recovery_info.as_ref().is_some_and(|(_, _, _, amb)| *amb));
+        let orphan_alive = checklist.and_then(|rc| rc.orphan_alive);
+
+        let latest_run_id = checklist
+            .and_then(|rc| rc.latest_run_id.clone())
+            .unwrap_or_else(|| latest_run_id_for(&snap, &m.id));
 
         let c_back = ctrl.clone();
         let c_log = ctrl.clone();
         let c_run = ctrl.clone();
         let c_keep = ctrl.clone();
+        let id_log = m.id.clone();
+        let rid_log = latest_run_id.clone();
         let id_run = m.id.clone();
         let id_keep = m.id.clone();
 
-        // Render each checklist item as verified, failed, or unknown strictly from snapshot fields.
+        // Render each checklist item as verified, failed, or unknown strictly from snapshot/checklist fields.
         let hold_check = if m.state.intent == Intent::Paused {
             check_line(
                 IconKind::Check,
@@ -470,27 +537,31 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             )
         };
 
-        let proc_check = match &recovery_info {
-            Some((_, _, _, true)) => check_line(
+        let proc_check = if ambiguous {
+            check_line(
                 IconKind::Alert,
                 p.attn,
                 "Earlier sync process: unknown — can't confirm whether a process still holds the lock.",
-            ),
-            Some((RecoveryCauseKind::EarlierSyncRunning, _, _, false)) => check_line(
+            )
+        } else if orphan_alive == Some(true)
+            || matches!(
+                recovery_info,
+                Some((RecoveryCauseKind::EarlierSyncRunning, _, _, false))
+            )
+        {
+            check_line(
                 IconKind::Octagon,
                 p.err,
                 "An earlier sync process is still running for this mapping.",
-            ),
-            Some((_, _, _, false)) => check_line(
-                IconKind::Check,
-                p.ok,
-                "No earlier sync process is running (per snapshot).",
-            ),
-            None => check_line(
+            )
+        } else if checklist.is_some() || recovery_info.is_some() {
+            check_line(IconKind::Check, p.ok, "No earlier sync process is running.")
+        } else {
+            check_line(
                 IconKind::Dash,
                 p.muted,
                 "Earlier sync process: Not checked yet.",
-            ),
+            )
         };
 
         let vol_snap = snap.volumes.iter().find(|v| v.identity == m.volume_id);
@@ -514,7 +585,6 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             ),
         };
 
-        // Recovery snapshots carry no re-verified folder identity result unless EndpointChanged is active.
         let identity_check = if m.state.readiness() == Readiness::EndpointChanged {
             check_line(
                 IconKind::Octagon,
@@ -525,24 +595,31 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             check_line(
                 IconKind::Dash,
                 p.muted,
-                "Local and cloud folder identities: Not checked yet.",
+                "Local and cloud folder identities: Not checked yet (verified when you resume).",
             )
         };
 
-        let evidence_line = match &recovery_info {
-            Some((_, detail, copies, _)) => {
-                let copies_part = match copies {
-                    0 => "No recovery copies recorded.".to_owned(),
-                    1 => "1 recovery copy was kept.".to_owned(),
-                    n => format!("{n} recovery copies were kept."),
-                };
-                if detail.trim().is_empty() {
-                    copies_part
-                } else {
-                    format!("{detail}. {copies_part}")
-                }
-            }
-            None => "Run details are not available in this snapshot.".to_owned(),
+        let copies_list = checklist
+            .map(|rc| rc.recovery_copies.clone())
+            .unwrap_or_default();
+        let copies_count = if !copies_list.is_empty() {
+            copies_list.len()
+        } else {
+            recovery_info.as_ref().map(|(_, _, n, _)| *n).unwrap_or(0)
+        };
+        let detail_text = checklist
+            .map(|rc| rc.cause.clone())
+            .or_else(|| recovery_info.as_ref().map(|(_, d, _, _)| d.clone()))
+            .unwrap_or_default();
+        let copies_part = match copies_count {
+            0 => "No recovery copies recorded.".to_owned(),
+            1 => "1 recovery copy was kept.".to_owned(),
+            n => format!("{n} recovery copies were kept."),
+        };
+        let evidence_line = if detail_text.trim().is_empty() {
+            copies_part
+        } else {
+            format!("{detail_text}. {copies_part}")
         };
 
         let mut body = card()
@@ -570,11 +647,105 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                                     .text_size(px(12.5))
                                     .text_color(p.fg),
                             )
-                            .child(link_button("Show run log", 12.5, move || {
-                                c_log.navigate(ScreenRoute::Activity);
-                            })),
+                            .child(link_button(
+                                "Show run log and recovery copies",
+                                12.5,
+                                move || {
+                                    c_log.open_run_inspection(id_log.clone(), rid_log.clone());
+                                },
+                            )),
                     ),
             );
+
+        if let Some(rc) = checklist
+            && (rc.has_lock_file || !rc.workdir_files.is_empty())
+        {
+            let lock_note = if rc.has_lock_file {
+                "Lock file present in work directory."
+            } else {
+                "No lock file in work directory."
+            };
+            let wd_note = if rc.workdir_files.is_empty() {
+                lock_note.to_owned()
+            } else {
+                format!("{lock_note} Files: {}", rc.workdir_files.join(", "))
+            };
+            body = body.child(
+                text(wd_note)
+                    .text_size(px(12.0))
+                    .text_color(p.muted)
+                    .pt(px(2.0)),
+            );
+        }
+
+        if !copies_list.is_empty() {
+            let mut copies_section = view()
+                .flex_col()
+                .gap(px(4.0))
+                .pt(px(8.0))
+                .border_t_1()
+                .border_color(p.hair)
+                .child(card_title("Recovery copies"));
+            for copy_item in &copies_list {
+                let c_cp = ctrl.clone();
+                let rid = latest_run_id.clone();
+                let rel = copy_item.relative_path.clone();
+                let is_remote = copy_item.is_remote;
+                copies_section = copies_section.child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .py(px(4.0))
+                        .child(
+                            view()
+                                .flex_col()
+                                .flex_1()
+                                .child(mono_text(copy_item.relative_path.clone(), 11.5, p.fg))
+                                .child(
+                                    text(format!(
+                                        "{} · {}",
+                                        copy_item.side_label, copy_item.size_label
+                                    ))
+                                    .text_size(px(11.5))
+                                    .text_color(p.muted),
+                                ),
+                        )
+                        .child(app_button(
+                            "Copy to inspection folder…",
+                            BtnKind::Default,
+                            true,
+                            false,
+                            None,
+                            None,
+                            move || {
+                                let c = c_cp.clone();
+                                let rid_c = rid.clone();
+                                let rel_c = rel.clone();
+                                let answer = pick_paths(
+                                    OpenDialog::folders()
+                                        .title("Choose inspection folder (outside synced folders)")
+                                        .button_label("Copy here"),
+                                );
+                                spawn(async move {
+                                    if let Ok(Some(paths)) = answer.await
+                                        && let Some(first) = paths.first()
+                                    {
+                                        c.send(UiCommand::CopyRecoveryCopyToInspection {
+                                            run_id: rid_c,
+                                            is_remote,
+                                            relative_path: rel_c,
+                                            dest_dir: first.to_string_lossy().into_owned(),
+                                        });
+                                    }
+                                });
+                            },
+                        )),
+                );
+            }
+            body = body.child(copies_section);
+        }
 
         if ambiguous {
             let c_diag = ctrl.clone();
@@ -596,6 +767,27 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                         move || c_diag.navigate(ScreenRoute::Preferences),
                     )),
                 );
+        } else if orphan_alive == Some(true) {
+            let c_recheck = ctrl.clone();
+            let id_recheck = m.id.clone();
+            body = body
+                .child(
+                    text("Wait for the earlier sync process to finish, then check again. FolderSync won't start a second sync while it is running.")
+                        .text_size(px(13.0))
+                        .text_color(p.err)
+                        .pt(px(8.0)),
+                )
+                .child(
+                    view().flex_row().gap(px(8.0)).pt(px(6.0)).child(app_button(
+                        "Check again",
+                        BtnKind::Default,
+                        false,
+                        false,
+                        None,
+                        None,
+                        move || c_recheck.send(UiCommand::InspectRecovery(id_recheck.clone())),
+                    )),
+                );
         } else {
             body = body
                 .child(
@@ -609,41 +801,47 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                         .flex_row()
                         .gap(px(8.0))
                         .pt(px(4.0))
-                        .child(app_button(
-                            "Run normally and resume",
-                            BtnKind::Primary,
-                            false,
-                            false,
-                            None,
-                            None,
-                            move || {
-                                c_run.send(UiCommand::CompleteRecovery {
-                                    mapping_id: id_run.clone(),
-                                    resume_and_run: true,
-                                });
-                                c_run.navigate(ScreenRoute::Overview);
-                            },
-                        ))
-                        .child(app_button(
-                            "Keep paused",
-                            BtnKind::Default,
-                            false,
-                            false,
-                            None,
-                            None,
-                            move || {
-                                c_keep.send(UiCommand::CompleteRecovery {
-                                    mapping_id: id_keep.clone(),
-                                    resume_and_run: false,
-                                });
-                                c_keep.navigate(ScreenRoute::Overview);
-                            },
-                        )),
+                        .child(
+                            app_button(
+                                "Run normally and resume",
+                                BtnKind::Primary,
+                                false,
+                                false,
+                                None,
+                                None,
+                                move || {
+                                    c_run.send(UiCommand::CompleteRecovery {
+                                        mapping_id: id_run.clone(),
+                                        resume_and_run: true,
+                                    });
+                                    c_run.navigate(ScreenRoute::Overview);
+                                },
+                            )
+                            .test_id("recovery-run-and-resume-btn"),
+                        )
+                        .child(
+                            app_button(
+                                "Keep paused",
+                                BtnKind::Default,
+                                false,
+                                false,
+                                None,
+                                None,
+                                move || {
+                                    c_keep.send(UiCommand::CompleteRecovery {
+                                        mapping_id: id_keep.clone(),
+                                        resume_and_run: false,
+                                    });
+                                    c_keep.navigate(ScreenRoute::Overview);
+                                },
+                            )
+                            .test_id("recovery-keep-paused-btn"),
+                        ),
                 );
         }
 
         body = body.child(
-            text("To get back a file: choose it in Show recovery copies, then Copy to inspection folder…. FolderSync never puts it back into the synced folder for you.")
+            text("To get back a file: choose it in Show run log and recovery copies, then Copy to inspection folder…. FolderSync never puts it back into the synced folder for you.")
                 .text_size(px(12.0))
                 .text_color(p.muted)
                 .pt(px(8.0)),

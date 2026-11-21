@@ -140,6 +140,12 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
         FinderExtensionStatus::Unavailable => (IconKind::Dash, "Not installed", Tone::Neutral),
     };
 
+    let open_at_login_subtitle = if snap.is_demo_mode {
+        "FolderSync starts in the menu bar when you log in (demo toggle — does not change macOS Login Items)."
+    } else {
+        "FolderSync starts in the menu bar when you log in."
+    };
+
     let general_card = card()
         .gap(px(14.0))
         .child(
@@ -149,7 +155,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                 .child(app_switch(
                     prefs.open_at_login,
                     "Open at login",
-                    "FolderSync starts in the menu bar when you log in (demo toggle — does not change macOS Login Items).",
+                    open_at_login_subtitle,
                     move |next| {
                         c_login.send(UiCommand::SetOpenAtLogin(next));
                     },
@@ -211,9 +217,7 @@ fn render_general(ctrl: AppController, snap: &UiSnapshot, bw_input: Signal<Strin
                     None,
                     None,
                     move || {
-                        c_ext.send(UiCommand::DemoAction(
-                            "Simulated Open Extension Settings (demo mode)".to_owned(),
-                        ));
+                        c_ext.send(UiCommand::OpenExtensionSettings);
                     },
                 )),
         );
@@ -334,11 +338,17 @@ fn render_diagnostics(
         .child(diag_kv("System", &prefs.system_summary));
 
     let c_exp = ctrl.clone();
+    let is_demo = snap.is_demo_mode;
+    let export_desc = if is_demo {
+        "Prepares versions, configuration without secrets, selected run logs and error details with no file contents or sign-in data. Demo mode simulates export without writing a file."
+    } else {
+        "Writes versions, configuration without secrets, recent run summaries and error details with no file contents or sign-in data."
+    };
     let mut export_card = card()
         .flex_1()
         .child(card_title("Export diagnostics"))
         .child(
-            text("Prepares versions, configuration without secrets, selected run logs and error details with no file contents or sign-in data. Demo mode simulates export without writing a file.")
+            text(export_desc)
                 .text_size(px(12.5))
                 .text_color(p.fg),
         )
@@ -354,17 +364,25 @@ fn render_diagnostics(
                     let c = c_exp.clone();
                     let answer = pick_save_path(
                         SaveDialog::new()
-                            .title("Export FolderSync diagnostics (simulated)")
+                            .title(if is_demo {
+                                "Export FolderSync diagnostics (simulated)"
+                            } else {
+                                "Export FolderSync diagnostics"
+                            })
                             .file_name("foldersync-diagnostics.txt"),
                     );
                     spawn(async move {
                         if let Ok(Some(path)) = answer.await {
-                            let msg = format!(
-                                "Simulated diagnostics export to {} (demo mode — no file written).",
-                                path.display()
-                            );
-                            export_notice.set(Some(msg.clone()));
-                            c.send(UiCommand::DemoAction(msg));
+                            let path_str = path.to_string_lossy().into_owned();
+                            let msg = if is_demo {
+                                format!(
+                                    "Simulated diagnostics export to {path_str} (demo mode — no file written)."
+                                )
+                            } else {
+                                format!("Exporting diagnostics to {path_str}…")
+                            };
+                            export_notice.set(Some(msg));
+                            c.send(UiCommand::ExportDiagnostics(path_str));
                         }
                     });
                 },
