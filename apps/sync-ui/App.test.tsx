@@ -61,6 +61,23 @@ test("Overview shows every state label, actions, Sync now verb, and Paper Mono p
   expect(app.spanStyle("text:household:Data/Research").fontSize).toBe(11);
 });
 
+test("Overview uses compact mockup typography and keeps names actionable", async () => {
+  const app = await open(".", DESKTOP);
+
+  const name = app.spanStyle("id:open-detail-documents >> text:Documents");
+  expect(name.fontSize).toBe(13.5);
+  expect(name.fontWeight).toBe(500);
+  expect(name.color).toBe("#1c1c1eff");
+  expect(app.spanStyle("id:nav-activity >> text:Activity").fontWeight).toBe(300);
+  expect(app.spanStyle("id:nav-overview >> text:Overview").fontWeight).toBe(500);
+  expect(app.shows("id:open-detail-documents")).toBe(true);
+  await app.press("id:open-detail-documents");
+  expect(app.texts()).toContain("Included subfolders");
+  await app.press("id:nav-activity");
+  expect(app.spanStyle("id:nav-activity >> text:Activity").fontWeight).toBe(500);
+  expect(app.spanStyle("id:nav-overview >> text:Overview").fontWeight).toBe(300);
+});
+
 test("Attention count badge is 5 and marking conflicts reviewed updates it to 4", async () => {
   const app = await open(".", DESKTOP);
 
@@ -98,6 +115,9 @@ test("Add-mapping review blocks both-populated with no Start first sync button",
   expect(app.texts()).toContain("Review “Projects”");
   expect(app.shows("id:wizard-start-first-sync-btn")).toBe(true);
   expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
+
+  expect(app.texts()).not.toContain("Automatic sync");
+  expect(app.texts().join("\n")).not.toContain("Starts only after");
 
   // Switch to Both populated (blocked) variant
   await app.press("id:review-variant-both-populated");

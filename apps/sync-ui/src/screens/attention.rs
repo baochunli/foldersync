@@ -10,8 +10,9 @@ use crate::contract::{
 };
 use crate::screens::AppController;
 use crate::theme::{
-    BtnKind, Palette, app_button, card, card_title, icon, link_button, mono_text, page_title,
-    status_pill,
+    BLOCK_GAP, BtnKind, CARD_ACTION_MARGIN, HEADER_BOTTOM_MARGIN, KV_ROW_GAP, Palette, S_CAPTION,
+    S_COMPACT, S_SMALL, W_STRONG, accented_card, app_button, card, card_title, icon, kv_row,
+    link_button, mono_text, page_title, status_pill,
 };
 
 /// Renders the Attention screen with blocking items first, then conflicts, then low-space advisories.
@@ -29,15 +30,16 @@ pub fn attention_view(ctrl: AppController) -> impl IntoElement {
             format!("{primary_count} items · items that block syncing first")
         };
 
-        let mut root = view().flex_col().w_full().gap(px(14.0)).child(
+        let mut root = view().flex_col().w_full().gap(px(BLOCK_GAP)).child(
             view()
+                .window_drag(true)
+                .mb(px(HEADER_BOTTOM_MARGIN))
                 .flex_col()
                 .gap(px(3.0))
                 .child(page_title("Attention"))
                 .child(
                     text(sub)
                         .test_id("attention-subtitle")
-                        .text_size(px(13.0))
                         .text_color(p.muted)
                         .tabular_nums(),
                 ),
@@ -80,31 +82,34 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
         p.attn_bd
     };
 
-    let mut c = card()
-        .border_l(px(4.0))
-        .border_l_color(accent_border)
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .flex_wrap()
-                .gap(px(8.0))
-                .child(status_pill(
-                    item.icon,
-                    item.pill_label.clone(),
-                    item.pill_tone,
-                ))
-                .child(card_title(item.title.clone())),
-        )
-        .child(labeled_para("Cause:", &item.cause))
-        .child(labeled_para("What FolderSync did:", &item.what_did));
+    let mut c = accented_card(accent_border);
+    let header = view()
+        .flex_row()
+        .items_center()
+        .flex_wrap()
+        .gap(px(8.0))
+        .child(status_pill(
+            item.icon,
+            item.pill_label.clone(),
+            item.pill_tone,
+        ))
+        .child(card_title(item.title.clone()));
+    let cause_emphasis = match &item.kind {
+        AttentionKind::Authentication { account_id, .. } => Some(account_id.as_str()),
+        _ => None,
+    };
+    let mut paragraphs = view()
+        .flex_col()
+        .gap(px(4.0))
+        .child(labeled_para("Cause:", &item.cause, cause_emphasis))
+        .child(labeled_para("What FolderSync did:", &item.what_did, None));
 
     if let AttentionKind::Conflicts { conflict_paths } = &item.kind {
         let mut list = view().flex_col().gap(px(3.0)).pl(px(12.0));
         for path in conflict_paths {
-            list = list.child(mono_text(format!("• {path}"), 11.5, p.fg));
+            list = list.child(mono_text(format!("• {path}"), S_CAPTION, p.fg));
         }
-        c = c.child(list);
+        paragraphs = paragraphs.child(list);
     }
 
     if let AttentionKind::EndpointChanged {
@@ -119,54 +124,35 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
             .and_then(|id| snap.mapping(id))
             .map(|m| m.cloud_path.clone())
             .unwrap_or_else(|| "Folder".to_owned());
-        c = c.child(
+        paragraphs = paragraphs.child(
             view()
                 .flex_col()
-                .gap(px(4.0))
-                .pt(px(4.0))
-                .child(
-                    view()
-                        .flex_row()
-                        .gap(px(12.0))
-                        .child(
-                            text("Set up with")
-                                .w(px(100.0))
-                                .text_size(px(12.0))
-                                .text_color(p.muted),
-                        )
-                        .child(mono_text(
-                            format!("{folder_label} · ID {expected_id}"),
-                            11.5,
-                            p.fg,
-                        )),
-                )
-                .child(
-                    view()
-                        .flex_row()
-                        .gap(px(12.0))
-                        .child(
-                            text("Found now")
-                                .w(px(100.0))
-                                .text_size(px(12.0))
-                                .text_color(p.muted),
-                        )
-                        .child(mono_text(
-                            format!("{folder_label} · ID {found_id}"),
-                            11.5,
-                            p.fg,
-                        )),
-                ),
+                .gap(px(KV_ROW_GAP))
+                .child(kv_row(
+                    "Set up with",
+                    mono_text(
+                        format!("{folder_label} · ID {expected_id}"),
+                        S_CAPTION,
+                        p.fg,
+                    ),
+                ))
+                .child(kv_row(
+                    "Found now",
+                    mono_text(format!("{folder_label} · ID {found_id}"), S_CAPTION, p.fg),
+                )),
         );
     }
 
-    c = c.child(labeled_para("Next:", &item.next_step));
+    c = c
+        .child(header)
+        .child(paragraphs.child(labeled_para("Next:", &item.next_step, None)));
 
     let mut actions = view()
         .flex_row()
         .flex_wrap()
         .items_center()
         .gap(px(8.0))
-        .pt(px(4.0));
+        .mt(px(CARD_ACTION_MARGIN));
 
     match &item.kind {
         AttentionKind::Authentication {
@@ -204,7 +190,7 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                             c1.navigate(ScreenRoute::Accounts);
                         },
                     ))
-                    .child(link_button("Open Accounts", 12.5, move || {
+                    .child(link_button("Open Accounts", S_COMPACT, move || {
                         c2.navigate(ScreenRoute::Accounts);
                     }));
             }
@@ -491,7 +477,7 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             return view()
                 .flex_col()
                 .gap(px(10.0))
-                .child(link_button("‹ Attention", 12.5, {
+                .child(link_button("‹ Attention", S_COMPACT, {
                     let c = ctrl.clone();
                     move || c.navigate(ScreenRoute::Attention)
                 }))
@@ -660,12 +646,12 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                             .child(
                                 text(evidence_line)
                                     .w_full()
-                                    .text_size(px(12.5))
+                                    .text_size(px(S_COMPACT))
                                     .text_color(p.fg),
                             )
                             .child(link_button(
                                 "Show run log and recovery copies",
-                                12.5,
+                                S_COMPACT,
                                 move || {
                                     c_log.open_run_inspection(id_log.clone(), rid_log.clone());
                                 },
@@ -688,7 +674,7 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             };
             body = body.child(
                 text(wd_note)
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted)
                     .pt(px(2.0)),
             );
@@ -718,13 +704,13 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                             view()
                                 .flex_col()
                                 .flex_1()
-                                .child(mono_text(copy_item.relative_path.clone(), 11.5, p.fg))
+                                .child(mono_text(copy_item.relative_path.clone(), S_CAPTION, p.fg))
                                 .child(
                                     text(format!(
                                         "{} · {}",
                                         copy_item.side_label, copy_item.size_label
                                     ))
-                                    .text_size(px(11.5))
+                                    .text_size(px(S_CAPTION))
                                     .text_color(p.muted),
                                 ),
                         )
@@ -768,7 +754,6 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             body = body
                 .child(
                     text("FolderSync can't confirm whether an earlier sync process owns the lock. Export diagnostics before resuming.")
-                        .text_size(px(13.0))
                         .text_color(p.err)
                         .pt(px(8.0)),
                 )
@@ -789,7 +774,6 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             body = body
                 .child(
                     text("Wait for the earlier sync process to finish, then check again. FolderSync won't start a second sync while it is running.")
-                        .text_size(px(13.0))
                         .text_color(p.err)
                         .pt(px(8.0)),
                 )
@@ -817,7 +801,6 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                     } else {
                         "Confirm folder identities match setup before resuming normal sync."
                     })
-                    .text_size(px(13.0))
                     .text_color(p.fg)
                     .pt(px(8.0)),
                 )
@@ -870,7 +853,7 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
 
         body = body.child(
             text("To get back a file: choose it in Show run log and recovery copies, then Copy to inspection folder…. FolderSync never puts it back into the synced folder for you.")
-                .text_size(px(12.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.muted)
                 .pt(px(8.0)),
         );
@@ -879,7 +862,7 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             .flex_col()
             .w_full()
             .gap(px(14.0))
-            .child(link_button("‹ Attention", 12.5, move || {
+            .child(link_button("‹ Attention", S_COMPACT, move || {
                 c_back.navigate(ScreenRoute::Attention);
             }))
             .child(page_title(format!("Recover “{}”", m.display_name)))
@@ -888,14 +871,19 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
     })
 }
 
-fn labeled_para(prefix: &str, body: &str) -> View {
-    let p = Palette::current();
-    view().w_full().min_w(px(0.0)).child(
-        text(format!("{prefix} {body}"))
-            .w_full()
-            .text_size(px(13.0))
-            .text_color(p.fg),
-    )
+fn labeled_para(prefix: &str, body: &str, emphasis: Option<&str>) -> Text {
+    let paragraph = text("")
+        .w_full()
+        .child(text(prefix.to_owned()).font_weight(W_STRONG));
+    if let Some(emphasis) = emphasis
+        && let Some((before, after)) = body.split_once(&format!(" {emphasis} "))
+    {
+        return paragraph
+            .child(text(format!(" {before} ")))
+            .child(text(emphasis.to_owned()).font_weight(W_STRONG))
+            .child(text(format!(" {after}")));
+    }
+    paragraph.child(text(format!(" {body}")))
 }
 
 fn check_line(icon_kind: IconKind, tint: AdaptiveColor, line: &str) -> View {
@@ -906,10 +894,5 @@ fn check_line(icon_kind: IconKind, tint: AdaptiveColor, line: &str) -> View {
         .gap(px(8.0))
         .py(px(2.0))
         .child(icon(icon_kind, 15.0, tint))
-        .child(
-            text(line.to_owned())
-                .flex_1()
-                .text_size(px(13.0))
-                .text_color(p.fg),
-        )
+        .child(text(line.to_owned()).flex_1().text_color(p.fg))
 }

@@ -10,8 +10,10 @@ use crate::contract::{
 };
 use crate::screens::{AppController, welcome::welcome_view};
 use crate::theme::{
-    BtnKind, Palette, app_button, capacity_meter, focus_ring, icon, link_button, mono_path,
-    page_title, progress_bar, status_dot, status_pill,
+    BLOCK_GAP, BtnKind, HEADER_BOTTOM_MARGIN, HEADER_GAP, NEUTRAL_HOVER, Palette, S_CAPTION,
+    S_CARD_TITLE, S_COMPACT, S_LEAD, S_SMALL, W_EMPH, W_STRONG, W_TITLE, app_button,
+    capacity_meter, focus_ring, icon, link_button, mono_path, name_link, page_title, progress_bar,
+    status_dot, status_pill,
 };
 
 /// Renders Overview (or Welcome when no accounts or mappings exist).
@@ -58,14 +60,16 @@ fn render_overview(ctrl: AppController, snap: &UiSnapshot) -> View {
     let mut root = view()
         .flex_col()
         .w_full()
-        .gap(px(14.0))
+        .gap(px(BLOCK_GAP))
         // Header row
         .child(
             view()
+                .window_drag(true)
+                .mb(px(HEADER_BOTTOM_MARGIN))
                 .flex_row()
                 .items_end()
                 .justify_between()
-                .gap(px(10.0))
+                .gap(px(HEADER_GAP))
                 .flex_wrap()
                 .child(
                     view()
@@ -76,7 +80,6 @@ fn render_overview(ctrl: AppController, snap: &UiSnapshot) -> View {
                         .child(
                             text(summary)
                                 .test_id("overview-summary")
-                                .text_size(px(13.0))
                                 .text_color(p.muted)
                                 .tabular_nums(),
                         ),
@@ -139,7 +142,7 @@ fn render_overview(ctrl: AppController, snap: &UiSnapshot) -> View {
                         "Scheduling paused. No mapping starts on its own. Sync now still works.{active_note}"
                     ))
                     .flex_1()
-                    .text_size(px(12.5))
+                    .text_size(px(S_COMPACT))
                     .text_color(p.fg),
                 )
                 .child(app_button(
@@ -221,7 +224,7 @@ fn volume_group_card(
     let cap_block = if missing {
         view().w(px(180.0)).items_end().child(
             text("Free space unknown")
-                .text_size(px(11.5))
+                .text_size(px(S_CAPTION))
                 .text_color(p.muted),
         )
     } else {
@@ -235,7 +238,7 @@ fn volume_group_card(
             .w(px(195.0))
             .flex_col()
             .items_end()
-            .gap(px(4.0))
+            .gap(px(3.0))
             .child(capacity_meter(
                 vol.used_percent,
                 vol.low_space,
@@ -244,7 +247,7 @@ fn volume_group_card(
             ))
             .child(
                 text(cap_text)
-                    .text_size(px(11.5))
+                    .text_size(px(S_CAPTION))
                     .text_color(cap_color)
                     .tabular_nums(),
             )
@@ -277,8 +280,8 @@ fn volume_group_card(
                     .gap(px(8.0))
                     .child(
                         text(vol.display_name.clone())
-                            .text_size(px(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(S_CARD_TITLE))
+                            .font_weight(W_TITLE)
                             .text_color(p.fg),
                     )
                     .child(status_pill(
@@ -287,7 +290,11 @@ fn volume_group_card(
                         Tone::Attn,
                     )),
             )
-            .child(text(reconnect_note).text_size(px(12.0)).text_color(p.attn))
+            .child(
+                text(reconnect_note)
+                    .text_size(px(S_SMALL))
+                    .text_color(p.attn),
+            )
     } else {
         view()
             .flex_1()
@@ -295,13 +302,13 @@ fn volume_group_card(
             .gap(px(1.0))
             .child(
                 text(vol.display_name.clone())
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(S_CARD_TITLE))
+                    .font_weight(W_TITLE)
                     .text_color(p.fg),
             )
             .child(
                 text(format!("{kind_label} · connected · {count_word}"))
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted),
             )
     };
@@ -377,13 +384,12 @@ fn state_variants_card(ctrl: AppController, snap: &UiSnapshot, rows: &[&MappingS
                         .gap(px(1.0))
                         .child(
                             text("Additional mapping states (demo showcase)")
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(W_TITLE)
                                 .text_color(p.fg),
                         )
                         .child(
                             text("Draft, Needs initialization, Not run yet, Queued, Running + paused, Stopping, and Retry pending")
-                                .text_size(px(11.5))
+                                .text_size(px(S_CAPTION))
                                 .text_color(p.muted),
                         ),
                 ),
@@ -410,11 +416,21 @@ fn mapping_row(
     let ctrl_name = ctrl.clone();
     let is_draft = pres.is_draft;
 
+    const IDENTITY_WIDTH: f32 = 170.0;
+    const STATUS_WIDTH: f32 = 220.0;
+    const LAST_WIDTH: f32 = 128.0;
+    const ACTION_WIDTH: f32 = 168.0;
+    const ROW_GAP: f32 = 14.0;
+
+    // Use the mockup's column widths as a basis and let the cells shrink
+    // at the window's minimum size so row actions remain in view.
     // Column 1: status dot + name link + cloud path + local path (both in Paper Mono)
     let path_tid = format!("path-{}", m.id);
     let col_identity = table_cell()
-        .flex_1()
-        .min_w(px(140.0))
+        .flex_auto()
+        .flex_grow(1.3)
+        .w(px(IDENTITY_WIDTH))
+        .min_w(px(114.0))
         .overflow_hidden()
         .flex_row()
         .items_center()
@@ -423,17 +439,16 @@ fn mapping_row(
         .child(
             view()
                 .flex_col()
-                .gap(px(1.0))
                 .flex_1()
                 .min_w(px(0.0))
                 .child(if is_draft {
                     text(m.display_name.clone())
-                        .text_size(px(13.5))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(S_LEAD))
+                        .font_weight(W_STRONG)
                         .text_color(p.fg)
                         .into_element()
                 } else {
-                    link_button(m.display_name.clone(), 13.5, move || {
+                    name_link(m.display_name.clone(), S_LEAD, move || {
                         ctrl_name.navigate(ScreenRoute::MappingDetail(id_detail.clone()));
                     })
                     .test_id(&format!("open-detail-{}", m.id))
@@ -445,8 +460,10 @@ fn mapping_row(
 
     // Column 2: status pill + status line + why/next line + optional thin indeterminate bar
     let mut col_status = table_cell()
-        .flex_1()
-        .min_w(px(155.0))
+        .flex_auto()
+        .flex_grow(1.7)
+        .w(px(STATUS_WIDTH))
+        .min_w(px(146.0))
         .overflow_hidden()
         .flex_col()
         .gap(px(3.0));
@@ -461,8 +478,7 @@ fn mapping_row(
     col_status = col_status.child(
         text(pres.status_line.clone())
             .w_full()
-            .text_size(px(13.0))
-            .font_weight(FontWeight::MEDIUM)
+            .font_weight(W_EMPH)
             .text_color(p.fg)
             .tabular_nums(),
     );
@@ -472,7 +488,7 @@ fn mapping_row(
             col_status = col_status.child(
                 text(why.clone())
                     .w_full()
-                    .text_size(px(12.0))
+                    .text_size(px(S_SMALL))
                     .text_color(p.muted),
             );
         }
@@ -489,11 +505,11 @@ fn mapping_row(
             if let Some(why) = why_opt {
                 why_row = why_row.child(
                     text(format!("{why} ·"))
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.muted),
                 );
             }
-            why_row = why_row.child(link_button(link.label(), 12.0, move || match link {
+            why_row = why_row.child(link_button(link.label(), S_SMALL, move || match link {
                 StatusLink::StartRecovery => ctrl_link.open_recovery(id_rec.clone()),
                 StatusLink::ShowConflicts | StatusLink::Reconnect | StatusLink::ReviewEndpoint => {
                     ctrl_link.navigate(ScreenRoute::Attention)
@@ -514,20 +530,21 @@ fn mapping_row(
 
     // Column 3: last completed timestamp
     let col_last = table_cell()
-        .w(px(96.0))
-        .flex_none()
+        .w(px(LAST_WIDTH))
+        .min_w(px(68.0))
+        .flex_shrink(1.0)
         .flex_col()
         .gap(px(1.0))
         .child(
             text(m.last_completed_label.clone())
-                .text_size(px(12.0))
-                .font_weight(FontWeight::MEDIUM)
+                .text_size(px(S_COMPACT))
+                .font_weight(W_EMPH)
                 .text_color(p.fg)
                 .tabular_nums(),
         )
         .child(if m.last_completed_label != "Never" {
             text("last completed")
-                .text_size(px(11.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.muted)
                 .into_element()
         } else {
@@ -536,8 +553,9 @@ fn mapping_row(
 
     // Column 4: action buttons (§6 table)
     let mut col_actions = table_cell()
-        .w(px(164.0))
-        .flex_none()
+        .w(px(ACTION_WIDTH))
+        .min_w(px(108.0))
+        .flex_shrink(1.0)
         .flex_row()
         .flex_wrap()
         .items_center()
@@ -679,11 +697,11 @@ fn mapping_row(
         .w_full()
         .flex_row()
         .items_center()
-        .gap(px(10.0))
-        .px(px(12.0))
+        .gap(px(ROW_GAP))
+        .px(px(16.0))
         .py(px(11.0))
         .min_h(px(52.0))
-        .hover(move |s| s.bg(p.sunk.opacity(0.65)))
+        .hover(|s| s.bg(NEUTRAL_HOVER.opacity(0.04)))
         .focus_visible(focus_ring)
         .child(col_identity)
         .child(col_status)

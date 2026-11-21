@@ -1,6 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="220" height="120" viewBox="0 0 220 120">
-  <path d="M78 46h64a20 20 0 0 0 3-39.8A27 27 0 0 0 93 13a23 23 0 0 0-15 33z" fill="#e8eefc" stroke="#2f62d9" stroke-width="2" stroke-linejoin="round"/>
-  <path d="M110 50v22M110 72H40v14M110 72v14M110 72h70v14" fill="none" stroke="#8a8b93" stroke-width="2" stroke-dasharray="4 4"/>
+  <!-- Cloud: symmetric about x=110; bbox x 68..152, y 4..46 (stroke-inclusive 3..47), so nothing is clipped. -->
+  <path d="M82 46H138A14 14 0 1 0 129.73 20.7A20 20 0 0 0 90.27 20.7A14 14 0 1 0 82 46Z" fill="#e8eefc" stroke="#2f62d9" stroke-width="2" stroke-linejoin="round"/>
+  <!-- Connector starts at the cloud's bottom centre (110,46); branches end over the box centres 40/110/180. -->
+  <path d="M110 46v26M110 72H40v14M110 72v14M110 72h70v14" fill="none" stroke="#8a8b93" stroke-width="2" stroke-dasharray="4 4"/>
   <rect x="14" y="88" width="52" height="24" rx="6" fill="#ffffff" stroke="#62636b" stroke-width="2"/>
   <rect x="84" y="88" width="52" height="24" rx="6" fill="#ffffff" stroke="#62636b" stroke-width="2"/>
   <rect x="154" y="88" width="52" height="24" rx="6" fill="#ffffff" stroke="#62636b" stroke-width="2"/>

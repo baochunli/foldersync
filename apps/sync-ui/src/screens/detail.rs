@@ -8,6 +8,7 @@ use nsh_base::{
     table_row,
 };
 use nsh_core::{
+    LineHeight,
     element::desktop::{MenuItem, popup_menu},
     prelude::*,
 };
@@ -18,8 +19,9 @@ use crate::contract::{
 };
 use crate::screens::AppController;
 use crate::theme::{
-    BtnKind, Palette, app_button, card, card_title, focus_ring, icon, link_button, mono_text,
-    page_title, section_label, status_pill,
+    BtnKind, CARD_ACTION_MARGIN, HEADER_BOTTOM_MARGIN, HEADER_GAP, KV_ROW_GAP, Palette, S_CAPTION,
+    S_COMPACT, S_SMALL, S_TINY, app_button, card, card_title, focus_ring, icon, kv_row,
+    link_button, mono_text, page_title, section_label, status_pill,
 };
 
 /// Renders the Mapping detail view for `mapping_id`.
@@ -29,8 +31,8 @@ pub fn detail_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEleme
         let Some(m) = snap.mapping(&mapping_id).cloned() else {
             return view()
                 .flex_col()
-                .gap(px(10.0))
-                .child(link_button("‹ Overview", 12.5, {
+                .gap(px(8.0))
+                .child(link_button("‹ Overview", S_SMALL, {
                     let c = ctrl.clone();
                     move || c.navigate(ScreenRoute::Overview)
                 }))
@@ -57,19 +59,15 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     let name_more = m.display_name.clone();
     let local_more = m.local_path.clone();
 
-    let mut status_row = view().flex_row().items_center().gap(px(8.0)).flex_wrap();
+    let mut status_row = view().flex_row().items_center().gap(px(6.0)).flex_wrap();
     if let Some(pill_label) = &pres.pill_label {
         status_row = status_row.child(status_pill(pres.icon, pill_label.clone(), pres.pill_tone));
     }
-    status_row = status_row.child(
-        text(pres.status_line.clone())
-            .text_size(px(13.0))
-            .text_color(p.fg),
-    );
+    status_row = status_row.child(text(pres.status_line.clone()).text_color(p.fg));
     if let Some(link) = pres.secondary_link {
         let ctrl_l = ctrl.clone();
         let id_rec = m.id.clone();
-        status_row = status_row.child(link_button(link.label(), 12.5, move || match link {
+        status_row = status_row.child(link_button(link.label(), S_COMPACT, move || match link {
             StatusLink::StartRecovery => ctrl_l.open_recovery(id_rec.clone()),
             StatusLink::ShowConflicts | StatusLink::Reconnect | StatusLink::ReviewEndpoint => {
                 ctrl_l.navigate(ScreenRoute::Attention)
@@ -204,26 +202,24 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         "identity matches setup"
     };
 
-    let mut locations_card = card()
-        .flex_1()
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .child(icon(IconKind::Swap, 16.0, p.muted))
-                .child(card_title("Locations")),
-        )
-        .child(kv_row(
-            "Cloud folder",
-            mono_text(m.cloud_path.clone(), 11.5, p.fg).into_element(),
-        ));
+    let locations_card = card().flex_1().child(
+        view()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(icon(IconKind::Swap, 16.0, p.muted))
+            .child(card_title("Locations")),
+    );
+    let mut locations = view().flex_col().gap(px(KV_ROW_GAP)).child(kv_row(
+        "Cloud folder",
+        mono_text(m.cloud_path.clone(), S_CAPTION, p.fg).into_element(),
+    ));
 
     if let Some((true, expected_id, found_id)) = &endpoint_change {
-        locations_card = locations_card
+        locations = locations
             .child(kv_row(
                 "At setup",
-                mono_text(expected_id.clone(), 11.5, p.fg).into_element(),
+                mono_text(expected_id.clone(), S_CAPTION, p.fg).into_element(),
             ))
             .child(kv_row(
                 "Found now",
@@ -232,49 +228,49 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     .items_center()
                     .flex_wrap()
                     .gap(px(6.0))
-                    .child(mono_text(found_id.clone(), 11.5, p.attn))
+                    .child(mono_text(found_id.clone(), S_CAPTION, p.attn))
                     .child(
                         text("· changed since setup")
-                            .text_size(px(12.0))
+                            .text_size(px(S_SMALL))
                             .text_color(p.attn),
                     )
                     .into_element(),
             ));
     } else {
-        locations_card = locations_card.child(kv_row(
+        locations = locations.child(kv_row(
             "Cloud folder ID",
             view()
                 .flex_row()
                 .items_center()
+                .flex_wrap()
                 .gap(px(6.0))
-                .child(mono_text(m.cloud_folder_id.clone(), 11.5, p.fg))
+                .child(mono_text(m.cloud_folder_id.clone(), S_CAPTION, p.fg))
                 .child(
                     text("· matches setup")
-                        .text_size(px(12.0))
+                        .text_size(px(S_SMALL))
                         .text_color(p.muted),
                 )
                 .into_element(),
         ));
     }
 
-    locations_card = locations_card
+    locations = locations
         .child(kv_row(
             "Account",
             text(format!("{} · {}", m.account_id, m.account_email))
-                .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
         ))
         .child(kv_row(
             "Local folder",
-            mono_text(m.local_path.clone(), 11.5, p.fg).into_element(),
+            mono_text(m.local_path.clone(), S_CAPTION, p.fg).into_element(),
         ));
 
     if let Some((false, expected_id, found_id)) = &endpoint_change {
-        locations_card = locations_card
+        locations = locations
             .child(kv_row(
                 "At setup",
-                mono_text(expected_id.clone(), 11.5, p.fg).into_element(),
+                mono_text(expected_id.clone(), S_CAPTION, p.fg).into_element(),
             ))
             .child(kv_row(
                 "Found now",
@@ -283,55 +279,54 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     .items_center()
                     .flex_wrap()
                     .gap(px(6.0))
-                    .child(mono_text(found_id.clone(), 11.5, p.attn))
+                    .child(mono_text(found_id.clone(), S_CAPTION, p.attn))
                     .child(
                         text("· changed since setup")
-                            .text_size(px(12.0))
+                            .text_size(px(S_SMALL))
                             .text_color(p.attn),
                     )
                     .into_element(),
             ));
     }
 
-    locations_card = locations_card
-        .child(kv_row(
-            "Volume",
-            text(format!("{} · {vol_fs} · {vol_status_note}", m.volume_name))
-                .text_size(px(12.5))
-                .text_color(p.fg)
-                .into_element(),
-        ))
-        .child(
-            view()
-                .flex_row()
-                .gap(px(8.0))
-                .pt(px(4.0))
-                .child(app_button(
-                    "Reveal in Finder",
-                    BtnKind::Default,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || {
-                        c_loc_rev.send(UiCommand::RevealPath(lp_reveal.clone()));
-                    },
-                ))
-                .child(app_button(
-                    "Open cloud folder",
-                    BtnKind::Default,
-                    true,
-                    !cp_open.starts_with("https://"),
-                    None,
-                    (!cp_open.starts_with("https://"))
-                        .then_some("Cloud web link is not available for this account"),
-                    move || {
-                        if cp_open.starts_with("https://") {
-                            c_loc_open.send(UiCommand::OpenCloudUrl(cp_open.clone()));
-                        }
-                    },
-                )),
-        );
+    locations = locations.child(kv_row(
+        "Volume",
+        text(format!("{} · {vol_fs} · {vol_status_note}", m.volume_name))
+            .text_color(p.fg)
+            .into_element(),
+    ));
+    let locations_card = locations_card.child(locations).child(
+        view()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(8.0))
+            .mt(px(CARD_ACTION_MARGIN))
+            .child(app_button(
+                "Reveal in Finder",
+                BtnKind::Default,
+                true,
+                false,
+                None,
+                None,
+                move || {
+                    c_loc_rev.send(UiCommand::RevealPath(lp_reveal.clone()));
+                },
+            ))
+            .child(app_button(
+                "Open cloud folder",
+                BtnKind::Default,
+                true,
+                !cp_open.starts_with("https://"),
+                None,
+                (!cp_open.starts_with("https://"))
+                    .then_some("Cloud web link is not available for this account"),
+                move || {
+                    if cp_open.starts_with("https://") {
+                        c_loc_open.send(UiCommand::OpenCloudUrl(cp_open.clone()));
+                    }
+                },
+            )),
+    );
 
     // Included subfolders card — "Change subfolders…" intentionally HIDDEN in Group 3 per brief!
     let mut subfolders_card = card()
@@ -352,7 +347,6 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 m.included_size_label,
                 m.total_size_label
             ))
-            .text_size(px(13.0))
             .text_color(p.fg)
             .tabular_nums(),
         );
@@ -368,82 +362,88 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .flex_row()
                 .flex_wrap()
                 .gap(px(4.0))
-                .child(text("Not synced:").text_size(px(12.0)).text_color(p.muted))
-                .child(mono_text(excluded_list, 11.5, p.muted)),
+                .child(
+                    text("Not synced:")
+                        .text_size(px(S_SMALL))
+                        .text_color(p.muted),
+                )
+                .child(mono_text(excluded_list, S_CAPTION, p.muted)),
         );
     } else {
         subfolders_card = subfolders_card.child(
             text("All subfolders in this folder are included.")
-                .text_size(px(12.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.muted),
         );
     }
 
     // Recent runs table card
     let mut runs_body = table_body().flex_col().w_full();
-    for run in &m.recent_runs {
+    let mut runs = m.recent_runs.iter().peekable();
+    while let Some(run) = runs.next() {
         let ctrl_show = ctrl.clone();
         let mid_show = m.id.clone();
         let rid_show = run.run_id.clone();
         let btn_tid = format!("show-run-{}", run.run_id);
-        runs_body = runs_body.child(
+        let mut row =
             table_row()
                 .w_full()
                 .items_center()
-                .gap(px(10.0))
-                .py(px(8.0))
-                .border_t_1()
-                .border_color(p.hair)
+                .gap(px(0.0))
                 .child(
-                    table_cell().w(px(110.0)).child(
+                    table_cell().px(px(10.0)).py(px(8.0)).w(px(110.0)).child(
                         text(run.started_label.clone())
-                            .text_size(px(12.5))
                             .text_color(p.fg)
                             .tabular_nums(),
                     ),
                 )
                 .child(
-                    table_cell().w(px(72.0)).child(
+                    table_cell().px(px(10.0)).py(px(8.0)).w(px(72.0)).child(
                         text(run.duration_label.clone())
-                            .text_size(px(12.5))
                             .text_color(p.fg)
                             .tabular_nums(),
                     ),
                 )
+                .child(table_cell().px(px(10.0)).py(px(8.0)).flex_1().child(
+                    view().flex_row().child(status_pill(
+                        run.result_icon,
+                        run.result_label.clone(),
+                        run.result_tone,
+                    )),
+                ))
                 .child(
-                    table_cell()
-                        .flex_1()
-                        .child(view().flex_row().child(status_pill(
-                            run.result_icon,
-                            run.result_label.clone(),
-                            run.result_tone,
-                        ))),
-                )
-                .child(
-                    table_cell().flex_1().child(
+                    table_cell().px(px(10.0)).py(px(8.0)).flex_1().child(
                         text(run.changes_label.clone())
-                            .text_size(px(12.5))
                             .text_color(p.muted)
                             .tabular_nums(),
                     ),
                 )
                 .child(
-                    table_cell().w(px(90.0)).items_end().child(
-                        app_button(
-                            "Show run",
-                            BtnKind::Default,
-                            true,
-                            false,
-                            None,
-                            None,
-                            move || {
-                                ctrl_show.open_run_inspection(mid_show.clone(), rid_show.clone())
-                            },
-                        )
-                        .test_id(&btn_tid),
-                    ),
-                ),
-        );
+                    table_cell()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .w(px(90.0))
+                        .items_end()
+                        .child(
+                            app_button(
+                                "Show run",
+                                BtnKind::Default,
+                                true,
+                                false,
+                                None,
+                                None,
+                                move || {
+                                    ctrl_show
+                                        .open_run_inspection(mid_show.clone(), rid_show.clone())
+                                },
+                            )
+                            .test_id(&btn_tid),
+                        ),
+                );
+        if runs.peek().is_some() {
+            row = row.border_b_1().border_color(p.hair);
+        }
+        runs_body = runs_body.child(row);
     }
 
     let recent_runs_card = card()
@@ -463,13 +463,37 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                     table_header().child(
                         table_row()
                             .w_full()
-                            .gap(px(10.0))
-                            .pb(px(6.0))
-                            .child(table_head().w(px(110.0)).child(section_label("Started")))
-                            .child(table_head().w(px(72.0)).child(section_label("Duration")))
-                            .child(table_head().flex_1().child(section_label("Result")))
-                            .child(table_head().flex_1().child(section_label("Changes")))
-                            .child(table_head().w(px(90.0))),
+                            .border_b_1()
+                            .border_color(p.hair)
+                            .child(
+                                table_head()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .w(px(110.0))
+                                    .child(section_label("Started")),
+                            )
+                            .child(
+                                table_head()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .w(px(72.0))
+                                    .child(section_label("Duration")),
+                            )
+                            .child(
+                                table_head()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .flex_1()
+                                    .child(section_label("Result")),
+                            )
+                            .child(
+                                table_head()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .flex_1()
+                                    .child(section_label("Changes")),
+                            )
+                            .child(table_head().px(px(10.0)).py(px(6.0)).w(px(90.0))),
                     ),
                 )
                 .child(runs_body),
@@ -497,16 +521,17 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .gap(px(8.0))
                 .min_w(px(150.0))
                 .min_h(px(28.0))
-                .px(px(10.0))
-                .py(px(4.0))
+                .px(px(9.0))
+                .py(px(3.0))
+                .line_height(LineHeight::Normal)
                 .rounded(px(7.0))
                 .bg(p.bg)
                 .border_1()
                 .border_color(p.border)
                 .cursor_pointer()
                 .focus_visible(focus_ring)
-                .child(text(sched_label).text_size(px(12.5)).text_color(p.fg))
-                .child(text("▾").text_size(px(11.0)).text_color(p.muted)),
+                .child(text(sched_label).text_color(p.fg))
+                .child(text("▾").text_size(px(S_TINY)).text_color(p.muted)),
         )
         .popup_style(move |s| {
             s.bg(p.card)
@@ -534,50 +559,48 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     let schedule_card = card()
         .flex_1()
         .child(card_title("Schedule"))
+        .child(view().flex_col().gap(px(KV_ROW_GAP))
         .child(kv_row("Check schedule", sched_select.into_element()))
         .child(kv_row(
             "Local changes",
             text(local_changes_copy)
-                .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
         ))
         .child(kv_row(
             "Next check",
             text(m.next_check_label.clone())
-                .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
         ))
+        )
         .child(
             text("Changes made in the cloud are found only by a run.")
-                .text_size(px(12.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.muted),
         )
         .child(view().pt(px(6.0)).child(section_label("Protection")))
+        .child(view().flex_col().gap(px(KV_ROW_GAP))
         .child(kv_row(
             "Deletion limit",
             text(format!(
                 "{DEFAULT_MAX_DELETE_PERCENT}% of tracked files. A run that would delete more stops for review."
             ))
-            .text_size(px(12.5))
             .text_color(p.fg)
             .into_element(),
         ))
         .child(kv_row(
             "Conflicts",
             text("Keep both versions")
-                .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
         ))
         .child(kv_row(
             "Recovery copies",
             text("Keep recovery copies (never pruned automatically)")
-                .text_size(px(12.5))
                 .text_color(p.fg)
                 .into_element(),
-        ));
+        )));
 
     // Recovery locations & Supported files card (full plan §18 policy)
     let rec_local = m.local_recovery_path.clone();
@@ -604,12 +627,13 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
     let recovery_card = card()
         .flex_1()
         .child(card_title("Recovery locations"))
+        .child(view().flex_col().gap(px(KV_ROW_GAP))
         .child(kv_row(
             "On this Mac",
             view()
                 .flex_col()
                 .gap(px(2.0))
-                .child(mono_text(m.local_recovery_path.clone(), 11.5, p.fg))
+                .child(mono_text(m.local_recovery_path.clone(), S_CAPTION, p.fg))
                 .child(
                     view()
                         .flex_row()
@@ -617,11 +641,11 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                         .gap(px(6.0))
                         .child(
                             text(m.local_recovery_size_label.clone())
-                                .text_size(px(12.0))
+                                .text_size(px(S_SMALL))
                                 .text_color(p.muted),
                         )
-                        .child(text("·").text_size(px(12.0)).text_color(p.muted))
-                        .child(link_button("Reveal", 12.0, move || {
+                        .child(text("·").text_size(px(S_SMALL)).text_color(p.muted))
+                        .child(link_button("Reveal", S_SMALL, move || {
                             c_rec_rev.send(UiCommand::RevealPath(rec_local.clone()));
                         })),
                 )
@@ -632,7 +656,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
             view()
                 .flex_col()
                 .gap(px(2.0))
-                .child(mono_text(m.cloud_recovery_path.clone(), 11.5, p.fg))
+                .child(mono_text(m.cloud_recovery_path.clone(), S_CAPTION, p.fg))
                 .child(
                     view()
                         .flex_row()
@@ -640,21 +664,22 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                         .gap(px(6.0))
                         .child(
                             text("Size not measured")
-                                .text_size(px(12.0))
+                                .text_size(px(S_SMALL))
                                 .text_color(p.muted),
                         )
-                        .child(text("·").text_size(px(12.0)).text_color(p.muted))
-                        .child(link_button("Open", 12.0, move || {
+                        .child(text("·").text_size(px(S_SMALL)).text_color(p.muted))
+                        .child(link_button("Open", S_SMALL, move || {
                             c_rec_open.send(UiCommand::OpenCloudUrl(rec_cloud.clone()));
                         })),
                 )
                 .into_element(),
         ))
+        )
         .child(
             text(
                 "Earlier versions kept when a run overwrote or removed a file. Not a full backup.",
             )
-            .text_size(px(12.0))
+            .text_size(px(S_SMALL))
             .text_color(p.muted),
         )
         .child(view().pt(px(6.0)).child(section_label("Supported files")))
@@ -686,7 +711,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         ))
         .child(
             text(format!("Exclusions: {exclusions_summary}"))
-                .text_size(px(12.0))
+                .text_size(px(S_SMALL))
                 .text_color(p.muted)
                 .pt(px(4.0)),
         );
@@ -695,50 +720,63 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         .flex_col()
         .w_full()
         .gap(px(14.0))
-        .child(link_button("‹ Overview", 12.5, move || {
-            ctrl_back.navigate(ScreenRoute::Overview);
-        }))
         .child(
             view()
-                .flex_row()
-                .items_end()
-                .justify_between()
-                .gap(px(10.0))
-                .flex_wrap()
+                .flex_col()
+                .items_start()
+                .child(
+                    link_button("‹ Overview", S_SMALL, move || {
+                        ctrl_back.navigate(ScreenRoute::Overview)
+                    })
+                    .mb(px(8.0)),
+                )
                 .child(
                     view()
-                        .flex_col()
-                        .gap(px(6.0))
-                        .flex_1()
-                        .child(page_title(m.display_name.clone()))
-                        .child(status_row),
-                )
-                .child({
-                    let mut bar = view()
+                        .w_full()
+                        .window_drag(true)
+                        .mb(px(HEADER_BOTTOM_MARGIN))
                         .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(primary_action)
-                        .child(pause_resume_action)
-                        .child(more_btn);
-                    if snap.is_demo_mode {
-                        bar = bar.child(
-                            app_button(
-                                "Step state (demo)",
-                                BtnKind::Ghost,
-                                true,
-                                false,
-                                None,
-                                Some("Cycle this mapping through demo states"),
-                                move || {
-                                    ctrl_step.send(UiCommand::DemoStepMappingState(id_step.clone()))
-                                },
-                            )
-                            .test_id("detail-step-state-btn"),
-                        );
-                    }
-                    bar
-                }),
+                        .items_end()
+                        .justify_between()
+                        .gap(px(HEADER_GAP))
+                        .flex_wrap()
+                        .child(
+                            view()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .flex_1()
+                                .child(page_title(m.display_name.clone()))
+                                .child(status_row),
+                        )
+                        .child({
+                            let mut bar = view()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(primary_action)
+                                .child(pause_resume_action)
+                                .child(more_btn);
+                            if snap.is_demo_mode {
+                                bar = bar.child(
+                                    app_button(
+                                        "Step state (demo)",
+                                        BtnKind::Ghost,
+                                        true,
+                                        false,
+                                        None,
+                                        Some("Cycle this mapping through demo states"),
+                                        move || {
+                                            ctrl_step.send(UiCommand::DemoStepMappingState(
+                                                id_step.clone(),
+                                            ))
+                                        },
+                                    )
+                                    .test_id("detail-step-state-btn"),
+                                );
+                            }
+                            bar
+                        }),
+                ),
         )
         .child(
             view()
@@ -759,34 +797,12 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         )
 }
 
-fn kv_row(label: &str, value: AnyElement) -> View {
-    let p = Palette::current();
-    view()
-        .flex_row()
-        .items_start()
-        .gap(px(12.0))
-        .py(px(2.0))
-        .child(
-            text(label.to_owned())
-                .w(px(130.0))
-                .flex_none()
-                .text_size(px(12.5))
-                .text_color(p.muted),
-        )
-        .child(view().flex_1().child(value))
-}
-
 fn policy_bullet(line: &str) -> View {
     let p = Palette::current();
     view()
         .flex_row()
         .items_start()
         .gap(px(6.0))
-        .child(text("•").text_size(px(12.0)).text_color(p.muted))
-        .child(
-            text(line.to_owned())
-                .flex_1()
-                .text_size(px(12.0))
-                .text_color(p.fg),
-        )
+        .child(text("•").text_color(p.muted))
+        .child(text(line.to_owned()).flex_1().text_color(p.fg))
 }

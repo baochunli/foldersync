@@ -6,7 +6,10 @@ use nsh_core::prelude::*;
 
 use crate::contract::{DemoPreset, IconKind, ScreenRoute, UiCommand};
 use crate::screens::AppController;
-use crate::theme::{BtnKind, Palette, app_button, brand_glyph, focus_ring, icon};
+use crate::theme::{
+    BADGE_LINE_HEIGHT, BtnKind, NEUTRAL_HOVER, Palette, S_CAPTION, S_CARD_TITLE, S_TINY,
+    SIDEBAR_WIDTH, W_BODY, W_STRONG, W_TITLE, app_button, brand_glyph, focus_ring, icon,
+};
 
 /// Renders the 212 pt sidebar with window-drag title-bar insets, `Tree` sections,
 /// live status footer, and a compact demo preset switcher.
@@ -43,9 +46,11 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
 
         let is_selected = {
             let id = entry_id.clone();
-            let route_sig = ctrl_row.route;
-            move || route_sig.get().sidebar_id() == id
+            let route = ctrl_row.route;
+            move || route.get().sidebar_id() == id
         };
+        let bg_selected = is_selected.clone();
+        let icon_selected = is_selected.clone();
 
         let attn_count = {
             let snap_sig = ctrl_row.snapshot;
@@ -76,28 +81,22 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                 ctrl_click.navigate(target_route.clone());
             })
             .bg(move || {
-                if is_selected() {
+                if bg_selected() {
                     p.sidebar_sel
                 } else {
                     AdaptiveColor::TRANSPARENT
                 }
             })
-            .hover(move |s| s.bg(p.sidebar_sel.opacity(0.6)))
+            .hover(|s| s.bg(NEUTRAL_HOVER.opacity(0.08)))
             .focus_visible(focus_ring)
-            .child(icon(
-                icon_kind,
-                16.0,
-                if entry_id == ctrl_row.route.get_untracked().sidebar_id() {
-                    p.primary
-                } else {
-                    p.muted
-                },
-            ))
+            .child(icon(icon_kind, 16.0, move || {
+                if icon_selected() { p.primary } else { p.muted }
+            }))
             .child(
                 text(entry_label)
                     .flex_1()
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(W_BODY)
+                    .style_when(is_selected, |s| s.font_weight(W_STRONG))
                     .text_color(p.fg),
             )
             .child(dynamic(move || {
@@ -109,14 +108,14 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                             .bg(p.attn_bg)
                             .border_1()
                             .border_color(p.attn_bd)
-                            .rounded_full()
+                            .rounded(px(10.0))
                             .px(px(7.0))
-                            .py(px(1.0))
                             .label(format!("{count} items need attention"))
                             .child(
                                 text(count.to_string())
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(S_TINY))
+                                    .line_height(px(BADGE_LINE_HEIGHT))
+                                    .font_weight(W_TITLE)
                                     .text_color(p.attn)
                                     .tabular_nums(),
                             )
@@ -129,7 +128,7 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
     };
 
     view()
-        .w(px(200.0))
+        .w(px(SIDEBAR_WIDTH))
         .flex_none()
         .h_full()
         .bg(p.sidebar)
@@ -155,8 +154,8 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                 .child(brand_glyph(22.0))
                 .child(
                     text("FolderSync")
-                        .text_size(px(14.0))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(S_CARD_TITLE))
+                        .font_weight(W_TITLE)
                         .text_color(p.fg),
                 ),
         )
@@ -177,7 +176,7 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                 .accessibility_label("Sections")
                 .items(items)
                 .selected(selected_id)
-                .list_style(|s| s.gap(px(2.0)))
+                .list_style(|s| s.gap(px(1.0)))
                 .render_item(render_item)
                 .on_selected_change(move |id: &SharedString| {
                     ctrl_sel.navigate(nav_for(id));
@@ -217,17 +216,22 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                 .border_t_1()
                 .border_color(p.hair)
                 .pt(px(10.0))
-                .px(px(8.0))
+                .px(px(9.0))
+                .pb(px(2.0))
                 .mt(px(8.0))
                 .flex_col()
-                .gap(px(4.0))
+                .gap(px(3.0))
                 .child(
                     view()
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
                         .child(icon(sched_icon, 13.0, p.muted))
-                        .child(text(sched_text).text_size(px(11.5)).text_color(p.muted)),
+                        .child(
+                            text(sched_text)
+                                .text_size(px(S_CAPTION))
+                                .text_color(p.muted),
+                        ),
                 );
             if let Some(rt) = running_text {
                 foot = foot.child(
@@ -236,7 +240,7 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                         .items_center()
                         .gap(px(6.0))
                         .child(icon(IconKind::Sync, 13.0, p.run))
-                        .child(text(rt).text_size(px(11.5)).text_color(p.muted)),
+                        .child(text(rt).text_size(px(S_CAPTION)).text_color(p.muted)),
                 );
             }
             foot.into_element()
@@ -283,8 +287,8 @@ fn demo_switcher_box(ctrl: AppController) -> impl IntoElement {
             .gap(px(5.0))
             .child(
                 text("Demo states")
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(S_TINY))
+                    .font_weight(W_TITLE)
                     .text_color(p.muted)
                     .px(px(4.0)),
             )
