@@ -28,6 +28,7 @@
   },
   "capabilities": {
     "application": true,
-    "openUrl": true
+    "openUrl": true,
+    "statusBar": true
   }
 }

@@ -46,14 +46,20 @@ fn wait_for_snapshot(
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
             panic!(
-                "timed out waiting for expected UiSnapshot; last snapshot: mappings={:?}, action_error={:?}, active_run={:?}",
+                "timed out waiting for expected UiSnapshot; last snapshot: mappings={:?}, action_error={:?}, active_run={:?}, account pending={:?}, accounts={:?}",
                 current
                     .mappings
                     .iter()
                     .map(|m| (&m.id, m.state))
                     .collect::<Vec<_>>(),
                 current.action_error,
-                current.active_run
+                current.active_run,
+                current.account_operation_pending,
+                current
+                    .accounts
+                    .iter()
+                    .map(|account| (&account.id, &account.status))
+                    .collect::<Vec<_>>(),
             );
         }
         std::thread::sleep(rem.min(Duration::from_millis(15)));
@@ -78,6 +84,7 @@ fn test_mgr_config(
         state_dir: Some(state_dir),
         finder_status_dir: Some(finder_dir),
         launcher: Some(launcher),
+        account_service: None,
         finder_notifier: Some(notifier),
         finder_heartbeat_interval: None,
         shutdown_timeout: Duration::from_secs(5),
@@ -826,5 +833,216 @@ fn channel_system_actions_live_transfer_progress_and_recovery_identity_checks() 
             .unwrap()
             .identities_verified
     );
+    mgr.shutdown();
+}
+
+#[test]
+fn manager_source_confirms_new_subfolders_before_reinitializing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    let omitted = remote_folder.join("Photos");
+    fs::create_dir(&omitted).unwrap();
+    fs::write(omitted.join("photo.jpg"), b"fixture").unwrap();
+
+    let launcher = Arc::new(FakeBisyncLauncher::new());
+    launcher.push_script(FakeLaunchScript::default());
+    launcher.push_script(FakeLaunchScript::default());
+    let mgr = ManagerSource::spawn(
+        test_mgr_config(
+            state_dir,
+            finder_dir,
+            launcher,
+            Arc::new(RecordingFinderNotifier::new()),
+        ),
+        Arc::new(RecordingSystemActions::new()),
+    );
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.is_demo_mode);
+    drive_wizard_init(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let ready = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.mappings
+            .first()
+            .is_some_and(|m| m.state.readiness() == Readiness::Ready)
+    });
+    let id = ready.mappings[0].id.clone();
+    let generation = ready.mappings[0].generation;
+    assert!(ready.mappings[0].scheduling_enabled);
+    assert_eq!(ready.mappings[0].schedule_minutes, 5);
+    assert!(ready.volumes[0].total_gb > 0);
+
+    mgr.dispatch(UiCommand::SetSchedulingPaused(true));
+    mgr.dispatch(UiCommand::SetScheduleInterval {
+        mapping_id: id.clone(),
+        minutes: 15,
+    });
+    mgr.dispatch(UiCommand::ChangeSubfolders(id.clone()));
+    let select = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.changing_subfolders
+    });
+    assert!(select.scheduling_paused);
+    assert_eq!(select.mappings[0].schedule_minutes, 15);
+    let photos = select
+        .wizard
+        .subfolders
+        .iter()
+        .find(|n| n.name == "Photos")
+        .unwrap();
+    assert_eq!(photos.size_label, "7 B");
+
+    mgr.dispatch(UiCommand::WizardToggleSubfolder(photos.id.clone()));
+    mgr.dispatch(UiCommand::PreviewFilterChange);
+    let review = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.filter_review.is_some()
+    });
+    let diff = review.wizard.filter_review.as_ref().unwrap();
+    assert_eq!(diff.added, ["/Photos/**"]);
+    assert!(diff.can_apply(), "{:?}", diff.checks);
+    assert_eq!(review.mappings[0].generation, generation);
+    mgr.dispatch(UiCommand::ApplyFilterChange);
+    mgr.dispatch(UiCommand::SetScheduleInterval {
+        mapping_id: id,
+        minutes: 30,
+    });
+    let gated = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.mappings[0].schedule_minutes == 30
+    });
+    assert_eq!(gated.mappings[0].generation, generation);
+    assert!(gated.mappings[0].excluded_subfolders.is_empty());
+
+    mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    mgr.dispatch(UiCommand::ApplyFilterChange);
+    let applied = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.wizard.step == WizardStep::FirstSync
+            && s.mappings[0].generation > generation
+            && s.mappings[0].state.readiness() == Readiness::Ready
+    });
+    assert!(applied.scheduling_paused);
+    assert!(applied.mappings[0].scheduling_enabled);
+    assert_eq!(applied.mappings[0].excluded_subfolders[0].0, "Photos");
+    assert_eq!(fs::read(omitted.join("photo.jpg")).unwrap(), b"fixture");
+    mgr.shutdown();
+}
+
+#[test]
+fn manager_source_reports_pending_verified_and_held_drive_access() {
+    use nsh_app_sync_ui::contract::AccountStatus;
+    use rclone_adapter::{FakeProcessRunner, FakeRunScript};
+    use sync_core::{AccountId, DeviceId};
+    use sync_manager::{
+        AccountRecord, AccountService, AccountServiceConfig, InMemorySecretStore, SecretStore,
+        SecretString, scoped_credential_key,
+        store::{DeviceRecord, SqliteStateStore},
+    };
+
+    let Some(binary) = pinned_rclone_path() else {
+        eprintln!(
+            "skipping fake account-operation integration test: pinned rclone binary not found"
+        );
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, ..) = setup_dirs(tmp.path());
+    let account_dir = state_dir.join("accounts/drive-test");
+    fs::create_dir_all(&account_dir).unwrap();
+    let config_path = account_dir.join("rclone.conf");
+    fs::write(&config_path, "RCLONE_ENCRYPT_V0:\nFakeCiphertext==\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let store = SqliteStateStore::open(&state_dir.join("state.sqlite")).unwrap();
+    let when = "2026-01-01T00:00:00Z".to_owned();
+    let device = store
+        .ensure_device(&DeviceRecord {
+            id: DeviceId::new("test-device"),
+            name: "Test device".to_owned(),
+            created_at: when.clone(),
+        })
+        .unwrap();
+    let id = AccountId::new("drive-test");
+    store
+        .upsert_account(&AccountRecord {
+            id: id.clone(),
+            display_name: "Test Drive".to_owned(),
+            kind: "drive".to_owned(),
+            remote_name: "test-drive".to_owned(),
+            remote_root_folder_id: "test-parent".to_owned(),
+            config_path,
+            auth_status: "pending".to_owned(),
+            created_at: when.clone(),
+            updated_at: when,
+        })
+        .unwrap();
+    drop(store);
+
+    let secrets = Arc::new(InMemorySecretStore::new());
+    let key = scoped_credential_key(device.id.as_str(), id.as_str()).unwrap();
+    secrets
+        .create_secret(&key, &SecretString::new("fixture"))
+        .unwrap();
+    let runner = Arc::new(FakeProcessRunner::new());
+    let script = |stream, text: &str| FakeRunScript {
+        lines: vec![OutputLine {
+            stream,
+            text: text.to_owned(),
+            truncated: false,
+        }],
+        ..Default::default()
+    };
+    runner.push_run(script(
+        StreamKind::Stderr,
+        "NOTICE: Please go to the following link: http://127.0.0.1:53682/auth?state=fixture",
+    ));
+    runner.push_run(FakeRunScript::default());
+    runner.push_run(script(
+        StreamKind::Stdout,
+        "[test-drive]\ntype = drive\ntoken = XXX",
+    ));
+    runner.push_run(script(StreamKind::Stdout, "[]"));
+    let mut service_config = AccountServiceConfig::with_state_dir(&state_dir);
+    service_config.rclone_binary_override = Some(binary);
+    service_config.secret_store = secrets.clone();
+    service_config.process_runner = runner;
+    let service = AccountService::for_locked_manager(service_config).unwrap();
+
+    let mut config = test_mgr_config(
+        state_dir,
+        finder_dir,
+        Arc::new(FakeBisyncLauncher::new()),
+        Arc::new(RecordingFinderNotifier::new()),
+    );
+    config.account_service = Some(Arc::new(service));
+    let sys = Arc::new(RecordingSystemActions::new());
+    let mgr = ManagerSource::spawn(config, sys.clone());
+    let pending = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| !s.accounts.is_empty());
+    assert_eq!(pending.accounts[0].status, AccountStatus::Unverified);
+    mgr.dispatch(UiCommand::ReconnectAccount(id.clone()));
+    let connected = wait_for_snapshot(&mgr, Duration::from_secs(40), |s| {
+        s.accounts[0].status == AccountStatus::Connected || s.action_error.is_some()
+    });
+    assert_eq!(connected.action_error, None);
+    assert!(
+        connected.accounts[0]
+            .access_summary
+            .contains("Shared folder listing verified")
+    );
+    assert_eq!(
+        sys.recorded(),
+        vec![RecordedSystemAction::OpenDriveAuthorization]
+    );
+
+    secrets.delete_secret(&key).unwrap();
+    mgr.dispatch(UiCommand::CheckAccountAccess(id));
+    let held = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.accounts[0].status == AccountStatus::SignInRequired
+    });
+    assert!(held.action_error.is_some());
     mgr.shutdown();
 }

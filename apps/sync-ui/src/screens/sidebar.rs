@@ -233,6 +233,24 @@ pub fn sidebar_view(ctrl: AppController) -> impl IntoElement {
                                 .text_color(p.muted),
                         ),
                 );
+            let paused = snap.scheduling_paused;
+            let c_toggle = ctrl_foot.clone();
+            foot = foot.child(
+                app_button(
+                    if paused {
+                        "Resume scheduling"
+                    } else {
+                        "Pause scheduling"
+                    },
+                    BtnKind::Ghost,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || c_toggle.send(UiCommand::SetSchedulingPaused(!paused)),
+                )
+                .test_id("toggle-scheduling"),
+            );
             if let Some(rt) = running_text {
                 foot = foot.child(
                     view()
