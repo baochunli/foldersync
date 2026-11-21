@@ -1028,9 +1028,23 @@ pub struct OperationHandle<T> {
     result: mpsc::Receiver<Result<T, ManagerError>>,
 }
 
+/// Requests cancellation even while another thread owns the operation handle.
+#[derive(Debug, Clone)]
+pub struct OperationCanceller(ProcessControl);
+
+impl OperationCanceller {
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+}
+
 impl<T> OperationHandle<T> {
     pub fn cancel(&self) {
         self.control.cancel();
+    }
+
+    pub fn canceller(&self) -> OperationCanceller {
+        OperationCanceller(self.control.clone())
     }
 
     pub fn wait(self) -> Result<T, ManagerError> {

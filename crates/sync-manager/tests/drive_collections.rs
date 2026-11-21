@@ -4,6 +4,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -650,17 +651,30 @@ fn authorization_cancel_stops_child_and_leaves_account_retryable() {
             fx.manager
                 .controlled_shutdown(Duration::from_secs(5))
                 .unwrap();
+            assert!(handle.wait().is_err());
         } else {
-            handle.cancel();
+            let canceller = handle.canceller().clone();
+            let (finished, result) = mpsc::channel();
+            let waiter = thread::spawn(move || finished.send(handle.wait()).unwrap());
+            assert!(matches!(
+                result.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            thread::spawn(move || canceller.cancel()).join().unwrap();
+            assert!(
+                result
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .is_err()
+            );
+            waiter.join().unwrap();
         }
-        assert!(handle.wait().is_err());
         assert_eq!(fx.runner.fake.stop_calls(), expected_spawns);
+        assert_eq!(
+            fx.manager.list_accounts().unwrap()[0].auth_status,
+            "authentication_required"
+        );
     }
-
-    assert_eq!(
-        fx.manager.list_accounts().unwrap()[0].auth_status,
-        "authentication_required"
-    );
 }
 
 fn wait_for_spawn(runner: &FakeProcessRunner, command: &str) {

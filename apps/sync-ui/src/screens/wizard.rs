@@ -632,15 +632,21 @@ fn render_step_folder(
                             .value(move || new_folder_name.get())
                             .on_change(move |value: &str| new_folder_name.set(value.to_owned())),
                     )
-                    .child(app_button(
-                        "Cancel",
-                        BtnKind::Default,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || new_folder_open.set(false),
-                    ))
+                    .child(
+                        app_button(
+                            "Cancel",
+                            BtnKind::Default,
+                            true,
+                            false,
+                            None,
+                            None,
+                            move || {
+                                new_folder_open.set(false);
+                                new_folder_name.set(String::new());
+                            },
+                        )
+                        .test_id("wizard-cancel-new-folder-btn"),
+                    )
                     .child(dynamic(move || {
                         let c = c.clone();
                         app_button(
@@ -655,6 +661,7 @@ fn render_step_folder(
                                     new_folder_name.get_untracked(),
                                 ));
                                 new_folder_open.set(false);
+                                new_folder_name.set(String::new());
                             },
                         )
                         .test_id("wizard-create-folder-btn")

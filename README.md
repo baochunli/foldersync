@@ -39,8 +39,9 @@ excluded local files in place.
 
 Accounts supports browser sign-in, import from an explicitly chosen exported
 configuration, reconnect, and checking access to the shared parent folder.
-Both native launchers include the credential helper. Quit cancels an in-progress
-browser sign-in as part of controlled shutdown.
+Choose **Cancel** in Accounts to stop an in-progress sign-in. Quit also cancels
+sign-in as part of controlled shutdown. Both native launchers include the
+credential helper.
 
 The wizard lists folders directly inside the selected Drive account's shared
 `Data` folder. It explains duplicate and unsupported folder names and lets you

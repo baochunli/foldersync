@@ -404,7 +404,14 @@ impl MappingSnapshot {
                 "Connect the disk selected during setup.".to_owned(),
             ),
             VolumeHold::Inaccessible => (
-                self.volume_issue.clone().unwrap_or_else(|| title.clone()),
+                format!(
+                    "{}.",
+                    self.volume_issue
+                        .as_deref()
+                        .unwrap_or(&title)
+                        .trim_end()
+                        .trim_end_matches('.')
+                ),
                 "Held the mapping because the local folder couldn’t be checked.".to_owned(),
                 "Check disk permissions, then choose Check again.".to_owned(),
             ),
@@ -1374,6 +1381,7 @@ pub struct UiSnapshot {
     pub preferences: PreferencesSnapshot,
     pub reconnecting_account: Option<AccountId>,
     pub account_operation_pending: bool,
+    pub authorization_canceling: bool,
     pub can_reopen_authorization: bool,
     pub status_notice: Option<String>,
     /// Actionable manager error displayed prominently in the UI with a Dismiss control.

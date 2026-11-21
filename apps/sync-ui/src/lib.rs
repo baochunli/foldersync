@@ -634,6 +634,17 @@ mod tests {
     }
 
     #[test]
+    fn inaccessible_volume_attention_cause_ends_with_one_period() {
+        let demo = DemoSource::new(DemoPreset::HouseholdOnly);
+        let mut mapping = demo.snapshot().mappings.remove(0);
+        let cause = "Can’t access the local folder because permission was denied";
+        for issue in [cause.to_owned(), format!("{cause}.")] {
+            mapping.volume_issue = Some(issue);
+            assert_eq!(mapping.volume_attention().cause, format!("{cause}."));
+        }
+    }
+
+    #[test]
     fn demo_commands_mutate_only_in_memory_state_and_preserve_conflict_history() {
         let demo = DemoSource::new(DemoPreset::HouseholdOnly);
         let s1 = demo.dispatch(UiCommand::PauseMapping(MappingId::new("documents")));

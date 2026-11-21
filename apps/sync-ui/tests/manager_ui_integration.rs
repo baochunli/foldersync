@@ -931,6 +931,218 @@ fn manager_source_confirms_new_subfolders_before_reinitializing() {
 }
 
 #[test]
+fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
+    use rclone_adapter::{
+        FakeProcessRunner, FakeRunScript, PasswordCommand, ProcessError, ProcessRunner,
+        ProcessSpec, RealProcessRunner, RunHandle, SpawnOptions,
+    };
+    use sync_core::{AccessMarker, AccountId, DeviceId};
+    use sync_manager::{
+        AccountRecord, AccountServiceConfig, DeviceRecord, InMemorySecretStore, SecretStore,
+        SecretString, SqliteStateStore, scoped_credential_key,
+    };
+
+    struct DriveFixtureRunner {
+        remote_root: PathBuf,
+        size: FakeProcessRunner,
+    }
+
+    impl ProcessRunner for DriveFixtureRunner {
+        fn spawn(
+            &self,
+            spec: &ProcessSpec,
+            options: SpawnOptions,
+        ) -> Result<RunHandle, ProcessError> {
+            if spec.args[0] == "size" {
+                return self.size.spawn(spec, options);
+            }
+            if spec.args.iter().any(|arg| arg == "--dirs-only") {
+                // Real local listings have no Drive IDs. Fake only the identity lookups.
+                let response = if spec.args.iter().any(|arg| arg == "household:") {
+                    r#"[{"Name":"Data","Path":"Data","IsDir":true,"ID":"data-id"}]"#
+                } else {
+                    assert!(spec.args.iter().any(|arg| arg == "household:Data"));
+                    r#"[{"Name":"Research","Path":"Research","IsDir":true,"ID":"research-id"}]"#
+                };
+                let listing = FakeProcessRunner::new();
+                listing.push_run(FakeRunScript {
+                    lines: vec![OutputLine {
+                        stream: StreamKind::Stdout,
+                        text: response.to_owned(),
+                        truncated: false,
+                    }],
+                    ..Default::default()
+                });
+                return listing.spawn(spec, options);
+            }
+            let mut spec = spec.clone();
+            spec.current_dir = Some(self.remote_root.clone());
+            RealProcessRunner.spawn(&spec, options)
+        }
+    }
+
+    let Some(binary) = pinned_rclone_path() else {
+        eprintln!("skipping Drive wizard test: pinned rclone binary not found");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_root, _, local_folder, local_recovery) =
+        setup_dirs(&temp.path().canonicalize().unwrap());
+    let collection_folder = remote_root.join("Data/Research");
+    fs::create_dir_all(&collection_folder).unwrap();
+    fs::create_dir_all(remote_root.join("Recovery/research-id/fixture-device")).unwrap();
+    let payload = "from the selected collection\n";
+    fs::write(collection_folder.join("note.txt"), payload).unwrap();
+
+    let account_id = AccountId::new("drive-fixture");
+    let config_path = state_dir.join("accounts/drive-fixture/rclone.conf");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(&config_path, "[household]\ntype = local\n").unwrap();
+    let store = SqliteStateStore::open(&state_dir.join("state.sqlite")).unwrap();
+    let timestamp = "2026-01-01T00:00:00Z".to_owned();
+    let device = store
+        .ensure_device(&DeviceRecord {
+            id: DeviceId::new("fixture-device"),
+            name: "Fixture device".to_owned(),
+            created_at: timestamp.clone(),
+        })
+        .unwrap();
+    store
+        .upsert_account(&AccountRecord {
+            id: account_id.clone(),
+            display_name: "Fixture Drive".to_owned(),
+            kind: "drive".to_owned(),
+            remote_name: "household".to_owned(),
+            remote_root_folder_id: "parent-id".to_owned(),
+            config_path,
+            auth_status: "ready".to_owned(),
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        })
+        .unwrap();
+    let secrets = Arc::new(InMemorySecretStore::new());
+    secrets
+        .create_secret(
+            &scoped_credential_key(device.id.as_str(), account_id.as_str()).unwrap(),
+            &SecretString::new("fixture"),
+        )
+        .unwrap();
+
+    let runner = Arc::new(DriveFixtureRunner {
+        remote_root,
+        size: FakeProcessRunner::new(),
+    });
+    runner.size.push_run(FakeRunScript {
+        wait_for_stop: true,
+        ..Default::default()
+    });
+    let mut accounts = AccountServiceConfig::with_state_dir(&state_dir);
+    accounts.rclone_binary_override = Some(binary.clone());
+    accounts.secret_store = secrets;
+    accounts.process_runner = runner.clone();
+    accounts.password_command_factory = Some(Arc::new(|_| {
+        Ok(PasswordCommand::new("/usr/bin/false", vec![]).unwrap())
+    }));
+    let mut config = test_mgr_config(
+        state_dir,
+        finder_dir,
+        Arc::new(RealBisyncLauncher::with_process_runner(
+            Some(binary),
+            runner.clone(),
+        )),
+        Arc::new(RecordingFinderNotifier::new()),
+    );
+    config.manager_accounts = Some(accounts);
+    let mgr = ManagerSource::spawn(config, Arc::new(RecordingSystemActions::new()));
+    mgr.dispatch(UiCommand::WizardReset);
+    let catalog = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        !s.cloud_catalog.is_empty() || s.cloud_catalog_error.is_some()
+    });
+    assert_eq!(catalog.cloud_catalog_error, None);
+    let collection = catalog.cloud_catalog[0].collection.clone().unwrap();
+    assert_eq!(collection.folder_id, "research-id");
+    assert_eq!(collection.ancestor_ids, ["parent-id", "data-id"]);
+
+    // Keep an existing location while choosing a collection, as when returning to Folder.
+    mgr.dispatch(UiCommand::WizardSetLocalPath(
+        local_folder.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardSetLocalRecoveryPath(
+        local_recovery.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardSelectFolder("Research".to_owned()));
+    wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.folder_size_pending && !runner.size.spawned_specs().is_empty()
+    });
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Location));
+    let location = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.wizard.step == WizardStep::Location && !s.folder_size_pending
+    });
+    assert_eq!(runner.size.stop_calls(), 1);
+    assert_eq!(location.action_error, None);
+    assert!(
+        location.wizard.location_valid(),
+        "{:?}",
+        location.wizard.location_checks
+    );
+    assert_eq!(location.wizard.cloud_file_count, Some(1));
+    assert_eq!(
+        location.wizard.cloud_total_bytes,
+        Some(payload.len() as u64)
+    );
+    assert_eq!(
+        location.wizard.review_scenario,
+        ReviewScenario::CloudToLocal
+    );
+    let drafts = store.list_mappings().unwrap();
+    assert_eq!(
+        drafts.len(),
+        1,
+        "Location must save the deferred draft once sizing stops"
+    );
+    let draft = &drafts[0];
+    assert_eq!(draft.state.readiness(), Readiness::Unconfigured);
+    assert_eq!(draft.collection, collection);
+    assert_eq!(draft.cloud_recovery_path, "household:Recovery/research-id");
+
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Review));
+    let review = wait_for_snapshot(&mgr, Duration::from_secs(20), |s| {
+        s.wizard.step == WizardStep::Review || s.action_error.is_some()
+    });
+    assert_eq!(review.action_error, None);
+    assert_eq!(review.wizard.drive_collection.as_ref(), Some(&collection));
+    mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    mgr.dispatch(UiCommand::WizardStartFirstSync);
+    let complete = wait_for_snapshot(&mgr, Duration::from_secs(90), |s| {
+        (s.wizard.first_sync_completed
+            && s.mapping(&draft.id).is_some_and(|mapping| {
+                mapping.state.readiness() == Readiness::Ready
+                    && mapping.state.execution == Execution::Idle
+            }))
+            || s.wizard.first_sync_error.is_some()
+            || s.action_error.is_some()
+    });
+    assert_eq!(complete.action_error, None);
+    assert_eq!(complete.wizard.first_sync_error, None);
+    let mapping = complete.mapping(&draft.id).unwrap();
+    assert_eq!(mapping.last_run.unwrap().outcome, RunOutcome::Success);
+    let saved = store.get_mapping(&draft.id).unwrap().unwrap();
+    assert_eq!(saved.collection, collection);
+    assert_eq!(saved.remote_endpoint_kind, "drive_remote");
+    assert_eq!(saved.remote_endpoint_value, "household:Data/Research");
+    assert_eq!(
+        fs::read_to_string(local_folder.join("note.txt")).unwrap(),
+        payload
+    );
+    let marker = fs::read_to_string(local_folder.join("RCLONE_TEST")).unwrap();
+    assert_eq!(
+        AccessMarker::parse(&marker).unwrap().collection_folder_id,
+        "research-id"
+    );
+    mgr.shutdown();
+}
+
+#[test]
 fn manager_source_reports_pending_verified_and_held_drive_access() {
     use nsh_app_sync_ui::contract::{AccountStatus, FolderSize};
     use rclone_adapter::{FakeProcessRunner, FakeRunScript};
@@ -1145,6 +1357,21 @@ fn manager_source_reports_pending_verified_and_held_drive_access() {
         "NOTICE: Please go to the following link: http://127.0.0.1:53682/auth?state=fixture",
     );
     browser_wait.wait_for_stop = true;
+    runner.push_run(browser_wait.clone());
+    mgr.dispatch(UiCommand::ReconnectAccount(id.clone()));
+    wait_for_snapshot(&mgr, Duration::from_secs(20), |s| {
+        s.can_reopen_authorization
+    });
+    let stops_before_cancel = runner.stop_calls();
+    mgr.dispatch(UiCommand::CancelReconnect);
+    let canceled = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        !s.account_operation_pending
+    });
+    assert_eq!(runner.stop_calls(), stops_before_cancel + 1);
+    assert_eq!(canceled.reconnecting_account, None);
+    assert!(!canceled.can_reopen_authorization);
+    assert_eq!(canceled.accounts[0].status, AccountStatus::SignInRequired);
+
     runner.push_run(browser_wait);
     mgr.dispatch(UiCommand::ReconnectAccount(id));
     wait_for_snapshot(&mgr, Duration::from_secs(20), |s| {

@@ -38,9 +38,9 @@ use sync_manager::{
     DarwinFinderNotifier, DriveAuthorization, FilterChangePreview, FinderActionDispatch,
     FinderNotifier, FolderSizeSnapshot, FolderSizeStatus, ImportAccountRequest, InitializeCommand,
     ManagerConfig, ManagerError, ManagerEvent, MappingStatusSnapshot, NoopFinderNotifier,
-    OperationHandle, RecoveryCopySide, RunRecord, SecretString, SideClassification,
-    SkippedCollection, StatusSnapshot, SyncManager, ValidatedFinderAction, detect_volume_identity,
-    disk_space_for_path, inspect_local_endpoint_detailed,
+    OperationCanceller, OperationHandle, RecoveryCopySide, RunRecord, SecretString,
+    SideClassification, SkippedCollection, StatusSnapshot, SyncManager, ValidatedFinderAction,
+    detect_volume_identity, disk_space_for_path, inspect_local_endpoint_detailed,
 };
 
 use crate::{
@@ -455,6 +455,7 @@ struct WorkerState {
     account_worker: Option<JoinHandle<()>>,
     account_operation_id: Option<AccountId>,
     reconnecting_account: Option<AccountId>,
+    authorization_canceller: Option<OperationCanceller>,
     authorization_url: Option<SecretString>,
     unverified_accounts: BTreeSet<AccountId>,
     inbox: Arc<WorkerInbox>,
@@ -520,6 +521,7 @@ fn manager_worker_main(
         account_worker: None,
         account_operation_id: None,
         reconnecting_account: None,
+        authorization_canceller: None,
         authorization_url: None,
         unverified_accounts: BTreeSet::new(),
         inbox: inbox.clone(),
@@ -646,6 +648,9 @@ fn manager_worker_main(
                     }
                 }
                 WorkerCmd::AuthorizationReady(url) => {
+                    if state.authorization_canceller.is_none() {
+                        continue;
+                    }
                     state.authorization_url = Some(url.clone());
                     if let Some((request_id, request)) = dispatch_system_action(
                         &mut state,
@@ -664,6 +669,7 @@ fn manager_worker_main(
                     }
                     let operation_id = state.account_operation_id.take();
                     let was_authorizing = state.reconnecting_account.take().is_some();
+                    state.authorization_canceller = None;
                     state.authorization_url = None;
                     match result {
                         Ok(account) => {
@@ -1419,7 +1425,14 @@ fn handle_ui_command(
             }
             (None, None)
         }
-        UiCommand::ConnectDemoAccount | UiCommand::CancelReconnect => (None, None),
+        UiCommand::ConnectDemoAccount => (None, None),
+        UiCommand::CancelReconnect => {
+            if let Some(canceller) = state.authorization_canceller.take() {
+                state.authorization_url = None;
+                canceller.cancel();
+            }
+            (None, None)
+        }
         UiCommand::ConnectDrive {
             account_id,
             display_name,
@@ -1984,6 +1997,7 @@ fn start_account_operation(state: &mut WorkerState, operation: AccountOperation)
             Ok(handle) => {
                 state.account_operation_id = Some(id.clone());
                 state.reconnecting_account = Some(id);
+                state.authorization_canceller = Some(handle.canceller());
                 state.account_worker = Some(thread::spawn(move || {
                     let result = handle
                         .wait()
@@ -2197,13 +2211,14 @@ fn wizard_review_fingerprint(wizard: &WizardDraft) -> String {
         .map(|n| n.name.as_str())
         .collect();
     format!(
-        "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
         wizard.selected_account,
         wizard.selected_folder,
         wizard.remote_folder_path.as_deref().unwrap_or(""),
         wizard.local_path,
         wizard.local_recovery_path,
         wizard.cloud_recovery_path,
+        wizard.drive_collection,
         excluded_subs,
         wizard.custom_patterns,
         wizard.review_scenario,
@@ -2212,6 +2227,20 @@ fn wizard_review_fingerprint(wizard: &WizardDraft) -> String {
         wizard.local_total_bytes,
         wizard.cloud_total_bytes,
     )
+}
+
+#[cfg(test)]
+#[test]
+fn wizard_review_fingerprint_changes_with_drive_ancestry() {
+    let mut wizard = default_real_wizard();
+    wizard.drive_collection = Some(CloudCollection {
+        folder_id: "research-id".to_owned(),
+        display_path: "Data/Research".to_owned(),
+        ancestor_ids: vec!["parent-id".to_owned(), "data-id".to_owned()],
+    });
+    let fingerprint = wizard_review_fingerprint(&wizard);
+    wizard.drive_collection.as_mut().unwrap().ancestor_ids[1] = "replacement-data-id".to_owned();
+    assert_ne!(wizard_review_fingerprint(&wizard), fingerprint);
 }
 
 fn record_mgr_result<T>(state: &mut WorkerState, res: Result<T, ManagerError>) {
@@ -2825,6 +2854,9 @@ fn update_folder_size(state: &mut WorkerState) {
             && pending.account == state.wizard.selected_account
         {
             recompute_real_wizard_inventory(state);
+            if let Err(err) = persist_real_draft_if_ready(state, false) {
+                state.action_error = Some(err);
+            }
         }
     }
 
@@ -3549,6 +3581,8 @@ fn project_ui_snapshot(
         preferences: state.preferences.clone(),
         reconnecting_account: state.reconnecting_account.clone(),
         account_operation_pending: state.account_worker.is_some(),
+        authorization_canceling: state.reconnecting_account.is_some()
+            && state.authorization_canceller.is_none(),
         can_reopen_authorization: state.authorization_url.is_some(),
         status_notice: state.status_notice.clone(),
         action_error: state.action_error.clone(),
@@ -4024,6 +4058,7 @@ fn empty_loading_snapshot() -> UiSnapshot {
         preferences: default_real_preferences(),
         reconnecting_account: None,
         account_operation_pending: false,
+        authorization_canceling: false,
         can_reopen_authorization: false,
         status_notice: None,
         action_error: None,

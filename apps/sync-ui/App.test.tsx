@@ -410,9 +410,15 @@ test("New folder refuses a duplicate name in Data", async () => {
   const app = await open(".", DESKTOP);
   await app.press("id:add-mapping-btn");
   await app.press("id:wizard-new-folder-btn");
+  await app.type("id:wizard-new-folder-name", "Discard this name");
+  await app.press("id:wizard-cancel-new-folder-btn");
+  await app.press("id:wizard-new-folder-btn");
+  expect(app.enabled("id:wizard-create-folder-btn")).toBe(false);
   await app.type("id:wizard-new-folder-name", "Projects");
   await app.press("id:wizard-create-folder-btn");
   expect(app.texts().join("\n")).toContain("The name `Projects` is already used in Data.");
+  await app.press("id:wizard-new-folder-btn");
+  expect(app.enabled("id:wizard-create-folder-btn")).toBe(false);
 });
 
 test("Cancel sign-in clears the browser waiting card", async () => {
