@@ -290,6 +290,104 @@ fn status_text_matches_plan_wording_and_never_claims_up_to_date() {
     }
 }
 
+#[test]
+fn unresolved_needs_initialization_survives_resume_volume_lost_and_volume_available() {
+    let draft = MappingState::new(
+        Readiness::NeedsInitialization,
+        Execution::Idle,
+        Intent::Paused,
+    );
+    let after_resume = apply_user_action(draft, UserAction::Resume);
+    assert_eq!(after_resume.state.intent, Intent::Enabled);
+    assert_eq!(after_resume.state.readiness, Readiness::NeedsInitialization);
+    assert_eq!(after_resume.state.execution, Execution::Idle);
+
+    let after_lost = apply_event(after_resume.state, ObservedEvent::VolumeLost);
+    assert_eq!(after_lost.state.readiness, Readiness::VolumeUnavailable);
+
+    let after_back = apply_event(after_lost.state, ObservedEvent::VolumeAvailable);
+    assert_eq!(
+        after_back.state.readiness,
+        Readiness::NeedsInitialization,
+        "reconnecting volume must not bypass NeedsInitialization"
+    );
+    assert_eq!(after_back.effect, TransitionEffect::None);
+
+    let after_tick = apply_event(after_back.state, ObservedEvent::ScheduleTriggered);
+    assert_eq!(after_tick.state.execution, Execution::Idle);
+    assert_eq!(after_tick.effect, TransitionEffect::None);
+
+    let after_init = apply_event(after_back.state, ObservedEvent::InitializationCompleted);
+    assert_eq!(after_init.state.readiness, Readiness::Ready);
+    assert_eq!(after_init.effect, TransitionEffect::EligibleForScheduling);
+}
+
+#[test]
+fn unresolved_auth_endpoint_and_recovery_gates_survive_unrelated_events() {
+    // AuthenticationRequired survives VolumeLost -> VolumeAvailable.
+    let auth_hold = MappingState::new(
+        Readiness::AuthenticationRequired,
+        Execution::Idle,
+        Intent::Enabled,
+    );
+    let lost = apply_event(auth_hold, ObservedEvent::VolumeLost).state;
+    let back = apply_event(lost, ObservedEvent::VolumeAvailable).state;
+    assert_eq!(back.readiness, Readiness::AuthenticationRequired);
+    let restored = apply_event(back, ObservedEvent::AuthenticationRestored).state;
+    assert_eq!(restored.readiness, Readiness::Ready);
+
+    // EndpointChanged survives AuthenticationFailed -> AuthenticationRestored.
+    let endpoint_hold =
+        MappingState::new(Readiness::EndpointChanged, Execution::Idle, Intent::Enabled);
+    let auth_bad = apply_event(endpoint_hold, ObservedEvent::AuthenticationFailed).state;
+    let auth_ok = apply_event(auth_bad, ObservedEvent::AuthenticationRestored).state;
+    assert_eq!(auth_ok.readiness, Readiness::EndpointChanged);
+    let validated = apply_event(auth_ok, ObservedEvent::EndpointValidated).state;
+    assert_eq!(validated.readiness, Readiness::Ready);
+
+    // VolumeUnavailable survives AuthenticationFailed -> AuthenticationRestored.
+    let vol_hold = MappingState::new(
+        Readiness::VolumeUnavailable,
+        Execution::Idle,
+        Intent::Enabled,
+    );
+    let auth_bad = apply_event(vol_hold, ObservedEvent::AuthenticationFailed).state;
+    let auth_ok = apply_event(auth_bad, ObservedEvent::AuthenticationRestored).state;
+    assert_eq!(auth_ok.readiness, Readiness::VolumeUnavailable);
+    let vol_ok = apply_event(auth_ok, ObservedEvent::VolumeAvailable).state;
+    assert_eq!(vol_ok.readiness, Readiness::Ready);
+}
+
+#[test]
+fn status_text_labels_past_failures_as_history_once_hold_is_cleared() {
+    let t = WallTime::new(14, 32).expect("valid time");
+    let ready = MappingState::new(Readiness::Ready, Execution::Idle, Intent::Enabled);
+
+    for (outcome, forbidden_current_hold) in [
+        (RunOutcome::Interrupted, "Recovery required"),
+        (RunOutcome::CriticalFailure, "Recovery required"),
+        (RunOutcome::AuthenticationFailure, "Authentication required"),
+        (
+            RunOutcome::EndpointOrVolumeMismatch,
+            "Endpoint changed — review required",
+        ),
+    ] {
+        let summary = LastRunSummary {
+            outcome,
+            completed_at: t,
+        };
+        let text = status_text(&ready, "Research", "PhotoSSD", Some(&summary));
+        assert_ne!(
+            text, forbidden_current_hold,
+            "cleared hold for {outcome:?} must not render as current blocker"
+        );
+        assert!(
+            text.contains("Last run") && text.contains("14:32"),
+            "expected historical wording with timestamp for {outcome:?}, got: {text}"
+        );
+    }
+}
+
 fn arb_readiness() -> impl Strategy<Value = Readiness> {
     prop::sample::select(all_readiness().to_vec())
 }

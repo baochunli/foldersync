@@ -96,6 +96,22 @@ fn policy_defaults_and_labels_match_plan() {
     assert!(!err.cause.is_empty());
     assert!(!err.next_step.is_empty());
 
+    // Deserialization must enforce the same 0..=100 validation as MaxDeletePercent::new.
+    assert_eq!(
+        serde_json::from_str::<MaxDeletePercent>("0")
+            .unwrap()
+            .value(),
+        0
+    );
+    assert_eq!(
+        serde_json::from_str::<MaxDeletePercent>("100")
+            .unwrap()
+            .value(),
+        100
+    );
+    assert!(serde_json::from_str::<MaxDeletePercent>("101").is_err());
+    assert!(serde_json::from_str::<MaxDeletePercent>("255").is_err());
+
     assert_eq!(ComparePolicy::default(), ComparePolicy::SizeModtime);
     let conflict = ConflictPolicy::default();
     assert_eq!(conflict.resolution, ConflictResolution::PreserveBoth);

@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Readiness dimension describing whether a mapping is eligible to sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -48,33 +48,157 @@ pub enum Intent {
     Paused,
 }
 
-/// Full three-dimensional state of a mapping.
+/// Independent unresolved readiness gates kept active until each gate's own
+/// check passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct ReadinessGates {
+    configured: bool,
+    needs_initialization: bool,
+    volume_unavailable: bool,
+    auth_required: bool,
+    endpoint_changed: bool,
+    recovery_required: bool,
+}
+
+impl ReadinessGates {
+    const fn from_readiness(readiness: Readiness) -> Self {
+        match readiness {
+            Readiness::Unconfigured => Self {
+                configured: false,
+                needs_initialization: true,
+                volume_unavailable: false,
+                auth_required: false,
+                endpoint_changed: false,
+                recovery_required: false,
+            },
+            Readiness::NeedsInitialization => Self {
+                configured: true,
+                needs_initialization: true,
+                volume_unavailable: false,
+                auth_required: false,
+                endpoint_changed: false,
+                recovery_required: false,
+            },
+            Readiness::Ready => Self {
+                configured: true,
+                needs_initialization: false,
+                volume_unavailable: false,
+                auth_required: false,
+                endpoint_changed: false,
+                recovery_required: false,
+            },
+            Readiness::VolumeUnavailable => Self {
+                configured: true,
+                needs_initialization: false,
+                volume_unavailable: true,
+                auth_required: false,
+                endpoint_changed: false,
+                recovery_required: false,
+            },
+            Readiness::AuthenticationRequired => Self {
+                configured: true,
+                needs_initialization: false,
+                volume_unavailable: false,
+                auth_required: true,
+                endpoint_changed: false,
+                recovery_required: false,
+            },
+            Readiness::EndpointChanged => Self {
+                configured: true,
+                needs_initialization: false,
+                volume_unavailable: false,
+                auth_required: false,
+                endpoint_changed: true,
+                recovery_required: false,
+            },
+            Readiness::RecoveryRequired => Self {
+                configured: true,
+                needs_initialization: false,
+                volume_unavailable: false,
+                auth_required: false,
+                endpoint_changed: false,
+                recovery_required: true,
+            },
+        }
+    }
+
+    const fn effective_readiness(self) -> Readiness {
+        if self.recovery_required {
+            Readiness::RecoveryRequired
+        } else if !self.configured {
+            Readiness::Unconfigured
+        } else if self.auth_required {
+            Readiness::AuthenticationRequired
+        } else if self.endpoint_changed {
+            Readiness::EndpointChanged
+        } else if self.volume_unavailable {
+            Readiness::VolumeUnavailable
+        } else if self.needs_initialization {
+            Readiness::NeedsInitialization
+        } else {
+            Readiness::Ready
+        }
+    }
+}
+
+/// Full three-dimensional state of a mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct MappingState {
-    /// Readiness of endpoints, credentials, volume, and recovery holds.
+    /// Effective readiness derived from all currently active readiness gates.
     pub readiness: Readiness,
     /// Current run execution status.
     pub execution: Execution,
     /// Persisted user pause/enable intent.
     pub intent: Intent,
+    gates: ReadinessGates,
+}
+
+impl<'de> Deserialize<'de> for MappingState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawMappingState {
+            readiness: Readiness,
+            execution: Execution,
+            intent: Intent,
+            #[serde(default)]
+            gates: Option<ReadinessGates>,
+        }
+        let raw = RawMappingState::deserialize(deserializer)?;
+        let gates = raw
+            .gates
+            .unwrap_or_else(|| ReadinessGates::from_readiness(raw.readiness));
+        Ok(Self {
+            readiness: gates.effective_readiness(),
+            execution: raw.execution,
+            intent: raw.intent,
+            gates,
+        })
+    }
 }
 
 impl MappingState {
     /// Constructs a mapping state from its three orthogonal dimensions.
     pub const fn new(readiness: Readiness, execution: Execution, intent: Intent) -> Self {
+        let gates = ReadinessGates::from_readiness(readiness);
         Self {
-            readiness,
+            readiness: gates.effective_readiness(),
             execution,
             intent,
+            gates,
         }
     }
 
     /// Returns the default state for a newly created draft mapping.
     pub const fn unconfigured() -> Self {
+        Self::new(Readiness::Unconfigured, Execution::Idle, Intent::Paused)
+    }
+
+    const fn with_gates(self, gates: ReadinessGates, execution: Execution) -> Self {
         Self {
-            readiness: Readiness::Unconfigured,
-            execution: Execution::Idle,
-            intent: Intent::Paused,
+            readiness: gates.effective_readiness(),
+            execution,
+            intent: self.intent,
+            gates,
         }
     }
 }
@@ -288,14 +412,14 @@ pub fn apply_user_action(state: MappingState, action: UserAction) -> TransitionR
             },
         },
         UserAction::ForceStop => match state.execution {
-            Execution::Running | Execution::Stopping => TransitionResult {
-                state: MappingState {
-                    readiness: Readiness::RecoveryRequired,
-                    execution: Execution::Interrupted,
-                    ..state
-                },
-                effect: TransitionEffect::ForceTerminateChild,
-            },
+            Execution::Running | Execution::Stopping => {
+                let mut gates = state.gates;
+                gates.recovery_required = true;
+                TransitionResult {
+                    state: state.with_gates(gates, Execution::Interrupted),
+                    effect: TransitionEffect::ForceTerminateChild,
+                }
+            }
             Execution::Queued => TransitionResult {
                 state: MappingState {
                     execution: Execution::Idle,
@@ -333,33 +457,42 @@ pub fn apply_user_action(state: MappingState, action: UserAction) -> TransitionR
 
 /// Applies an observed event to `state` and returns the next state and effect.
 pub fn apply_event(state: MappingState, event: ObservedEvent) -> TransitionResult {
+    let eligible_if_ready = |next: MappingState| {
+        if next.readiness == Readiness::Ready
+            && next.intent == Intent::Enabled
+            && next.execution == Execution::Idle
+        {
+            TransitionEffect::EligibleForScheduling
+        } else {
+            TransitionEffect::None
+        }
+    };
+
     match event {
         ObservedEvent::Configured => {
-            let readiness = if state.readiness == Readiness::Unconfigured {
-                Readiness::NeedsInitialization
+            if !state.gates.configured {
+                let mut gates = state.gates;
+                gates.configured = true;
+                gates.needs_initialization = true;
+                TransitionResult {
+                    state: state.with_gates(gates, state.execution),
+                    effect: TransitionEffect::None,
+                }
             } else {
-                state.readiness
-            };
-            TransitionResult {
-                state: MappingState { readiness, ..state },
-                effect: TransitionEffect::None,
+                TransitionResult {
+                    state,
+                    effect: TransitionEffect::None,
+                }
             }
         }
         ObservedEvent::InitializationCompleted => {
             if state.readiness == Readiness::NeedsInitialization {
-                let next = MappingState {
-                    readiness: Readiness::Ready,
-                    ..state
-                };
-                let effect = if next.intent == Intent::Enabled && next.execution == Execution::Idle
-                {
-                    TransitionEffect::EligibleForScheduling
-                } else {
-                    TransitionEffect::None
-                };
+                let mut gates = state.gates;
+                gates.needs_initialization = false;
+                let next = state.with_gates(gates, state.execution);
                 TransitionResult {
                     state: next,
-                    effect,
+                    effect: eligible_if_ready(next),
                 }
             } else {
                 TransitionResult {
@@ -404,39 +537,32 @@ pub fn apply_event(state: MappingState, event: ObservedEvent) -> TransitionResul
             }
         }
         ObservedEvent::VolumeLost => {
-            let readiness = match state.readiness {
-                Readiness::RecoveryRequired | Readiness::Unconfigured => state.readiness,
-                _ => Readiness::VolumeUnavailable,
-            };
+            if !state.gates.configured {
+                return TransitionResult {
+                    state,
+                    effect: TransitionEffect::None,
+                };
+            }
+            let mut gates = state.gates;
+            gates.volume_unavailable = true;
             let (execution, effect) = match state.execution {
                 Execution::Running => (Execution::Stopping, TransitionEffect::RequestGracefulStop),
                 Execution::Queued => (Execution::Idle, TransitionEffect::None),
                 other => (other, TransitionEffect::None),
             };
             TransitionResult {
-                state: MappingState {
-                    readiness,
-                    execution,
-                    ..state
-                },
+                state: state.with_gates(gates, execution),
                 effect,
             }
         }
         ObservedEvent::VolumeAvailable => {
-            if state.readiness == Readiness::VolumeUnavailable {
-                let next = MappingState {
-                    readiness: Readiness::Ready,
-                    ..state
-                };
-                let effect = if next.intent == Intent::Enabled && next.execution == Execution::Idle
-                {
-                    TransitionEffect::EligibleForScheduling
-                } else {
-                    TransitionEffect::None
-                };
+            if state.gates.volume_unavailable {
+                let mut gates = state.gates;
+                gates.volume_unavailable = false;
+                let next = state.with_gates(gates, state.execution);
                 TransitionResult {
                     state: next,
-                    effect,
+                    effect: eligible_if_ready(next),
                 }
             } else {
                 TransitionResult {
@@ -446,39 +572,32 @@ pub fn apply_event(state: MappingState, event: ObservedEvent) -> TransitionResul
             }
         }
         ObservedEvent::AuthenticationFailed => {
-            let readiness = match state.readiness {
-                Readiness::RecoveryRequired | Readiness::Unconfigured => state.readiness,
-                _ => Readiness::AuthenticationRequired,
-            };
+            if !state.gates.configured {
+                return TransitionResult {
+                    state,
+                    effect: TransitionEffect::None,
+                };
+            }
+            let mut gates = state.gates;
+            gates.auth_required = true;
             let execution = if state.execution == Execution::Queued {
                 Execution::Idle
             } else {
                 state.execution
             };
             TransitionResult {
-                state: MappingState {
-                    readiness,
-                    execution,
-                    ..state
-                },
+                state: state.with_gates(gates, execution),
                 effect: TransitionEffect::None,
             }
         }
         ObservedEvent::AuthenticationRestored => {
-            if state.readiness == Readiness::AuthenticationRequired {
-                let next = MappingState {
-                    readiness: Readiness::Ready,
-                    ..state
-                };
-                let effect = if next.intent == Intent::Enabled && next.execution == Execution::Idle
-                {
-                    TransitionEffect::EligibleForScheduling
-                } else {
-                    TransitionEffect::None
-                };
+            if state.gates.auth_required {
+                let mut gates = state.gates;
+                gates.auth_required = false;
+                let next = state.with_gates(gates, state.execution);
                 TransitionResult {
                     state: next,
-                    effect,
+                    effect: eligible_if_ready(next),
                 }
             } else {
                 TransitionResult {
@@ -488,39 +607,32 @@ pub fn apply_event(state: MappingState, event: ObservedEvent) -> TransitionResul
             }
         }
         ObservedEvent::EndpointChanged => {
-            let readiness = match state.readiness {
-                Readiness::RecoveryRequired | Readiness::Unconfigured => state.readiness,
-                _ => Readiness::EndpointChanged,
-            };
+            if !state.gates.configured {
+                return TransitionResult {
+                    state,
+                    effect: TransitionEffect::None,
+                };
+            }
+            let mut gates = state.gates;
+            gates.endpoint_changed = true;
             let execution = if state.execution == Execution::Queued {
                 Execution::Idle
             } else {
                 state.execution
             };
             TransitionResult {
-                state: MappingState {
-                    readiness,
-                    execution,
-                    ..state
-                },
+                state: state.with_gates(gates, execution),
                 effect: TransitionEffect::None,
             }
         }
         ObservedEvent::EndpointValidated => {
-            if state.readiness == Readiness::EndpointChanged {
-                let next = MappingState {
-                    readiness: Readiness::Ready,
-                    ..state
-                };
-                let effect = if next.intent == Intent::Enabled && next.execution == Execution::Idle
-                {
-                    TransitionEffect::EligibleForScheduling
-                } else {
-                    TransitionEffect::None
-                };
+            if state.gates.endpoint_changed {
+                let mut gates = state.gates;
+                gates.endpoint_changed = false;
+                let next = state.with_gates(gates, state.execution);
                 TransitionResult {
                     state: next,
-                    effect,
+                    effect: eligible_if_ready(next),
                 }
             } else {
                 TransitionResult {
@@ -530,66 +642,56 @@ pub fn apply_event(state: MappingState, event: ObservedEvent) -> TransitionResul
             }
         }
         ObservedEvent::RunFinished(outcome) => {
-            let (readiness, execution) = match outcome {
+            let mut gates = state.gates;
+            let execution = match outcome {
                 RunOutcome::Success
                 | RunOutcome::SuccessWithConflicts
-                | RunOutcome::RetryableFailure => (state.readiness, Execution::Idle),
+                | RunOutcome::RetryableFailure => Execution::Idle,
                 RunOutcome::AuthenticationFailure => {
-                    let next_r = if state.readiness == Readiness::RecoveryRequired {
-                        Readiness::RecoveryRequired
-                    } else {
-                        Readiness::AuthenticationRequired
-                    };
-                    (next_r, Execution::Idle)
+                    gates.auth_required = true;
+                    Execution::Idle
                 }
                 RunOutcome::EndpointOrVolumeMismatch => {
-                    let next_r = match state.readiness {
-                        Readiness::RecoveryRequired | Readiness::VolumeUnavailable => {
-                            state.readiness
-                        }
-                        _ => Readiness::EndpointChanged,
-                    };
-                    (next_r, Execution::Idle)
+                    gates.endpoint_changed = true;
+                    Execution::Idle
                 }
                 RunOutcome::InvalidConfiguration
                 | RunOutcome::CriticalFailure
                 | RunOutcome::UnknownFailure
-                | RunOutcome::CorruptState => (Readiness::RecoveryRequired, Execution::Idle),
-                RunOutcome::Interrupted => (Readiness::RecoveryRequired, Execution::Interrupted),
+                | RunOutcome::CorruptState => {
+                    gates.recovery_required = true;
+                    Execution::Idle
+                }
+                RunOutcome::Interrupted => {
+                    gates.recovery_required = true;
+                    Execution::Interrupted
+                }
             };
             TransitionResult {
-                state: MappingState {
-                    readiness,
-                    execution,
-                    ..state
-                },
+                state: state.with_gates(gates, execution),
                 effect: TransitionEffect::None,
             }
         }
         ObservedEvent::RecoveryCompleted { next_readiness } => {
-            if state.readiness == Readiness::RecoveryRequired {
-                let readiness: Readiness = next_readiness.into();
+            if state.gates.recovery_required {
+                let mut gates = state.gates;
+                gates.recovery_required = false;
+                match next_readiness {
+                    PostRecoveryReadiness::Ready => {}
+                    PostRecoveryReadiness::NeedsInitialization => gates.needs_initialization = true,
+                    PostRecoveryReadiness::VolumeUnavailable => gates.volume_unavailable = true,
+                    PostRecoveryReadiness::AuthenticationRequired => gates.auth_required = true,
+                    PostRecoveryReadiness::EndpointChanged => gates.endpoint_changed = true,
+                }
                 let execution = if state.execution == Execution::Interrupted {
                     Execution::Idle
                 } else {
                     state.execution
                 };
-                let next = MappingState {
-                    readiness,
-                    execution,
-                    ..state
-                };
-                let effect = if next.readiness == Readiness::Ready
-                    && next.intent == Intent::Enabled
-                    && next.execution == Execution::Idle
-                {
-                    TransitionEffect::EligibleForScheduling
-                } else {
-                    TransitionEffect::None
-                };
+                let next = state.with_gates(gates, execution);
                 TransitionResult {
                     state: next,
-                    effect,
+                    effect: eligible_if_ready(next),
                 }
             } else {
                 TransitionResult {
@@ -766,7 +868,14 @@ pub fn status_text(
                 outcome: RunOutcome::Success,
                 completed_at,
             }) => format!("Paused — last completed at {completed_at}"),
-            _ => "Paused".to_owned(),
+            Some(LastRunSummary {
+                outcome: RunOutcome::Interrupted,
+                completed_at,
+            }) => format!("Paused — last run interrupted at {completed_at}"),
+            Some(LastRunSummary { completed_at, .. }) => {
+                format!("Paused — last run failed at {completed_at}")
+            }
+            None => "Paused".to_owned(),
         };
     }
 
@@ -784,22 +893,12 @@ pub fn status_text(
             ..
         }) => "Last run failed — will retry".to_owned(),
         Some(LastRunSummary {
-            outcome: RunOutcome::AuthenticationFailure,
-            ..
-        }) => "Authentication required".to_owned(),
-        Some(LastRunSummary {
-            outcome: RunOutcome::EndpointOrVolumeMismatch,
-            ..
-        }) => "Endpoint changed — review required".to_owned(),
-        Some(LastRunSummary {
-            outcome:
-                RunOutcome::InvalidConfiguration
-                | RunOutcome::CriticalFailure
-                | RunOutcome::UnknownFailure
-                | RunOutcome::CorruptState
-                | RunOutcome::Interrupted,
-            ..
-        }) => "Recovery required".to_owned(),
+            outcome: RunOutcome::Interrupted,
+            completed_at,
+        }) => format!("Last run interrupted at {completed_at} — ready to sync"),
+        Some(LastRunSummary { completed_at, .. }) => {
+            format!("Last run failed at {completed_at} — ready to sync")
+        }
         None => "Ready to sync".to_owned(),
     }
 }

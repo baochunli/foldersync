@@ -407,6 +407,67 @@ fn name_validation_reports_all_findings_without_picking_a_winner() {
     assert!(validate_names(&clean).is_empty());
 }
 
+#[test]
+fn name_validation_reports_exact_duplicates_without_flagging_shared_prefixes() {
+    let paths = [
+        "notes/report.txt",
+        "notes/report.txt",
+        "notes/other.txt",
+        "shared/a.txt",
+        "shared/b.txt",
+    ];
+    let findings = validate_names(&paths);
+
+    assert!(findings.iter().any(|f| {
+        matches!(
+            f.kind,
+            NameFindingKind::ExactDuplicateName {
+                ref normalized_path,
+                occurrences: 2
+            } if normalized_path == "notes/report.txt"
+        ) && f.paths == vec!["notes/report.txt".to_owned(), "notes/report.txt".to_owned()]
+    }));
+    assert!(!findings.iter().any(|f| {
+        matches!(
+            f.kind,
+            NameFindingKind::ExactDuplicateName {
+                ref normalized_path,
+                ..
+            } if normalized_path == "shared" || normalized_path == "notes"
+        )
+    }));
+}
+
+#[test]
+fn name_validation_uses_unicode_caseless_matching() {
+    let greek = [
+        "docs/\u{03A3}.txt",
+        "docs/\u{03C2}.txt",
+        "docs/\u{03C3}.txt",
+    ];
+    let findings = validate_names(&greek);
+    assert!(
+        findings.iter().any(|f| {
+            matches!(f.kind, NameFindingKind::CaseOnlyCollision { .. })
+                && f.paths.contains(&"docs/\u{03A3}.txt".to_owned())
+                && f.paths.contains(&"docs/\u{03C2}.txt".to_owned())
+                && f.paths.contains(&"docs/\u{03C3}.txt".to_owned())
+        }),
+        "expected Σ/ς/σ to collide under Unicode caseless matching, got: {findings:?}"
+    );
+
+    let german = ["docs/stra\u{00DF}e.txt", "docs/STRASSE.txt"];
+    let findings = validate_names(&german);
+    assert!(
+        findings.iter().any(|f| {
+            matches!(f.kind, NameFindingKind::CaseOnlyCollision { .. })
+                && f.paths.contains(&"docs/stra\u{00DF}e.txt".to_owned())
+                && f.paths.contains(&"docs/STRASSE.txt".to_owned())
+        }),
+        "expected ß/SS to collide under Unicode caseless matching, got: {findings:?}"
+    );
+}
+
 fn path_segments_strategy() -> impl Strategy<Value = PathBuf> {
     prop::collection::vec("[a-z0-9_-]{1,8}", 1..5).prop_map(|segs| {
         let mut pb = PathBuf::from("/Volumes/WorkSSD");

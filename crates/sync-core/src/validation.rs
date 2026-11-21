@@ -6,6 +6,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use unicase::UniCase;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::model::{CloudCollection, DeviceId, LocalBinding, MappingId};
@@ -565,6 +566,13 @@ pub fn validate_cloud_collections(
 /// Machine-readable classification of a filename or path compatibility finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NameFindingKind {
+    /// Two or more entries in the inventory share the exact same relative path.
+    ExactDuplicateName {
+        /// Normalized relative path that appeared multiple times.
+        normalized_path: String,
+        /// Number of occurrences observed in the input list.
+        occurrences: usize,
+    },
     /// Two or more distinct paths differ only by letter case.
     CaseOnlyCollision {
         /// Case-folded key shared by the colliding paths.
@@ -620,11 +628,19 @@ pub struct NameFinding {
 /// Reports every finding without picking a winning path.
 pub fn validate_names<S: AsRef<str>>(relative_paths: &[S]) -> Vec<NameFinding> {
     let mut findings = Vec::new();
+    let mut exact_entries: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut unique_prefixes: BTreeSet<String> = BTreeSet::new();
 
     for raw in relative_paths {
         let path = raw.as_ref();
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        if !segments.is_empty() {
+            exact_entries
+                .entry(segments.join("/"))
+                .or_default()
+                .push(path.to_owned());
+        }
 
         for component in &segments {
             if *component == "." || *component == ".." {
@@ -685,6 +701,26 @@ pub fn validate_names<S: AsRef<str>>(relative_paths: &[S]) -> Vec<NameFinding> {
         }
     }
 
+    // Report exact duplicate full paths (distinct from shared directory prefixes).
+    for (normalized_path, raw_entries) in exact_entries {
+        if raw_entries.len() >= 2 {
+            let occurrences = raw_entries.len();
+            findings.push(NameFinding {
+                kind: NameFindingKind::ExactDuplicateName {
+                    normalized_path: normalized_path.clone(),
+                    occurrences,
+                },
+                paths: raw_entries,
+                cause: format!(
+                    "Multiple items ({occurrences}) share the exact same path `{normalized_path}`."
+                ),
+                next_step:
+                    "Inspect the duplicate items and rename or consolidate them before syncing."
+                        .to_owned(),
+            });
+        }
+    }
+
     // Group prefixes by canonical Unicode NFC form to find NFC/NFD collisions.
     let mut by_nfc: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for prefix in &unique_prefixes {
@@ -708,20 +744,26 @@ pub fn validate_names<S: AsRef<str>>(relative_paths: &[S]) -> Vec<NameFinding> {
         }
     }
 
-    // Group distinct NFC forms by lowercased key to find case-only collisions.
-    let mut by_case: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    // Group distinct NFC forms by Unicode caseless matching (NFD + Unicode full case folding).
+    let mut by_case: BTreeMap<UniCase<String>, BTreeMap<String, BTreeSet<String>>> =
+        BTreeMap::new();
     for (nfc_form, raw_variants) in by_nfc {
-        let case_key = nfc_form.to_lowercase();
+        let caseless_key = UniCase::unicode(nfc_form.nfd().collect::<String>());
         by_case
-            .entry(case_key)
+            .entry(caseless_key)
             .or_default()
             .entry(nfc_form)
             .or_default()
             .extend(raw_variants);
     }
 
-    for (case_key, nfc_groups) in by_case {
+    for (caseless_key, nfc_groups) in by_case {
         if nfc_groups.len() >= 2 {
+            let normalized_key: String = caseless_key
+                .into_inner()
+                .nfc()
+                .collect::<String>()
+                .to_lowercase();
             let paths: Vec<String> = nfc_groups
                 .into_values()
                 .flatten()
@@ -730,11 +772,11 @@ pub fn validate_names<S: AsRef<str>>(relative_paths: &[S]) -> Vec<NameFinding> {
                 .collect();
             findings.push(NameFinding {
                 kind: NameFindingKind::CaseOnlyCollision {
-                    normalized_key: case_key.clone(),
+                    normalized_key: normalized_key.clone(),
                 },
                 paths,
                 cause: format!(
-                    "Multiple items differ only by letter case (`{case_key}`), which collides on case-insensitive volumes."
+                    "Multiple items differ only by letter case (`{normalized_key}`), which collides under caseless matching."
                 ),
                 next_step: "Review the conflicting items and rename them so each name is unique regardless of case.".to_owned(),
             });

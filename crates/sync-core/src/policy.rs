@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::model::CloudCollection;
 use crate::validation::{ValidationError, ValidationErrorKind};
@@ -23,9 +23,16 @@ const ACCESS_MARKER_PREFIX: &str = "FOLDERSYNC-ACCESS-MARKER-";
 /// Percentage deletion limit passed to rclone bisync (`--max-delete`).
 ///
 /// This is a **percentage of tracked files**, not an absolute file count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct MaxDeletePercent(u8);
+
+impl<'de> Deserialize<'de> for MaxDeletePercent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let percent = u8::deserialize(deserializer)?;
+        Self::new(percent).map_err(serde::de::Error::custom)
+    }
+}
 
 impl MaxDeletePercent {
     /// Creates a validated percentage in `0..=100`.
