@@ -212,6 +212,11 @@ impl From<SecretStoreError> for AccountError {
 impl From<ConfigError> for AccountError {
     fn from(err: ConfigError) -> Self {
         match err {
+            ConfigError::CredentialHelperFailed => Self::AuthenticationRequired {
+                cause: format!("{err}."),
+                next_step: "Unlock your macOS login Keychain, then retry from a logged-in GUI session."
+                    .to_string(),
+            },
             ConfigError::AuthenticationRequired { reason } => Self::AuthenticationRequired {
                 cause: format!("Failed to unlock encrypted rclone configuration: {reason}."),
                 next_step: "Unlock your macOS Keychain or reconnect the account.".to_string(),
@@ -1849,6 +1854,18 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::secrets::InMemorySecretStore;
+
+    #[test]
+    fn credential_helper_failure_points_to_the_login_keychain() {
+        let err = AccountError::from(ConfigError::CredentialHelperFailed);
+        assert!(matches!(err, AccountError::AuthenticationRequired { .. }));
+        assert_eq!(
+            err.cause(),
+            "FolderSync's credential helper could not read the account passphrase from the Keychain."
+        );
+        assert!(err.next_step().contains("Unlock your macOS login Keychain"));
+        assert!(err.next_step().contains("logged-in GUI session"));
+    }
 
     #[cfg(unix)]
     fn make_helper_factory(tmp: &Path, store: Arc<InMemorySecretStore>) -> PasswordCommandFactory {

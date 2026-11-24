@@ -35,8 +35,8 @@ folder using `sync-cli`.
   `~/.rclone.conf`) unless the user explicitly passes both `--from <path>` and
   `--allow-global-config` to `account import`.
 - **Per-state scoped encryption passphrase:** A random 256-bit passphrase is
-  generated per account and registered (create-only) in macOS Keychain as a
-  generic password under service `dev.foldersync` and account
+  generated per account and registered (create-only) in the macOS login
+  Keychain as a generic password under service `dev.foldersync` and account
   `<install-id>/<account-id>`, where `<install-id>` is the random per-state ID
   stored in `state.sqlite`. Disposable qualification state directories therefore
   never overwrite or delete another state directory's Keychain credentials. No
@@ -47,10 +47,14 @@ folder using `sync-cli`.
   replacing it cleanly.
 - **Credential helper:** Pinned rclone retrieves the passphrase exclusively via
   `--password-command "<path-to-sync-cli> credential-helper --account <install-id>/<account-id>"`
-  with `--ask-password=false` and stdin closed. Neither the config passphrase
-  nor the OAuth `client_secret` is ever placed in command-line arguments or
-  ordinary logs. Config inspection uses `rclone config redacted` (never
-  `config dump`) and never includes child stdout in error messages.
+  with `--ask-password=false` and stdin closed. The CLI and app helper use the
+  macOS account's home directory to open the login Keychain explicitly, even
+  when rclone runs with an isolated `HOME`. Account management uses the same
+  login Keychain for credential creation, updates, and deletion. Neither the
+  config passphrase nor the OAuth `client_secret` is ever placed in
+  command-line arguments or ordinary logs. Config inspection uses
+  `rclone config redacted` (never `config dump`) and never includes child stdout
+  in error messages.
 - **Locked Keychain handling:** The macOS Keychain backend sets
   `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail` so a locked Keychain
   fails immediately with `authentication_required` (exit code `3`) instead of
@@ -112,18 +116,28 @@ your own personal OAuth client before connecting a real Drive account:
 1. Open [Google Cloud Console](https://console.cloud.google.com/) and create a
    dedicated project (for example, `foldersync-personal`).
 2. Under **APIs & Services → Library**, enable the **Google Drive API**.
-3. Under **APIs & Services → OAuth consent screen**:
-   - Choose **External** (for personal Google accounts) and keep the app in
-     **Testing** mode during household qualification.
-   - Add each participating household Google account email under **Test users**.
-   - Note: Google Testing-mode refresh tokens can expire after ~7 days; test
-     reauthorization and review consent/publishing requirements before long-term
-     use.
-4. Under **APIs & Services → Credentials → Create Credentials → OAuth client ID**:
-   - Application type: **Desktop app**.
-   - Record the **Client ID** (`...apps.googleusercontent.com`) and **Client
-     secret**.
-5. Supply the Client secret without putting it as a literal in a shell command,
+3. Open **Google Auth Platform → Branding** and choose **Get started** if
+   prompted. Enter an app name, a user support email, and developer contact
+   information. Leave the logo blank. Displaying a logo for an external
+   production app requires brand verification.
+   [Google branding setup](https://support.google.com/cloud/answer/15544987)
+4. Under **Audience**, choose **External**. Choose one publishing status:
+   - **Testing** for qualification. Under **Test users**, add the Google
+     accounts that will sign in. Google limits testing to 100 users and
+     expires Drive refresh tokens after seven days.
+   - **Publish app** for long-lived refresh tokens. Authorize again after
+     publishing to obtain a new token. While your app is unverified for its
+     Drive scopes, Google shows the **Google hasn’t verified this app** screen
+     and caps access at 100 users over the life of the project. For the
+     project you created, choose **Advanced → Go to [project name] (unsafe)**
+     to continue.
+
+   [Google audience and publishing settings](https://support.google.com/cloud/answer/15549945)
+5. Under **Clients → Create client**, choose **Desktop app** and create the
+   client. Copy the **Client ID** and **Client secret** immediately or
+   download the client JSON. Google may only show the full secret at
+   creation. [Google client secret visibility](https://support.google.com/cloud/answer/15549257)
+6. Supply the Client secret without putting it as a literal in a shell command,
    echoing it to your terminal, or placing it at a predictable `/tmp` path —
    choose one of:
    - **No-echo shell read piped to `--client-secret-stdin`:** Note that
@@ -216,6 +230,20 @@ unset OAUTH_SECRET
   --expected-id "<LEAF_FOLDER_ID_FROM_STEP_4>"
 ```
 
+### Troubleshoot Keychain access and browser sign-in
+
+- Run setup from Terminal in a logged-in macOS desktop session. An SSH
+  session can fail with `errSecInteractionNotAllowed`. If the login Keychain
+  is locked, open Keychain Access to unlock it or run
+  `security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"`.
+  Retry from the desktop session if access is still denied.
+- FolderSync looks for the passphrase in the login Keychain. If an earlier
+  setup created it in a custom default Keychain, copy the item to the login
+  Keychain in Keychain Access before retrying.
+- The browser must be able to reach rclone's OAuth callback at
+  `127.0.0.1:53682` on the Mac running setup. Open the sign-in URL in a
+  browser on that Mac.
+
 ### Explicit single-remote import (optional developer flow)
 
 To copy **one** named remote from a user-chosen unencrypted rclone config file
@@ -287,8 +315,21 @@ for scripted multi-client evidence.
 Before enabling household use, verify on the disposable shared parent with both
 Account A and Account B:
 
-1. **Keychain roundtrip:** Run the manual `#[ignore]` Keychain test if desired:
-   `cargo test -p sync-manager --lib keychain_generic_password_roundtrip_manual_only -- --ignored`.
+1. **Keychain roundtrip:** From a logged-in macOS Terminal, build a disposable
+   debug helper and run the manual test with the separate test service:
+   ```sh
+   (
+     set -e
+     TEST_ROOT="$(mktemp -d)"
+     mkdir "$TEST_ROOT/home" "$TEST_ROOT/state" "$TEST_ROOT/tmp"
+     export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+     export HOME="$TEST_ROOT/home" FOLDERSYNC_STATE_DIR="$TEST_ROOT/state" TMPDIR="$TEST_ROOT/tmp"
+     cargo build -p sync-cli --target-dir "$TEST_ROOT/target" --features sync-manager/keychain-test-helper
+     FOLDERSYNC_TEST_HELPER="$TEST_ROOT/target/debug/sync-cli" \
+       cargo test -p sync-manager --target-dir "$TEST_ROOT/target" --features keychain-test-helper \
+       --lib credential_helper_reads_login_keychain_with_isolated_home_manual_only -- --ignored
+   )
+   ```
 2. **Duplicate-name guard:** Temporarily create two sibling folders named
    `Data/Research` in Drive and confirm `remote resolve Data/Research` refuses
    with an error of the form:

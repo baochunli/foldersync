@@ -51,12 +51,67 @@ fn make_test_password_helper(dir: &Path, secret: &str) -> PasswordCommand {
     fs::write(&secret_file, secret.as_bytes()).unwrap();
     fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let helper = dir.join("foldersync-test-cred-helper");
     let script = format!("#!/bin/sh\ncat \"{}\"\n", secret_file.display());
-    fs::write(&helper, script.as_bytes()).unwrap();
+    write_test_password_helper(dir, &script)
+}
+
+#[cfg(unix)]
+fn write_test_password_helper(dir: &Path, script: &str) -> PasswordCommand {
+    let helper = dir.join("foldersync-test-cred-helper");
+    fs::write(&helper, script).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
 
     PasswordCommand::new(helper, vec!["--account".to_string(), "acc-1".to_string()]).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_rclone_password_helper_failure_diagnosed_and_setup_file_removed() {
+    let Some(rclone_path) = pinned_binary_path() else {
+        eprintln!("Skipping: pinned rclone is absent; run scripts/fetch-rclone.sh");
+        return;
+    };
+    let engine = qualify_binary(&rclone_path).unwrap();
+    for (label, script) in [
+        (
+            "helper-exits-3",
+            "#!/bin/sh\necho synthetic-helper-stderr >&2\nexit 3\n",
+        ),
+        ("helper-empty", "#!/bin/sh\nexit 0\n"),
+    ] {
+        let ws = TempWorkspace::new(label);
+        let source_config_path = ws.path("source.conf");
+        fs::write(&source_config_path, "[local_fixture]\ntype = local\n").unwrap();
+        let account_dir = ws.path("state/accounts/local-fixture");
+        let config_path = account_dir.join("rclone.conf");
+        let err = import_single_remote_into_encrypted_config(
+            &engine,
+            &RealProcessRunner,
+            &ImportRemoteSpec {
+                source_config_path,
+                source_remote_name: "local_fixture".to_string(),
+                target_remote_name: "local_fixture".to_string(),
+                target_config_path: config_path.clone(),
+                lock_path: account_dir.join("config.lock"),
+                password_command: write_test_password_helper(&ws.root, script),
+                override_root_folder_id: None,
+                allow_global_default_source: false,
+            },
+        )
+        .unwrap_err();
+        assert!(!config_path.exists());
+        let remaining: Vec<_> = fs::read_dir(&account_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining, ["config.lock"]);
+        let message = err.to_string();
+        assert!(
+            message.contains("FolderSync's credential helper could not read the account passphrase from the Keychain"),
+            "{label}: {message}"
+        );
+        assert!(!message.contains("synthetic-helper-stderr"));
+    }
 }
 
 #[test]

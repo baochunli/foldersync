@@ -1570,12 +1570,20 @@ mod tests {
         assert_eq!(stdout, "fake-secret-42\n");
         assert!(stderr.is_empty());
 
+        let (missing_code, missing_stdout, missing_stderr) =
+            run_args(&rt, &["credential-helper", "--account", "inst-1/missing"]);
+        assert_eq!(missing_code, ExitCode::from(1));
+        assert!(missing_stdout.is_empty());
+        assert!(missing_stderr.contains("No credential stored"));
+        assert!(!missing_stderr.contains("fake-secret-42"));
+
         store.set_locked(true);
         let (code2, stdout2, stderr2) =
             run_args(&rt, &["credential-helper", "--account", "inst-1/drive-1"]);
         assert_eq!(code2, ExitCode::from(EXIT_AUTH_REQUIRED));
         assert!(stdout2.is_empty());
         assert!(stderr2.contains("authentication_required"));
+        assert!(stderr2.contains("credential store is locked"));
         assert!(!stderr2.contains("fake-secret-42"));
     }
 

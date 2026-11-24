@@ -60,15 +60,19 @@ pub fn handle_credential_helper_invocation() {
             (Some(flag), Some(key), None) if flag == "--account" => key.into_string().ok(),
             _ => None,
         };
-        let ok = key.is_some_and(|key| {
-            sync_manager::run_credential_helper(
-                &sync_manager::SystemSecretStore,
-                &key,
-                &mut std::io::stdout().lock(),
-            )
-            .is_ok()
-        });
-        std::process::exit(if ok { 0 } else { 3 });
+        let Some(key) = key else {
+            eprintln!("Usage: credential-helper --account <id>");
+            std::process::exit(3);
+        };
+        if let Err(err) = sync_manager::run_credential_helper(
+            &sync_manager::SystemSecretStore,
+            &key,
+            &mut std::io::stdout().lock(),
+        ) {
+            eprintln!("{err}");
+            std::process::exit(3);
+        }
+        std::process::exit(0);
     }
 }
 
