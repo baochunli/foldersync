@@ -163,15 +163,15 @@ final class FolderSyncFinderExtension: FIFinderSync {
         stateLock.unlock()
 
         let controller = FIFinderSyncController.default()
-        if updateDirectoryURLs, let newRootURLs = SnapshotEvaluator.directoryRootURLs(for: evaluation) {
+        if updateDirectoryURLs, let newDirectoryURLs = SnapshotEvaluator.monitoredDirectoryURLs(for: evaluation) {
             // Derive watch-list updates only from successful reads; do not probe
             // arbitrary user paths with FileManager inside the app sandbox.
-            if newRootURLs != previousDirectoryURLs {
+            if newDirectoryURLs != previousDirectoryURLs {
                 stateLock.lock()
-                currentDirectoryURLs = newRootURLs
+                currentDirectoryURLs = newDirectoryURLs
                 stateLock.unlock()
-                controller.directoryURLs = newRootURLs
-                logger.notice("Updated directoryURLs count=\(newRootURLs.count)")
+                controller.directoryURLs = newDirectoryURLs
+                logger.notice("Updated directoryURLs count=\(newDirectoryURLs.count)")
             }
         }
 
@@ -186,28 +186,35 @@ final class FolderSyncFinderExtension: FIFinderSync {
     // MARK: - FIFinderSync callbacks
 
     override func beginObservingDirectory(at url: URL) {
-        logger.notice("beginObservingDirectory path=\(url.path, privacy: .public)")
+        logMappedRootObservation("beginObservingDirectory", at: url)
     }
 
     override func endObservingDirectory(at url: URL) {
-        logger.notice("endObservingDirectory path=\(url.path, privacy: .public)")
+        logMappedRootObservation("endObservingDirectory", at: url)
+    }
+
+    private func logMappedRootObservation(_ event: String, at url: URL) {
+        stateLock.lock()
+        let snapshot = lastKnownSnapshot
+        stateLock.unlock()
+        guard let snapshot, SnapshotEvaluator.rootMapping(for: url, in: snapshot) != nil else {
+            return
+        }
+        logger.notice("\(event, privacy: .public) path=\(url.path, privacy: .public)")
     }
 
     override func requestBadgeIdentifier(for url: URL) {
         let evaluation = evaluateCurrentState()
+        guard let badge = SnapshotEvaluator.badgeState(for: url, evaluation: evaluation) else {
+            return
+        }
 
         stateLock.lock()
         lastEvaluation = evaluation
-        if let badge = SnapshotEvaluator.badgeState(for: url, evaluation: evaluation) {
-            observedRootURLs.insert(url)
-            stateLock.unlock()
-            FIFinderSyncController.default().setBadgeIdentifier(badge.rawValue, for: url)
-            logger.notice("Badged root path=\(url.path, privacy: .public) badge=\(badge.rawValue, privacy: .public)")
-        } else {
-            stateLock.unlock()
-            // v1 ruling: mapped-folder ROOTS only; clear badge on children.
-            FIFinderSyncController.default().setBadgeIdentifier("", for: url)
-        }
+        observedRootURLs.insert(url)
+        stateLock.unlock()
+        FIFinderSyncController.default().setBadgeIdentifier(badge.rawValue, for: url)
+        logger.notice("Badged root path=\(url.path, privacy: .public) badge=\(badge.rawValue, privacy: .public)")
     }
 
     // MARK: - Toolbar and Context Menu
@@ -218,7 +225,8 @@ final class FolderSyncFinderExtension: FIFinderSync {
 
     override func menu(for menuKind: FIMenuKind) -> NSMenu? {
         let controller = FIFinderSyncController.default()
-        let targetURL = controller.selectedItemURLs()?.first ?? controller.targetedURL()
+        let selectedURLs = controller.selectedItemURLs() ?? []
+        let targetURL = controller.targetedURL()
 
         // Re-read snapshot on menu open so deleted/corrupt files surface immediately.
         let readResult = readSnapshotFromDisk()
@@ -241,10 +249,17 @@ final class FolderSyncFinderExtension: FIFinderSync {
         stateLock.unlock()
 
         let mapping: MappingSnapshot?
-        if let targetURL {
-            mapping = SnapshotEvaluator.menuMapping(for: targetURL, evaluation: evaluation)
+        if menuKind == .toolbarItemMenu {
+            mapping = (selectedURLs.first ?? targetURL).flatMap {
+                SnapshotEvaluator.menuMapping(for: $0, evaluation: evaluation)
+            }
         } else {
-            mapping = nil
+            let targetURLs = menuKind == .contextualMenuForItems && !selectedURLs.isEmpty
+                ? selectedURLs : (targetURL.map { [$0] } ?? [])
+            guard let context = SnapshotEvaluator.contextMenuMapping(for: targetURLs, in: knownSnapshot) else {
+                return nil
+            }
+            mapping = evaluation.successfulSnapshot == nil ? nil : context
         }
 
         let menu = NSMenu(title: "FolderSync")

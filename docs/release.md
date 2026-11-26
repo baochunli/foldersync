@@ -110,13 +110,19 @@ disables automatic scheduling so each test run comes from its own Finder
   `RecoveryRequired` hold, and unchanged bisync listings.
 - Checks the console state before interacting with Finder. On an unlocked
   console it registers the disposable extension and opens the mapped root
-  and its parent in the logged-in Finder session. Opening the root checks
-  directory observation. Opening the parent displays the root and requests
-  its `paused` badge. The script queries the Finder extension log subsystem
-  and matches snapshot decode, watched-root registration, and badge evidence
-  to the run's handoff path, host ID, and extension PID. It records these
-  checks as **NOT VERIFIED** if the console is locked, absent, or its status
-  cannot be determined.
+  and its parent in the logged-in Finder session. The extension monitors
+  the parent so Finder can request a badge when the mapped root comes into
+  view. Opening the root checks directory observation. The script queries
+  the Finder extension log subsystem and matches snapshot decode, watch
+  registration, and the expected `paused` badge to the run's handoff path,
+  host ID, and extension PID. It records these checks as **NOT VERIFIED**
+  if the console is locked, absent, or its status cannot be determined.
+
+A disposable package logged the expected `paused` root badge during an
+unlocked controlled comparison in icon view. The full scripted rerun had
+no Finder extension events, and additional view and reopen trials did not
+reliably reproduce the callback. Check the evidence for the current run.
+[ADR 0002 root badge comparison](decisions/0002-finder-extension.md#packaged-root-badge-comparison-2026-11-26)
 
 The script writes `target/app-qualification/app-evidence.json` and
 `target/app-qualification/app-evidence.md` after cleanup. Each check includes
