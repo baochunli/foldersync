@@ -105,8 +105,8 @@ do {
     }
 }
 
-// 3b. Valid-to-invalid transition: failed read keeps cached snapshot ONLY for stale root badges;
-// menu mappings and directoryURLs updates come strictly from successful reads.
+// 3b. Failed reads keep stale root badges and contextual menu scope; action IDs
+// and directoryURLs updates come strictly from successful reads.
 do {
     let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("fs-transition-\(UUID().uuidString)")
     let mappedDir = tempRoot.appendingPathComponent("Research")
@@ -135,7 +135,7 @@ do {
     )
     expect(SnapshotEvaluator.badgeState(for: mappedDir, evaluation: initialEval) == .synced, "initial valid snapshot should badge synced")
     expect(SnapshotEvaluator.menuMapping(for: mappedDir, evaluation: initialEval)?.id == "research", "initial valid snapshot should supply menu mapping")
-    expect(SnapshotEvaluator.directoryRootURLs(for: initialEval)?.count == 1, "initial valid snapshot should supply directoryURLs")
+    expect(SnapshotEvaluator.monitoredDirectoryURLs(for: initialEval)?.count == 1, "initial valid snapshot should supply directoryURLs")
 
     // Next read fails (deleted / corrupt / unsupported version) while host runs and prior TTL hasn't elapsed
     let failedEval = SnapshotEvaluator.evaluate(
@@ -145,7 +145,7 @@ do {
         hostAppRunning: true
     )
     if case .stale(let retained, let reason, let readOk) = failedEval {
-        expect(retained == priorSnap, "failed read must retain lastKnownSnapshot only for stale root badges")
+        expect(retained == priorSnap, "failed read must retain lastKnownSnapshot for stale root badges and context scope")
         expect(reason == "Status unavailable (invalid snapshot)", "failed read reason should propagate to menu")
         expect(!readOk, "failed read must mark readSucceeded=false")
     } else {
@@ -155,7 +155,7 @@ do {
     expect(SnapshotEvaluator.badgeState(for: mappedDir, evaluation: failedEval) == .stale, "valid-to-invalid transition must badge mapped root as stale")
     expect(SnapshotEvaluator.badgeState(for: childFile, evaluation: failedEval) == nil, "valid-to-invalid transition must still NOT badge child files")
     expect(SnapshotEvaluator.menuMapping(for: mappedDir, evaluation: failedEval) == nil, "failed read must supply NO mapping to Finder menu (only Open FolderSync without mapping ID)")
-    expect(SnapshotEvaluator.directoryRootURLs(for: failedEval) == nil, "failed read must NOT supply directoryURLs updates")
+    expect(SnapshotEvaluator.monitoredDirectoryURLs(for: failedEval) == nil, "failed read must NOT supply directoryURLs updates")
 
     // Contrast: a valid-but-expired read still succeeded, so menuMapping and directoryURLs come from that successful read
     let validExpiredEval = SnapshotEvaluator.evaluate(
@@ -166,7 +166,7 @@ do {
     )
     expect(SnapshotEvaluator.badgeState(for: mappedDir, evaluation: validExpiredEval) == .stale, "expired valid snapshot should badge root as stale")
     expect(SnapshotEvaluator.menuMapping(for: mappedDir, evaluation: validExpiredEval)?.id == "research", "successful expired read may supply menu mapping")
-    expect(SnapshotEvaluator.directoryRootURLs(for: validExpiredEval)?.count == 1, "successful expired read may supply directoryURLs")
+    expect(SnapshotEvaluator.monitoredDirectoryURLs(for: validExpiredEval)?.count == 1, "successful expired read may supply directoryURLs")
 }
 
 // 4. Root-only badge rule: mapped root gets badge; child file/subfolder gets nil (no badge)
@@ -176,8 +176,10 @@ do {
     let nestedDir = mappedDir.appendingPathComponent("Subfolder")
     let nestedFile = nestedDir.appendingPathComponent("paper.pdf")
     let siblingDir = tempRoot.appendingPathComponent("Research-Extra")
+    let siblingAlias = tempRoot.appendingPathComponent("Alias")
     try! FileManager.default.createDirectory(at: nestedDir, withIntermediateDirectories: true)
     try! FileManager.default.createDirectory(at: siblingDir, withIntermediateDirectories: true)
+    try! FileManager.default.createSymbolicLink(at: siblingAlias, withDestinationURL: mappedDir)
     try! Data("pdf".utf8).write(to: nestedFile)
     defer { try? FileManager.default.removeItem(at: tempRoot) }
 
@@ -191,6 +193,17 @@ do {
     )
     let freshEval = SnapshotEvaluation.fresh(snap)
     let staleEval = SnapshotEvaluation.stale(snap, reason: "Outdated", readSucceeded: true)
+    let otherMappedDir = tempRoot.appendingPathComponent("Archive")
+    let sharedParentSnapshot = StatusSnapshot(
+        version: snap.version,
+        generatedAt: snap.generatedAt,
+        staleAfterSeconds: snap.staleAfterSeconds,
+        mappings: snap.mappings + [
+            MappingSnapshot(id: "archive", rootPath: otherMappedDir.path, state: .paused, label: "Paused")
+        ]
+    )
+    let monitoredPaths = SnapshotEvaluator.monitoredDirectoryURLs(for: .fresh(sharedParentSnapshot))?.map(\.path)
+    expect(monitoredPaths == [tempRoot.resolvingSymlinksInPath().path], "mapped siblings share one monitored parent")
 
     // Resolve /var -> /private/var to verify symlink equivalence
     let resolvedRoot = mappedDir.resolvingSymlinksInPath()
@@ -199,6 +212,7 @@ do {
     expect(SnapshotEvaluator.badgeState(for: nestedDir, evaluation: freshEval) == nil, "nested subfolder must NOT get a badge (roots only)")
     expect(SnapshotEvaluator.badgeState(for: nestedFile, evaluation: freshEval) == nil, "nested file must NOT get a badge (roots only)")
     expect(SnapshotEvaluator.badgeState(for: siblingDir, evaluation: freshEval) == nil, "sibling prefix-sharing dir must NOT match")
+    expect(SnapshotEvaluator.badgeState(for: siblingAlias, evaluation: freshEval) == nil, "sibling symlink must NOT inherit the root badge")
     expect(SnapshotEvaluator.badgeState(for: mappedDir, evaluation: staleEval) == .stale, "stale snapshot must badge mapped root as stale")
     expect(SnapshotEvaluator.badgeState(for: nestedFile, evaluation: staleEval) == nil, "stale snapshot must still NOT badge child files")
 
@@ -206,6 +220,12 @@ do {
     expect(SnapshotEvaluator.owningMapping(for: mappedDir, in: snap)?.id == "research", "owningMapping should match root")
     expect(SnapshotEvaluator.owningMapping(for: nestedFile, in: snap)?.id == "research", "owningMapping should match child for context menu")
     expect(SnapshotEvaluator.owningMapping(for: siblingDir, in: snap) == nil, "owningMapping must NOT match sibling Research-Extra")
+    expect(SnapshotEvaluator.menuMapping(for: siblingAlias, evaluation: freshEval) == nil, "sibling symlink must NOT inherit a mapping menu")
+    expect(SnapshotEvaluator.contextMenuMapping(for: [mappedDir, nestedFile], in: snap)?.id == "research", "context menu may target a selection inside one mapping")
+    expect(SnapshotEvaluator.contextMenuMapping(for: [tempRoot], in: snap) == nil, "monitored parent must NOT offer a context menu")
+    expect(SnapshotEvaluator.contextMenuMapping(for: [siblingDir], in: snap) == nil, "unmapped sibling must NOT offer a context menu")
+    expect(SnapshotEvaluator.contextMenuMapping(for: [mappedDir, siblingDir], in: snap) == nil, "selection including an unmapped sibling must NOT offer a context menu")
+    expect(SnapshotEvaluator.contextMenuMapping(for: [mappedDir, otherMappedDir], in: sharedParentSnapshot) == nil, "selection spanning mappings must NOT offer a context menu")
 }
 
 // 5. Accessible labels are non-empty plain text for all BadgeStates

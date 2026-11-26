@@ -130,6 +130,7 @@ fn dispatch(
         "status" => run_cmd(cmd_status(rt, &rest, out), err_out),
         "collections" => run_cmd(cmd_collections(rt, &rest, out), err_out),
         "add-mapping" => run_cmd(cmd_add_mapping(rt, &rest, out), err_out),
+        "remove-mapping" => run_cmd(cmd_remove_mapping(rt, &rest, out), err_out),
         "init" => run_cmd(cmd_init(rt, &rest, out), err_out),
         "run-once" => run_cmd(cmd_run_once(rt, &rest, out), err_out),
         "pause" => run_cmd(cmd_pause(rt, &rest, out), err_out),
@@ -243,6 +244,7 @@ Commands:
     [--remote-recovery-dir <path>]
     [--collection <path>]
     [--max-delete-percent <1-100>]
+  remove-mapping <mapping> --state-dir <dir>  Remove a mapping from the state
   init <mapping> --state-dir <dir>             Initialize a mapping
   run-once <mapping> --state-dir <dir>         Run one manual synchronization pass
   pause <mapping> --state-dir <dir>            Persist pause intent for a mapping
@@ -1151,6 +1153,19 @@ fn cmd_scheduling(rt: &CliRuntime, args: &[String], out: &mut dyn Write) -> Resu
         "Automatic scheduling {}.",
         if paused { "paused" } else { "resumed" }
     )?;
+    Ok(())
+}
+
+fn cmd_remove_mapping(
+    rt: &CliRuntime,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (id, state_dir, finder_dir) = parse_mapping_and_flags(args)?;
+    let mgr = rt.open_manager(state_dir, finder_dir)?;
+    mgr.remove_mapping(MappingId::new(id.clone()))?;
+    mgr.shutdown()?;
+    writeln!(out, "Removed mapping `{id}`.")?;
     Ok(())
 }
 
