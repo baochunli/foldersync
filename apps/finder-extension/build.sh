@@ -174,7 +174,8 @@ cleanup_build_stage() {
   local status=$?
   rm -rf "$BUILD_STAGE"
   if [[ "$status" -ne 0 && -n "$DEV_STATE_DIR" ]]; then
-    rmdir "${DEV_STATE_DIR}/finder" "$DEV_STATE_DIR"
+    rmdir "${DEV_STATE_DIR}/finder" 2>/dev/null || true
+    rmdir "$DEV_STATE_DIR" 2>/dev/null || true
   fi
 }
 trap cleanup_build_stage EXIT

@@ -43,7 +43,7 @@ requests badges as items come into view. [Apple's Finder Sync guide](https://dev
 The earlier spike badge results below apply to the mock host. The live
 production home-relative handoff, interactive Finder menu clicks, and
 installed Developer ID bundle remain outside this run. See the
-[release qualification commands](../release.md#packaged-app-and-finder-qualification-2026-11-21).
+[release qualification commands](../release.md#scripted-packaged-app-and-finder-qualification).
 
 ## Test Environment
 

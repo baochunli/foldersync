@@ -109,11 +109,14 @@ disables automatic scheduling so each test run comes from its own Finder
   Relaunches the package and verifies run reconciliation, the
   `RecoveryRequired` hold, and unchanged bisync listings.
 - Checks the console state before interacting with Finder. On an unlocked
-  console it registers the disposable extension, opens and reveals the mapped
-  root, and looks for successful snapshot decode, watched-root registration
-  and observation, and a root badge request with badge `paused`. It records
-  these checks as **NOT VERIFIED** if the console is locked, absent, or its
-  status cannot be determined.
+  console it registers the disposable extension and opens the mapped root
+  and its parent in the logged-in Finder session. Opening the root checks
+  directory observation. Opening the parent displays the root and requests
+  its `paused` badge. The script queries the Finder extension log subsystem
+  and matches snapshot decode, watched-root registration, and badge evidence
+  to the run's handoff path, host ID, and extension PID. It records these
+  checks as **NOT VERIFIED** if the console is locked, absent, or its status
+  cannot be determined.
 
 The script writes `target/app-qualification/app-evidence.json` and
 `target/app-qualification/app-evidence.md` after cleanup. Each check includes
@@ -141,6 +144,7 @@ tests/app/run-app-checks.sh --release target/package-appqa-release/FolderSync.ap
 
 This runs the local lifecycle and Finder checks on a staged copy of the signed
 bundle and adds `spctl --assess --type execute` and `xcrun stapler validate`.
+The script also fetches or verifies the workspace rclone pin for fixture setup.
 For fresh-machine Gatekeeper, use the final production bundle on a second Mac
 or a clean macOS VM with ordinary download quarantine in place. Follow the
 operational verification steps below.

@@ -182,16 +182,17 @@ class Qualification:
         self.results[key].update(status=status, evidence=list(evidence))
         print(f"{status:12} {self.labels[key]}", flush=True)
 
-    def command(self, *argv, timeout=30, check=True, logfile=None):
+    def command(self, *argv, timeout=30, check=True, logfile=None, env=None):
         argv = [str(part) for part in argv]
+        env = self.env if env is None else env
         if logfile is not None:
             print(f"Running {Path(argv[0]).name} (log: {logfile})", flush=True)
             with logfile.open("x") as output:
-                proc = subprocess.run(argv, env=self.env, cwd=REPO, timeout=timeout,
+                proc = subprocess.run(argv, env=env, cwd=REPO, timeout=timeout,
                                       stdout=output, stderr=subprocess.STDOUT, text=True)
             proc.stdout = logfile.read_text(errors="replace")
         else:
-            proc = subprocess.run(argv, env=self.env, cwd=REPO, timeout=timeout,
+            proc = subprocess.run(argv, env=env, cwd=REPO, timeout=timeout,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if check:
             require(proc.returncode == 0, f"{Path(argv[0]).name} exited {proc.returncode}: {proc.stdout[-4000:]}")
@@ -203,14 +204,16 @@ class Qualification:
     def only_staged_registration(self):
         inventory = self.inventory("-vv")
         if inventory in ("", "(no matches)"):
-            return
+            return False
         paths = re.findall(r"^\s*Path\s*=\s*(.+)$", inventory, flags=re.M)
         require(paths == [str(self.appex)], f"Unexpected existing disposable ID registration: {inventory}")
+        return True
 
     def build_or_stage(self):
         require(self.inventory() in ("", "(no matches)"), f"{EXTENSION_ID} is already registered")
+        # The workspace CLI initializes the local fixture in both modes.
+        self.command(REPO / "scripts/fetch-rclone.sh", timeout=300)
         if not self.args.release:
-            self.command(REPO / "scripts/fetch-rclone.sh", timeout=300)
             nsh = os.environ.get("NSH_BIN") or self.original_home / ".local/bin/nsh"
             log = self.scratch / "package.log"
             try:
@@ -511,12 +514,14 @@ class Qualification:
         elected = self.inventory("-vv")
         require(elected.startswith("+") and str(self.appex) in elected,
                 f"PluginKit did not elect the staged extension: {elected}")
-        predicate = f'subsystem == "{LOG_SUBSYSTEM}" AND processImagePath == {json.dumps(str(self.extension))}'
+        # Unified logging can reuse the image path from an earlier bundle with the same Mach-O UUID.
+        predicate = f'subsystem == "{LOG_SUBSYSTEM}"'
         observations = {}
         logs = []
-        self.command("/usr/bin/open", "-a", "Finder", self.local)
+        # Finder observes the root's contents and requests its badge when the parent shows the root.
+        self.command("/usr/bin/open", "-a", "Finder", self.local, env=os.environ)
         time.sleep(2)
-        self.command("/usr/bin/open", "-R", self.local)
+        self.command("/usr/bin/open", "-a", "Finder", self.local.parent, env=os.environ)
         for _ in range(10):
             time.sleep(3)
             if self.check_console() != "unlocked":
@@ -542,16 +547,19 @@ class Qualification:
 
     def cleanup(self):
         problems = []
-        if self.appex.is_dir() and (self.registration_attempted or self.launched):
+        registered = self.registration_attempted
+        if self.appex.is_dir():
             try:
-                self.only_staged_registration()
-                self.command(*PLUGIN, "-e", "ignore", "-i", EXTENSION_ID)
+                registered = self.only_staged_registration() or registered
+                if registered:
+                    self.command(*PLUGIN, "-e", "ignore", "-i", EXTENSION_ID)
             except COMMAND_ERRORS as exc:
                 problems.append(str(exc))
-            try:
-                self.command(*PLUGIN, "-r", self.appex)
-            except COMMAND_ERRORS as exc:
-                problems.append(str(exc))
+            if registered:
+                try:
+                    self.command(*PLUGIN, "-r", self.appex)
+                except COMMAND_ERRORS as exc:
+                    problems.append(str(exc))
 
         for proc, _ in self.launched:
             if proc.poll() is None:
@@ -578,7 +586,7 @@ class Qualification:
             shutil.rmtree(checked_path(self.handoff_state, TARGET))
         shutil.rmtree(checked_path(self.scratch, TARGET))
         inventory = self.inventory()
-        if (self.registration_attempted or self.launched) and inventory not in ("", "(no matches)"):
+        if (registered or self.launched) and inventory not in ("", "(no matches)"):
             problems.append("Disposable extension still registered: " + inventory)
         real_state = self.original_home / "Library/Application Support/FolderSync"
         absent = not os.path.lexists(real_state)
