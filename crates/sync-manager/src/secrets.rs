@@ -280,8 +280,8 @@ pub fn run_credential_helper(
         })
 }
 
-/// Real macOS Keychain backend (`Security.framework` generic password under
-/// service `dev.foldersync` and account `<install-id>/<account-id>`).
+/// Real macOS Keychain backend (generic password in the user's login Keychain
+/// under service `dev.foldersync` and account `<install-id>/<account-id>`).
 ///
 /// Always sets `kSecUseAuthenticationUI = kSecUseAuthenticationUIFail` so a
 /// locked Keychain fails immediately with [`SecretStoreError::AuthenticationRequired`]
@@ -292,8 +292,15 @@ pub struct KeychainSecretStore;
 
 #[cfg(target_os = "macos")]
 mod macos_keychain {
-    use std::ffi::c_void;
-    use std::ptr;
+    use std::{
+        ffi::{CStr, CString, OsStr, c_void},
+        mem::MaybeUninit,
+        os::unix::ffi::OsStrExt,
+        path::{Path, PathBuf},
+        ptr,
+    };
+
+    use core_foundation_sys::array::{CFArrayCreate, kCFTypeArrayCallBacks};
 
     use super::{
         KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore, SecretStoreError, SecretString,
@@ -315,10 +322,19 @@ mod macos_keychain {
     const ERR_SEC_USER_CANCELED: OSStatus = -128;
     const ERR_SEC_NOT_AVAILABLE: OSStatus = -25291;
     const ERR_SEC_AUTH_FAILED: OSStatus = -25293;
+    const ERR_SEC_NO_SUCH_KEYCHAIN: OSStatus = -25294;
     const ERR_SEC_DUPLICATE_ITEM: OSStatus = -25299;
     const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
+    const ERR_SEC_NO_DEFAULT_KEYCHAIN: OSStatus = -25307;
     const ERR_SEC_INTERACTION_NOT_ALLOWED: OSStatus = -25308;
     const ERR_SEC_DECODE: OSStatus = -26275;
+    const KEYCHAIN_UNLOCKED: u32 = 1;
+
+    const SERVICE: &str = if cfg!(all(debug_assertions, feature = "keychain-test-helper")) {
+        "dev.foldersync.test"
+    } else {
+        KEYCHAIN_SERVICE
+    };
 
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
@@ -358,9 +374,13 @@ mod macos_keychain {
         static kSecReturnData: CFStringRef;
         static kSecMatchLimit: CFStringRef;
         static kSecMatchLimitOne: CFStringRef;
+        static kSecMatchSearchList: CFStringRef;
+        static kSecUseKeychain: CFStringRef;
         static kSecUseAuthenticationUI: CFStringRef;
         static kSecUseAuthenticationUIFail: CFStringRef;
 
+        fn SecKeychainOpen(path: *const libc::c_char, keychain: *mut CFTypeRef) -> OSStatus;
+        fn SecKeychainGetStatus(keychain: CFTypeRef, status: *mut u32) -> OSStatus;
         fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
         fn SecItemAdd(attributes: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
         fn SecItemUpdate(query: CFDictionaryRef, attributes_to_update: CFDictionaryRef)
@@ -429,6 +449,92 @@ mod macos_keychain {
         OwnedCF::new(ptr)
     }
 
+    fn login_keychain_path() -> Result<PathBuf, SecretStoreError> {
+        let mut buffer = vec![0; 16 * 1024];
+        loop {
+            let mut passwd = MaybeUninit::<libc::passwd>::uninit();
+            let mut result = ptr::null_mut();
+            // SAFETY: the outputs are writable and the buffer stays alive while
+            // the returned passwd record and its strings are read.
+            let status = unsafe {
+                libc::getpwuid_r(
+                    libc::getuid(),
+                    passwd.as_mut_ptr(),
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if status == libc::ERANGE {
+                buffer.resize(buffer.len() * 2, 0);
+                continue;
+            }
+            if status == 0 && !result.is_null() {
+                let home = unsafe { (*result).pw_dir };
+                if !home.is_null() {
+                    let home = Path::new(OsStr::from_bytes(
+                        unsafe { CStr::from_ptr(home) }.to_bytes(),
+                    ));
+                    if home.is_absolute() {
+                        return Ok(home.join("Library/Keychains/login.keychain-db"));
+                    }
+                }
+            }
+            return Err(SecretStoreError::AuthenticationRequired {
+                reason: "Could not resolve the macOS login Keychain from the OS account home"
+                    .to_string(),
+            });
+        }
+    }
+
+    fn with_login_keychain<T>(
+        open: impl FnOnce(&Path) -> Result<T, SecretStoreError>,
+    ) -> Result<T, SecretStoreError> {
+        // The rclone child and its helper inherit an isolated HOME. Pass the
+        // passwd-derived path explicitly, including in the NSH native entry.
+        open(&login_keychain_path()?)
+    }
+
+    fn open_login_keychain(key: &str) -> Result<OwnedCF, SecretStoreError> {
+        with_login_keychain(|path| {
+            let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                SecretStoreError::Backend {
+                    reason: "Invalid macOS login Keychain path".to_string(),
+                }
+            })?;
+            let mut keychain = ptr::null();
+            let status = unsafe { SecKeychainOpen(path.as_ptr(), &mut keychain) };
+            if status != ERR_SEC_SUCCESS {
+                return Err(map_os_status(status, key));
+            }
+            let keychain = OwnedCF::new(keychain)?;
+
+            // SecKeychainOpen can return a reference for a nonexistent file.
+            let mut flags = 0;
+            let status = unsafe { SecKeychainGetStatus(keychain.as_ptr(), &mut flags) };
+            if status != ERR_SEC_SUCCESS {
+                return Err(map_os_status(status, key));
+            }
+            if flags & KEYCHAIN_UNLOCKED == 0 {
+                return Err(map_os_status(ERR_SEC_INTERACTION_NOT_ALLOWED, key));
+            }
+            Ok(keychain)
+        })
+    }
+
+    fn login_keychain_search_list(key: &str) -> Result<OwnedCF, SecretStoreError> {
+        let keychain = open_login_keychain(key)?;
+        let array = unsafe {
+            CFArrayCreate(
+                kCFAllocatorDefault,
+                &keychain.as_ptr(),
+                1,
+                &kCFTypeArrayCallBacks,
+            )
+        };
+        OwnedCF::new(array.cast())
+    }
+
     fn map_os_status(status: OSStatus, key: &str) -> SecretStoreError {
         match status {
             ERR_SEC_DUPLICATE_ITEM => SecretStoreError::AlreadyExists {
@@ -443,8 +549,10 @@ mod macos_keychain {
             ERR_SEC_AUTH_FAILED => SecretStoreError::AuthenticationRequired {
                 reason: "macOS Keychain authentication failed (errSecAuthFailed)".to_string(),
             },
-            ERR_SEC_NOT_AVAILABLE => SecretStoreError::AuthenticationRequired {
-                reason: "macOS Keychain is unavailable (errSecNotAvailable)".to_string(),
+            ERR_SEC_NOT_AVAILABLE | ERR_SEC_NO_SUCH_KEYCHAIN | ERR_SEC_NO_DEFAULT_KEYCHAIN => {
+                SecretStoreError::AuthenticationRequired {
+                    reason: "No macOS login Keychain is available".to_string(),
+                }
             },
             ERR_SEC_USER_CANCELED => SecretStoreError::AuthenticationRequired {
                 reason: "macOS Keychain authorization was canceled (errSecUserCanceled)".to_string(),
@@ -461,7 +569,8 @@ mod macos_keychain {
     impl SecretStore for KeychainSecretStore {
         fn get_secret(&self, key: &str) -> Result<SecretString, SecretStoreError> {
             validate_credential_key(key)?;
-            let service_cf = cf_string(KEYCHAIN_SERVICE)?;
+            let search_list = login_keychain_search_list(key)?;
+            let service_cf = cf_string(SERVICE)?;
             let account_cf = cf_string(key)?;
 
             let query = unsafe {
@@ -469,6 +578,7 @@ mod macos_keychain {
                     (kSecClass, kSecClassGenericPassword),
                     (kSecAttrService, service_cf.as_ptr()),
                     (kSecAttrAccount, account_cf.as_ptr()),
+                    (kSecMatchSearchList, search_list.as_ptr()),
                     (kSecReturnData, kCFBooleanTrue),
                     (kSecMatchLimit, kSecMatchLimitOne),
                     (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
@@ -513,7 +623,8 @@ mod macos_keychain {
                     reason: "secret passphrase must not be empty".to_string(),
                 });
             }
-            let service_cf = cf_string(KEYCHAIN_SERVICE)?;
+            let keychain = open_login_keychain(key)?;
+            let service_cf = cf_string(SERVICE)?;
             let account_cf = cf_string(key)?;
             let value_cf = cf_data(secret.expose().as_bytes())?;
 
@@ -522,6 +633,7 @@ mod macos_keychain {
                     (kSecClass, kSecClassGenericPassword),
                     (kSecAttrService, service_cf.as_ptr()),
                     (kSecAttrAccount, account_cf.as_ptr()),
+                    (kSecUseKeychain, keychain.as_ptr()),
                     (kSecValueData, value_cf.as_ptr()),
                     (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
                 ])?
@@ -538,7 +650,8 @@ mod macos_keychain {
             match self.create_secret(key, secret) {
                 Ok(()) => Ok(()),
                 Err(SecretStoreError::AlreadyExists { .. }) => {
-                    let service_cf = cf_string(KEYCHAIN_SERVICE)?;
+                    let search_list = login_keychain_search_list(key)?;
+                    let service_cf = cf_string(SERVICE)?;
                     let account_cf = cf_string(key)?;
                     let value_cf = cf_data(secret.expose().as_bytes())?;
                     let query = unsafe {
@@ -546,6 +659,7 @@ mod macos_keychain {
                             (kSecClass, kSecClassGenericPassword),
                             (kSecAttrService, service_cf.as_ptr()),
                             (kSecAttrAccount, account_cf.as_ptr()),
+                            (kSecMatchSearchList, search_list.as_ptr()),
                             (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
                         ])?
                     };
@@ -563,7 +677,8 @@ mod macos_keychain {
 
         fn delete_secret(&self, key: &str) -> Result<(), SecretStoreError> {
             validate_credential_key(key)?;
-            let service_cf = cf_string(KEYCHAIN_SERVICE)?;
+            let search_list = login_keychain_search_list(key)?;
+            let service_cf = cf_string(SERVICE)?;
             let account_cf = cf_string(key)?;
 
             let query = unsafe {
@@ -571,6 +686,7 @@ mod macos_keychain {
                     (kSecClass, kSecClassGenericPassword),
                     (kSecAttrService, service_cf.as_ptr()),
                     (kSecAttrAccount, account_cf.as_ptr()),
+                    (kSecMatchSearchList, search_list.as_ptr()),
                     (kSecUseAuthenticationUI, kSecUseAuthenticationUIFail),
                 ])?
             };
@@ -580,6 +696,126 @@ mod macos_keychain {
             } else {
                 Err(map_os_status(status, key))
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::{env, process::Command};
+        use tempfile::TempDir;
+
+        #[test]
+        fn helper_keychain_lookup_uses_passwd_home_with_an_isolated_home() {
+            const CHILD_MARKER: &str = "FOLDERSYNC_TEST_PASSWD_HOME_CHILD";
+            if env::var_os(CHILD_MARKER).is_some() {
+                let inherited_home = PathBuf::from(env::var_os("HOME").unwrap());
+                let path = with_login_keychain(|path| {
+                    assert!(path.is_absolute());
+                    assert!(path.ends_with("Library/Keychains/login.keychain-db"));
+                    assert!(!path.starts_with(&inherited_home));
+                    Ok(path.to_path_buf())
+                })
+                .unwrap();
+                assert_eq!(path, login_keychain_path().unwrap());
+                assert_eq!(env::var_os("HOME").unwrap(), inherited_home.as_os_str());
+                return;
+            }
+
+            let scratch = TempDir::new().unwrap();
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "secrets::macos_keychain::tests::helper_keychain_lookup_uses_passwd_home_with_an_isolated_home",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env("HOME", scratch.path().join("home"))
+                .env("FOLDERSYNC_STATE_DIR", scratch.path().join("state"))
+                .env("TMPDIR", scratch.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+
+        #[test]
+        fn missing_keychain_and_locked_keychain_have_distinct_diagnostics() {
+            let key = "test-install/test-account";
+            let missing = map_os_status(ERR_SEC_NO_SUCH_KEYCHAIN, key).to_string();
+            let not_found = map_os_status(ERR_SEC_ITEM_NOT_FOUND, key).to_string();
+            let locked = map_os_status(ERR_SEC_INTERACTION_NOT_ALLOWED, key).to_string();
+            assert!(missing.contains("No macOS login Keychain is available"));
+            assert!(not_found.contains("no credential stored"));
+            assert!(locked.contains("errSecInteractionNotAllowed"));
+        }
+
+        #[cfg(all(debug_assertions, feature = "keychain-test-helper"))]
+        #[test]
+        #[ignore = "touches real macOS Keychain; run manually from a logged-in GUI Terminal"]
+        fn credential_helper_reads_login_keychain_with_isolated_home_manual_only() {
+            const TEST_SERVICE: &str = "dev.foldersync.test";
+            const TEST_PASSPHRASE: &str = "synthetic-foldersync-owner-test-passphrase";
+            assert_eq!(SERVICE, TEST_SERVICE);
+
+            let helper = PathBuf::from(env::var_os("FOLDERSYNC_TEST_HELPER").unwrap())
+                .canonicalize()
+                .unwrap();
+            let scratch = TempDir::new().unwrap();
+            let home = scratch.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let key = format!("manual-test/{}", uuid::Uuid::new_v4().simple());
+            let keychain = login_keychain_path().unwrap();
+            let isolated_command = |program: &Path| {
+                let mut command = Command::new(program);
+                command
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("FOLDERSYNC_STATE_DIR", scratch.path().join("state"))
+                    .env("TMPDIR", scratch.path());
+                command
+            };
+            let security = || isolated_command(Path::new("/usr/bin/security"));
+            // Trust only the built CLI for this synthetic item.
+            let created = security()
+                .args(["add-generic-password", "-s", TEST_SERVICE, "-a", &key])
+                .args(["-w", TEST_PASSPHRASE, "-T"])
+                .arg(&helper)
+                .arg(&keychain)
+                .output()
+                .unwrap();
+            assert!(
+                created.status.success(),
+                "{}",
+                String::from_utf8_lossy(&created.stderr)
+            );
+
+            let output = isolated_command(&helper)
+                .args(["credential-helper", "--account", &key])
+                .output();
+            // Attempt cleanup even if the helper could not launch or read the item.
+            let deleted = security()
+                .args(["delete-generic-password", "-s", TEST_SERVICE, "-a", &key])
+                .arg(&keychain)
+                .output()
+                .unwrap();
+            assert!(
+                deleted.status.success(),
+                "{}",
+                String::from_utf8_lossy(&deleted.stderr)
+            );
+
+            let output = output.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout == format!("{TEST_PASSPHRASE}\n").into_bytes());
+            assert!(output.stderr.is_empty());
         }
     }
 }
@@ -714,28 +950,6 @@ mod tests {
         assert!(matches!(
             run_credential_helper(&store, "a/b/c", &mut bad_out),
             Err(SecretStoreError::InvalidAccountId(_))
-        ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "touches real macOS Keychain; run manually during owner qualification"]
-    fn keychain_generic_password_roundtrip_manual_only() {
-        let store = KeychainSecretStore;
-        let key = scoped_credential_key("manual-qual", "foldersync-test").unwrap();
-        let secret = SecretString::new("manual-qual-passphrase");
-        let _ = store.delete_secret(&key);
-        store.create_secret(&key, &secret).unwrap();
-        assert!(matches!(
-            store.create_secret(&key, &secret),
-            Err(SecretStoreError::AlreadyExists { .. })
-        ));
-        let got = store.get_secret(&key).unwrap();
-        assert_eq!(got.expose(), secret.expose());
-        store.delete_secret(&key).unwrap();
-        assert!(matches!(
-            store.get_secret(&key),
-            Err(SecretStoreError::NotFound { .. })
         ));
     }
 }

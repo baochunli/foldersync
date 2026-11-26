@@ -18,9 +18,9 @@ use thiserror::Error;
 use crate::{
     config::{
         AccountConfigLock, ConfigError, check_config_recovery_state,
-        cleanup_account_setup_temp_files, encrypted_remote_has_token_with_manifest,
-        enforce_private_config_permissions, is_encrypted_config_content,
-        stderr_indicates_auth_failure,
+        cleanup_account_setup_temp_files, config_output_indicates_credential_helper_failure,
+        encrypted_remote_has_token_with_manifest, enforce_private_config_permissions,
+        is_encrypted_config_content, stderr_indicates_auth_failure,
     },
     log_parser::strip_ansi_codes,
     process::{
@@ -318,6 +318,9 @@ pub(crate) fn run_drive_auth_with_manifest_locked(
     }
 
     let run_out = run_out?;
+    if config_output_indicates_credential_helper_failure(&run_out.output) {
+        return Err(ConfigError::CredentialHelperFailed.into());
+    }
     if !run_out.exit_status.is_success() {
         // Never include child stdout in config/auth errors.
         let stderr = run_out.output.stderr_text();
@@ -568,6 +571,30 @@ mod tests {
             run_drive_auth_with_manifest_locked(&req, &manifest, &lock, &runner_no_token, None)
                 .unwrap_err();
         assert!(matches!(err, DriveAuthError::TokenNotSaved { .. }));
+
+        let runner_helper_failure = FakeProcessRunner::new();
+        runner_helper_failure.push_run(FakeRunScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stderr,
+                text: "Failed to load config file: password command failed: exit status 3"
+                    .to_string(),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        let err = run_drive_auth_with_manifest_locked(
+            &req,
+            &manifest,
+            &lock,
+            &runner_helper_failure,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DriveAuthError::Config(ConfigError::CredentialHelperFailed)
+        ));
+        assert_eq!(runner_helper_failure.spawned_specs().len(), 1);
 
         fs::write(&fake_bin, b"replacement after qualification").unwrap();
         let err =

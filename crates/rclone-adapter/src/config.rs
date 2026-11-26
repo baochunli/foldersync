@@ -25,7 +25,10 @@ use thiserror::Error;
 
 use crate::{
     log_parser::strip_ansi_codes,
-    process::{ProcessError, ProcessRunner, ProcessSpec, SpawnOptions, minimal_isolated_env},
+    process::{
+        CapturedOutput, ProcessError, ProcessRunner, ProcessSpec, SpawnOptions, StreamKind,
+        minimal_isolated_env,
+    },
     qualification::{
         EngineIdentity, QualificationError, QualificationManifest,
         verify_binary_identity_with_manifest, verify_executable_metadata,
@@ -149,6 +152,10 @@ pub enum ConfigError {
     SymlinkRefused { path: PathBuf },
     #[error("config `{path}` is not encrypted (missing {RCLONE_ENCRYPT_HEADER} marker)")]
     NotEncrypted { path: PathBuf },
+    #[error(
+        "FolderSync's credential helper could not read the account passphrase from the Keychain"
+    )]
+    CredentialHelperFailed,
     #[error("authentication required to unlock or verify encrypted config: {reason}")]
     AuthenticationRequired { reason: String },
     #[error(
@@ -188,6 +195,24 @@ pub fn is_encrypted_config_content(content: &str) -> bool {
     content
         .lines()
         .any(|line| line.trim() == RCLONE_ENCRYPT_HEADER)
+}
+
+pub(crate) fn config_output_indicates_credential_helper_failure(output: &CapturedOutput) -> bool {
+    output.lines.iter().any(|line| {
+        let lower = strip_ansi_codes(&line.text).to_ascii_lowercase();
+        let diagnostic = "failed to read new password with --password-command";
+        match line.stream {
+            // encryption set prints this diagnostic to stdout, which other
+            // config commands use for INI data.
+            StreamKind::Stdout => lower.trim_start().starts_with(diagnostic),
+            StreamKind::Stderr => {
+                lower.contains(diagnostic)
+                    || lower.contains("password command failed")
+                    || lower.contains("password command returned empty string")
+                    || lower.contains("using --password-command returned:")
+            }
+        }
+    })
 }
 
 /// Returns `true` if captured stderr/stdout indicates a credential-store lock,
@@ -969,6 +994,10 @@ fn run_verified_rclone_config_cmd(
     };
     let handle = runner.spawn(&spec, SpawnOptions::default())?;
     let run_out = handle.wait()?;
+    // rclone's encryption set can log a failed helper and still exit successfully.
+    if config_output_indicates_credential_helper_failure(&run_out.output) {
+        return Err(ConfigError::CredentialHelperFailed);
+    }
     if !run_out.exit_status.is_success() {
         // Never include child stdout in config command errors.
         let stderr = run_out.output.stderr_text();
@@ -1786,7 +1815,7 @@ client_secret = top-secret
             &engine, &manifest, &runner, &cfg, &lock, &pw, &spec,
         )
         .unwrap_err();
-        assert!(matches!(err, ConfigError::AuthenticationRequired { .. }));
+        assert!(matches!(err, ConfigError::CredentialHelperFailed));
         assert!(
             !cfg.exists(),
             "final rclone.conf must never be published when encryption fails"
