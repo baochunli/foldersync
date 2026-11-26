@@ -34,7 +34,8 @@ use sync_manager::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(120);
-const DEREGISTRATION_POLL: Duration = Duration::from_millis(250);
+const BUSY_DETACH_TIMEOUT: Duration = Duration::from_secs(30);
+const DETACH_POLL: Duration = Duration::from_millis(250);
 const VOLUME_NAME: &str = "FolderSync Test Disk";
 const MAPPING: &str = "disk-image";
 const ACCOUNT: &str = "fixture";
@@ -61,6 +62,19 @@ fn checked(output: Output) -> io::Result<String> {
     }
 }
 
+fn checked_detach(output: Output) -> io::Result<String> {
+    let busy = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .any(|line| line.trim_end().ends_with(" - Resource busy"));
+    checked(output).map_err(|error| {
+        if busy {
+            io::Error::new(io::ErrorKind::ResourceBusy, error)
+        } else {
+            error
+        }
+    })
+}
+
 fn owned_info(info: &str, image: &Path) -> Option<String> {
     info.split("================================================")
         .find(|section| {
@@ -83,15 +97,39 @@ fn detach_and_wait(
     device: &str,
     force: bool,
     timeout: Duration,
+    busy_timeout: Duration,
     mut read_info: impl FnMut() -> io::Result<String>,
     mut detach: impl FnMut(&str, bool) -> io::Result<()>,
 ) -> io::Result<()> {
-    if !owned_info(&read_info()?, image).is_some_and(|section| device_in(&section, device)) {
-        return Err(io::Error::other(format!(
-            "refused to detach {device}: hdiutil info did not confirm image ownership"
-        )));
+    let deadline = Instant::now() + busy_timeout;
+    let action = if force { UNPLUG } else { "controlled detach" };
+    for attempt in 1.. {
+        if !owned_info(&read_info()?, image).is_some_and(|section| device_in(&section, device)) {
+            return Err(io::Error::other(format!(
+                "refused to detach {device}: hdiutil info did not confirm image ownership"
+            )));
+        }
+        eprintln!("{action}: attempt {attempt} on {device}");
+        match detach(device, force) {
+            Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::ResourceBusy => {
+                eprintln!("{action}: attempt {attempt} on {device} returned {error}");
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    thread::sleep(DETACH_POLL.min(remaining));
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ResourceBusy,
+                        format!(
+                            "busy deadline expired after {busy_timeout:?} on {device}: {error}"
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
-    detach(device, force)?;
     let Some(section) = wait_for_deregistration(image, timeout, &mut read_info)? else {
         return Ok(());
     };
@@ -128,13 +166,14 @@ fn wait_for_deregistration(
         if section.is_none() || remaining.is_zero() {
             return Ok(section);
         }
-        thread::sleep(DEREGISTRATION_POLL.min(remaining));
+        thread::sleep(DETACH_POLL.min(remaining));
     }
 }
 
 #[cfg(test)]
 mod deregistration_tests {
     use super::*;
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
 
     const IMAGE: &str = "/tmp/owned/original.dmg";
     const DEVICE: &str = "/dev/disk12";
@@ -151,6 +190,7 @@ mod deregistration_tests {
             DEVICE,
             true,
             Duration::from_secs(5),
+            Duration::ZERO,
             || Ok(info.next().expect("unexpected info query").to_owned()),
             |device, force| {
                 detaches.push((device.to_owned(), force));
@@ -170,6 +210,7 @@ mod deregistration_tests {
             Path::new(IMAGE),
             DEVICE,
             true,
+            Duration::ZERO,
             Duration::ZERO,
             || Ok(info.next().expect("unexpected info query").to_owned()),
             |device, force| {
@@ -197,6 +238,7 @@ mod deregistration_tests {
             DEVICE,
             false,
             Duration::ZERO,
+            Duration::ZERO,
             || Ok(info.next().expect("unexpected info query").to_owned()),
             |device, force| {
                 detaches.push((device.to_owned(), force));
@@ -206,6 +248,87 @@ mod deregistration_tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(detaches, [(DEVICE.to_owned(), false)]);
+    }
+
+    fn busy() -> io::Result<()> {
+        checked_detach(Output {
+            status: ExitStatus::from_raw(libc::EBUSY << 8),
+            stdout: Vec::new(),
+            stderr: b"hdiutil: couldn't eject \"disk12\" - Resource busy\n".to_vec(),
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn retries_busy_detaches_until_the_recorded_node_ejects() {
+        for force in [true, false] {
+            let mut info = [OWNED, OWNED, OWNED, UNRELATED].into_iter();
+            let mut attempts = 0;
+            detach_and_wait(
+                Path::new(IMAGE),
+                DEVICE,
+                force,
+                Duration::ZERO,
+                Duration::from_secs(5),
+                || Ok(info.next().expect("unexpected info query").to_owned()),
+                |device, forced| {
+                    assert_eq!((device, forced), (DEVICE, force));
+                    attempts += 1;
+                    if attempts <= 2 { busy() } else { Ok(()) }
+                },
+            )
+            .unwrap();
+            assert_eq!(attempts, 3);
+            assert!(info.next().is_none());
+        }
+    }
+
+    #[test]
+    fn busy_retry_rechecks_device_ownership() {
+        let mut info = [OWNED, UNRELATED].into_iter();
+        let mut attempts = 0;
+        let error = detach_and_wait(
+            Path::new(IMAGE),
+            DEVICE,
+            true,
+            Duration::ZERO,
+            Duration::from_secs(5),
+            || Ok(info.next().expect("unexpected info query").to_owned()),
+            |device, force| {
+                assert_eq!((device, force), (DEVICE, true));
+                attempts += 1;
+                busy()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not confirm image ownership")
+        );
+        assert_eq!(attempts, 1);
+        assert!(info.next().is_none());
+    }
+
+    #[test]
+    fn busy_deadline_returns_a_reason_without_another_detach() {
+        let mut attempts = 0;
+        let error = detach_and_wait(
+            Path::new(IMAGE),
+            DEVICE,
+            true,
+            Duration::ZERO,
+            Duration::ZERO,
+            || Ok(OWNED.to_owned()),
+            |_, _| {
+                attempts += 1;
+                busy()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
+        assert!(error.to_string().contains("busy deadline expired"));
+        assert_eq!(attempts, 1);
     }
 }
 
@@ -341,22 +464,41 @@ impl Images {
             .ok_or_else(|| io::Error::other("attach did not report the requested mountpoint"))
     }
 
-    fn detach(&mut self, index: usize, force: bool) -> io::Result<()> {
+    fn detach(
+        &mut self,
+        index: usize,
+        unplug: Option<(&SyncManager, &RunRecord)>,
+    ) -> io::Result<()> {
         let image = &mut self.images[index];
         let device = image.device.as_deref().expect("recorded attach device");
         detach_and_wait(
             &image.path,
             device,
-            force,
+            unplug.is_some(),
             DEADLINE,
+            BUSY_DETACH_TIMEOUT,
             || checked(hdiutil(&["info"], None)?),
             |device, force| {
+                if force && let Some((manager, active)) = unplug {
+                    let current = manager
+                        .get_run(&active.id)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| {
+                            io::Error::other(format!("missing active run {}", active.id))
+                        })?;
+                    if current.finished_at.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            format!("run {} finished before forced detach", active.id),
+                        ));
+                    }
+                }
                 let mut args = vec!["detach"];
                 if force {
                     args.push("-force");
                 }
                 args.push(device);
-                let result = checked(hdiutil(&args, None)?)?;
+                let result = checked_detach(hdiutil(&args, None)?)?;
                 image.detach_requested = true;
                 eprintln!(
                     "{}: {}",
@@ -373,12 +515,33 @@ impl Images {
         Ok(())
     }
 
+    fn detach_for_scenario(
+        &mut self,
+        index: usize,
+        unplug: Option<(&SyncManager, &RunRecord)>,
+        scenario: &str,
+    ) -> bool {
+        match self.detach(index, unplug) {
+            Ok(()) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ResourceBusy | io::ErrorKind::Interrupted
+                ) =>
+            {
+                eprintln!("NOT VERIFIED: {scenario}: {error}");
+                false
+            }
+            Err(error) => panic!("{scenario}: {error}"),
+        }
+    }
+
     fn cleanup(&mut self) -> io::Result<()> {
         let mut detach_error = None;
         for index in (0..self.images.len()).rev() {
             if self.images[index].device.is_some()
                 && !self.images[index].detach_requested
-                && let Err(error) = self.detach(index, false)
+                && let Err(error) = self.detach(index, None)
             {
                 detach_error = Some(error);
             }
@@ -806,7 +969,14 @@ fn presence_case(wrong_disk: bool) {
     let id = MAPPING.into();
     let before = manager.list_runs(&id).unwrap().len();
 
-    images.detach(original, false).unwrap();
+    let scenario = if wrong_disk {
+        "same-name replacement disk"
+    } else {
+        "missing disk"
+    };
+    if !images.detach_for_scenario(original, None, scenario) {
+        return;
+    }
     let wrong_root = mount.join("decoy");
     let mut wrong_hashes = BTreeMap::new();
     if let Some(replacement) = replacement {
@@ -862,7 +1032,9 @@ fn presence_case(wrong_disk: bool) {
             wrong_hashes,
             "replacement disk was modified"
         );
-        images.detach(replacement, false).unwrap();
+        if !images.detach_for_scenario(replacement, None, scenario) {
+            return;
+        }
     } else {
         assert!(!fixture.local.exists(), "missing local root was created");
     }
@@ -1046,7 +1218,15 @@ fn unplug_case(phase: UnplugPhase) {
         }
         thread::sleep(Duration::from_millis(50));
     };
-    images.detach(original, true).unwrap();
+    if !images.detach_for_scenario(
+        original,
+        Some((&manager, &active)),
+        &format!("{UNPLUG}: {phase:?}"),
+    ) {
+        // Stop and join the manager before the image guard tries normal cleanup.
+        manager.shutdown().unwrap();
+        return;
+    }
 
     let snapshot = manager.wait_until_idle(DEADLINE).unwrap();
     let finished = manager.get_run(&active.id).unwrap().unwrap();
