@@ -115,6 +115,18 @@ independent clients and omits cross-account recovery.
    tests/qualification/run-drive.sh --qual-home "$QUAL_HOME"
    ```
 
+   To rerun the three overlap, duplicate-name, and shortcut scenarios:
+
+   ```bash
+   tests/qualification/run-drive.sh --qual-home "$QUAL_HOME" \
+     --only drive_delayed_upload_overlap,drive_duplicate_names,drive_native_document_and_shortcut
+   ```
+
+   Add `--dry-run` to preview the same selection. Preflight and cleanup
+   still run. The summary and evidence identify the subset run and list
+   the skipped scenarios. A successful subset reports `PASS (subset)`.
+   The nightly job runs the full suite for the configured accounts.
+
    The cleanup row in `drive-evidence.json` lists `recorded_fixture_ids`
    and the `drive_trash` result for each ID. Cleanup requires the sentinel
    and the original `Data` folder ID for each fixture, verifies its direct
@@ -146,8 +158,9 @@ independent clients and omits cross-account recovery.
    result and observed discrepancies. The JSON includes full run IDs,
    checkpoints, expected hashes, exact byte locations, and recorded folder
    IDs. `truth/` holds fixture versions and `cloud-checks/` holds downloaded
-   copies outside all sync trees. A run returns 0 for `PASS`, 3 for `FAIL` or
-   `INCOMPLETE`, and 2 for input and infrastructure errors. Inspect
+   copies outside all sync trees. A run returns 0 for `PASS` or
+   `PASS (subset)`, 3 for `FAIL` or `INCOMPLETE`, and 2 for input and
+   infrastructure errors. Inspect
    `nightly.log` when the scheduled runner cannot start or publish evidence.
 
    ```bash
@@ -166,7 +179,7 @@ independent clients and omits cross-account recovery.
 | Interruption | A mid-transfer SIGINT leaves a partial batch, diagnostic workdir, and recovery hold. |
 | Rename versus edit | The renamed baseline and the edited version both survive. |
 | Drive-side edit | An upload through the connected account, outside a client, propagates and preserves the earlier bytes. |
-| Delayed upload | Measured upload progress overlaps a peer's same-file edit. Subsequent runs account for every version. |
+| Delayed upload | Either edit can become the live file on Drive and both clients. The evidence records the winner and where to find the overwritten version. |
 | Duplicate names | Both intentionally duplicated Drive files retain their IDs and bytes. The local projection is recorded. |
 | Native document and shortcut | The Sheet export remains byte-stable, the shortcut retains its original target, and both stay out of local sync trees. |
 | Same-name folder replacement | Mappings enter `EndpointChanged`. Hashes verify the original folder, the new folder, and pending local changes remain separate. |
@@ -178,6 +191,12 @@ scenarios verify inventories on repeated attempts. An unobserved overlap,
 interruption, or other required check appears as `INCOMPLETE`. Client B has a
 bounded wait for collections just created by A. The runner records the
 elapsed time and number of listings.
+
+When the peer's sync overwrites the delayed upload on Drive, the overwritten
+version is kept in the Drive `Recovery` folder. The delayed-upload scenario
+also accepts a verified recovery copy on a client. Check
+`overlap.loser_location` for the actual copy and `overlap.winner` for the
+version that stayed live. The baseline must also be recoverable.
 
 **Existing disposable import mode.** The legacy entry point still accepts
 `--remote`, optional `--account-b`, `--rclone-config`, and a fresh

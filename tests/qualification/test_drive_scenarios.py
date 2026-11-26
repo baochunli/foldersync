@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from common import ScenarioEvidence, TruthSet, compute_overall_status
 from run_drive_qualification import (
-    DRIVE_FOLDER, DRIVE_SHEET, DRIVE_SHORTCUT, SENTINEL, Client, DriveQualification,
+    DRIVE_FOLDER, DRIVE_SHEET, DRIVE_SHORTCUT, SENTINEL, Client, DriveQualification, DriveRunner,
     read_export, require_sentinel, sentinel_bytes, transfer_progress,
 )
 
@@ -33,6 +33,7 @@ class FakeRunner:
         self.skip_signal = False
         self.client_b_visible_on = client_b_visible_on
         self.client_b_collection_attempts = 0
+        self.peer_wins_overlap = False
 
     @staticmethod
     def device_id(client):
@@ -157,6 +158,8 @@ class FakeRunner:
     def cloud(self, client, *args):
         verb, target = args[:2]
         if verb == "backend":
+            if target == "shortcut":
+                self.commands.append({"client": client.name, "args": args})
             return self.backend(target, *args[3:])
         folder_id = args[args.index("--drive-root-folder-id") + 1] if "--drive-root-folder-id" in args else None
         if verb == "copyto":
@@ -216,16 +219,18 @@ class FakeRunner:
             data = sentinel_bytes("parent-id") if fid == "sentinel-id" else self.objects[fid][3]
             Path(destination).write_bytes(data)
             return ""
-        if action == "moveid":
-            folder, _, mime, data, extra = self.objects[args[0]]
-            self.objects[args[0]] = (folder, args[1].split(":", 1)[1], mime, data, extra)
-            return ""
         if action == "shortcut":
             folder = args[args.index("--drive-root-folder-id") + 1]
             self.objects["shortcut-id"] = (folder, args[1], DRIVE_SHORTCUT, b"",
                                            {"shortcutDetails": {"targetId": f"{folder}-source-bin"}})
             return ""
         raise AssertionError((action, args))
+
+    def rename_duplicate(self, client, parent_id, data_id, scratch, folder_id, file_id):
+        assert require_sentinel(self, client, parent_id, scratch) == data_id
+        folder, name, mime, data, extra = self.objects[file_id]
+        assert folder == folder_id and name == "second.txt"
+        self.objects[file_id] = (folder, "duplicate.txt", mime, data, extra)
 
     def trash_recorded_folders(self, client, parent_id, data_id, scratch, folder_ids):
         assert require_sentinel(self, client, parent_id, scratch) == data_id
@@ -240,8 +245,14 @@ class FakeRunner:
 
     def overlap_upload(self, client, source, folder_id, during):
         during()
-        self.folders[folder_id][1]["shared.txt"] = source.read_bytes()
-        return {"uploaded_bytes_before_peer": 1, "upload_active_after_peer": True}
+        if self.peer_wins_overlap:
+            self.recoveries[folder_id][f"device-b/run-{self.run_id}/shared.txt"] = source.read_bytes()
+        else:
+            self.folders[folder_id][1]["shared.txt"] = source.read_bytes()
+        return {
+            "uploaded_bytes_before_peer": 1, "peer_started_during_upload": True,
+            "upload_active_after_peer": not self.peer_wins_overlap,
+        }
 
     def interrupt(self, client, key, batch):
         if self.skip_signal:
@@ -313,7 +324,10 @@ class DriveScenarioTests(unittest.TestCase):
         self.assertEqual(visibility["attempts"], suite.runner.client_b_collection_attempts)
         self.assertEqual(visibility["elapsed_seconds"], 60.0)
 
-    def run_suite(self, *, account_b="drive-b", skip_signal=False, lose_recovery=False, deny_trash=False):
+    def run_suite(
+        self, *, account_b="drive-b", skip_signal=False, lose_recovery=False, deny_trash=False,
+        only=None, peer_wins_overlap=False, overlap_recovery_problem=None,
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clients = [Client(f"client-{name}", root / name, account_b if name == "b" and account_b else "drive-a")
@@ -325,12 +339,23 @@ class DriveScenarioTests(unittest.TestCase):
             runner = FakeRunner()
             runner.skip_signal = skip_signal
             runner.deny_trash = deny_trash
+            runner.peer_wins_overlap = peer_wins_overlap
             suite = DriveQualification(runner, clients, root, "Fixture", 42, account_b)
             export = root / "disposable.conf"
             export.touch()
             cloud = runner.cloud
 
             def read_cloud(client, *args):
+                if overlap_recovery_problem and args[0] == "lsjson" and args[-1].startswith("recovery-for-"):
+                    folder = args[-1].removeprefix("recovery-for-")
+                    if runner.folders[folder][0] == "Data/Fixture-delayed-upload":
+                        backups = runner.recoveries[folder]
+                        if overlap_recovery_problem == "missing":
+                            for path, data in list(backups.items()):
+                                if len(data) == 768 * 1024:
+                                    del backups[path]
+                        else:
+                            backups["unknown.bin"] = b"unknown bytes"
                 if lose_recovery and args[0] == "copy" and args[-1].startswith("recovery-for-"):
                     cloud(client, *args)
                     for file in Path(args[2]).rglob("*"):
@@ -344,12 +369,60 @@ class DriveScenarioTests(unittest.TestCase):
                 patch.object(runner, "cloud", side_effect=read_cloud),
                 patch("run_drive_qualification.BATCH_COUNT", 4),
             ):
-                results = suite.run(export, "parent-id")
+                results = suite.run(export, "parent-id", only=only)
             self.assertFalse(export.exists())
             self.assertEqual(runner.mappings, {})
             self.assertEqual(runner.trashed, {row["folder_id"] for row in results[-1].outcomes["drive_trash"]
                                               if row["status"] == "TRASHED"})
             return results
+
+    def test_delayed_upload_passes_with_either_winner_and_records_loser(self):
+        for peer_wins, winner, loser_tree in (
+            (False, "delayed", "client-b-recovery"),
+            (True, "peer-edit", "drive-recovery"),
+        ):
+            with self.subTest(winner=winner):
+                results = self.run_suite(only={"delayed-upload"}, peer_wins_overlap=peer_wins)
+                evidence = next(row for row in results if row.name == "drive_delayed_upload_overlap")
+                self.assertEqual(evidence.effective_status(), "PASS", evidence.conclusion)
+                overlap = evidence.outcomes["overlap"]
+                self.assertEqual(overlap["winner"], winner)
+                self.assertTrue(overlap["loser_location"].startswith(f"{loser_tree}:recovery:"))
+                self.assertIn(winner, evidence.conclusion)
+                self.assertEqual(len(evidence.outcomes["checkpoints"]), 3)
+
+    def test_delayed_upload_rejects_missing_loser_and_unknown_recovery_bytes(self):
+        for problem, message in (
+            ("missing", "Missing required recovery copy of delayed"),
+            ("unknown", "unknown.bin"),
+        ):
+            with self.subTest(problem=problem):
+                results = self.run_suite(
+                    only={"delayed-upload"}, peer_wins_overlap=True, overlap_recovery_problem=problem,
+                )
+                evidence = next(row for row in results if row.name == "drive_delayed_upload_overlap")
+                self.assertEqual(evidence.effective_status(), "FAIL", evidence.conclusion)
+                self.assertIn(message, evidence.conclusion)
+
+    def test_subset_executes_preflight_selected_case_and_cleanup(self):
+        results = self.run_suite(only={"delayed-upload"})
+        self.assertEqual([s.name for s in results], [
+            "drive_preflight_account_and_folder_ids", "drive_delayed_upload_overlap", "drive_cleanup",
+        ])
+        self.assertEqual(compute_overall_status(results), "PASS")
+        self.assertEqual(set(results[-1].outcomes["recorded_fixture_ids"]), {"delayed-upload"})
+
+    def test_shortcut_argv_overrides_skip_after_the_defaults(self):
+        results = self.run_suite(only={"native"})
+        evidence = next(row for row in results if row.name == "drive_native_document_and_shortcut")
+        args, = [command["args"] for command in evidence.commands if command["args"][:2] == ("backend", "shortcut")]
+        client = Client("client-a", Path("/fixture/client-a"), "drive-a")
+        runner = DriveRunner(Path("/fixture/sync-cli"), Path("/fixture/rclone"))
+        runner.device_ids[client.name] = "device-a"
+        argv = runner.cloud_command(client, *args)
+        self.assertLess(argv.index("--drive-skip-gdocs"), argv.index("--drive-skip-shortcuts=false"))
+        self.assertEqual([arg for arg in argv if arg.startswith("--drive-skip-shortcuts")],
+                         ["--drive-skip-shortcuts", "--drive-skip-shortcuts=false"])
 
     def test_all_scenarios_drive_three_paused_clients_and_verify_versions(self):
         results = self.run_suite()
