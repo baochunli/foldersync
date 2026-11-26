@@ -77,6 +77,31 @@ SCENARIOS = {
     "two-account": "drive_two_account_ownership_and_recovery_move",
     "cleanup": "drive_cleanup",
 }
+REQUIRED_SCENARIOS = {"preflight", "cleanup"}
+
+
+def parse_only(value: str) -> set[str]:
+    valid = {name: key for key, name in SCENARIOS.items() if key not in REQUIRED_SCENARIOS}
+    requested = {name.strip() for name in value.split(",")}
+    if unknown := requested - valid.keys():
+        raise ValueError(f"Unknown scenario names for --only: {', '.join(map(repr, sorted(unknown)))}. "
+                         f"Valid names: {', '.join(valid)}.")
+    return {valid[name] for name in requested}
+
+
+def select_scenarios(account_b: str | bool | None, only: set[str] | None) -> dict[str, str]:
+    if only is not None and "two-account" in only and not account_b:
+        raise ValueError(f"{SCENARIOS['two-account']} requires a second account.")
+    return {
+        key: name for key, name in SCENARIOS.items()
+        if (key != "two-account" or account_b) and (only is None or key in REQUIRED_SCENARIOS or key in only)
+    }
+
+
+def skipped_scenarios(selected: dict[str, str], only: set[str] | None) -> list[str] | None:
+    if only is None:
+        return None
+    return [name for key, name in SCENARIOS.items() if key not in selected]
 
 
 def _normalize_os_root_alias(abs_path: str) -> str:
@@ -500,7 +525,7 @@ class DriveRunner:
         with os.fdopen(open_private_file(client.config, os.O_RDONLY), "rb") as file:
             header = next((line.strip() for line in file if line.strip() and not line.lstrip().startswith(b"#")), b"")
         if header != b"RCLONE_ENCRYPT_V0:":
-            raise RuntimeError("Drive trash requires the encrypted qualification account config.")
+            raise RuntimeError("Drive metadata updates require the encrypted qualification account config.")
 
         # Deliberately bypass command capture and its evidence pipeline. The pinned
         # config show prints the decrypted remote into a private in-memory pipe.
@@ -528,9 +553,6 @@ class DriveRunner:
         """Trash only recorded fixtures that are still direct children of the original Data folder."""
         if not folder_ids:
             return
-        # Use verified TLS without proxy settings, redirects, or SSL key logging.
-        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        tls.load_default_certs()
         for fixture, folder_id in folder_ids.items():
             result = {"fixture": fixture, "folder_id": folder_id, "status": "REFUSED"}
             try:
@@ -540,7 +562,7 @@ class DriveRunner:
                 if data_id != expected_data_id:
                     raise RuntimeError("The disposable Data folder ID changed during the run.")
                 token = self._qualification_access_token(client, parent_id)
-                with closing(http.client.HTTPSConnection("www.googleapis.com", timeout=30, context=tls)) as conn:
+                with closing(qualification_drive_connection()) as conn:
                     before = qualification_drive_file(conn, folder_id, token)
                     if not matches_fixture(before, folder_id, data_id):
                         raise RuntimeError("The recorded ID is no longer a folder directly under the verified Data folder.")
@@ -548,7 +570,7 @@ class DriveRunner:
                         result["status"] = "ALREADY TRASHED"
                     elif before.get("trashed") is False and before.get("explicitlyTrashed") is False:
                         result["status"] = "FAILED"
-                        after = qualification_drive_file(conn, folder_id, token, trash=True)
+                        after = qualification_drive_file(conn, folder_id, token, update={"trashed": True})
                         if not matches_fixture(after, folder_id, data_id) or (
                             after.get("trashed") is not True or after.get("explicitlyTrashed") is not True
                         ):
@@ -559,6 +581,26 @@ class DriveRunner:
             except SCENARIO_ERRORS as exc:
                 result["detail"] = redact_credential_stderr(str(exc))
             yield result
+
+    def rename_duplicate(
+        self, client: Client, parent_id: str, data_id: str, scratch: Path, folder_id: str, file_id: str,
+    ) -> None:
+        if not DRIVE_ID_RE.fullmatch(file_id) or file_id in {parent_id, data_id, folder_id}:
+            raise RuntimeError("Invalid or reserved Drive duplicate fixture ID.")
+        if require_sentinel(self, client, parent_id, scratch) != data_id:
+            raise RuntimeError("The disposable Data folder ID changed during the run.")
+        token = self._qualification_access_token(client, parent_id)
+        identity = {"id": file_id, "parents": [folder_id], "trashed": False}
+        with closing(qualification_drive_connection()) as conn:
+            before = qualification_drive_file(conn, file_id, token)
+            mime = before.get("mimeType")
+            if (any(before.get(key) != value for key, value in identity.items()) or before.get("name") != "second.txt"
+                    or not isinstance(mime, str) or not mime or mime.startswith("application/vnd.google-apps.")):
+                raise RuntimeError("The recorded ID is no longer the ordinary second.txt directly under the scenario folder.")
+            after = qualification_drive_file(conn, file_id, token, update={"name": "duplicate.txt"})
+            expected = {**identity, "name": "duplicate.txt", "mimeType": mime}
+            if any(after.get(key) != value for key, value in expected.items()):
+                raise RuntimeError("Drive did not confirm the rename for this exact file ID and parent.")
 
     def overlap_upload(self, client: Client, source: Path, folder_id: str, during) -> dict[str, Any]:
         args = [
@@ -591,6 +633,7 @@ class DriveRunner:
                 ), True)
                 return {
                     "upload_observed_at": observed, "uploaded_bytes_before_peer": progress,
+                    "peer_started_during_upload": overlap,
                     "upload_active_after_peer": active_after_peer,
                 }
             except BaseException:
@@ -655,17 +698,24 @@ def matches_fixture(metadata: dict[str, Any], folder_id: str, data_id: str) -> b
             and metadata.get("parents") == [data_id])
 
 
+def qualification_drive_connection() -> http.client.HTTPSConnection:
+    # Use verified TLS without proxy settings, redirects, or SSL key logging.
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    tls.load_default_certs()
+    return http.client.HTTPSConnection("www.googleapis.com", timeout=30, context=tls)
+
+
 def qualification_drive_file(
-    conn: http.client.HTTPSConnection, folder_id: str, token: str, *, trash: bool = False,
+    conn: http.client.HTTPSConnection, file_id: str, token: str, *, update: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Read or trash one exact Drive ID without retaining HTTP diagnostics."""
-    target = f"/drive/v3/files/{folder_id}?supportsAllDrives=true&fields=id,mimeType,parents,trashed,explicitlyTrashed"
+    """Read or update one exact Drive ID without retaining HTTP diagnostics."""
+    target = f"/drive/v3/files/{file_id}?supportsAllDrives=true&fields=id,name,mimeType,parents,trashed,explicitlyTrashed"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    if trash:
+    if update is not None:
         headers["Content-Type"] = "application/json"
-    method = "PATCH" if trash else "GET"
+    method = "PATCH" if update is not None else "GET"
     try:
-        conn.request(method, target, body=b'{"trashed":true}' if trash else None, headers=headers)
+        conn.request(method, target, body=json.dumps(update).encode() if update is not None else None, headers=headers)
         with conn.getresponse() as response:
             if response.status != 200:
                 raise RuntimeError(f"Drive {method} returned HTTP {response.status}.")
@@ -748,6 +798,7 @@ def verify_checkpoint(
     conflicts: set[str],
     recovered: dict[str, str | None],
     labels: set[str] | None = None,
+    *, reject_unknown_recovery: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Require exact live inventories and locate each version by hash, including backups."""
     records = truth.records if labels is None else {label: truth.records[label] for label in sorted(labels)}
@@ -761,6 +812,8 @@ def verify_checkpoint(
             if tree not in expected_live:
                 if label:
                     locations[label].append(f"{tree}:recovery:{path}")
+                elif reject_unknown_recovery:
+                    errors.append(f"{tree} unexpected {path} ({digest})")
                 continue
             original = records[label]["rel_path"] if label else None
             conflict = label in conflicts and re.fullmatch(re.escape(original) + r"\.conflict\d+", path)
@@ -999,15 +1052,21 @@ class DriveQualification:
                 )
         return trees
 
+    def checkpoint_trees(
+        self, key: str, name: str, clients: list[Client], reader: Client, backups: bool,
+    ) -> dict[str, dict[str, str]]:
+        trees = self.snapshot(key, name, reader, backups)
+        for client in clients:
+            trees[client.name] = self.truth.scan_tree_hashes(client.data(key))
+            trees[f"{client.name}-recovery"] = self.truth.scan_tree_hashes(client.recovery(key))
+        return trees
+
     def checkpoint(
         self, key: str, name: str, clients: list[Client], live: set[str],
         recovered: dict[str, str | None], conflicts: set[str], reader: Client | None = None,
         offline: tuple[Client, set[str]] | None = None,
     ) -> None:
-        trees = self.snapshot(key, name, reader or clients[0], bool(recovered))
-        for client in clients:
-            trees[client.name] = self.truth.scan_tree_hashes(client.data(key))
-            trees[f"{client.name}-recovery"] = self.truth.scan_tree_hashes(client.recovery(key))
+        trees = self.checkpoint_trees(key, name, clients, reader or clients[0], bool(recovered))
         expected = {tree: live for tree in ["drive", *(c.name for c in clients)]}
         mismatches = [
             f"{client.name} live paths or hashes differ from Drive"
@@ -1023,9 +1082,11 @@ class DriveQualification:
         self, name: str, trees: dict[str, dict[str, str]], expected: dict[str, set[str]],
         conflicts: set[str], recovered: dict[str, str | None],
         mismatches: list[str] | None = None,
-        *, labels: set[str] | None = None,
+        *, labels: set[str] | None = None, reject_unknown_recovery: bool = False,
     ) -> None:
-        accounting, errors = verify_checkpoint(self.truth, trees, expected, conflicts, recovered, labels)
+        accounting, errors = verify_checkpoint(
+            self.truth, trees, expected, conflicts, recovered, labels, reject_unknown_recovery=reject_unknown_recovery,
+        )
         errors.extend(mismatches or [])
         self.evidence.hash_accounting = accounting
         self.evidence.outcomes.setdefault("checkpoints", []).append({
@@ -1247,14 +1308,35 @@ class DriveQualification:
             a, Path(self.truth.records["delayed"]["truth_file"]), self.folder_ids[key], lambda: self.sync(b, key),
         )
         self.evidence.outcomes["overlap"] = timing
-        if not timing["upload_active_after_peer"]:
+        if not timing["peer_started_during_upload"]:
             self.evidence.status = "NOT VERIFIED"
-            self.evidence.conclusion = "Did not observe an in-progress upload spanning a peer run."
+            self.evidence.conclusion = "Did not observe an in-progress upload when the peer run started."
             return
         self.sync(b, key)
         self.sync(a, key)
-        old = {"baseline-00": None, "peer-edit": None}
-        self.repeat(key, clients, baseline - old.keys() | {"delayed"}, old, set())
+        competing = {self.truth.records[label]["sha256"]: label for label in ("delayed", "peer-edit")}
+        winner = None
+        for cycle in range(1, 3):
+            for client in clients:
+                self.sync(client, key)
+            name = f"cycle-{cycle}"
+            trees = self.checkpoint_trees(key, name, clients, a, backups=True)
+            if winner is None:
+                winner = competing.get(trees["drive"].get("shared.txt"))
+                if winner is None:
+                    raise RuntimeError(f"{name}: Drive shared.txt is missing or has an unknown version.")
+            loser, = set(competing.values()) - {winner}
+            live = baseline - {"baseline-00"} | {winner}
+            self.check(
+                name, trees, {tree: live for tree in ("drive", a.name, b.name)}, set(),
+                {"baseline-00": None, loser: None}, reject_unknown_recovery=True,
+            )
+        loser_location = next(
+            location for row in self.evidence.hash_accounting if row["label"] == loser
+            for location in row["locations"] if ":recovery:" in location
+        )
+        timing.update(winner=winner, loser_location=loser_location)
+        self.evidence.conclusion = f"{winner} stayed live on Drive and both clients. {loser} was verified at {loser_location}."
 
     def download_by_id(self, client: Client, file_id: str, filename: Path, *options: str) -> str:
         if not DRIVE_ID_RE.fullmatch(file_id):
@@ -1279,9 +1361,8 @@ class DriveQualification:
                 raise RuntimeError(f"Could not identify the uploaded duplicate fixture {path}.")
             ids[matches[0]] = label
         second_id = next(file_id for file_id, label in ids.items() if label == "duplicate-two")
-        # moveid supplies a source ID and does not overwrite an existing destination object.
-        self.runner.cloud(a, "backend", "moveid", f"{a.remote}:", second_id,
-                          f"{a.remote}:duplicate.txt", "--drive-root-folder-id", folder_id)
+        # Rename by ID so Drive keeps both objects under the same name.
+        self.runner.rename_duplicate(a, self.parent_id, self.data_id, self.root, folder_id, second_id)
         for cycle in range(3):
             if cycle:
                 for client in clients:
@@ -1323,7 +1404,7 @@ class DriveQualification:
         self.upload(a, key, "fixture.csv", source, "--drive-skip-gdocs=false",
                     "--drive-import-formats", "csv", "--drive-export-formats", "csv")
         self.runner.cloud(a, "backend", "shortcut", f"{a.remote}:", "source.bin", "source-link.bin",
-                          "--drive-root-folder-id", folder_id)
+                          "--drive-root-folder-id", folder_id, "--drive-skip-shortcuts=false")
         first_ids = None
         first_sha = None
         for cycle in range(3):
@@ -1406,8 +1487,9 @@ class DriveQualification:
                 "drive": baseline, "replacement": {"replacement-only"}, a.name: baseline | {"pending-local"}, b.name: baseline,
             }, set(), {})
 
-    def run(self, export: Path | None, root_id: str) -> list[ScenarioEvidence]:
+    def run(self, export: Path | None, root_id: str, *, only: set[str] | None = None) -> list[ScenarioEvidence]:
         self.parent_id = root_id
+        selected = select_scenarios(self.account_b, only)
         cases = [
             ("preflight", "Verify the sentinel, accounts, independent devices, and paused scheduling.",
              "none", lambda: self.preflight(export, root_id)),
@@ -1435,36 +1517,36 @@ class DriveQualification:
              "Import a CSV as a Sheet and create a shortcut to a tracked file", self.native_and_shortcut),
             ("replacement", "Verify the mapping holds when a new folder takes the old name.",
              "Move the original aside and create a same-name folder", self.replacement_hold),
+            ("two-account", "Download A's original bytes from B's Drive recovery directory.",
+             "B overwrites and deletes files uploaded by A", self.two_account),
+            ("cleanup", "Remove this run's mappings and verify recoverable trash for its collection IDs.",
+             "none", self.cleanup),
         ]
-        if self.account_b:
-            cases.append((
-                "two-account", "Download A's original bytes from B's Drive recovery directory.",
-                "B overwrites and deletes files uploaded by A", self.two_account,
-            ))
-        cases.append(("cleanup", "Remove this run's mappings and verify recoverable trash for its collection IDs.",
-                      "none", self.cleanup))
         results = []
         preflight_ok = True
         interrupted = False
         for key, description, injected, run in cases:
+            if key not in selected:
+                continue
             self.runner.commands = []
             self.evidence = evidence = ScenarioEvidence(
                 SCENARIOS[key], description, utc_now(), "", injected, False, "",
                 commands=self.runner.commands,
             )
-            if (not preflight_ok or interrupted) and (key != "cleanup" or not (self.mapping_ids or self.folder_ids)):
+            if (not preflight_ok or interrupted) and key != "cleanup":
                 evidence.status = "NOT RUN"
                 evidence.conclusion = "The run was interrupted." if interrupted else "Drive preflight did not pass."
             else:
                 self.truth = TruthSet(private_dir(self.truth_dir / key), self.seed)
                 try:
-                    if key not in ("preflight", "cleanup") and self.require_sentinel() != self.data_id:
+                    if key not in REQUIRED_SCENARIOS and self.require_sentinel() != self.data_id:
                         raise RuntimeError("The disposable Data folder ID changed during the run.")
                     run()
                     if key == "preflight":
                         self.data_id = self.require_sentinel()
                     if not evidence.status:
-                        evidence.status, evidence.conclusion, evidence.passed = "PASS", "Verified.", True
+                        evidence.status, evidence.passed = "PASS", True
+                        evidence.conclusion = evidence.conclusion or "Verified."
                 except SCENARIO_ERRORS as exc:
                     evidence.status = "FAIL"
                     evidence.conclusion = redact_credential_stderr(str(exc))
@@ -1503,20 +1585,31 @@ def evidence_summary(scenarios: list[ScenarioEvidence]) -> list[dict[str, Any]]:
 
 
 def write_drive_evidence(out: Path, run_id: str, seed: int, started: str,
-                         versions: dict[str, str], scenarios: list[ScenarioEvidence]) -> str:
+                         versions: dict[str, str], scenarios: list[ScenarioEvidence],
+                         skipped: list[str] | None = None) -> str:
     status = compute_overall_status(scenarios)
+    subset = skipped is not None
+    if subset and status == "PASS":
+        status = "PASS (subset)"
+    run_type = "subset run" if subset else "full run"
+    scope = f"{run_type}. Skipped scenarios — {', '.join(skipped) or 'none'}" if subset else run_type
     summary = evidence_summary(scenarios)
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".evidence-", dir=out) as scratch:
         json_path, md_path = (Path(scratch) / f"drive-evidence.{suffix}" for suffix in ("json", "md"))
         write_evidence_files(json_path, md_path, "real-google-drive", seed, started, utc_now(), versions, scenarios,
-                             f"{status} for this run. Use the owner decision checklist for release acceptance.")
+                             f"{status} for this {run_type}. Use the owner decision checklist for release acceptance.")
         payload = json.loads(json_path.read_text(encoding="utf-8"))
-        json_path.write_text(json.dumps({"run_id": run_id, "summary": summary, **payload}, indent=2) + "\n")
+        header = {"run_id": run_id, "run_type": run_type,
+                  "skipped_scenarios": skipped or [], "summary": summary}
+        payload["status"] = status
+        json_path.write_text(json.dumps({**header, **payload}, indent=2) + "\n")
         detail = md_path.read_text(encoding="utf-8").split("\n", 1)[1]
+        detail = "\n".join(line for line in detail.split("\n") if not line.startswith("- **Overall result:**"))
         lines = [
             "# Google Drive qualification", "",
             f"Run `{run_id}` · **{status}** · {started}", "",
+            scope, "",
             "| Scenario | Result | Loss / unexpected duplication | Last sync run |",
             "| --- | --- | --- | --- |",
         ]
@@ -1534,6 +1627,8 @@ def write_drive_evidence(out: Path, run_id: str, seed: int, started: str,
         md_path.replace(out / md_path.name)
     for scenario in scenarios:
         print(f"[{scenario.effective_status()}] {scenario.name}: {scenario.conclusion}")
+    if subset:
+        print(scope)
     print(f"Overall status: {status} (evidence: {out / 'drive-evidence.json'})")
     return status
 
@@ -1542,13 +1637,19 @@ def new_run_id() -> str:
     return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:12]}"
 
 
-def show_plan(run_id: str, prefix: str, account_b: str | bool | None, **paths: Any) -> None:
+def show_plan(
+    run_id: str, prefix: str, account_b: str | bool | None, selected: dict[str, str],
+    skipped: list[str] | None, **paths: Any,
+) -> None:
+    collections = [f"Data/{prefix}-{key}" for key in selected if key not in REQUIRED_SCENARIOS]
+    if "replacement" in selected:
+        collections.append(f"Data/{prefix}-replacement-original")
     print(json.dumps({
         "mode": "dry-run", "run_id": run_id, "overall_expected_status": "INCOMPLETE", "account_b": account_b,
-        "collections": [f"Data/{prefix}-{key}" for key in SCENARIOS
-                        if key not in ("preflight", "cleanup") and (key != "two-account" or account_b)]
-                       + [f"Data/{prefix}-replacement-original"],
-        "scenarios": [name for key, name in SCENARIOS.items() if key != "two-account" or account_b],
+        "run_type": "subset run" if skipped is not None else "full run",
+        "skipped_scenarios": skipped or [],
+        "collections": collections,
+        "scenarios": list(selected.values()),
         **paths,
     }, indent=2))
 
@@ -1584,11 +1685,13 @@ def run_persistent(args: argparse.Namespace, run_id: str) -> int:
     if any((args.remote, args.account_b, args.rclone_config, args.state_dir, args.out_dir, args.sync_cli, args.prefix)):
         raise ValueError("Use --qual-home by itself for persistent accounts. Use the import flags for an export.")
     home, parent_id, account_b, cli_sha = read_qual_home(args.qual_home)
+    selected = select_scenarios(account_b, args.only)
+    skipped = skipped_scenarios(selected, args.only)
     prefix = f"FolderSyncQual-{run_id}"
     evidence_dir = checked_private_directory(home / "evidence")
     out = evidence_dir / run_id
     if args.dry_run:
-        show_plan(run_id, prefix, account_b, qual_home=str(home), evidence_dir=str(out))
+        show_plan(run_id, prefix, account_b, selected, skipped, qual_home=str(home), evidence_dir=str(out))
         return 0
     with lock_qual_home(home):
         private_dir(out)
@@ -1620,19 +1723,19 @@ def run_persistent(args: argparse.Namespace, run_id: str) -> int:
             versions = get_tool_versions(sync_cli, rclone, version, digest, cli_env=clients[0].env(rclone))
             versions["sync_cli_sha256"] = cli_sha
             suite = DriveQualification(DriveRunner(sync_cli, rclone), clients, out, prefix, args.seed, "qual" if account_b else None)
-            results = suite.run(None, parent_id)
+            results = suite.run(None, parent_id, only=args.only)
         except SCENARIO_ERRORS as exc:
             results = [ScenarioEvidence(
                 name, "", started, utc_now(), "none", False, redact_credential_stderr(str(exc)),
                 "NOT VERIFIED" if key == "preflight" else "NOT RUN",
-            ) for key, name in SCENARIOS.items() if key != "two-account" or account_b]
-        status = write_drive_evidence(out, run_id, args.seed, started, versions, results)
+            ) for key, name in selected.items()]
+        status = write_drive_evidence(out, run_id, args.seed, started, versions, results, skipped)
         publish_latest(evidence_dir, run_id, args.keep)
-    return 0 if status == "PASS" else 3
+    return 0 if status in {"PASS", "PASS (subset)"} else 3
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--qual-home", help="Persistent qualification home created by drive-setup.sh")
     parser.add_argument("--keep", type=int, help="Keep this many published evidence runs under --qual-home")
     parser.add_argument("--remote", help="Required primary Drive remote in the disposable export")
@@ -1643,12 +1746,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", help="Import-mode evidence directory")
     parser.add_argument("--seed", type=int, default=20261120)
     parser.add_argument("--sync-cli", type=Path, help="Import-mode executable sync-cli")
+    parser.add_argument("--only", metavar="SCENARIO[,SCENARIO...]", help="Run only the named scenarios plus preflight and cleanup")
     parser.add_argument("--dry-run", action="store_true", help="Print the plan without launching any tools")
     args = parser.parse_args(argv)
     os.umask(0o077)
 
     try:
         run_id = new_run_id()
+        if args.only is not None:
+            args.only = parse_only(args.only)
         if args.keep is not None and (not args.qual_home or args.keep < 1):
             raise ValueError("--keep requires --qual-home and a positive number of runs.")
         if args.qual_home:
@@ -1656,9 +1762,12 @@ def main(argv: list[str] | None = None) -> int:
         args.prefix = args.prefix or "FolderSyncQual"
         args.out_dir = args.out_dir or str(REPO_ROOT / "target" / "qualification")
         remote, account_b, state_dir, config, out = validate_args(args)
+        selected = select_scenarios(account_b, args.only)
+        skipped = skipped_scenarios(selected, args.only)
         prefix = f"{args.prefix}-{run_id}"
         if args.dry_run:
-            show_plan(run_id, prefix, account_b, remote=remote, state_dir=str(state_dir), evidence_dir=str(out))
+            show_plan(run_id, prefix, account_b, selected, skipped,
+                      remote=remote, state_dir=str(state_dir), evidence_dir=str(out))
             return 0
 
         export_bytes, root_id = read_export(config, remote, account_b)
@@ -1691,9 +1800,9 @@ def main(argv: list[str] | None = None) -> int:
                 file.write(export_bytes)
             del export_bytes
             suite = DriveQualification(DriveRunner(sync_cli, rclone), clients, root, prefix, args.seed, account_b)
-            results = suite.run(export, root_id)
-        status = write_drive_evidence(out, run_id, args.seed, started, versions, results)
-        return 0 if status == "PASS" else 3
+            results = suite.run(export, root_id, only=args.only)
+        status = write_drive_evidence(out, run_id, args.seed, started, versions, results, skipped)
+        return 0 if status in {"PASS", "PASS (subset)"} else 3
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Error: {redact_credential_stderr(str(exc))}", file=sys.stderr)
         return 2

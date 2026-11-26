@@ -6,7 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -14,7 +14,7 @@ import drive_setup
 from common import ScenarioEvidence, compute_overall_status
 from run_drive_qualification import (
     DRIVE_FOLDER, Client, DriveQualification, DriveRunner, capture_record, lock_qual_home,
-    publish_latest, upload_progress, write_drive_evidence,
+    main, publish_latest, upload_progress, write_drive_evidence,
 )
 
 
@@ -47,7 +47,9 @@ class UnattendedDriveTests(unittest.TestCase):
         results = suite.run(None, "parent-id")
         self.assertEqual(results[0].effective_status(), "FAIL")
         self.assertIn("sentinel", results[0].conclusion.lower())
-        self.assertTrue(all(row.effective_status() == "NOT RUN" for row in results[1:]))
+        self.assertTrue(all(row.effective_status() == "NOT RUN" for row in results[1:-1]))
+        self.assertEqual(results[-1].effective_status(), "PASS")
+        self.assertEqual(results[-1].outcomes["recorded_fixture_ids"], {})
         self.assertEqual([call.args[1:3] for call in runner.cloud.call_args_list], [("backend", "query")] * 2)
 
     def test_oauth_secret_only_reaches_the_child_stdin(self):
@@ -135,6 +137,57 @@ class UnattendedDriveTests(unittest.TestCase):
         self.assertEqual(requests[1].kwargs["headers"]["Authorization"], "Bearer access-canary")
         self.assertEqual([row["status"] for row in results], ["TRASHED", "REFUSED", "REFUSED", "FAILED", "REFUSED", "REFUSED"])
         self.assertNotIn("access-canary", json.dumps(results))
+
+    def test_exact_id_rename_checks_sentinel_and_only_parent_before_updating_name(self):
+        runner = DriveRunner(Path("/fixture/sync-cli"), Path("/fixture/rclone"))
+        client = Client("client-a", self.root, "qual")
+        metadata = {"id": "second-id", "name": "second.txt", "parents": ["fixture-id"],
+                    "mimeType": "text/plain", "trashed": False}
+        for before, data_id, error in (
+            (metadata, "data-id", None),
+            ({**metadata, "parents": ["elsewhere"]}, "data-id", "directly under"),
+            ({**metadata, "parents": ["fixture-id", "elsewhere"]}, "data-id", "directly under"),
+            ({**metadata, "id": "other-id"}, "data-id", "directly under"),
+            (metadata, "replacement-data-id", "Data folder ID changed"),
+        ):
+            with self.subTest(before=before, data_id=data_id):
+                track = Mock()
+                connection = track.connection
+                replies = []
+                for document in (before, {**metadata, "name": "duplicate.txt"}):
+                    response = MagicMock(status=200)
+                    response.read.return_value = json.dumps(document).encode()
+                    response.__enter__.return_value = response
+                    replies.append(response)
+                connection.getresponse.side_effect = replies
+                track.sentinel.return_value = data_id
+                track.access.return_value = "access-canary"
+                with (
+                    patch("run_drive_qualification.require_sentinel", track.sentinel),
+                    patch.object(runner, "_qualification_access_token", track.access),
+                    patch("run_drive_qualification.http.client.HTTPSConnection", return_value=connection),
+                ):
+                    args = (client, "parent-id", "data-id", self.root, "fixture-id", "second-id")
+                    if error:
+                        with self.assertRaisesRegex(RuntimeError, error):
+                            runner.rename_duplicate(*args)
+                    else:
+                        runner.rename_duplicate(*args)
+                track.sentinel.assert_called_once_with(runner, client, "parent-id", self.root)
+                requests = connection.request.call_args_list
+                if data_id != "data-id":
+                    track.access.assert_not_called()
+                    self.assertEqual(requests, [])
+                    continue
+                track.access.assert_called_once_with(client, "parent-id")
+                self.assertEqual([call[0] for call in track.mock_calls[:3]], [
+                    "sentinel", "access", "connection.request",
+                ])
+                self.assertEqual([call.args[0] for call in requests], ["GET"] if error else ["GET", "PATCH"])
+                self.assertTrue(all(call.args[1].split("?")[0] == "/drive/v3/files/second-id" for call in requests))
+                if not error:
+                    self.assertEqual(json.loads(requests[1].kwargs["body"]), {"name": "duplicate.txt"})
+                self.assertEqual(runner.commands, [])
 
     def test_trash_refuses_missing_sentinel_or_changed_data_before_reading_credentials(self):
         runner = DriveRunner(Path("/fixture/sync-cli"), Path("/fixture/rclone"))
@@ -234,6 +287,56 @@ class UnattendedDriveTests(unittest.TestCase):
         payload = json.loads((latest / "drive-evidence.json").read_text())
         self.assertEqual(payload["summary"][0]["status"], "INCOMPLETE")
         self.assertIn("| `missed` | **INCOMPLETE**", (latest / "drive-evidence.md").read_text())
+
+    def test_subset_dry_run_parses_scenario_names_and_lists_skips(self):
+        home = self.root / "qual"
+        home.mkdir(mode=0o700)
+        (home / "evidence").mkdir(mode=0o700)
+        config = home / "qual.toml"
+        config.touch(mode=0o600)
+        config.write_text(f'parent_id = "fake-parent"\naccount_b = false\nsync_cli_sha256 = "{"0" * 64}"\n')
+        args = ["--qual-home", str(home), "--dry-run"]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(main(args + [
+                "--only", "drive_duplicate_names, drive_native_document_and_shortcut",
+            ]), 0)
+        plan = json.loads(out.getvalue())
+        self.assertEqual(plan["run_type"], "subset run")
+        self.assertEqual(plan["scenarios"], [
+            "drive_preflight_account_and_folder_ids", "drive_duplicate_names",
+            "drive_native_document_and_shortcut", "drive_cleanup",
+        ])
+        self.assertIn("drive_delayed_upload_overlap", plan["skipped_scenarios"])
+        self.assertEqual(len(plan["collections"]), 2)
+        self.assertFalse(list((home / "evidence").iterdir()))
+        for selection, message in (
+            ("drive_unknown", "Valid names"),
+            ("drive_duplicate_names,", "Valid names"),
+            ("drive_two_account_ownership_and_recovery_move", "requires a second account"),
+        ):
+            with self.subTest(selection=selection), redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(main(args + ["--only", selection]), 2)
+                self.assertIn(message, error.getvalue())
+                if message == "Valid names":
+                    self.assertIn("drive_duplicate_names", error.getvalue())
+
+    def test_subset_pass_is_labeled_in_console_and_both_evidence_headers(self):
+        case = ScenarioEvidence("drive_selected", "", "", "", "", True, "Verified.")
+        skipped = ["drive_other"]
+        out = self.root / "evidence"
+        with redirect_stdout(io.StringIO()) as console:
+            self.assertEqual(write_drive_evidence(out, "test-run", 42, "", {}, [case], skipped), "PASS (subset)")
+        payload = json.loads((out / "drive-evidence.json").read_text())
+        self.assertEqual(payload["status"], "PASS (subset)")
+        self.assertEqual(payload["run_type"], "subset run")
+        self.assertEqual(payload["skipped_scenarios"], skipped)
+        markdown = (out / "drive-evidence.md").read_text()
+        for summary in (console.getvalue(), markdown):
+            self.assertIn("subset run", summary)
+            self.assertIn("drive_other", summary)
+            self.assertIn("PASS (subset)", summary)
+        self.assertNotIn("Overall result:** `PASS`", markdown)
 
     def test_upload_overlap_requires_partial_progress_for_the_fixture(self):
         row = {"stats": {"transferring": [{"name": "fixture", "bytes": 4, "size": 9}]}}
