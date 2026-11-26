@@ -30,10 +30,13 @@ mkdir -p target/disk-images-evidence
 The test creates each image and all throwaway sync state in its own temporary
 directory. It uses `hdiutil attach -nobrowse -mountpoint` and records the
 image's device node. Before any detach it checks that `hdiutil info` still
-associates that node with the exact image path. Cleanup uses an ordinary
-detach and retains the scratch directory if it cannot confirm the images
-are gone. The local-fixture account uses its own empty config. No Google
-Drive account or Keychain item is needed.
+associates that node with the exact image path. After each detach it polls
+for up to 120 seconds for the image to disappear. On timeout, it retries
+with one ordinary detach if the recorded node still belongs to that image.
+Cleanup retains the scratch directory if any fixture image is still
+registered or its mountpoint cannot be confirmed safe. The local-fixture
+account uses its own empty config. No Google Drive account or Keychain
+item is needed.
 
 ## Read the evidence
 

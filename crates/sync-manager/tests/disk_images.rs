@@ -34,6 +34,7 @@ use sync_manager::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(120);
+const DEREGISTRATION_POLL: Duration = Duration::from_millis(250);
 const VOLUME_NAME: &str = "FolderSync Test Disk";
 const MAPPING: &str = "disk-image";
 const ACCOUNT: &str = "fixture";
@@ -77,10 +78,142 @@ fn device_in(info: &str, device: &str) -> bool {
         .any(|line| line.split_whitespace().next() == Some(device))
 }
 
+fn detach_and_wait(
+    image: &Path,
+    device: &str,
+    force: bool,
+    timeout: Duration,
+    mut read_info: impl FnMut() -> io::Result<String>,
+    mut detach: impl FnMut(&str, bool) -> io::Result<()>,
+) -> io::Result<()> {
+    if !owned_info(&read_info()?, image).is_some_and(|section| device_in(&section, device)) {
+        return Err(io::Error::other(format!(
+            "refused to detach {device}: hdiutil info did not confirm image ownership"
+        )));
+    }
+    detach(device, force)?;
+    let Some(section) = wait_for_deregistration(image, timeout, &mut read_info)? else {
+        return Ok(());
+    };
+
+    // A device number can be reused while the original image's path is still
+    // listed. Only use the node if the last poll still associates it with us.
+    let retry_error = if device_in(&section, device) {
+        eprintln!("Image still registered after {timeout:?}. Retrying normal detach of {device}.");
+        let error = detach(device, false).err();
+        if wait_for_deregistration(image, timeout, &mut read_info)?.is_none() {
+            return Ok(());
+        }
+        error
+    } else {
+        None
+    };
+    let mut message = format!("image still registered: {}", image.display());
+    if let Some(error) = retry_error {
+        message.push_str(&format!(". Normal detach retry failed: {error}"));
+    }
+    Err(io::Error::new(io::ErrorKind::TimedOut, message))
+}
+
+// Return the still-registered image section only if the deadline expires.
+fn wait_for_deregistration(
+    image: &Path,
+    timeout: Duration,
+    read_info: &mut impl FnMut() -> io::Result<String>,
+) -> io::Result<Option<String>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let section = owned_info(&read_info()?, image);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if section.is_none() || remaining.is_zero() {
+            return Ok(section);
+        }
+        thread::sleep(DEREGISTRATION_POLL.min(remaining));
+    }
+}
+
+#[cfg(test)]
+mod deregistration_tests {
+    use super::*;
+
+    const IMAGE: &str = "/tmp/owned/original.dmg";
+    const DEVICE: &str = "/dev/disk12";
+    const OWNED: &str = "image-path : /tmp/owned/original.dmg\n/dev/disk12";
+    const PATH_ONLY: &str = "image-path : /tmp/owned/original.dmg\n/dev/disk120";
+    const UNRELATED: &str = "image-path : /tmp/other/another.dmg\n/dev/disk12";
+
+    #[test]
+    fn waits_for_the_exact_image_to_disappear() {
+        let mut info = [OWNED, OWNED, PATH_ONLY, UNRELATED].into_iter();
+        let mut detaches = Vec::new();
+        detach_and_wait(
+            Path::new(IMAGE),
+            DEVICE,
+            true,
+            Duration::from_secs(5),
+            || Ok(info.next().expect("unexpected info query").to_owned()),
+            |device, force| {
+                detaches.push((device.to_owned(), force));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(info.next().is_none());
+        assert_eq!(detaches, [(DEVICE.to_owned(), true)]);
+    }
+
+    #[test]
+    fn retries_normal_detach_once_after_timeout() {
+        let mut info = [OWNED, OWNED, OWNED].into_iter();
+        let mut detaches = Vec::new();
+        let error = detach_and_wait(
+            Path::new(IMAGE),
+            DEVICE,
+            true,
+            Duration::ZERO,
+            || Ok(info.next().expect("unexpected info query").to_owned()),
+            |device, force| {
+                detaches.push((device.to_owned(), force));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(info.next().is_none());
+        assert_eq!(
+            detaches,
+            [(DEVICE.to_owned(), true), (DEVICE.to_owned(), false)]
+        );
+    }
+
+    #[test]
+    fn refuses_retry_after_the_recorded_node_moves_to_another_image() {
+        let stale =
+            format!("{PATH_ONLY}\n================================================\n{UNRELATED}");
+        let mut info = [OWNED, stale.as_str()].into_iter();
+        let mut detaches = Vec::new();
+        let error = detach_and_wait(
+            Path::new(IMAGE),
+            DEVICE,
+            false,
+            Duration::ZERO,
+            || Ok(info.next().expect("unexpected info query").to_owned()),
+            |device, force| {
+                detaches.push((device.to_owned(), force));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(detaches, [(DEVICE.to_owned(), false)]);
+    }
+}
+
 struct Image {
     path: PathBuf,
     device: Option<String>,
     mount: Option<PathBuf>,
+    detach_requested: bool,
 }
 
 struct Images {
@@ -136,6 +269,7 @@ impl Images {
             path,
             device: None,
             mount: None,
+            detach_requested: false,
         });
         let index = self.images.len() - 1;
         checked(
@@ -172,6 +306,7 @@ impl Images {
             Err(err) => return Err(err),
         }
         image.mount = Some(mount.to_owned());
+        image.detach_requested = false;
         let output = Command::new("/usr/bin/hdiutil")
             .args(["attach", "-nobrowse", "-mountpoint"])
             .arg(mount)
@@ -209,23 +344,28 @@ impl Images {
     fn detach(&mut self, index: usize, force: bool) -> io::Result<()> {
         let image = &mut self.images[index];
         let device = image.device.as_deref().expect("recorded attach device");
-        let info = checked(hdiutil(&["info"], None)?)?;
-        if !owned_info(&info, &image.path).is_some_and(|section| device_in(&section, device)) {
-            return Err(io::Error::other(format!(
-                "refused to detach {device}: hdiutil info did not confirm image ownership"
-            )));
-        }
-        let mut args = vec!["detach"];
-        if force {
-            args.push("-force");
-        }
-        args.push(device);
-        let result = checked(hdiutil(&args, None)?)?;
-        eprintln!(
-            "{}: {}",
-            if force { UNPLUG } else { "controlled detach" },
-            result.trim()
-        );
+        detach_and_wait(
+            &image.path,
+            device,
+            force,
+            DEADLINE,
+            || checked(hdiutil(&["info"], None)?),
+            |device, force| {
+                let mut args = vec!["detach"];
+                if force {
+                    args.push("-force");
+                }
+                args.push(device);
+                let result = checked(hdiutil(&args, None)?)?;
+                image.detach_requested = true;
+                eprintln!(
+                    "{}: {}",
+                    if force { UNPLUG } else { "controlled detach" },
+                    result.trim()
+                );
+                Ok(())
+            },
+        )?;
         image.device = None;
         if let Some(mount) = &image.mount {
             self.probe.0.lock().unwrap().remove(mount);
@@ -237,6 +377,7 @@ impl Images {
         let mut detach_error = None;
         for index in (0..self.images.len()).rev() {
             if self.images[index].device.is_some()
+                && !self.images[index].detach_requested
                 && let Err(error) = self.detach(index, false)
             {
                 detach_error = Some(error);
