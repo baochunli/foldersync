@@ -86,3 +86,35 @@ jobs:
         run: |
           chmod +x apps/finder-extension/build.sh
           apps/finder-extension/build.sh --test
+
+  macos-disk-images:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustc --version
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: .tools/rclone
+          key: rclone-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packaging/qualification-manifest.toml') }}
+      - run: scripts/fetch-rclone.sh
+      - name: Qualify disposable APFS disk images
+        shell: bash
+        env:
+          FOLDERSYNC_DISK_IMAGES_CI: "1"
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          test_home="$(mktemp -d)"
+          trap 'rmdir "$test_home"' EXIT
+          HOME="$test_home" FOLDERSYNC_STATE_DIR="$test_home/state" \
+            cargo test --locked -p sync-manager --test disk_images -- --ignored --nocapture --test-threads=1
