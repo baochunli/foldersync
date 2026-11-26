@@ -660,7 +660,8 @@ public enum SnapshotEvaluator {
 
     /// Evaluates the latest snapshot read outcome. When reading or decoding fails,
     /// returns `.stale(..., readSucceeded: false)` so `lastKnownSnapshot` is used
-    /// strictly for stale root badges and never supplies menu mappings or watch-list changes.
+    /// for stale root badges and to keep contextual menus scoped to mapped directories.
+    /// It never supplies menu action IDs or watch-list changes.
     public static func evaluate(
         readResult: SnapshotReadResult,
         lastKnownSnapshot: StatusSnapshot?,
@@ -696,28 +697,39 @@ public enum SnapshotEvaluator {
     }
 
     public static func rootMapping(for url: URL, in snapshot: StatusSnapshot) -> MappingSnapshot? {
-        let candidate = canonicalPath(url.path)
-        for mapping in snapshot.mappings {
-            if canonicalPath(mapping.rootPath) == candidate {
-                return mapping
-            }
+        let candidate = url.standardizedFileURL.path
+        return snapshot.mappings.first { mapping in
+            rootPaths(for: mapping).contains(candidate)
         }
-        return nil
     }
 
     public static func owningMapping(for url: URL, in snapshot: StatusSnapshot) -> MappingSnapshot? {
-        let candidate = canonicalPath(url.path)
-        for mapping in snapshot.mappings {
-            let root = canonicalPath(mapping.rootPath)
-            if candidate == root {
-                return mapping
+        let candidate = url.standardizedFileURL.path
+        return snapshot.mappings.first { mapping in
+            let roots = rootPaths(for: mapping)
+            let isInside = { (path: String) in
+                roots.contains { root in
+                    path == root || path.hasPrefix(root == "/" ? "/" : root + "/")
+                }
             }
-            let prefix = root == "/" ? "/" : root + "/"
-            if candidate.hasPrefix(prefix) {
-                return mapping
-            }
+            // Only resolve Finder's URL after it matches a mapped path lexically.
+            return isInside(candidate) && isInside(canonicalPath(url.path))
         }
-        return nil
+    }
+
+    private static func rootPaths(for mapping: MappingSnapshot) -> [String] {
+        let configured = URL(fileURLWithPath: mapping.rootPath).standardizedFileURL.path
+        return [configured, canonicalPath(mapping.rootPath)]
+    }
+
+    /// Context menus are limited to selections entirely inside one mapping.
+    public static func contextMenuMapping(for urls: [URL], in snapshot: StatusSnapshot?) -> MappingSnapshot? {
+        guard let snapshot, let first = urls.first,
+              let mapping = owningMapping(for: first, in: snapshot),
+              urls.dropFirst().allSatisfy({ owningMapping(for: $0, in: snapshot)?.id == mapping.id }) else {
+            return nil
+        }
+        return mapping
     }
 
     /// Resolves the mapping for context/toolbar menu actions. Returns `nil` after a
@@ -733,13 +745,14 @@ public enum SnapshotEvaluator {
         return owningMapping(for: url, in: snapshot)
     }
 
-    /// Derives `directoryURLs` updates only from successful snapshot reads.
-    public static func directoryRootURLs(for evaluation: SnapshotEvaluation) -> Set<URL>? {
+    /// Finder requests badges for visible items inside monitored directories.
+    /// Monitoring a root's parent covers the root both as an item and as a directory.
+    public static func monitoredDirectoryURLs(for evaluation: SnapshotEvaluation) -> Set<URL>? {
         guard let snapshot = evaluation.successfulSnapshot else {
             return nil
         }
         return Set(snapshot.mappings.map {
-            URL(fileURLWithPath: canonicalPath($0.rootPath))
+            URL(fileURLWithPath: canonicalPath($0.rootPath), isDirectory: true).deletingLastPathComponent()
         })
     }
 

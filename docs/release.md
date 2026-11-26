@@ -79,87 +79,96 @@ cargo test --locked -p rclone-adapter --lib qualifies_ad_hoc_packaged_helper -- 
 - **Isolated dev override:** Passing `--dev-shared-dir` to `packaging/build-app.sh` or `apps/finder-extension/build.sh` creates a fresh private state directory under `<repo>/target/`. The generated absolute-path exception grants access to its `finder/` child. Use the printed `State dir` as `FOLDERSYNC_STATE_DIR` so the manager writes `finder/status.json` directly into the signed handoff.
 - **Future `<TEAM_ID>.*` App Group option:** Once Developer ID signing is qualified by the owner, the Finder handoff directory may optionally migrate to a `<TEAM_ID>.*` macOS App Group container (see `docs/decisions/0002-finder-extension.md`).
 
-### Packaged app and Finder qualification (2026-11-21)
+### Scripted packaged-app and Finder qualification
 
-The default ad hoc bundle and a disposable bundle with ID `dev.foldersync.pkgcheck`
-both passed `codesign --verify --deep --strict --verbose=2` on macOS 27.2.1
-arm64. The disposable ID isolates the Finder registration from the production ID.
+From the repository root on the build Mac, with Python 3.9+, the pinned Rust
+toolchain, NSH 0.6.1, and Xcode Command Line Tools available, run:
 
-The qualification used a private scratch directory under `target/`, an isolated
-`HOME`, and the generated state directory. The following commands show the
-build and fixture setup, with `scratch` set to that scratch directory and
-`NSH_BIN` set to the installed NSH 0.6.1 executable before changing `HOME`.
+```bash
+tests/app/run-app-checks.sh
+```
+
+The script fetches and verifies pinned rclone and builds an ad hoc package with
+bundle ID `dev.foldersync.pkgcheck` and `--dev-shared-dir`. It runs from a
+disposable fixture under `target/` with isolated `HOME`,
+`FOLDERSYNC_STATE_DIR`, and `TMPDIR`. It uses a local-to-local mapping and
+disables automatic scheduling so each test run comes from its own Finder
+`sync_now` request. Run from an unlocked console to qualify the Finder checks.
+
+- Verifies the deep strict code signature and checks the bundled helper
+  SHA-256 against the sealed manifest.
+- Verifies the live manager publishes the fixture snapshot and owns the OS file
+  lock. Launches a second packaged instance and confirms the first retains
+  exclusive ownership while the second exits through native quit.
+- Queues an ADR 0002 `sync_now` request and verifies its consumption, byte-for-byte
+  transfer, bundled engine identity, and explicit fixture rclone config. Sends
+  native quit to the tracked PID after the queued run drains and checks that
+  the lock is free.
+- Interrupts an observed partial multi-file transfer by stopping the test
+  manager and its verified bundled helper, then terminating both fixture PIDs.
+  Relaunches the package and verifies run reconciliation, the
+  `RecoveryRequired` hold, and unchanged bisync listings.
+- Checks the console state before interacting with Finder. On an unlocked
+  console it elects the disposable extension and waits up to 120 seconds
+  for its initialization log before opening Finder windows. It opens the
+  parent to show the mapped root, then opens the root to check directory
+  observation. Each attempt uses fresh windows in the logged-in Finder
+  session and closes them by ID. The script re-elects the extension for
+  up to three attempts and records each attempt in the evidence.
+- Matches snapshot decode, root observation, and the expected `paused`
+  badge to the run's handoff path, host ID, and extension PID. Finder
+  checks are **NOT VERIFIED** if the console is unavailable or the
+  extension never initializes. A root observation without the exact
+  badge request after all attempts is a **FAIL**.
+
+The earlier root badge investigation captured a `paused` root badge in
+a controlled icon-view comparison. The scripted evidence records each
+current run's result.
+[ADR 0002 root badge comparison](decisions/0002-finder-extension.md#packaged-root-badge-comparison-2026-11-26)
+
+The script writes `target/app-qualification/app-evidence.json` and
+`target/app-qualification/app-evidence.md` after cleanup. Each check includes
+its status and evidence. Exit status is 0 when all selected checks pass, 1
+when a check fails, and 2 when checks remain unverified without a failure.
+Cleanup disables and unregisters the staged extension, waits for disposable
+processes to exit, and removes the staged bundle and fixtures.
+
+#### Owner-only signed and notarized qualification
+
+Build and notarize a dedicated disposable bundle. The bundle ID and absolute
+handoff path are part of the signature, so use the same checkout for the
+build and the qualification. Each run consumes the empty handoff directory
+created by the build and preserves the signed input bundle.
 
 ```bash
 scripts/fetch-rclone.sh
-export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-mkdir -p "$scratch/home" "$scratch/build-state"
-export HOME="$scratch/home" FOLDERSYNC_STATE_DIR="$scratch/build-state"
-unset FOLDERSYNC_DEMO FOLDERSYNC_RCLONE
-packaging/build-app.sh --out "$scratch/package" --nsh-bin "$NSH_BIN" \
-  --bundle-id dev.foldersync.pkgcheck --dev-shared-dir
-app="$scratch/package/FolderSync.app"
-appex="$app/Contents/PlugIns/FolderSyncFinder.appex"
-codesign --verify --deep --strict --verbose=2 "$app"
-shared=$(plutil -extract FolderSyncSharedDir raw "$appex/Contents/Info.plist")
-state=$(dirname "$shared")
-export FOLDERSYNC_STATE_DIR="$state"
-cargo build --locked -p sync-cli
-mkdir -p "$scratch/watched/Docs" "$scratch/remote"
-printf 'Local fixture\n' > "$scratch/watched/Docs/baseline.txt"
-target/debug/sync-cli --state-dir "$state" add-mapping --id docs \
-  --local-dir "$scratch/watched/Docs" --remote-dir "$scratch/remote" \
-  --recovery-dir "$scratch/recovery" --remote-recovery-dir "$scratch/remote-recovery"
-target/debug/sync-cli --state-dir "$state" init docs
+packaging/build-app.sh --bundle-id dev.foldersync.pkgcheck --dev-shared-dir \
+  --out target/package-appqa-release --sign "Developer ID Application: <Name> (<TEAM_ID>)"
+packaging/notarize.sh --app target/package-appqa-release/FolderSync.app \
+  --keychain-profile foldersync-notary \
+  --out-zip target/package-appqa-release/FolderSync-notarize.zip
+tests/app/run-app-checks.sh --release target/package-appqa-release/FolderSync.app
 ```
 
-After initialization, the check removed the CLI's `finder/status.json` and
-started `"$app/Contents/MacOS/FolderSync"` with the same isolated environment
-and demo mode unset. The packaged app recreated the snapshot and held the
-exclusive manager lock. A second pass launched the bundle in Finder's GUI
-session using `open -n -W --env "HOME=$HOME" --env "FOLDERSYNC_STATE_DIR=$state" "$app"`.
-Each pass added a fresh local file and atomically queued an ADR 0002
-`sync_now` action for `docs` in `"$shared/actions"`. The packaged manager
-consumed the request and copied the new file to the local fixture.
+This runs the local lifecycle and Finder checks on a staged copy of the signed
+bundle and adds `spctl --assess --type execute` and `xcrun stapler validate`.
+The script also fetches or verifies the workspace rclone pin for fixture setup.
+For fresh-machine Gatekeeper, use the final production bundle on a second Mac
+or a clean macOS VM with ordinary download quarantine in place. Follow the
+operational verification steps below.
+
+#### Owner-only Keychain qualification
 
 ```bash
-sqlite3 -readonly "$state/state.sqlite" \
-  "SELECT mode, status, outcome_kind, exit_code, child_executable,
-          engine_version, engine_platform, engine_sha256
-     FROM runs WHERE mapping_id = 'docs' ORDER BY rowid;"
-shasum -a 256 "$app/Contents/Helpers/rclone"
+tests/app/run-app-checks.sh --with-keychain
 ```
 
-Both normal runs recorded `completed`, `success`, and exit code `0`.
-The database and each run's `argv.json` identified bundled
-`FolderSync.app/Contents/Helpers/rclone` v1.76.0 (`osx-arm64`). The recorded
-digest matched the signed helper bytes and the sealed manifest's
-`bundled_sha256` (`e3d56f1e6f4b28e0d42222ca6ab4e813fc704d9f3a5637f4bd8099a6e1f8295e`).
-The recorded arguments pointed `--config` at the throwaway
-`accounts/local-fixture/rclone.conf` under the generated state directory.
-
-```bash
-id=dev.foldersync.pkgcheck.finder-extension
-pluginkit -a "$appex"
-pluginkit -e use -i "$id"
-open -a Finder "$scratch/watched/Docs"
-open -R "$scratch/watched/Docs"
-/usr/bin/log show --last 2m --style compact \
-  --predicate 'subsystem == "dev.foldersync.app.finder-extension"'
-pluginkit -e ignore -i "$id"
-pluginkit -r "$appex"
-pluginkit -m -A -D -v -i "$id"
-```
-
-The packaged extension decoded the manager's snapshot, registered one watched
-root, and received Finder's directory observation callback for that root.
-The console was locked during the check, and the log did not show a root
-badge request. Root badge assignment and interactive menu clicks in Finder
-remain unverified for the packaged build. See
-[ADR 0002](decisions/0002-finder-extension.md#packaged-manager-qualification-2026-11-21)
-for the log excerpt. The check unregistered the extension, terminated the
-packaged app by PID, and removed the disposable bundles and state.
+The Keychain check is currently **NOT VERIFIED**. It requires a packaged
+credential-helper probe that creates a uniquely keyed item in
+`dev.foldersync.test`, reads it with the same executable under a different
+`HOME`, and deletes it. The current packaged helper supports only reads from
+the production service, so the script records the missing capability without
+accessing the Keychain.
 
 ## Owner Notarization Steps (Apple Developer Account)
 

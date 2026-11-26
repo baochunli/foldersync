@@ -36,14 +36,35 @@ produced the following unified log messages (temporary paths abbreviated).
 
 The watch-list update follows successful snapshot decoding, and the observation
 callback confirms Finder reached the configured root. The console was locked
-and no `Badged root` event appeared during either attempt. Packaged root badge
-assignment still needs a check from an unlocked Finder session because Finder
-requests badges as items come into view. [Apple's Finder Sync guide](https://developer.apple.com/library/archive/documentation/General/Conceptual/ExtensibilityPG/Finder.html)
+and neither attempt produced a `Badged root` event. The unlocked comparison
+below checked root badge assignment separately.
 
 The earlier spike badge results below apply to the mock host. The live
 production home-relative handoff, interactive Finder menu clicks, and
 installed Developer ID bundle remain outside this run. See the
-[release qualification commands](../release.md#packaged-app-and-finder-qualification-2026-11-21).
+[release qualification commands](../release.md#scripted-packaged-app-and-finder-qualification).
+
+### Packaged root badge comparison (2026-11-26)
+
+Finder asks for a badge when an item inside a monitored directory comes into
+view. Directory observation covers monitored directories and their
+descendants. FolderSync monitors one entry per distinct mapped root parent.
+This makes the root eligible when displayed in its parent and keeps
+observation inside the mapped folder. [Apple's badge callback contract](https://developer.apple.com/documentation/findersync/fifindersyncprotocol/requestbadgeidentifier%28for%3A%29) · [Apple's directory watch contract](https://developer.apple.com/documentation/findersync/fifindersynccontroller/directoryurls)
+
+The extension matches badge requests to exact mapped root paths. Context
+menus require every target to belong to the same mapping. Observation logs
+include only mapped roots. The extension uses the snapshot and the paths
+Finder supplies, without enumerating the monitored directories.
+
+On an unlocked console, an instrumented disposable package emitted
+`Badged root path=<fixture>/watched/Docs badge=paused` with parent monitoring
+when the parent opened in a frontmost icon window. The matched root-only
+control produced directory observation without a badge request. Both builds
+registered all six badge images on the shared controller before registering
+the watch list. Reopening and switching between icon and list views did not
+reliably reproduce the badge event. The full scripted rerun recorded no
+extension initialization or badge event on that console. [Apple's badge image registration guidance](https://developer.apple.com/documentation/findersync/fifindersynccontroller/setbadgeimage%28_%3Alabel%3Aforbadgeidentifier%3A%29)
 
 ## Test Environment
 
@@ -90,7 +111,7 @@ Finder Sync extensions must run inside the macOS App Sandbox (`com.apple.securit
 5. `NSRunningApplication.runningApplications(withBundleIdentifier:)` succeeded inside the sandboxed extension (`count=1` when running), enabling host-liveness staleness detection alongside timestamp expiry.
 
 **Unit-tested model guarantees (not live-verified in Finder):**
-- Deleting `status.json` or replacing it with corrupt/unsupported-version JSON while the host app is running and the prior snapshot is still within TTL evaluates as `.stale(..., readSucceeded: false)`. The cached snapshot is retained strictly for stale root badges; `menuMapping` and `directoryRootURLs` return `nil`, so the menu disables mapping actions (`Sync now`, `Pause`, `Show last run`) and exposes only `Open FolderSync` with no mapping ID. Verified in `apps/finder-extension/Tests/SnapshotModelTests.swift` (section `3b`), not exercised interactively in Finder.
+- Deleting `status.json` or replacing it with corrupt or unsupported JSON evaluates as `.stale(..., readSucceeded: false)`. The cached snapshot supplies stale root badges and limits contextual menu placement to mapped folders. Mapping actions are disabled, `Open FolderSync` carries no mapping ID, and watch changes wait for a successful read. The snapshot tests cover this behavior.
 
 **Implementation lessons learned during live verification:**
 - **Canonical path normalization is mandatory:** Finder passes resolved paths (`/private/var/...`), whereas callers often write symlinked paths (`/var/...`). Both snapshot roots and Finder callback URLs must be canonicalized via `standardizedFileURL.resolvingSymlinksInPath()`.
@@ -146,7 +167,7 @@ Written atomically (`status.json.tmp` → rename to `status.json`), followed by 
 - `generated_at`: RFC 3339 / ISO 8601 UTC timestamp.
 - `stale_after_seconds`: Optional integer (default `300` seconds / 5 minutes).
 - `mappings[].state`: One of `synced`, `syncing`, `attention`, `paused`, `disk_missing`.
-- **Staleness rule:** If `status.json` is missing, unreadable, corrupt, has an unsupported version, is older than `stale_after_seconds`, or the host app bundle ID is not running, all known mapping roots display the `stale` badge (`FolderSync unavailable`) and the context menu shows plain-text stale status. After a failed read/decode, menu mappings and watch-list updates are cleared (only `Open FolderSync` remains enabled, with no mapping ID).
+- **Staleness rule:** If `status.json` is missing, unreadable, corrupt, has an unsupported version, is older than `stale_after_seconds`, or the host app bundle ID is not running, known mapping roots display the `stale` badge (`FolderSync unavailable`) and the context menu shows plain-text stale status. After a failed read or decode, the last watch list stays in place and only `Open FolderSync` remains enabled, with no mapping ID.
 - **Accessibility:** Every badge registers a distinct symbol shape, color, and text label; the context menu always begins with a disabled plain-text status line (`Status: ...`).
 
 ### Action Files: `actions/action-<uuid>.json` (Extension → Host)
