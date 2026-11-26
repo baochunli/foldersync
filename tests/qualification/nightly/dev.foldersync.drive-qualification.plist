@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.foldersync.drive-qualification</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@RUNNER@</string>
+        <string>--qual-home</string>
+        <string>@QUAL_HOME@</string>
+        <string>--keep</string>
+        <string>14</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FOLDERSYNC_QUAL_PYTHON</key>
+        <string>@PYTHON@</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG@</string>
+</dict>
+</plist>

@@ -58,6 +58,47 @@ fn scheduling_requires_a_pause_or_resume_action() {
 }
 
 #[test]
+fn removing_a_mapping_keeps_its_files() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    let local = tmp.path().join("local");
+    let remote = tmp.path().join("remote");
+    let recovery = tmp.path().join("recovery");
+    for dir in [&local, &remote, &recovery] {
+        fs::create_dir(dir).unwrap();
+        fs::write(dir.join("keep.txt"), "keep").unwrap();
+    }
+    let cli = |args: &[&str]| {
+        cli_cmd(tmp.path())
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let added = cli(&[
+        "add-mapping",
+        "--id",
+        "fixture",
+        "--local-dir",
+        local.to_str().unwrap(),
+        "--remote-dir",
+        remote.to_str().unwrap(),
+        "--recovery-dir",
+        recovery.to_str().unwrap(),
+    ]);
+    assert!(added.status.success(), "{added:?}");
+    let removed = cli(&["remove-mapping", "fixture"]);
+    assert!(removed.status.success(), "{removed:?}");
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&cli(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(snapshot["mappings"], serde_json::json!([]));
+    for dir in [&local, &remote, &recovery] {
+        assert_eq!(fs::read_to_string(dir.join("keep.txt")).unwrap(), "keep");
+    }
+}
+
+#[test]
 fn drive_command_errors_release_the_state_lock() {
     let tmp = TempDir::new().unwrap();
     let state = tmp.path().join("state");
