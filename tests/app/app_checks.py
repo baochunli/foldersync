@@ -28,6 +28,10 @@ EXTENSION_ID = BUNDLE_ID + ".finder-extension"
 LOG_SUBSYSTEM = "dev.foldersync.app.finder-extension"
 HELPER_PATH = "Contents/Helpers/rclone"
 PLUGIN = ("/usr/bin/pluginkit",)
+FINDER_WINDOW = ("/usr/bin/osascript", Path(__file__).with_name("finder-window.applescript"))
+FINDER_CHECKS = ("finder_snapshot", "finder_watch", "finder_badge")
+FINDER_LAUNCH_SECONDS = 120
+FINDER_WINDOW_SECONDS = 12
 PASS, FAIL, UNVERIFIED = "PASS", "FAIL", "NOT VERIFIED"
 CHECKS = {
     "signature": "Packaged bundle and deep strict signature",
@@ -85,9 +89,10 @@ def finder_evidence(logs, shared, root, expected_badge):
     observed = f"beginObservingDirectory path={root}"
     requested = f"Badged root path={root} badge={expected_badge}"
     return {
+        "finder_launch": [f"PID {pid}  {started}" for pid in sorted(pids)],
         "finder_snapshot": [m for m in messages if m in (started, registered)]
         if registered in messages else [],
-        "finder_watch": [registered, observed] if registered in messages and observed in messages else [],
+        "finder_watch": [observed] if observed in messages else [],
         "finder_badge": [requested] if requested in messages else [],
     }
 
@@ -166,6 +171,7 @@ class Qualification:
         self.remote = scratch / "peer"
         self.launched = []
         self.registration_attempted = False
+        self.finder_attempts = []
         self.stage = "signature"
         self.env = {key: value for key, value in os.environ.items()
                     if key not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")
@@ -497,56 +503,129 @@ class Qualification:
             self.console = "unknown"
         return self.console
 
-    def run_finder(self):
-        finder_checks = ("finder_snapshot", "finder_watch", "finder_badge")
-        self.stage = "finder_snapshot"
-        self.check_console()
-        if self.console != "unlocked":
-            for key in finder_checks:
-                self.result(key, UNVERIFIED, f"Console session is {self.console}; skipped Finder interaction.")
-            return
+    def read_finder_evidence(self, start):
+        # Unified logging can reuse the image path from an earlier bundle with the same Mach-O UUID.
+        predicate = f'subsystem == "{LOG_SUBSYSTEM}"'
+        raw = self.command("/usr/bin/log", "show", "--start", start.strftime("%Y-%m-%d %H:%M:%S"),
+                           "--style", "ndjson", "--no-pager", "--predicate", predicate).stdout
+        logs = []
+        for line in raw.splitlines():
+            if not line.startswith("{"):
+                continue
+            row = json.loads(line)
+            if "timestamp" in row:
+                timestamp = dt.datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S.%f%z")
+                # log show accepts whole seconds. Exclude activity before this election.
+                if timestamp >= start:
+                    logs.append(row)
+        return finder_evidence(logs, self.state / "finder", self.local, "paused")
+
+    def poll_finder(self, attempt, start, key, seconds):
+        deadline = time.monotonic() + seconds
+        while self.check_console() == "unlocked":
+            attempt["observations"] = self.read_finder_evidence(start)
+            remaining = deadline - time.monotonic()
+            if attempt["observations"][key] or remaining <= 0:
+                break
+            time.sleep(min(3, remaining))
+
+    def close_finder_window(self, window):
+        self.command(*FINDER_WINDOW, "close", window["id"], window["target"], env=os.environ)
+        window["closed"] = True
+
+    def run_finder_attempt(self, attempt):
         # LaunchServices can discover the extension when the packaged host starts.
         self.only_staged_registration()
-        start = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.registration_attempted = True
+        if attempt["number"] > 1:
+            self.command(*PLUGIN, "-e", "ignore", "-i", EXTENSION_ID)
+        start = dt.datetime.now().astimezone()
         self.command(*PLUGIN, "-a", self.appex)
         self.command(*PLUGIN, "-e", "use", "-i", EXTENSION_ID)
         elected = self.inventory("-vv")
         require(elected.startswith("+") and str(self.appex) in elected,
                 f"PluginKit did not elect the staged extension: {elected}")
-        # Unified logging can reuse the image path from an earlier bundle with the same Mach-O UUID.
-        predicate = f'subsystem == "{LOG_SUBSYSTEM}"'
-        observations = {}
-        logs = []
-        # Finder observes the root's contents and requests its badge when the parent shows the root.
-        self.command("/usr/bin/open", "-a", "Finder", self.local, env=os.environ)
-        time.sleep(2)
-        self.command("/usr/bin/open", "-a", "Finder", self.local.parent, env=os.environ)
-        for _ in range(10):
-            time.sleep(3)
+        attempt["election"] = elected.splitlines()[0]
+        print(f"Finder attempt {attempt['number']}/3. Waiting up to {FINDER_LAUNCH_SECONDS}s for initialization.",
+              flush=True)
+
+        wait_started = time.monotonic()
+        self.poll_finder(attempt, start, "finder_launch", FINDER_LAUNCH_SECONDS)
+        attempt["launch_wait_seconds"] = round(time.monotonic() - wait_started, 1)
+        if self.console != "unlocked":
+            return f"Console became {self.console} while waiting for Finder."
+        if not attempt["observations"]["finder_launch"]:
+            return f"No matching initialization within {FINDER_LAUNCH_SECONDS}s. No windows opened."
+
+        # Show the root as an item in its parent first, then browse the root itself.
+        for directory, key in ((self.local.parent, "finder_badge"), (self.local, "finder_watch")):
             if self.check_console() != "unlocked":
-                for key in finder_checks:
-                    self.result(key, UNVERIFIED, f"Console became {self.console} during the Finder check.")
-                return
-            raw = self.command("/usr/bin/log", "show", "--start", start, "--style", "ndjson", "--no-pager",
-                               "--predicate", predicate).stdout
-            logs = [json.loads(line) for line in raw.splitlines() if line.startswith("{")]
-            observations = finder_evidence(logs, self.state / "finder", self.local, "paused")
-            if all(observations.values()):
+                return f"Console became {self.console} during Finder navigation."
+            result = self.command(*FINDER_WINDOW, "open", directory, attempt["view"], env=os.environ)
+            window = {"id": int(result.stdout.strip()), "target": str(directory), "closed": False}
+            attempt["windows"].append(window)
+            try:
+                self.poll_finder(attempt, start, key, FINDER_WINDOW_SECONDS)
+            finally:
+                self.close_finder_window(window)
+        return f"Finder navigation finished with console {self.console}."
+
+    def run_finder(self):
+        self.stage = "finder_snapshot"
+        observations = finder_evidence([], self.state / "finder", self.local, "paused")
+        for number, view in enumerate(("icon", "list", "icon"), start=1):
+            if self.check_console() != "unlocked":
+                break
+            # Each election must earn its own evidence, independent of earlier attempts.
+            attempt = {"number": number, "view": view, "windows": [],
+                       "outcome": "Attempt interrupted before completion.",
+                       "observations": {key: [] for key in observations}}
+            self.finder_attempts.append(attempt)
+            try:
+                attempt["outcome"] = self.run_finder_attempt(attempt)
+            except (*COMMAND_ERRORS, ValueError) as exc:
+                attempt["outcome"] = str(exc)
+            print(f"Finder attempt {number}/3. {attempt['outcome']}", flush=True)
+            for key, messages in attempt["observations"].items():
+                observations[key].extend(messages)
+            if self.console != "unlocked" or all(observations.values()):
                 break
 
-        relevant = [row["eventMessage"] for row in logs if row.get("eventMessage")
-                    and any(str(path) in row["eventMessage"] for path in (self.local, self.state / "finder"))]
-        for key in finder_checks:
-            messages = observations.get(key)
+        if self.console != "unlocked" or self.check_console() != "unlocked":
+            for key in FINDER_CHECKS:
+                self.result(key, UNVERIFIED, f"Console session is {self.console} (environment).")
+            return
+        if not observations["finder_launch"]:
+            for key in FINDER_CHECKS:
+                self.result(key, UNVERIFIED, "No matching disposable extension initialization in any attempt (environment).")
+            return
+
+        visited_root = any(window["target"] == str(self.local)
+                           for attempt in self.finder_attempts for window in attempt["windows"])
+        missing = {
+            "finder_snapshot": (FAIL, "Extension initialized without a matching snapshot watch registration."),
+            "finder_watch": (FAIL if visited_root else UNVERIFIED, "No observation of the fixture root."),
+            "finder_badge": (
+                FAIL if observations["finder_watch"] else UNVERIFIED,
+                "No exact paused root badge request in any attempt.",
+            ),
+        }
+        for key in FINDER_CHECKS:
+            messages = observations[key]
             if messages:
                 self.result(key, PASS, *dict.fromkeys(messages))
             else:
-                self.result(key, FAIL, "No matching Finder log event on the unlocked console.",
-                            elected.splitlines()[0], *relevant[-7:])
+                self.result(key, *missing[key])
 
     def cleanup(self):
         problems = []
+        for attempt in self.finder_attempts:
+            for window in attempt["windows"]:
+                if not window["closed"]:
+                    try:
+                        self.close_finder_window(window)
+                    except COMMAND_ERRORS as exc:
+                        problems.append(str(exc))
         registered = self.registration_attempted
         if self.appex.is_dir():
             try:
@@ -618,10 +697,23 @@ class Qualification:
 def write_evidence(output, check):
     items = list(check.results.values())
     status = overall(item["status"] for item in items)
-    evidence = {"status": status, "console": check.console, "checks": items}
+    evidence = {"status": status, "console": check.console, "checks": items,
+                "finder_attempts": check.finder_attempts}
     markdown = [f"# Packaged app qualification — {status}", "", f"Console session: {check.console}", ""]
     for item in items:
         markdown += [f"## {item['status']} — {item['name']}", "", "```text", *item["evidence"], "```", ""]
+    for attempt in check.finder_attempts:
+        markdown += [f"## Finder attempt {attempt['number']} ({attempt['view']} view)", "", "```text"]
+        if "election" in attempt:
+            markdown.append(attempt["election"])
+        if "launch_wait_seconds" in attempt:
+            markdown.append(f"Waited {attempt['launch_wait_seconds']}s for initialization.")
+        for window in attempt["windows"]:
+            closed = "closed" if window["closed"] else "open"
+            markdown.append(f"Window {window['id']} {closed}  {window['target']}")
+        markdown += list(dict.fromkeys(message for messages in attempt["observations"].values()
+                                       for message in messages))
+        markdown += [attempt["outcome"], "```", ""]
     for suffix, content in (("json", json.dumps(evidence, indent=2)), ("md", "\n".join(markdown))):
         destination = checked_path(output / f"app-evidence.{suffix}", TARGET)
         with tempfile.NamedTemporaryFile(mode="w", dir=output, delete=False) as temporary:

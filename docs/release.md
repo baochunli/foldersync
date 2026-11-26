@@ -109,19 +109,21 @@ disables automatic scheduling so each test run comes from its own Finder
   Relaunches the package and verifies run reconciliation, the
   `RecoveryRequired` hold, and unchanged bisync listings.
 - Checks the console state before interacting with Finder. On an unlocked
-  console it registers the disposable extension and opens the mapped root
-  and its parent in the logged-in Finder session. The extension monitors
-  the parent so Finder can request a badge when the mapped root comes into
-  view. Opening the root checks directory observation. The script queries
-  the Finder extension log subsystem and matches snapshot decode, watch
-  registration, and the expected `paused` badge to the run's handoff path,
-  host ID, and extension PID. It records these checks as **NOT VERIFIED**
-  if the console is locked, absent, or its status cannot be determined.
+  console it elects the disposable extension and waits up to 120 seconds
+  for its initialization log before opening Finder windows. It opens the
+  parent to show the mapped root, then opens the root to check directory
+  observation. Each attempt uses fresh windows in the logged-in Finder
+  session and closes them by ID. The script re-elects the extension for
+  up to three attempts and records each attempt in the evidence.
+- Matches snapshot decode, root observation, and the expected `paused`
+  badge to the run's handoff path, host ID, and extension PID. Finder
+  checks are **NOT VERIFIED** if the console is unavailable or the
+  extension never initializes. A root observation without the exact
+  badge request after all attempts is a **FAIL**.
 
-A disposable package logged the expected `paused` root badge during an
-unlocked controlled comparison in icon view. The full scripted rerun had
-no Finder extension events, and additional view and reopen trials did not
-reliably reproduce the callback. Check the evidence for the current run.
+The earlier root badge investigation captured a `paused` root badge in
+a controlled icon-view comparison. The scripted evidence records each
+current run's result.
 [ADR 0002 root badge comparison](decisions/0002-finder-extension.md#packaged-root-badge-comparison-2026-11-26)
 
 The script writes `target/app-qualification/app-evidence.json` and
