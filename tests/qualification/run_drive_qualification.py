@@ -7,6 +7,7 @@ import argparse
 import configparser
 import csv
 import fcntl
+import http.client
 import io
 import json
 import os
@@ -14,6 +15,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import ssl
 import stat
 import subprocess
 import sys
@@ -24,7 +26,7 @@ from collections import Counter
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from common import (
     REPO_ROOT,
@@ -44,6 +46,7 @@ from common import (
 
 REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 DRIVE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,255}")
+ACCESS_TOKEN_RE = re.compile(r"[A-Za-z0-9_.~+/-]+=*")
 CLI_TIMEOUT = 750  # Manager allows up to 600 s for a sync plus Drive preflight.
 DRIVE_TIMEOUT = 180
 COLLECTION_VISIBILITY_TIMEOUT = 60
@@ -355,6 +358,10 @@ class Client:
     def home(self) -> Path:
         return self.root / "home"
 
+    @property
+    def config(self) -> Path:
+        return self.state / "accounts" / "qual" / "rclone.conf"
+
     def data(self, key: str) -> Path:
         return (self.run_root or self.root) / "data" / key
 
@@ -469,12 +476,11 @@ class DriveRunner:
         return self.device_ids[client.name]
 
     def cloud_command(self, client: Client, *args: str) -> list[str]:
-        config = client.state / "accounts" / "qual" / "rclone.conf"
         # rclone's SpaceSepList uses CSV quoting, including doubled quotes.
         helper = '"' + str(self.sync_cli).replace('"', '""') + '"'
         helper += f" credential-helper --account {self.device_id(client)}/qual"
         return [
-            str(self.rclone), "--use-json-log", "--config", str(config),
+            str(self.rclone), "--use-json-log", "--config", str(client.config),
             "--ask-password=false", "--password-command", helper,
             "--drive-skip-gdocs", "--drive-skip-shortcuts",
             *args,
@@ -489,6 +495,70 @@ class DriveRunner:
         if args[:2] == ("backend", "query") and "search result INCOMPLETE" in proc.stderr:
             raise RuntimeError("Drive reported an incomplete query. Refused to use its results.")
         return self.record(client, "rclone", list(args), proc, True)
+
+    def _qualification_access_token(self, client: Client, parent_id: str) -> str:
+        with os.fdopen(open_private_file(client.config, os.O_RDONLY), "rb") as file:
+            header = next((line.strip() for line in file if line.strip() and not line.lstrip().startswith(b"#")), b"")
+        if header != b"RCLONE_ENCRYPT_V0:":
+            raise RuntimeError("Drive trash requires the encrypted qualification account config.")
+
+        # Deliberately bypass command capture and its evidence pipeline. The pinned
+        # config show prints the decrypted remote into a private in-memory pipe.
+        try:
+            proc = subprocess.run(
+                self.cloud_command(client, "config", "show", client.remote), env=client.env(self.rclone),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=DRIVE_TIMEOUT,
+            )
+            proc.check_returncode()
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.read_string(proc.stdout)
+            remote = parser[client.remote]
+            if remote["type"] == "drive" and remote["root_folder_id"] == parent_id:
+                token = json.loads(remote["token"])["access_token"]
+                if isinstance(token, str) and ACCESS_TOKEN_RE.fullmatch(token):
+                    return token
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, configparser.Error, subprocess.SubprocessError):
+            pass  # These exceptions can contain credential bytes.
+        raise RuntimeError("Could not read an access token from the encrypted qualification account.")
+
+    def trash_recorded_folders(
+        self, client: Client, parent_id: str, expected_data_id: str, scratch: Path, folder_ids: dict[str, str],
+    ) -> Iterator[dict[str, str]]:
+        """Trash only recorded fixtures that are still direct children of the original Data folder."""
+        if not folder_ids:
+            return
+        # Use verified TLS without proxy settings, redirects, or SSL key logging.
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        tls.load_default_certs()
+        for fixture, folder_id in folder_ids.items():
+            result = {"fixture": fixture, "folder_id": folder_id, "status": "REFUSED"}
+            try:
+                if not DRIVE_ID_RE.fullmatch(folder_id) or folder_id in {parent_id, expected_data_id}:
+                    raise RuntimeError("Invalid or reserved Drive fixture folder ID.")
+                data_id = require_sentinel(self, client, parent_id, scratch)
+                if data_id != expected_data_id:
+                    raise RuntimeError("The disposable Data folder ID changed during the run.")
+                token = self._qualification_access_token(client, parent_id)
+                with closing(http.client.HTTPSConnection("www.googleapis.com", timeout=30, context=tls)) as conn:
+                    before = qualification_drive_file(conn, folder_id, token)
+                    if not matches_fixture(before, folder_id, data_id):
+                        raise RuntimeError("The recorded ID is no longer a folder directly under the verified Data folder.")
+                    if before.get("trashed") is True and before.get("explicitlyTrashed") is True:
+                        result["status"] = "ALREADY TRASHED"
+                    elif before.get("trashed") is False and before.get("explicitlyTrashed") is False:
+                        result["status"] = "FAILED"
+                        after = qualification_drive_file(conn, folder_id, token, trash=True)
+                        if not matches_fixture(after, folder_id, data_id) or (
+                            after.get("trashed") is not True or after.get("explicitlyTrashed") is not True
+                        ):
+                            raise RuntimeError("Drive did not confirm recoverable trash for this exact folder ID and parent.")
+                        result["status"] = "TRASHED"
+                    else:
+                        raise RuntimeError("Drive did not confirm an independently trashable fixture.")
+            except SCENARIO_ERRORS as exc:
+                result["detail"] = redact_credential_stderr(str(exc))
+            yield result
 
     def overlap_upload(self, client: Client, source: Path, folder_id: str, during) -> dict[str, Any]:
         args = [
@@ -578,6 +648,36 @@ class DriveRunner:
             "transferred_after_signal": after_signal,
             "returncode": proc.returncode,
         }
+
+
+def matches_fixture(metadata: dict[str, Any], folder_id: str, data_id: str) -> bool:
+    return (metadata.get("id") == folder_id and metadata.get("mimeType") == DRIVE_FOLDER
+            and metadata.get("parents") == [data_id])
+
+
+def qualification_drive_file(
+    conn: http.client.HTTPSConnection, folder_id: str, token: str, *, trash: bool = False,
+) -> dict[str, Any]:
+    """Read or trash one exact Drive ID without retaining HTTP diagnostics."""
+    target = f"/drive/v3/files/{folder_id}?supportsAllDrives=true&fields=id,mimeType,parents,trashed,explicitlyTrashed"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if trash:
+        headers["Content-Type"] = "application/json"
+    method = "PATCH" if trash else "GET"
+    try:
+        conn.request(method, target, body=b'{"trashed":true}' if trash else None, headers=headers)
+        with conn.getresponse() as response:
+            if response.status != 200:
+                raise RuntimeError(f"Drive {method} returned HTTP {response.status}.")
+            body = response.read(16_385)
+        if len(body) > 16_384:
+            raise ValueError("Oversized metadata.")
+        metadata = json.loads(body)
+        if not isinstance(metadata, dict):
+            raise ValueError("Invalid metadata.")
+        return metadata
+    except (http.client.HTTPException, OSError, ValueError):
+        raise RuntimeError(f"Drive {method} did not return valid file metadata.") from None
 
 
 def upload_progress(log: bytes, name: str) -> int:
@@ -751,7 +851,8 @@ class DriveQualification:
 
     def cleanup(self) -> None:
         errors = []
-        self.evidence.outcomes["collections_retained_by_id"] = self.folder_ids.copy()
+        self.evidence.outcomes["recorded_fixture_ids"] = self.folder_ids.copy()
+        trash = self.evidence.outcomes["drive_trash"] = []
         removed = []
         for client in self.clients:
             planned = {key: mapping_id for (name, key), mapping_id in self.mapping_ids.items() if name == client.name}
@@ -776,9 +877,16 @@ class DriveQualification:
         self.evidence.outcomes.update({"removed_mappings": removed, "errors": errors})
         if errors:
             raise RuntimeError(f"Could not remove {len(errors)} run mappings. See the evidence.")
-        if self.folder_ids:
-            self.evidence.status = "NOT VERIFIED"
-            self.evidence.conclusion = "Recorded Drive folders retained. Pinned rclone has no exact-ID folder trash command."
+        if not self.folder_ids:
+            return
+        self.evidence.outcomes["data_folder_id"] = self.data_id
+        for result in self.runner.trash_recorded_folders(
+            self.clients[0], self.parent_id, self.data_id, self.root, self.folder_ids,
+        ):
+            trash.append(result)
+        confirmed = {row["fixture"]: row["folder_id"] for row in trash if row["status"] in {"TRASHED", "ALREADY TRASHED"}}
+        if confirmed != self.folder_ids:
+            raise RuntimeError(f"Could not confirm trash for all {len(self.folder_ids)} Drive fixtures. See the evidence.")
 
     def collection_matches(self, client: Client, name: str, *, timeout: float = CLI_TIMEOUT) -> list[dict[str, Any]]:
         listing = self.cli_json(client, "collections", "list", "--account", "qual", timeout=timeout)
@@ -1255,6 +1363,8 @@ class DriveQualification:
         baseline = self.start(key, clients, ["original.txt"])
         folder_id = self.folder_ids[key]
         data_id = self.require_sentinel()
+        if data_id != self.data_id:
+            raise RuntimeError("The disposable Data folder ID changed during the run.")
         name = f"{self.prefix}-{key}"
         parked_name = f"{name}-original"
         rows = drive_children(self.runner, a, data_id)
@@ -1331,7 +1441,7 @@ class DriveQualification:
                 "two-account", "Download A's original bytes from B's Drive recovery directory.",
                 "B overwrites and deletes files uploaded by A", self.two_account,
             ))
-        cases.append(("cleanup", "Remove this run's mappings and account for its Drive collection IDs.",
+        cases.append(("cleanup", "Remove this run's mappings and verify recoverable trash for its collection IDs.",
                       "none", self.cleanup))
         results = []
         preflight_ok = True
@@ -1342,17 +1452,17 @@ class DriveQualification:
                 SCENARIOS[key], description, utc_now(), "", injected, False, "",
                 commands=self.runner.commands,
             )
-            if (not preflight_ok or interrupted) and (key != "cleanup" or not self.mapping_ids):
+            if (not preflight_ok or interrupted) and (key != "cleanup" or not (self.mapping_ids or self.folder_ids)):
                 evidence.status = "NOT RUN"
                 evidence.conclusion = "The run was interrupted." if interrupted else "Drive preflight did not pass."
             else:
                 self.truth = TruthSet(private_dir(self.truth_dir / key), self.seed)
                 try:
-                    if key not in ("preflight", "cleanup"):
-                        self.data_id = self.require_sentinel()
+                    if key not in ("preflight", "cleanup") and self.require_sentinel() != self.data_id:
+                        raise RuntimeError("The disposable Data folder ID changed during the run.")
                     run()
                     if key == "preflight":
-                        self.require_sentinel()
+                        self.data_id = self.require_sentinel()
                     if not evidence.status:
                         evidence.status, evidence.conclusion, evidence.passed = "PASS", "Verified.", True
                 except SCENARIO_ERRORS as exc:
@@ -1498,7 +1608,7 @@ def run_persistent(args: argparse.Namespace, run_id: str) -> int:
                 client = Client(name, root, "qual", private_dir(fixture_roots / name))
                 for location in (client.home, client.home / "tmp", client.state):
                     checked_private_directory(location)
-                for location in (client.state / "state.sqlite", client.state / "accounts" / "qual" / "rclone.conf"):
+                for location in (client.state / "state.sqlite", client.config):
                     os.close(open_private_file(location, os.O_RDONLY))
                 for directory, subdirs, files in os.walk(client.state):
                     for name in subdirs + files:

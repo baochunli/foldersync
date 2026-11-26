@@ -3,11 +3,12 @@
 import json
 import io
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import drive_setup
 from common import ScenarioEvidence, compute_overall_status
@@ -64,11 +65,12 @@ class UnattendedDriveTests(unittest.TestCase):
         self.assertEqual(child.communicate.call_args.kwargs["input"], "secret-canary\n")
         self.assertEqual(runner.commands, [])
 
-    def test_cleanup_only_removes_recorded_mappings_and_preserves_collection_ids(self):
+    def test_cleanup_removes_owned_mappings_and_submits_only_recorded_folder_ids(self):
         runner = Mock()
         client = Client("client-a", self.root, "qual")
         suite = DriveQualification(runner, [client], self.root, "fixture", 42, None)
         suite.evidence = ScenarioEvidence("cleanup", "", "", "", "", False, "")
+        suite.parent_id, suite.data_id = "parent-id", "data-id"
         suite.folder_ids["owned"] = "owned-id"
         suite.mapping_ids[client.name, "owned"] = "fixture-owned"
         runner.cli.side_effect = [
@@ -78,12 +80,124 @@ class UnattendedDriveTests(unittest.TestCase):
             ]})),
             (0, ""),
         ]
+        runner.trash_recorded_folders.return_value = [
+            {"fixture": "owned", "folder_id": "owned-id", "status": "TRASHED"},
+        ]
         suite.cleanup()
         self.assertEqual(runner.cli.call_args_list[-1].args, (client, "remove-mapping", "fixture-owned"))
         self.assertEqual(runner.cli.call_count, 2)
         runner.cloud.assert_not_called()
-        self.assertEqual(suite.evidence.outcomes["collections_retained_by_id"], {"owned": "owned-id"})
-        self.assertEqual(suite.evidence.effective_status(), "NOT VERIFIED")
+        runner.trash_recorded_folders.assert_called_once_with(
+            client, "parent-id", "data-id", self.root, {"owned": "owned-id"},
+        )
+        self.assertEqual(suite.evidence.outcomes["drive_trash"][0]["status"], "TRASHED")
+
+    def test_exact_id_trash_refuses_wrong_parent_shortcuts_and_unconfirmed_updates(self):
+        runner = DriveRunner(Path("/fixture/sync-cli"), Path("/fixture/rclone"))
+        client = Client("client-a", self.root, "qual")
+        folders = {
+            "original": "owned-id", "moved": "moved-id", "shortcut": "shortcut-id",
+            "unconfirmed": "unconfirmed-id", "bad-path": "bad/id", "data": "data-id",
+        }
+
+        def metadata(folder_id, parent="data-id", mime_type=DRIVE_FOLDER, trashed=False):
+            return {"id": folder_id, "parents": [parent], "mimeType": mime_type,
+                    "trashed": trashed, "explicitlyTrashed": trashed}
+
+        connection = Mock()
+        responses = [
+            metadata("owned-id"), metadata("owned-id", trashed=True),
+            metadata("moved-id", parent="elsewhere-id"), metadata("shortcut-id", mime_type="application/vnd.google-apps.shortcut"),
+            metadata("unconfirmed-id"), metadata("unconfirmed-id"),
+        ]
+        replies = []
+        for document in responses:
+            response = MagicMock(status=200)
+            response.read.return_value = json.dumps(document).encode()
+            response.__enter__.return_value = response
+            replies.append(response)
+        connection.getresponse.side_effect = replies
+        with (
+            patch("run_drive_qualification.require_sentinel", return_value="data-id"),
+            patch.object(runner, "_qualification_access_token", return_value="access-canary"),
+            patch("run_drive_qualification.http.client.HTTPSConnection", return_value=connection) as https,
+        ):
+            results = list(runner.trash_recorded_folders(client, "parent-id", "data-id", self.root, folders))
+        self.assertTrue(all(call.args == ("www.googleapis.com",) for call in https.call_args_list))
+        requests = connection.request.call_args_list
+        request_ids = [(call.args[0], call.args[1].split("?")[0]) for call in requests]
+        self.assertEqual(request_ids, [
+            ("GET", "/drive/v3/files/owned-id"), ("PATCH", "/drive/v3/files/owned-id"),
+            ("GET", "/drive/v3/files/moved-id"), ("GET", "/drive/v3/files/shortcut-id"),
+            ("GET", "/drive/v3/files/unconfirmed-id"), ("PATCH", "/drive/v3/files/unconfirmed-id"),
+        ])
+        self.assertEqual(json.loads(requests[1].kwargs["body"]), {"trashed": True})
+        self.assertEqual(requests[1].kwargs["headers"]["Authorization"], "Bearer access-canary")
+        self.assertEqual([row["status"] for row in results], ["TRASHED", "REFUSED", "REFUSED", "FAILED", "REFUSED", "REFUSED"])
+        self.assertNotIn("access-canary", json.dumps(results))
+
+    def test_trash_refuses_missing_sentinel_or_changed_data_before_reading_credentials(self):
+        runner = DriveRunner(Path("/fixture/sync-cli"), Path("/fixture/rclone"))
+        client = Client("client-a", self.root, "qual")
+        for sentinel in (RuntimeError("sentinel missing"), "replacement-data-id"):
+            guard = {"side_effect": sentinel} if isinstance(sentinel, Exception) else {"return_value": sentinel}
+            with (
+                patch("run_drive_qualification.require_sentinel", **guard),
+                patch.object(runner, "_qualification_access_token") as access,
+                patch("run_drive_qualification.http.client.HTTPSConnection") as https,
+            ):
+                results = list(runner.trash_recorded_folders(client, "parent-id", "data-id", self.root, {"fixture": "owned-id"}))
+            self.assertEqual(results[0]["status"], "REFUSED")
+            access.assert_not_called()
+            https.assert_not_called()
+
+    def test_trash_stops_mutating_if_sentinel_disappears_between_fixtures(self):
+        runner = DriveRunner(Path("/fixture/sync-cli"), Path("/fixture/rclone"))
+        client = Client("client-a", self.root, "qual")
+        initial = {"id": "first-id", "parents": ["data-id"], "mimeType": DRIVE_FOLDER,
+                   "trashed": False, "explicitlyTrashed": False}
+        trashed = {**initial, "trashed": True, "explicitlyTrashed": True}
+        with (
+            patch("run_drive_qualification.require_sentinel", side_effect=["data-id", RuntimeError("sentinel missing")]),
+            patch.object(runner, "_qualification_access_token", return_value="access-canary") as access,
+            patch("run_drive_qualification.http.client.HTTPSConnection"),
+            patch("run_drive_qualification.qualification_drive_file", side_effect=[initial, trashed]) as request,
+        ):
+            results = list(runner.trash_recorded_folders(
+                client, "parent-id", "data-id", self.root, {"first": "first-id", "second": "second-id"},
+            ))
+        self.assertEqual([row["status"] for row in results], ["TRASHED", "REFUSED"])
+        access.assert_called_once()
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["first-id", "first-id"])
+
+    def test_access_token_is_read_through_private_pipe_and_errors_exclude_credentials(self):
+        runner = DriveRunner(Path("/fixture/sync-cli"), Path("/fixture/rclone"))
+        client = Client("client-a", self.root, "qual")
+        config = client.state / "accounts" / "qual" / "rclone.conf"
+        config.parent.mkdir(parents=True)
+        config.write_bytes(b"# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nFakeCiphertext==\n")
+        config.chmod(0o600)
+        runner.device_ids[client.name] = "device-a"
+        token = json.dumps({"access_token": "access-canary", "refresh_token": "refresh-canary"})
+        raw = f"[qual]\ntype = drive\nroot_folder_id = parent-id\ntoken = {token}\n"
+        with patch("run_drive_qualification.subprocess.run",
+                   return_value=subprocess.CompletedProcess([], 0, stdout=raw)) as spawn:
+            self.assertEqual(runner._qualification_access_token(client, "parent-id"), "access-canary")
+            argv, = spawn.call_args.args
+            self.assertEqual(argv[-3:], ["config", "show", "qual"])
+            self.assertIn("--password-command", argv)
+            self.assertEqual(spawn.call_args.kwargs["stdout"], subprocess.PIPE)
+            self.assertEqual(spawn.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            self.assertNotIn("canary", repr(spawn.call_args))
+        with patch("run_drive_qualification.subprocess.run", return_value=subprocess.CompletedProcess([], 1, stdout=raw)):
+            with self.assertRaises(RuntimeError) as failure:
+                runner._qualification_access_token(client, "parent-id")
+        self.assertNotIn("canary", str(failure.exception))
+        self.assertEqual(runner.commands, [])
+        config.write_text(raw)
+        with patch("run_drive_qualification.subprocess.run") as spawn, self.assertRaisesRegex(RuntimeError, "encrypted"):
+            runner._qualification_access_token(client, "parent-id")
+        spawn.assert_not_called()
 
     def test_not_run_is_incomplete_and_credential_stderr_is_redacted(self):
         unfinished = ScenarioEvidence("missed", "", "", "", "", False, "", "NOT RUN")

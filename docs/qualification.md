@@ -108,22 +108,22 @@ independent clients and omits cross-account recovery.
    parent. Each run uses fresh `Data/FolderSyncQual-<run-id>-…` collections,
    fresh mappings and local trees, and paused global scheduling in all
    three persistent client states. The runner checks the sentinel before
-   each scenario, removes the run's mappings, and records its collection IDs.
+   each scenario, removes the run's mappings, and moves the recorded
+   collection IDs to Drive trash.
 
    ```bash
    tests/qualification/run-drive.sh --qual-home "$QUAL_HOME"
    ```
 
-   **Cloud cleanup is currently manual.** The pinned Drive backend has no
-   command to trash a folder by its ID. Its purge operation leaves an
-   ID-rooted folder in place. The harness records retained fixture IDs in
-   the cleanup row and reports `INCOMPLETE` when all other checks pass.
-   Review `collections_retained_by_id` in the JSON before trashing each
-   fixture by its Drive folder URL. Check `Recovery/<collection-id>` for
-   associated recovery data after archiving the evidence. Automatic
-   cleanup is required before scheduling long-term, unattended
-   qualification without periodic owner cleanup.
-   [Pinned rclone Drive backend](https://github.com/rclone/rclone/blob/v1.76.0/backend/drive/drive.go#L2745-L2818)
+   The cleanup row in `drive-evidence.json` lists `recorded_fixture_ids`
+   and the `drive_trash` result for each ID. Cleanup requires the sentinel
+   and the original `Data` folder ID for each fixture, verifies its direct
+   parent immediately before the trash request, and checks Drive's
+   confirmation. Keep the disposable parent free of manual moves or
+   edits during the run. Drive's update endpoint provides no atomic
+   parent precondition. Recovery trees under `Recovery/<collection-id>`
+   remain available for the owner checklist.
+   [Drive trash guide](https://developers.google.com/workspace/drive/api/guides/delete#move_a_file_to_the_trash)
 
 4. **Install the nightly job from the same GUI session.** The default is
    02:00 local time. The lock covers both scheduled and manual runs and
@@ -171,7 +171,7 @@ independent clients and omits cross-account recovery.
 | Native document and shortcut | The Sheet export remains byte-stable, the shortcut retains its original target, and both stay out of local sync trees. |
 | Same-name folder replacement | Mappings enter `EndpointChanged`. Hashes verify the original folder, the new folder, and pending local changes remain separate. |
 | Cross-account recovery | Account B can read A's replaced and deleted bytes in the Drive recovery directory. |
-| Cleanup | This run's mapping IDs and retained Drive folder IDs are accounted for. |
+| Cleanup | This run's mappings are removed and every recorded fixture ID is confirmed in recoverable Drive trash. |
 
 Reconciliation scenarios verify SHA-256 through two follow-up cycles. Hold
 scenarios verify inventories on repeated attempts. An unobserved overlap,

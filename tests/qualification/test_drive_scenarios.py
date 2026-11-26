@@ -11,7 +11,7 @@ from unittest.mock import patch
 from common import ScenarioEvidence, TruthSet, compute_overall_status
 from run_drive_qualification import (
     DRIVE_FOLDER, DRIVE_SHEET, DRIVE_SHORTCUT, SENTINEL, Client, DriveQualification,
-    read_export, sentinel_bytes, transfer_progress,
+    read_export, require_sentinel, sentinel_bytes, transfer_progress,
 )
 
 
@@ -26,6 +26,8 @@ class FakeRunner:
         self.folders = {}
         self.objects = {}
         self.recoveries = {}
+        self.trashed = set()
+        self.deny_trash = False
         self.run_id = 0
         self.runs = {}
         self.skip_signal = False
@@ -225,6 +227,17 @@ class FakeRunner:
             return ""
         raise AssertionError((action, args))
 
+    def trash_recorded_folders(self, client, parent_id, data_id, scratch, folder_ids):
+        assert require_sentinel(self, client, parent_id, scratch) == data_id
+        for fixture, folder_id in folder_ids.items():
+            if self.deny_trash:
+                yield {"fixture": fixture, "folder_id": folder_id, "status": "FAILED"}
+                self.deny_trash = False
+                continue
+            assert self.folders[folder_id][0].startswith("Data/")
+            self.trashed.add(folder_id)
+            yield {"fixture": fixture, "folder_id": folder_id, "status": "TRASHED"}
+
     def overlap_upload(self, client, source, folder_id, during):
         during()
         self.folders[folder_id][1]["shared.txt"] = source.read_bytes()
@@ -300,7 +313,7 @@ class DriveScenarioTests(unittest.TestCase):
         self.assertEqual(visibility["attempts"], suite.runner.client_b_collection_attempts)
         self.assertEqual(visibility["elapsed_seconds"], 60.0)
 
-    def run_suite(self, *, account_b="drive-b", skip_signal=False, lose_recovery=False):
+    def run_suite(self, *, account_b="drive-b", skip_signal=False, lose_recovery=False, deny_trash=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clients = [Client(f"client-{name}", root / name, account_b if name == "b" and account_b else "drive-a")
@@ -311,6 +324,7 @@ class DriveScenarioTests(unittest.TestCase):
                 (client.root / "recovery").mkdir()
             runner = FakeRunner()
             runner.skip_signal = skip_signal
+            runner.deny_trash = deny_trash
             suite = DriveQualification(runner, clients, root, "Fixture", 42, account_b)
             export = root / "disposable.conf"
             export.touch()
@@ -333,13 +347,15 @@ class DriveScenarioTests(unittest.TestCase):
                 results = suite.run(export, "parent-id")
             self.assertFalse(export.exists())
             self.assertEqual(runner.mappings, {})
+            self.assertEqual(runner.trashed, {row["folder_id"] for row in results[-1].outcomes["drive_trash"]
+                                              if row["status"] == "TRASHED"})
             return results
 
     def test_all_scenarios_drive_three_paused_clients_and_verify_versions(self):
         results = self.run_suite()
-        self.assertEqual(compute_overall_status(results), "INCOMPLETE", [(s.name, s.conclusion) for s in results])
+        self.assertEqual(compute_overall_status(results), "PASS", [(s.name, s.conclusion) for s in results])
         self.assertEqual(len(results), 15)
-        self.assertTrue(all(s.passed for s in results[:-1]), [(s.name, s.conclusion) for s in results])
+        self.assertTrue(all(s.passed for s in results), [(s.name, s.conclusion) for s in results])
         preflight, distinct, conflict, _, offline, guard, interrupted = results[:7]
         cross_account = results[-2]
         self.assertEqual(len(set(preflight.outcomes["devices"].values())), 3)
@@ -352,7 +368,15 @@ class DriveScenarioTests(unittest.TestCase):
         self.assertTrue(any("drive-recovery:recovery:device-b/" in loc
                             for row in cross_account.hash_accounting for loc in row["locations"]))
         self.assertEqual([len(results[i].outcomes["checkpoints"]) for i in range(7, 13)], [3, 3, 3, 4, 4, 3])
-        self.assertEqual(len(results[-1].outcomes["collections_retained_by_id"]), 14)
+        self.assertEqual(len(results[-1].outcomes["recorded_fixture_ids"]), 14)
+        self.assertEqual(len(results[-1].outcomes["drive_trash"]), 14)
+
+    def test_failed_trash_keeps_the_run_from_passing(self):
+        results = self.run_suite(deny_trash=True)
+        self.assertTrue(all(s.passed for s in results[:-1]))
+        self.assertEqual(compute_overall_status(results), "FAIL")
+        self.assertEqual([row["status"] for row in results[-1].outcomes["drive_trash"]],
+                         ["FAILED"] + ["TRASHED"] * 13)
 
     def test_missed_signal_is_incomplete_and_wrong_recovery_bytes_fail(self):
         incomplete = self.run_suite(account_b=None, skip_signal=True)
