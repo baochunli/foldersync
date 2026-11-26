@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import csv
+import fcntl
+import io
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import stat
@@ -17,7 +21,7 @@ import tempfile
 import time
 import uuid
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +36,7 @@ from common import (
     is_forbidden_real_state_dir,
     redact_credential_stderr,
     resolve_verified_pinned_rclone,
+    sha256_file,
     stop_owned_process,
     utc_now,
     write_evidence_files,
@@ -43,6 +48,14 @@ CLI_TIMEOUT = 750  # Manager allows up to 600 s for a sync plus Drive preflight.
 DRIVE_TIMEOUT = 180
 COLLECTION_VISIBILITY_TIMEOUT = 60
 BATCH_COUNT = 24
+SENTINEL = "FOLDERSYNC-QUALIFICATION-DISPOSABLE"
+DRIVE_FOLDER = "application/vnd.google-apps.folder"
+DRIVE_SHORTCUT = "application/vnd.google-apps.shortcut"
+DRIVE_SHEET = "application/vnd.google-apps.spreadsheet"
+RUN_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}")
+QUAL_HOME = "~/Library/Application Support/FolderSync-Qual"
+QUAL_CONFIG_RE = re.compile(r'parent_id = "([A-Za-z0-9_-]{1,255})"\naccount_b = (true|false)\nsync_cli_sha256 = "([a-f0-9]{64})"\n')
+SCENARIO_ERRORS = (OSError, RuntimeError, ValueError, KeyError, StopIteration, sqlite3.Error, subprocess.SubprocessError)
 
 SCENARIOS = {
     "preflight": "drive_preflight_account_and_folder_ids",
@@ -52,7 +65,14 @@ SCENARIOS = {
     "offline": "drive_three_client_offline_return",
     "guard": "drive_deletion_guard_abort",
     "interrupt": "drive_interruption",
+    "rename-edit": "drive_rename_vs_edit",
+    "outside-edit": "drive_outside_client_edit",
+    "delayed-upload": "drive_delayed_upload_overlap",
+    "duplicate": "drive_duplicate_names",
+    "native": "drive_native_document_and_shortcut",
+    "replacement": "drive_folder_identity_hold",
     "two-account": "drive_two_account_ownership_and_recovery_move",
+    "cleanup": "drive_cleanup",
 }
 
 
@@ -188,6 +208,69 @@ def open_exclusive_state_dir_fd(state_dir: Path) -> int:
     return fd
 
 
+def qual_path(raw: str) -> Path:
+    expanded = os.path.expanduser(raw)
+    if not expanded or ".." in Path(expanded).parts or any(ord(c) < 32 or ord(c) == 127 for c in expanded):
+        raise ValueError("Invalid qualification home path.")
+    path = Path(_normalize_os_root_alias(os.path.abspath(expanded)))
+    if path.is_relative_to("/Volumes") or is_forbidden_real_state_dir(path) or is_forbidden_rclone_config(path):
+        raise ValueError("Choose a dedicated qualification home outside live state, rclone, and mounted volumes.")
+    return path
+
+
+def checked_private_directory(path: Path) -> Path:
+    parent_fd, leaf, _ = _open_parent_fd_no_symlinks_from_root(str(path))
+    try:
+        fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError(f"Expected an owner-only 0700 directory at {path}.")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+    return path
+
+
+def open_private_file(path: Path, flags: int) -> int:
+    parent_fd, leaf, _ = _open_parent_fd_no_symlinks_from_root(str(path))
+    try:
+        fd = os.open(leaf, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+        os.close(fd)
+        raise ValueError(f"Expected a private regular file at {path}.")
+    return fd
+
+
+def read_qual_home(raw: str) -> tuple[Path, str, bool, str]:
+    home = checked_private_directory(qual_path(raw))
+    with os.fdopen(open_private_file(home / "qual.toml", os.O_RDONLY), encoding="utf-8") as file:
+        match = QUAL_CONFIG_RE.fullmatch(file.read(1024))
+    if not match:
+        raise ValueError("Invalid qual.toml. Complete drive-setup.sh in a fresh qualification home.")
+    return home, match[1], match[2] == "true", match[3]
+
+
+@contextmanager
+def lock_qual_home(home: Path):
+    try:
+        fd = open_private_file(home / "run.lock", os.O_RDWR | os.O_CREAT | os.O_EXCL)
+    except FileExistsError:
+        fd = open_private_file(home / "run.lock", os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Drive qualification is already running for this home.") from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def validate_args(args: argparse.Namespace) -> tuple[str, str | None, Path, Path, Path]:
     if not args.remote or not args.state_dir:
         raise ValueError("Pass both --remote <name> and --state-dir <dir> explicitly.")
@@ -262,6 +345,7 @@ class Client:
     name: str
     root: Path
     remote: str
+    run_root: Path | None = None
 
     @property
     def state(self) -> Path:
@@ -272,10 +356,10 @@ class Client:
         return self.root / "home"
 
     def data(self, key: str) -> Path:
-        return self.root / "data" / key
+        return (self.run_root or self.root) / "data" / key
 
     def recovery(self, key: str) -> Path:
-        return self.root / "recovery" / key
+        return (self.run_root or self.root) / "recovery" / key
 
     def env(self, rclone: Path) -> dict[str, str]:
         return {
@@ -358,6 +442,24 @@ class DriveRunner:
         result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
         return result.returncode, self.record(client, "sync-cli", list(args), result, check)
 
+    def add_account(self, client: Client, parent_id: str, client_id: str, secret: str) -> None:
+        command = [
+            str(self.sync_cli), "--state-dir", str(client.state), "account", "add-drive",
+            "--id", "qual", "--remote", client.remote, "--root-folder-id", parent_id,
+            "--client-id", client_id, "--client-secret-stdin",
+        ]
+        proc = subprocess.Popen(
+            command, env=client.env(self.rclone), start_new_session=True, stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, errors="replace",
+        )
+        try:
+            _, stderr = proc.communicate(input=secret + "\n", timeout=CLI_TIMEOUT)
+        except BaseException:
+            stop_owned_process(proc)
+            raise
+        if proc.returncode:
+            raise RuntimeError(f"{client.name} authorization failed: {redact_credential_stderr(stderr)}")
+
     def device_id(self, client: Client) -> str:
         if client.name not in self.device_ids:
             rows = run_rows(client, "SELECT id FROM devices")
@@ -366,21 +468,65 @@ class DriveRunner:
             self.device_ids[client.name] = rows[0]["id"]
         return self.device_ids[client.name]
 
-    def cloud(self, client: Client, *args: str) -> str:
+    def cloud_command(self, client: Client, *args: str) -> list[str]:
         config = client.state / "accounts" / "qual" / "rclone.conf"
         # rclone's SpaceSepList uses CSV quoting, including doubled quotes.
         helper = '"' + str(self.sync_cli).replace('"', '""') + '"'
         helper += f" credential-helper --account {self.device_id(client)}/qual"
-        command = [
-            str(self.rclone), *args, "--use-json-log", "--config", str(config),
+        return [
+            str(self.rclone), "--use-json-log", "--config", str(config),
             "--ask-password=false", "--password-command", helper,
             "--drive-skip-gdocs", "--drive-skip-shortcuts",
+            *args,
         ]
+
+    def cloud(self, client: Client, *args: str) -> str:
         proc = subprocess.run(
-            command, env=client.env(self.rclone), stdin=subprocess.DEVNULL, capture_output=True,
+            self.cloud_command(client, *args), env=client.env(self.rclone),
+            stdin=subprocess.DEVNULL, capture_output=True,
             text=True, errors="replace", timeout=DRIVE_TIMEOUT,
         )
+        if args[:2] == ("backend", "query") and "search result INCOMPLETE" in proc.stderr:
+            raise RuntimeError("Drive reported an incomplete query. Refused to use its results.")
         return self.record(client, "rclone", list(args), proc, True)
+
+    def overlap_upload(self, client: Client, source: Path, folder_id: str, during) -> dict[str, Any]:
+        args = [
+            "copyto", str(source), f"{client.remote}:shared.txt", "--drive-root-folder-id", folder_id,
+            "--bwlimit", "16k", "--stats", "200ms", "--stats-log-level", "NOTICE",
+        ]
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                self.cloud_command(client, *args), env=client.env(self.rclone), start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+            )
+            try:
+                deadline = time.monotonic() + DRIVE_TIMEOUT
+                progress = 0
+                while proc.poll() is None and time.monotonic() < deadline:
+                    # pread does not move the shared write offset used by the child.
+                    content = os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0)
+                    if (progress := upload_progress(content, source.name)):
+                        break
+                    time.sleep(0.2)
+                observed = utc_now()
+                overlap = bool(progress and proc.poll() is None)
+                if overlap:
+                    during()
+                active_after_peer = overlap and proc.poll() is None
+                proc.wait(timeout=max(1, deadline - time.monotonic()))
+                log.seek(0)
+                self.record(client, "rclone", args, subprocess.CompletedProcess(
+                    args, proc.returncode, "", log.read(),
+                ), True)
+                return {
+                    "upload_observed_at": observed, "uploaded_bytes_before_peer": progress,
+                    "upload_active_after_peer": active_after_peer,
+                }
+            except BaseException:
+                if proc.poll() is None:
+                    stop_owned_process(proc)
+                raise
 
     def interrupt(self, client: Client, key: str, batch: set[str]) -> dict[str, Any]:
         args = ["run-once", key]
@@ -434,15 +580,77 @@ class DriveRunner:
         }
 
 
+def upload_progress(log: bytes, name: str) -> int:
+    for line in reversed(log.splitlines()):
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        for row in (event.get("stats") or {}).get("transferring") or []:
+            if row["name"] == name and 0 < row["bytes"] < row["size"]:
+                return row["bytes"]
+    return 0
+
+
+def drive_children(runner: DriveRunner, client: Client, parent_id: str) -> list[dict[str, Any]]:
+    if not DRIVE_ID_RE.fullmatch(parent_id):
+        raise ValueError("Invalid Drive parent ID.")
+    output = runner.cloud(client, "backend", "query", f"{client.remote}:", f"'{parent_id}' in parents and trashed = false")
+    rows = json.loads(output)
+    if rows is None:
+        return []
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict) or not isinstance(row.get("id"), str) or not DRIVE_ID_RE.fullmatch(row["id"])
+        or parent_id not in row.get("parents", []) or not isinstance(row.get("name"), str)
+        or not isinstance(row.get("mimeType"), str)
+        for row in rows
+    ):
+        raise RuntimeError("Drive returned an invalid child listing.")
+    return rows
+
+
+def drive_directory(runner: DriveRunner, client: Client, parent_id: str, name: str) -> str:
+    matches = [row for row in drive_children(runner, client, parent_id) if row["name"].casefold() == name.casefold()]
+    if len(matches) != 1 or matches[0]["name"] != name or matches[0]["mimeType"] != DRIVE_FOLDER:
+        raise RuntimeError(f"Expected exactly one actual Drive directory named {name}.")
+    return matches[0]["id"]
+
+
+def sentinel_bytes(parent_id: str) -> bytes:
+    return f"{SENTINEL}\n{parent_id}\n".encode()
+
+
+def require_sentinel(runner: DriveRunner, client: Client, parent_id: str, scratch: Path) -> str:
+    try:
+        data_id = drive_directory(runner, client, parent_id, "Data")
+        rows = [row for row in drive_children(runner, client, data_id) if row["name"].casefold() == SENTINEL.casefold()]
+        expected = sentinel_bytes(parent_id)
+        if (
+            len(rows) != 1 or rows[0]["name"] != SENTINEL
+            or rows[0]["mimeType"].startswith("application/vnd.google-apps.")
+            or int(rows[0].get("size", -1)) != len(expected)
+        ):
+            raise RuntimeError("Expected exactly one ordinary sentinel with the configured parent ID.")
+        with tempfile.TemporaryDirectory(prefix="sentinel-", dir=scratch) as temp:
+            destination = Path(temp) / "sentinel"
+            runner.cloud(client, "backend", "copyid", f"{client.remote}:", rows[0]["id"], str(destination))
+            if destination.read_bytes() != expected:
+                raise RuntimeError("The sentinel's contents do not match the configured parent ID.")
+        return data_id
+    except SCENARIO_ERRORS as exc:
+        raise RuntimeError(f"Disposable Drive sentinel could not be verified: {exc}") from None
+
+
 def verify_checkpoint(
     truth: TruthSet,
     trees: dict[str, dict[str, str]],
     expected_live: dict[str, set[str]],
     conflicts: set[str],
     recovered: dict[str, str | None],
+    labels: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Require exact live inventories and locate each version by hash, including backups."""
-    records = truth.records
+    records = truth.records if labels is None else {label: truth.records[label] for label in sorted(labels)}
     locations: dict[str, list[str]] = {label: [] for label in records}
     labels_by_hash = {record["sha256"]: label for label, record in records.items()}
     errors = [f"Missing live inventory for {tree}" for tree in sorted(expected_live.keys() - trees.keys())]
@@ -501,6 +709,7 @@ class DriveQualification:
         self.seed = seed
         self.account_b = account_b
         self.folder_ids: dict[str, str] = {}
+        self.mapping_ids: dict[tuple[str, str], str] = {}
         self.last_runs: dict[tuple[str, str], str] = {}
         self.cloud_checks = private_dir(root / "cloud-checks")
         self.truth_dir = private_dir(root / "truth")
@@ -509,14 +718,15 @@ class DriveQualification:
     def cli_json(self, client: Client, *args: str, timeout: float = CLI_TIMEOUT) -> Any:
         return json.loads(self.runner.cli(client, *args, "--json", timeout=timeout)[1])
 
-    def preflight(self, export: Path, root_id: str) -> None:
+    def preflight(self, export: Path | None, root_id: str) -> None:
         identities = {}
         for client in self.clients:
             self.runner.cli(client, "scheduling", "pause")
-            self.runner.cli(
-                client, "account", "import", "--from", str(export), "--remote", client.remote,
-                "--id", "qual", "--root-folder-id", root_id,
-            )
+            if export is not None:
+                self.runner.cli(
+                    client, "account", "import", "--from", str(export), "--remote", client.remote,
+                    "--id", "qual", "--root-folder-id", root_id,
+                )
             accounts = self.cli_json(client, "account", "list")
             status = self.cli_json(client, "status")
             if (
@@ -535,6 +745,40 @@ class DriveQualification:
             "devices": identities, "root_folder_id": root_id, "account_b": self.account_b,
             "sources": {client.name: client.remote for client in self.clients},
         })
+
+    def require_sentinel(self) -> str:
+        return require_sentinel(self.runner, self.clients[0], self.parent_id, self.root)
+
+    def cleanup(self) -> None:
+        errors = []
+        self.evidence.outcomes["collections_retained_by_id"] = self.folder_ids.copy()
+        removed = []
+        for client in self.clients:
+            planned = {key: mapping_id for (name, key), mapping_id in self.mapping_ids.items() if name == client.name}
+            if not planned:
+                continue
+            try:
+                mappings = {row["id"]: row for row in self.cli_json(client, "status")["mappings"]}
+            except SCENARIO_ERRORS as exc:
+                errors.append(redact_credential_stderr(str(exc)))
+                continue
+            for key, mapping_id in planned.items():
+                if (row := mappings.get(mapping_id)) is None:
+                    continue
+                if row["local_root"] != str(client.data(key)) or row["collection_folder_id"] != self.folder_ids[key]:
+                    errors.append(f"Refused to remove {client.name} mapping {mapping_id}: its endpoints differ.")
+                    continue
+                try:
+                    self.runner.cli(client, "remove-mapping", mapping_id)
+                    removed.append({"client": client.name, "mapping_id": mapping_id})
+                except SCENARIO_ERRORS as exc:
+                    errors.append(redact_credential_stderr(str(exc)))
+        self.evidence.outcomes.update({"removed_mappings": removed, "errors": errors})
+        if errors:
+            raise RuntimeError(f"Could not remove {len(errors)} run mappings. See the evidence.")
+        if self.folder_ids:
+            self.evidence.status = "NOT VERIFIED"
+            self.evidence.conclusion = "Recorded Drive folders retained. Pinned rclone has no exact-ID folder trash command."
 
     def collection_matches(self, client: Client, name: str, *, timeout: float = CLI_TIMEOUT) -> list[dict[str, Any]]:
         listing = self.cli_json(client, "collections", "list", "--account", "qual", timeout=timeout)
@@ -569,10 +813,12 @@ class DriveQualification:
         first = clients[0]
         name = f"{self.prefix}-{key}"
         path = f"Data/{name}"
-        entries = json.loads(self.runner.cloud(first, "lsjson", f"{first.remote}:Data"))
-        if any(entry["Name"].casefold() == name.casefold() for entry in entries):
+        entries = drive_children(self.runner, first, self.data_id)
+        if any(entry["name"].casefold() == name.casefold() for entry in entries):
             raise RuntimeError(f"Refused to reuse existing Drive fixture {path}.")
-        self.runner.cloud(first, "mkdir", f"{first.remote}:{path}")
+        self.runner.cloud(first, "mkdir", f"{first.remote}:{name}", "--drive-root-folder-id", self.data_id)
+        folder_id = drive_directory(self.runner, first, self.data_id, name)
+        self.folder_ids[key] = folder_id
         for client in clients:
             if first.name == "client-a" and client.name == "client-b":
                 matches = self.wait_for_collection(client, name, path)
@@ -580,13 +826,14 @@ class DriveQualification:
                 matches = self.collection_matches(client, name)
             if len(matches) != 1 or matches[0]["display_path"] != path:
                 raise RuntimeError(f"{client.name} could not unambiguously see {path}.")
-            folder_id = matches[0]["folder_id"]
-            if not DRIVE_ID_RE.fullmatch(folder_id) or self.folder_ids.setdefault(key, folder_id) != folder_id:
+            if matches[0]["folder_id"] != folder_id:
                 raise RuntimeError(f"{client.name} resolved a different Drive folder ID for {path}.")
             private_dir(client.data(key))
             private_dir(client.recovery(key))
+            mapping_id = f"{self.prefix}-{key}"
+            self.mapping_ids[client.name, key] = mapping_id
             self.runner.cli(
-                client, "add-mapping", "--id", key, "--account", "qual", "--folder-id", folder_id,
+                client, "add-mapping", "--id", mapping_id, "--account", "qual", "--folder-id", folder_id,
                 "--local", str(client.data(key)), "--local-recovery", str(client.recovery(key)),
             )
         self.evidence.outcomes.update({"folder_id": folder_id, "collection": path})
@@ -595,24 +842,23 @@ class DriveQualification:
         snapshot = self.cli_json(client, "status")
         if not snapshot["scheduling_paused"]:
             raise RuntimeError(f"Automatic scheduling is enabled in {client.name}.")
-        mapping = next(mapping for mapping in snapshot["mappings"] if mapping["id"] == key)
+        mapping = next(mapping for mapping in snapshot["mappings"] if mapping["id"] == self.mapping_ids[client.name, key])
         if mapping["next_poll_at"] is not None:
             raise RuntimeError(f"An automatic run is scheduled for {client.name} {key}.")
         return mapping
 
     def sync(self, client: Client, key: str, command: str = "run-once") -> dict[str, Any]:
-        self.runner.cli(client, command, key)
+        rc, _ = self.runner.cli(client, command, self.mapping_ids[client.name, key], check=False)
         status = self.status(client, key)
         run_id = status["last_run_id"]
-        if (
-            not run_id or self.last_runs.get((client.name, key)) == run_id
-            or status["last_run_outcome"] not in {"Success", "SuccessWithConflicts"}
-        ):
+        fresh = bool(run_id and self.last_runs.get((client.name, key)) != run_id)
+        if fresh:
+            self.last_runs[client.name, key] = run_id
+            self.evidence.outcomes.setdefault("runs", []).append({
+                "client": client.name, "id": run_id, "command": command, "outcome": status["last_run_outcome"],
+            })
+        if rc or not fresh or status["last_run_outcome"] not in {"Success", "SuccessWithConflicts"}:
             raise RuntimeError(f"{client.name} {key} did not record a fresh successful run.")
-        self.last_runs[client.name, key] = run_id
-        self.evidence.outcomes.setdefault("runs", []).append({
-            "client": client.name, "id": run_id, "command": command, "outcome": status["last_run_outcome"],
-        })
         return status
 
     def remote_tree(self, client: Client, remote: str, destination: Path, *options: str) -> dict[str, str]:
@@ -634,9 +880,15 @@ class DriveQualification:
             "drive": self.remote_tree(reader, f"{reader.remote}:", save / "live", "--drive-root-folder-id", folder_id),
         }
         if backups:
-            trees["drive-recovery"] = self.remote_tree(
-                reader, f"{reader.remote}:Recovery/{folder_id}", save / "recovery",
-            )
+            recovery_id = drive_directory(self.runner, reader, self.parent_id, "Recovery")
+            matches = [row for row in drive_children(self.runner, reader, recovery_id)
+                       if row["name"].casefold() == folder_id.casefold()]
+            if matches:
+                if len(matches) != 1 or matches[0]["name"] != folder_id or matches[0]["mimeType"] != DRIVE_FOLDER:
+                    raise RuntimeError(f"Unexpected Drive recovery directory for {folder_id}.")
+                trees["drive-recovery"] = self.remote_tree(
+                    reader, f"{reader.remote}:", save / "recovery", "--drive-root-folder-id", matches[0]["id"],
+                )
         return trees
 
     def checkpoint(
@@ -663,8 +915,9 @@ class DriveQualification:
         self, name: str, trees: dict[str, dict[str, str]], expected: dict[str, set[str]],
         conflicts: set[str], recovered: dict[str, str | None],
         mismatches: list[str] | None = None,
+        *, labels: set[str] | None = None,
     ) -> None:
-        accounting, errors = verify_checkpoint(self.truth, trees, expected, conflicts, recovered)
+        accounting, errors = verify_checkpoint(self.truth, trees, expected, conflicts, recovered, labels)
         errors.extend(mismatches or [])
         self.evidence.hash_accounting = accounting
         self.evidence.outcomes.setdefault("checkpoints", []).append({
@@ -737,9 +990,10 @@ class DriveQualification:
         key = "offline"
         a, b, c = self.clients
         baseline = self.start(key, self.clients, ["shared.txt", "delete.txt"])
-        self.runner.cli(c, "pause", key)
+        mapping_id = self.mapping_ids[c.name, key]
+        self.runner.cli(c, "pause", mapping_id)
         paused = self.status(c, key)
-        blocked_rc, _ = self.runner.cli(c, "run-once", key, check=False)
+        blocked_rc, _ = self.runner.cli(c, "run-once", mapping_id, check=False)
         if paused["intent"] != "Paused" or blocked_rc == 0:
             raise RuntimeError("The offline client's pause hold did not verify.")
         self.put(c, key, "shared.txt", "offline-edit", 502)
@@ -757,7 +1011,7 @@ class DriveQualification:
         unchanged = self.status(c, key)
         if unchanged["intent"] != "Paused" or unchanged["last_run_id"] != paused["last_run_id"]:
             raise RuntimeError("The paused client ran while it was offline.")
-        self.runner.cli(c, "resume", key)
+        self.runner.cli(c, "resume", mapping_id)
         conflict_outcome = self.sync(c, key)["last_run_outcome"]
         edits = {"offline-edit", "online-edit"}
         self.repeat(
@@ -776,7 +1030,7 @@ class DriveQualification:
             a.data(key).joinpath(self.truth.records[label]["rel_path"]).unlink()
         aborted_run = None
         for attempt in range(1, 3):
-            rc, _ = self.runner.cli(a, "run-once", key, check=False)
+            rc, _ = self.runner.cli(a, "run-once", self.mapping_ids[a.name, key], check=False)
             status = self.status(a, key)
             rows = run_rows(
                 a, "SELECT outcome_kind FROM runs WHERE id=?", (status["last_run_id"],),
@@ -801,7 +1055,7 @@ class DriveQualification:
         batch = {f"batch/part-{i:02d}.bin": f"batch-{i:02d}" for i in range(BATCH_COUNT)}
         for path, label in batch.items():
             self.put(a, key, path, label, 2 * 1024 * 1024)
-        injected = self.runner.interrupt(a, key, set(batch))
+        injected = self.runner.interrupt(a, self.mapping_ids[a.name, key], set(batch))
         status = self.status(a, key)
         trees = self.snapshot(key, "after-signal", a, False)
         downloaded = set(trees["drive"]) & batch.keys()
@@ -829,7 +1083,7 @@ class DriveQualification:
         ):
             raise RuntimeError("The interrupted run did not persist its outcome, workdir, and recovery hold.")
         for attempt in range(1, 3):
-            rc, _ = self.runner.cli(a, "run-once", key, check=False)
+            rc, _ = self.runner.cli(a, "run-once", self.mapping_ids[a.name, key], check=False)
             if rc == 0 or self.status(a, key)["last_run_id"] != injected["signaled_run"]:
                 raise RuntimeError("The interrupted client ran again while held for review.")
             followup = self.snapshot(key, f"hold-{attempt}", a, False)
@@ -848,9 +1102,204 @@ class DriveQualification:
         self.repeat(key, self.clients, baseline - recover.keys() | {"edit-b"}, recover, set(), reader=b)
         self.evidence.notes.append("Verify Drive ownership and quota attribution separately in the owner checklist.")
 
-    def run(self, export: Path, root_id: str) -> list[ScenarioEvidence]:
+    def upload(self, client: Client, key: str, path: str, source: Path, *options: str) -> None:
+        self.runner.cloud(
+            client, "copyto", str(source), f"{client.remote}:{path}",
+            "--drive-root-folder-id", self.folder_ids[key], *options,
+        )
+
+    def rename_edit(self) -> None:
+        key = "rename-edit"
+        a, b = clients = self.clients[:2]
+        baseline = self.start(key, clients, ["original.txt"])
+        a.data(key).joinpath("original.txt").rename(a.data(key) / "renamed.txt")
+        self.truth.records["baseline-00"]["rel_path"] = "renamed.txt"
+        self.put(b, key, "original.txt", "concurrent-edit", 501)
+        self.sync(a, key)
+        self.sync(b, key)
+        self.repeat(key, clients, baseline | {"concurrent-edit"}, {}, set())
+
+    def outside_edit(self) -> None:
+        key = "outside-edit"
+        a, b = clients = self.clients[:2]
+        baseline = self.start(key, clients, ["shared.txt"])
+        self.truth.generate_version("outside-edit", "shared.txt", size_bytes=501, binary=True)
+        self.upload(a, key, "shared.txt", Path(self.truth.records["outside-edit"]["truth_file"]))
+        for client in clients:
+            self.sync(client, key)
+        self.repeat(key, clients, baseline - {"baseline-00"} | {"outside-edit"}, {"baseline-00": None}, set())
+
+    def delayed_upload(self) -> None:
+        key = "delayed-upload"
+        a, b = clients = self.clients[:2]
+        baseline = self.start(key, clients, ["shared.txt"])
+        self.truth.generate_version("delayed", "shared.txt", size_bytes=768 * 1024, binary=True)
+        self.put(b, key, "shared.txt", "peer-edit", 501)
+        timing = self.runner.overlap_upload(
+            a, Path(self.truth.records["delayed"]["truth_file"]), self.folder_ids[key], lambda: self.sync(b, key),
+        )
+        self.evidence.outcomes["overlap"] = timing
+        if not timing["upload_active_after_peer"]:
+            self.evidence.status = "NOT VERIFIED"
+            self.evidence.conclusion = "Did not observe an in-progress upload spanning a peer run."
+            return
+        self.sync(b, key)
+        self.sync(a, key)
+        old = {"baseline-00": None, "peer-edit": None}
+        self.repeat(key, clients, baseline - old.keys() | {"delayed"}, old, set())
+
+    def download_by_id(self, client: Client, file_id: str, filename: Path, *options: str) -> str:
+        if not DRIVE_ID_RE.fullmatch(file_id):
+            raise ValueError("Invalid Drive file ID.")
+        self.runner.cloud(client, "backend", "copyid", f"{client.remote}:", file_id, str(filename), *options)
+        return sha256_file(filename)
+
+    def duplicate_names(self) -> None:
+        key = "duplicate"
+        a, b = clients = self.clients[:2]
+        baseline = self.start(key, clients, [])
+        folder_id = self.folder_ids[key]
+        paths = {"duplicate.txt": "duplicate-one", "second.txt": "duplicate-two"}
+        for path, label in paths.items():
+            self.truth.generate_version(label, path, size_bytes=501, binary=True)
+            self.upload(a, key, path, Path(self.truth.records[label]["truth_file"]))
+        rows = drive_children(self.runner, a, folder_id)
+        ids = {}
+        for path, label in paths.items():
+            matches = [row["id"] for row in rows if row["name"] == path]
+            if len(matches) != 1:
+                raise RuntimeError(f"Could not identify the uploaded duplicate fixture {path}.")
+            ids[matches[0]] = label
+        second_id = next(file_id for file_id, label in ids.items() if label == "duplicate-two")
+        # moveid supplies a source ID and does not overwrite an existing destination object.
+        self.runner.cloud(a, "backend", "moveid", f"{a.remote}:", second_id,
+                          f"{a.remote}:duplicate.txt", "--drive-root-folder-id", folder_id)
+        for cycle in range(3):
+            if cycle:
+                for client in clients:
+                    self.sync(client, key)
+            rows = drive_children(self.runner, a, folder_id)
+            duplicate_ids = {row["id"] for row in rows if row["name"] == "duplicate.txt"}
+            observed = {"cycle": cycle, "objects": [], "local_versions": {}}
+            self.evidence.outcomes.setdefault("duplicates", []).append(observed)
+            if duplicate_ids != ids.keys():
+                observed["actual_ids"] = sorted(duplicate_ids)
+                raise RuntimeError("Drive duplicate IDs changed. See duplicates in the evidence.")
+            save = private_dir(self.cloud_checks / f"duplicate-{cycle}")
+            hashes = set()
+            for file_id, label in ids.items():
+                expected = self.truth.records[label]
+                digest = self.download_by_id(a, file_id, save / file_id)
+                observed["objects"].append({"id": file_id, "expected": expected, "sha256": digest})
+                if digest != expected["sha256"]:
+                    raise RuntimeError(f"Drive duplicate {file_id} lost its original bytes.")
+                hashes.add(digest)
+            trees = {"drive": self.remote_tree(
+                a, f"{a.remote}:", save / "ordinary", "--drive-root-folder-id", folder_id, "--exclude", "/duplicate.txt",
+            )}
+            for client in clients:
+                files = trees[client.name] = self.truth.scan_tree_hashes(client.data(key))
+                digest = files.pop("duplicate.txt", None)
+                observed["local_versions"][client.name] = digest
+                if digest is not None and digest not in hashes:
+                    raise RuntimeError(f"{client.name} has an unrecognized version of the duplicate.")
+            self.check(f"duplicates-{cycle}", trees, {tree: baseline for tree in trees}, set(), {}, labels=baseline)
+
+    def native_and_shortcut(self) -> None:
+        key = "native"
+        a, b = clients = self.clients[:2]
+        baseline = self.start(key, clients, ["source.bin"])
+        folder_id = self.folder_ids[key]
+        source = self.truth.truth_dir / "fixture.csv"
+        source.write_bytes(b"name,value\nfixture,retained\n")
+        self.upload(a, key, "fixture.csv", source, "--drive-skip-gdocs=false",
+                    "--drive-import-formats", "csv", "--drive-export-formats", "csv")
+        self.runner.cloud(a, "backend", "shortcut", f"{a.remote}:", "source.bin", "source-link.bin",
+                          "--drive-root-folder-id", folder_id)
+        first_ids = None
+        first_sha = None
+        for cycle in range(3):
+            if cycle:
+                for client in clients:
+                    self.sync(client, key)
+            rows = drive_children(self.runner, a, folder_id)
+            names = {"fixture": DRIVE_SHEET, "source-link.bin": DRIVE_SHORTCUT}
+            actual = {}
+            for name, mime in names.items():
+                matches = [row for row in rows if row["name"] == name]
+                if len(matches) != 1 or matches[0]["mimeType"] != mime:
+                    raise RuntimeError(f"Expected exactly one {mime} named {name}.")
+                actual[name] = matches[0]
+            target_id = actual["source-link.bin"]["shortcutDetails"]["targetId"]
+            if [row["id"] for row in rows if row["name"] == "source.bin"] != [target_id]:
+                raise RuntimeError("Drive shortcut no longer points to the original file.")
+            export = self.truth.truth_dir / "fixture-export.csv" if not cycle else self.cloud_checks / f"native-export-{cycle}.csv"
+            digest = self.download_by_id(a, actual["fixture"]["id"], export,
+                                         "--drive-skip-gdocs=false", "--drive-export-formats", "csv")
+            ids = {name: row["id"] for name, row in actual.items()}
+            self.evidence.outcomes.setdefault("drive_only", []).append({
+                "cycle": cycle, "ids": ids, "shortcut_target_id": target_id, "export_sha256": digest,
+                "initial_export": str(self.truth.truth_dir / "fixture-export.csv"),
+            })
+            if not cycle:
+                if list(csv.reader(io.StringIO(export.read_text(encoding="utf-8-sig")))) != [["name", "value"], ["fixture", "retained"]]:
+                    raise RuntimeError("Native import/export did not preserve the fixture values.")
+                first_ids, first_sha = ids, digest
+            if ids != first_ids or digest != first_sha:
+                raise RuntimeError("Drive-only object identities or native export bytes changed.")
+            self.checkpoint(key, f"drive-only-{cycle}", clients, baseline, {}, set())
+
+    def replacement_hold(self) -> None:
+        key = "replacement"
+        a, b = clients = self.clients[:2]
+        baseline = self.start(key, clients, ["original.txt"])
+        folder_id = self.folder_ids[key]
+        data_id = self.require_sentinel()
+        name = f"{self.prefix}-{key}"
+        parked_name = f"{name}-original"
+        rows = drive_children(self.runner, a, data_id)
+        if [row["id"] for row in rows if row["name"].casefold() == name.casefold()] != [folder_id] or any(
+            row["name"].casefold() == parked_name.casefold() for row in rows
+        ):
+            raise RuntimeError("Refused to move a collection with an ambiguous identity or destination.")
+        self.runner.cloud(a, "moveto", f"{a.remote}:{name}", f"{a.remote}:{parked_name}",
+                          "--drive-root-folder-id", data_id)
+        if drive_directory(self.runner, a, data_id, parked_name) != folder_id:
+            raise RuntimeError("Could not verify that the original folder was preserved by the move.")
+        self.runner.cloud(a, "mkdir", f"{a.remote}:{name}", "--drive-root-folder-id", data_id)
+        replacement_id = drive_directory(self.runner, a, data_id, name)
+        if replacement_id == folder_id:
+            raise RuntimeError("Replacement retained the original Drive ID.")
+        self.folder_ids["replacement-new"] = replacement_id
+        self.truth.generate_version("replacement-only", "replacement.txt", size_bytes=501, binary=True)
+        self.upload(a, "replacement-new", "replacement.txt", Path(self.truth.records["replacement-only"]["truth_file"]))
+        self.put(a, key, "pending.txt", "pending-local", 503)
+        self.evidence.outcomes.update({"original_id": folder_id, "replacement_id": replacement_id})
+        for cycle in range(1, 3):
+            for client in clients:
+                rc, _ = self.runner.cli(client, "run-once", self.mapping_ids[client.name, key], check=False)
+                status = self.status(client, key)
+                self.evidence.outcomes.setdefault("holds", []).append({
+                    "client": client.name, "cycle": cycle, "readiness": status["readiness"],
+                    "id": status["last_run_id"],
+                })
+                if rc == 0 or status["readiness"] != "EndpointChanged":
+                    raise RuntimeError(f"{client.name} did not hold on the changed Drive folder identity.")
+            trees = self.snapshot(key, f"hold-{cycle}", a, False)
+            trees["replacement"] = self.remote_tree(
+                a, f"{a.remote}:", self.cloud_checks / f"replacement-new-{cycle}",
+                "--drive-root-folder-id", replacement_id,
+            )
+            for client in clients:
+                trees[client.name] = self.truth.scan_tree_hashes(client.data(key))
+            self.check(f"replacement-{cycle}", trees, {
+                "drive": baseline, "replacement": {"replacement-only"}, a.name: baseline | {"pending-local"}, b.name: baseline,
+            }, set(), {})
+
+    def run(self, export: Path | None, root_id: str) -> list[ScenarioEvidence]:
+        self.parent_id = root_id
         cases = [
-            ("preflight", "Verify the imported accounts, three device IDs, and paused scheduling.",
+            ("preflight", "Verify the sentinel, accounts, independent devices, and paused scheduling.",
              "none", lambda: self.preflight(export, root_id)),
             ("distinct", "Converge independent edits after both clients have synced.",
              "A and B edit different files", self.distinct),
@@ -864,68 +1313,247 @@ class DriveQualification:
              "delete four of ten tracked files", self.guard),
             ("interrupt", "Verify preserved bytes, the workdir, and the recovery hold after interruption.",
              "SIGINT to the active bisync child during a batch", self.interrupt),
+            ("rename-edit", "Preserve the renamed baseline and the new edit.",
+             "A renames a file B edits", self.rename_edit),
+            ("outside-edit", "Propagate an edit made directly on Drive and preserve the prior bytes.",
+             "Drive-side upload outside the CLI clients", self.outside_edit),
+            ("delayed-upload", "Account for overlapping same-file versions.",
+             "A's slow Drive-side upload overlaps B's sync of a local edit", self.delayed_upload),
+            ("duplicate", "Preserve both same-name Drive file IDs and verify both byte streams.",
+             "Create two files with exactly the same Drive name", self.duplicate_names),
+            ("native", "Verify a native Sheet and shortcut remain Drive-only and intact.",
+             "Import a CSV as a Sheet and create a shortcut to a tracked file", self.native_and_shortcut),
+            ("replacement", "Verify the mapping holds when a new folder takes the old name.",
+             "Move the original aside and create a same-name folder", self.replacement_hold),
         ]
         if self.account_b:
             cases.append((
                 "two-account", "Download A's original bytes from B's Drive recovery directory.",
                 "B overwrites and deletes files uploaded by A", self.two_account,
             ))
+        cases.append(("cleanup", "Remove this run's mappings and account for its Drive collection IDs.",
+                      "none", self.cleanup))
         results = []
         preflight_ok = True
+        interrupted = False
         for key, description, injected, run in cases:
             self.runner.commands = []
             self.evidence = evidence = ScenarioEvidence(
                 SCENARIOS[key], description, utc_now(), "", injected, False, "",
                 commands=self.runner.commands,
             )
-            if not preflight_ok:
-                evidence.status, evidence.conclusion = "NOT RUN", "Drive preflight did not pass."
+            if (not preflight_ok or interrupted) and (key != "cleanup" or not self.mapping_ids):
+                evidence.status = "NOT RUN"
+                evidence.conclusion = "The run was interrupted." if interrupted else "Drive preflight did not pass."
             else:
                 self.truth = TruthSet(private_dir(self.truth_dir / key), self.seed)
                 try:
+                    if key not in ("preflight", "cleanup"):
+                        self.data_id = self.require_sentinel()
                     run()
+                    if key == "preflight":
+                        self.require_sentinel()
                     if not evidence.status:
                         evidence.status, evidence.conclusion, evidence.passed = "PASS", "Verified.", True
-                except (OSError, RuntimeError, ValueError, KeyError, StopIteration, sqlite3.Error, subprocess.SubprocessError) as exc:
+                except SCENARIO_ERRORS as exc:
                     evidence.status = "FAIL"
                     evidence.conclusion = redact_credential_stderr(str(exc))
+                except KeyboardInterrupt:
+                    interrupted = True
+                    evidence.status, evidence.conclusion = "NOT VERIFIED", "The run was interrupted."
+                finally:
+                    if key == "preflight" and export is not None:
+                        export.unlink()
             evidence.finished_at = utc_now()
             results.append(evidence)
             if key == "preflight":
                 preflight_ok = evidence.passed
-                export.unlink()
         return results
 
 
-def main() -> int:
+def evidence_summary(scenarios: list[ScenarioEvidence]) -> list[dict[str, Any]]:
+    rows = []
+    for scenario in scenarios:
+        outcomes = scenario.outcomes
+        status = scenario.effective_status()
+        checkpoint_errors = [error for check in outcomes.get("checkpoints", []) for error in check["errors"]]
+        ids = [run["id"] for run in outcomes.get("runs", []) + outcomes.get("holds", []) if run["id"]]
+        ids.extend(outcomes[field] for field in ("signaled_run", "aborted_run") if outcomes.get(field))
+        rows.append({
+            "scenario": scenario.name.removeprefix("drive_"),
+            "status": status if status in ("PASS", "FAIL") else "INCOMPLETE",
+            "conclusion": scenario.conclusion,
+            "unaccounted_versions": [row["label"] for row in scenario.hash_accounting if not row["locations"]],
+            "unexpected_copies": sorted({error for error in checkpoint_errors if "expected one copy" in error
+                                         and error.rsplit(" ", 1)[-1].isdecimal() and int(error.rsplit(" ", 1)[-1]) > 1}),
+            "observed_duplicate_ids": [item["id"] for item in outcomes.get("duplicates", [{}])[-1].get("objects", [])],
+            "run_ids": list(dict.fromkeys(ids)),
+        })
+    return rows
+
+
+def write_drive_evidence(out: Path, run_id: str, seed: int, started: str,
+                         versions: dict[str, str], scenarios: list[ScenarioEvidence]) -> str:
+    status = compute_overall_status(scenarios)
+    summary = evidence_summary(scenarios)
+    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".evidence-", dir=out) as scratch:
+        json_path, md_path = (Path(scratch) / f"drive-evidence.{suffix}" for suffix in ("json", "md"))
+        write_evidence_files(json_path, md_path, "real-google-drive", seed, started, utc_now(), versions, scenarios,
+                             f"{status} for this run. Use the owner decision checklist for release acceptance.")
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        json_path.write_text(json.dumps({"run_id": run_id, "summary": summary, **payload}, indent=2) + "\n")
+        detail = md_path.read_text(encoding="utf-8").split("\n", 1)[1]
+        lines = [
+            "# Google Drive qualification", "",
+            f"Run `{run_id}` · **{status}** · {started}", "",
+            "| Scenario | Result | Loss / unexpected duplication | Last sync run |",
+            "| --- | --- | --- | --- |",
+        ]
+        for row in summary:
+            discrepancy = "; ".join(row["unaccounted_versions"] + row["unexpected_copies"])
+            if not discrepancy:
+                if row["observed_duplicate_ids"] and row["status"] == "PASS":
+                    discrepancy = "Both intentional duplicates retained"
+                else:
+                    discrepancy = "None observed" if row["status"] == "PASS" else "Unverified"
+            last_run = row["run_ids"][-1][:12] if row["run_ids"] else "—"
+            lines.append(f"| `{row['scenario']}` | **{row['status']}** | {discrepancy} | `{last_run}` |")
+        md_path.write_text("\n".join(lines) + "\n\nFull run IDs are in the JSON summary.\n" + detail, encoding="utf-8")
+        json_path.replace(out / json_path.name)
+        md_path.replace(out / md_path.name)
+    for scenario in scenarios:
+        print(f"[{scenario.effective_status()}] {scenario.name}: {scenario.conclusion}")
+    print(f"Overall status: {status} (evidence: {out / 'drive-evidence.json'})")
+    return status
+
+
+def new_run_id() -> str:
+    return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:12]}"
+
+
+def show_plan(run_id: str, prefix: str, account_b: str | bool | None, **paths: Any) -> None:
+    print(json.dumps({
+        "mode": "dry-run", "run_id": run_id, "overall_expected_status": "INCOMPLETE", "account_b": account_b,
+        "collections": [f"Data/{prefix}-{key}" for key in SCENARIOS
+                        if key not in ("preflight", "cleanup") and (key != "two-account" or account_b)]
+                       + [f"Data/{prefix}-replacement-original"],
+        "scenarios": [name for key, name in SCENARIOS.items() if key != "two-account" or account_b],
+        **paths,
+    }, indent=2))
+
+
+def publish_latest(evidence_dir: Path, run_id: str, keep: int | None) -> None:
+    latest = evidence_dir / "latest"
+    try:
+        os.close(open_private_file(latest, os.O_RDONLY))
+    except FileNotFoundError:
+        pass
+    with tempfile.TemporaryDirectory(prefix=".latest-", dir=evidence_dir) as scratch:
+        pointer = Path(scratch) / "latest"
+        pointer.write_text(run_id + "\n", encoding="utf-8")
+        pointer.replace(latest)
+    if keep is None:
+        return
+    previous = []
+    for item in evidence_dir.iterdir():
+        if item.name == run_id or not RUN_ID_RE.fullmatch(item.name) or item.is_symlink() or not item.is_dir():
+            continue
+        try:
+            with os.fdopen(open_private_file(item / "drive-evidence.json", os.O_RDONLY), encoding="utf-8") as file:
+                if json.load(file).get("run_id") == item.name:
+                    previous.append(item)
+        except (OSError, ValueError):
+            continue  # A non-evidence directory is outside the retention policy.
+    previous.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+    for item in previous[keep - 1:]:
+        shutil.rmtree(item)
+
+
+def run_persistent(args: argparse.Namespace, run_id: str) -> int:
+    if any((args.remote, args.account_b, args.rclone_config, args.state_dir, args.out_dir, args.sync_cli, args.prefix)):
+        raise ValueError("Use --qual-home by itself for persistent accounts. Use the import flags for an export.")
+    home, parent_id, account_b, cli_sha = read_qual_home(args.qual_home)
+    prefix = f"FolderSyncQual-{run_id}"
+    evidence_dir = checked_private_directory(home / "evidence")
+    out = evidence_dir / run_id
+    if args.dry_run:
+        show_plan(run_id, prefix, account_b, qual_home=str(home), evidence_dir=str(out))
+        return 0
+    with lock_qual_home(home):
+        private_dir(out)
+        started = utc_now()
+        versions = {}
+        try:
+            rclone, version, digest = resolve_verified_pinned_rclone()
+            sync_cli = home / "bin" / "sync-cli"
+            os.close(open_private_file(sync_cli, os.O_RDONLY))
+            if sha256_file(sync_cli) != cli_sha or not os.access(sync_cli, os.X_OK):
+                raise ValueError("The credential helper binary changed. Re-run setup in a fresh qualification home.")
+            fixture_roots = private_dir(out / "clients")
+            clients = []
+            for letter in "abc":
+                name = f"client-{letter}"
+                root = checked_private_directory(home / "clients" / name)
+                client = Client(name, root, "qual", private_dir(fixture_roots / name))
+                for location in (client.home, client.home / "tmp", client.state):
+                    checked_private_directory(location)
+                for location in (client.state / "state.sqlite", client.state / "accounts" / "qual" / "rclone.conf"):
+                    os.close(open_private_file(location, os.O_RDONLY))
+                for directory, subdirs, files in os.walk(client.state):
+                    for name in subdirs + files:
+                        if (Path(directory) / name).is_symlink():
+                            raise ValueError(f"Refused a symlink in {client.name}'s qualification state.")
+                private_dir(client.data(""))
+                private_dir(client.recovery(""))
+                clients.append(client)
+            versions = get_tool_versions(sync_cli, rclone, version, digest, cli_env=clients[0].env(rclone))
+            versions["sync_cli_sha256"] = cli_sha
+            suite = DriveQualification(DriveRunner(sync_cli, rclone), clients, out, prefix, args.seed, "qual" if account_b else None)
+            results = suite.run(None, parent_id)
+        except SCENARIO_ERRORS as exc:
+            results = [ScenarioEvidence(
+                name, "", started, utc_now(), "none", False, redact_credential_stderr(str(exc)),
+                "NOT VERIFIED" if key == "preflight" else "NOT RUN",
+            ) for key, name in SCENARIOS.items() if key != "two-account" or account_b]
+        status = write_drive_evidence(out, run_id, args.seed, started, versions, results)
+        publish_latest(evidence_dir, run_id, args.keep)
+    return 0 if status == "PASS" else 3
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--qual-home", help="Persistent qualification home created by drive-setup.sh")
+    parser.add_argument("--keep", type=int, help="Keep this many published evidence runs under --qual-home")
     parser.add_argument("--remote", help="Required primary Drive remote in the disposable export")
     parser.add_argument("--account-b", "--remote-b", help="Second Google account's remote in the same export")
     parser.add_argument("--state-dir", help="Required fresh, empty, non-symlinked state directory")
     parser.add_argument("--rclone-config", help="Required disposable unencrypted Drive config export")
-    parser.add_argument("--prefix", default="FolderSyncQual", help="Prefix for newly named collections under Data")
-    parser.add_argument("--out-dir", default=str(REPO_ROOT / "target" / "qualification"))
+    parser.add_argument("--prefix", help="Import-mode prefix for newly named collections under Data")
+    parser.add_argument("--out-dir", help="Import-mode evidence directory")
     parser.add_argument("--seed", type=int, default=20261120)
-    parser.add_argument("--sync-cli", type=Path, default=REPO_ROOT / "target" / "release" / "sync-cli")
+    parser.add_argument("--sync-cli", type=Path, help="Import-mode executable sync-cli")
     parser.add_argument("--dry-run", action="store_true", help="Print the plan without launching any tools")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    os.umask(0o077)
 
     try:
+        run_id = new_run_id()
+        if args.keep is not None and (not args.qual_home or args.keep < 1):
+            raise ValueError("--keep requires --qual-home and a positive number of runs.")
+        if args.qual_home:
+            return run_persistent(args, run_id)
+        args.prefix = args.prefix or "FolderSyncQual"
+        args.out_dir = args.out_dir or str(REPO_ROOT / "target" / "qualification")
         remote, account_b, state_dir, config, out = validate_args(args)
-        prefix = f"{args.prefix}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:12]}"
+        prefix = f"{args.prefix}-{run_id}"
         if args.dry_run:
-            print(json.dumps({
-                "mode": "dry-run", "overall_expected_status": "INCOMPLETE",
-                "remote": remote, "account_b": account_b,
-                "collections": [f"Data/{prefix}-{key}" for key in SCENARIOS if key != "preflight" and (key != "two-account" or account_b)],
-                "scenarios": [name for key, name in SCENARIOS.items() if key != "two-account" or account_b],
-                "state_dir": str(state_dir), "evidence_dir": str(out),
-            }, indent=2))
+            show_plan(run_id, prefix, account_b, remote=remote, state_dir=str(state_dir), evidence_dir=str(out))
             return 0
 
         export_bytes, root_id = read_export(config, remote, account_b)
         rclone, version, digest = resolve_verified_pinned_rclone()
-        sync_cli = args.sync_cli.resolve(strict=True)
+        sync_cli = (args.sync_cli or REPO_ROOT / "target" / "release" / "sync-cli").resolve(strict=True)
         if not sync_cli.is_file() or not os.access(sync_cli, os.X_OK):
             raise ValueError("Build an executable sync-cli and pass its location with --sync-cli.")
         if any(char in str(sync_cli) for char in "\r\n"):
@@ -954,16 +1582,7 @@ def main() -> int:
             del export_bytes
             suite = DriveQualification(DriveRunner(sync_cli, rclone), clients, root, prefix, args.seed, account_b)
             results = suite.run(export, root_id)
-        status = compute_overall_status(results)
-        write_evidence_files(
-            out / "drive-evidence.json", out / "drive-evidence.md", "real-google-drive",
-            args.seed, started, utc_now(), versions, results,
-            f"{status} for the scripted {'two-account' if account_b else 'single-account'} Drive scenarios. "
-            "Use the owner decision checklist for workload and release acceptance.",
-        )
-        for scenario in results:
-            print(f"[{scenario.effective_status()}] {scenario.name}: {scenario.conclusion}")
-        print(f"Overall status: {status} (evidence: {out / 'drive-evidence.json'})")
+        status = write_drive_evidence(out, run_id, args.seed, started, versions, results)
         return 0 if status == "PASS" else 3
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Error: {redact_credential_stderr(str(exc))}", file=sys.stderr)
