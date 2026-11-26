@@ -169,7 +169,15 @@ mkdir -p "$TARGET_ROOT" "$OUT_DIR"
 # fresh mktemp -d staging directory under target/ so fixed filenames in --out
 # are never followed via shell redirection.
 BUILD_STAGE="$(mktemp -d "${TARGET_ROOT}/.finder-build-stage.XXXXXXXX")"
-trap 'rm -rf "$BUILD_STAGE"' EXIT
+DEV_STATE_DIR=""
+cleanup_build_stage() {
+  local status=$?
+  rm -rf "$BUILD_STAGE"
+  if [[ "$status" -ne 0 && -n "$DEV_STATE_DIR" ]]; then
+    rmdir "${DEV_STATE_DIR}/finder" "$DEV_STATE_DIR"
+  fi
+}
+trap cleanup_build_stage EXIT
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then
   TEST_BIN="${BUILD_STAGE}/SnapshotModelTests"
