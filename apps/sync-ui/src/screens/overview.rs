@@ -6,7 +6,8 @@ use nsh_core::prelude::*;
 use sync_core::{Execution, Intent, Readiness, VolumeKind};
 
 use crate::contract::{
-    IconKind, MappingSnapshot, ScreenRoute, StatusLink, Tone, UiCommand, UiSnapshot, VolumeSnapshot,
+    IconKind, MappingSnapshot, SYNC_ALL_NOW_LABEL, ScreenRoute, StatusLink, Tone, UiCommand,
+    UiSnapshot, VolumeSnapshot,
 };
 use crate::screens::{AppController, welcome::welcome_view};
 use crate::theme::{
@@ -91,7 +92,7 @@ fn render_overview(ctrl: AppController, snap: &UiSnapshot) -> View {
                         .gap(px(8.0))
                         .child(
                             app_button(
-                                "Sync ready mappings",
+                                SYNC_ALL_NOW_LABEL,
                                 BtnKind::Default,
                                 false,
                                 ready_count == 0,

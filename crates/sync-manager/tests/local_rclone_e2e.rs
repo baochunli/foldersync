@@ -264,6 +264,66 @@ fn changing_filters_initializes_with_a_fresh_workdir_and_keeps_excluded_files() 
 }
 
 #[test]
+fn removing_custom_exclusion_uploads_local_only_directory_without_deleting_files() {
+    if !require_pinned_rclone(
+        "removing_custom_exclusion_uploads_local_only_directory_without_deleting_files",
+    ) {
+        return;
+    }
+
+    let fx = RealFixture::new();
+    write_rel(&fx.local_dir, "proj/.git/HEAD", b"ref: refs/heads/main\n");
+    write_rel(
+        &fx.local_dir,
+        "proj/.git/objects/data",
+        b"local-only object",
+    );
+    let expected_files = tree_hashes(&fx.local_dir);
+    let manager = fx.open_manager();
+    manager
+        .register_local_fixture_account("local-1", "Local fixture")
+        .unwrap();
+    let mut cmd = fx.add_mapping_cmd();
+    cmd.extra_exclusions.insert(".git/".to_owned());
+    manager.add_mapping(cmd).unwrap();
+    let id = MappingId::new("research");
+    manager
+        .initialize(InitializeCommand {
+            mapping_id: id.clone(),
+            expected_direction: Some(InitPreference::Path1),
+        })
+        .unwrap();
+    let original = manager.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let original = &original.mappings[0];
+    assert_eq!(original.readiness, Readiness::Ready);
+    assert_eq!(tree_hashes(&fx.local_dir), expected_files);
+    assert!(tree_hashes(&fx.remote_dir).is_empty());
+    let marker_path = fx.remote_dir.join(ACCESS_MARKER_FILENAME);
+    let original_marker = fs::read(&marker_path).unwrap();
+
+    let preview = manager
+        .propose_filter_change(&id, Default::default())
+        .unwrap();
+    assert_eq!(preview.removed_exclusions(), [".git/"]);
+    assert!(preview.added_exclusions().is_empty());
+    assert_eq!(preview.preflight().direction, Ok(InitPreference::Path1));
+    assert!(tree_hashes(&fx.remote_dir).is_empty());
+    manager.apply_filter_change(preview).unwrap();
+
+    let migrated = manager.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let migrated = &migrated.mappings[0];
+    assert_eq!(migrated.readiness, Readiness::Ready);
+    assert_eq!(migrated.last_run_outcome, Some(RunOutcome::Success));
+    assert_ne!(migrated.active_generation_id, original.active_generation_id);
+    assert_eq!(tree_hashes(&fx.local_dir), expected_files);
+    assert_eq!(tree_hashes(&fx.remote_dir), expected_files);
+    assert_eq!(fs::read(marker_path).unwrap(), original_marker);
+    assert!(tree_hashes(&fx.local_recovery).is_empty());
+    assert!(tree_hashes(&fx.remote_recovery).is_empty());
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn download_initialization_propagates_remote_files_to_empty_local() {
     if !require_pinned_rclone("download_initialization_propagates_remote_files_to_empty_local") {
         return;

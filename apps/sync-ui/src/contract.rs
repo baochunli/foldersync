@@ -7,9 +7,12 @@
 use std::collections::BTreeSet;
 
 use sync_core::{
-    AccountId, AvailableAction, CloudCollection, Execution, Intent, LastRunSummary, MappingId,
-    MappingState, Readiness, RunId, VolumeIdentity, VolumeKind, available_actions, status_text,
+    AccountId, AvailableAction, CloudCollection, DEFAULT_EXCLUSIONS, Execution, Intent,
+    LastRunSummary, MappingId, MappingState, Readiness, RunId, VolumeIdentity, VolumeKind,
+    available_actions, status_text,
 };
+
+pub(crate) const SYNC_ALL_NOW_LABEL: &str = "Sync all now";
 
 /// Top-level route shown in the main window content area.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +198,24 @@ pub struct VolumeSnapshot {
     pub used_percent: u8,
     pub low_space: bool,
     pub last_seen_label: Option<String>,
-    pub recovery_root_label: Option<String>,
+}
+
+pub(crate) fn is_low_space(free_bytes: u64, used_percent: u8) -> bool {
+    free_bytes < 10_000_000_000 || (used_percent >= 95 && free_bytes < 50_000_000_000)
+}
+
+#[cfg(test)]
+#[test]
+fn low_space_thresholds() {
+    const GB: u64 = 1_000_000_000;
+    // 3.6 TB with 178 GB free and 500 GB with 20 GB free.
+    assert!(!is_low_space(178 * GB, 95));
+    assert!(is_low_space(20 * GB, 96));
+    assert!(is_low_space(5 * GB, 25));
+    assert!(is_low_space(10 * GB - 1, 94));
+    assert!(!is_low_space(10 * GB, 94));
+    assert!(is_low_space(50 * GB - 1, 95));
+    assert!(!is_low_space(50 * GB, 95));
 }
 
 /// Summary of one historical run shown in Mapping detail.
@@ -961,7 +981,7 @@ pub enum AttentionKind {
     },
     LowSpaceAdvisory {
         volume_name: String,
-        recovery_path: String,
+        recovery_path: Option<String>,
     },
 }
 
@@ -981,6 +1001,59 @@ pub struct AttentionItem {
     pub what_did: String,
     pub next_step: String,
     pub kind: AttentionKind,
+}
+
+impl AttentionItem {
+    pub(crate) fn low_space_advisory(
+        volume: &VolumeSnapshot,
+        mappings: &[MappingSnapshot],
+        mut recovery_on_volume: impl FnMut(&str) -> bool,
+    ) -> Option<Self> {
+        if !volume.connected || !volume.low_space {
+            return None;
+        }
+
+        let mappings: Vec<_> = mappings
+            .iter()
+            .filter(|m| m.volume_id == volume.identity && !m.is_variant_showcase)
+            .collect();
+        let names: Vec<_> = mappings.iter().map(|m| m.display_name.as_str()).collect();
+        let (last, others) = names.split_last()?;
+        let volume_name = &volume.display_name;
+        let cause = if others.is_empty() {
+            format!("{last} syncs to {volume_name}.")
+        } else {
+            format!("{} and {last} sync to {volume_name}.", others.join(", "))
+        };
+        let recovery_path = mappings
+            .iter()
+            .map(|m| m.local_recovery_path.as_str())
+            .find(|path| !path.is_empty() && recovery_on_volume(path))
+            .map(str::to_owned);
+        let next_step = if recovery_path.is_some() {
+            "Free space on this volume, or move older recovery copies after checking them."
+        } else {
+            "Free space on this volume."
+        };
+        Some(Self {
+            id: format!("attn-space-{}", volume.identity.stable_id),
+            priority: AttentionPriority::LowSpaceAdvisory,
+            mapping_id: None,
+            mapping_name: None,
+            pill_label: "Low space".to_owned(),
+            pill_tone: Tone::Attn,
+            icon: IconKind::Alert,
+            is_error_accent: false,
+            title: format!("{volume_name} · {} free", volume.free_label),
+            cause,
+            what_did: "FolderSync kept your files and recovery copies.".to_owned(),
+            next_step: next_step.to_owned(),
+            kind: AttentionKind::LowSpaceAdvisory {
+                volume_name: volume_name.clone(),
+                recovery_path,
+            },
+        })
+    }
 }
 
 /// Connection state of a configured Google Drive account.
@@ -1179,6 +1252,7 @@ pub struct WizardDraft {
     pub remote_folder_path: Option<String>,
     pub drive_collection: Option<CloudCollection>,
     pub local_path: String,
+    pub location_check_pending: bool,
     pub volume_name: String,
     pub volume_kind: VolumeKind,
     pub volume_fs: String,
@@ -1238,6 +1312,29 @@ impl WizardDraft {
         (self.total_gb_opt().unwrap_or_default() - omitted).max(0.0)
     }
 
+    pub(crate) fn add_custom_pattern(&mut self, pattern: &str) -> bool {
+        let pattern = pattern.trim();
+        if pattern.is_empty()
+            || DEFAULT_EXCLUSIONS
+                .iter()
+                .any(|entry| entry.pattern == pattern)
+            || self
+                .custom_patterns
+                .iter()
+                .any(|existing| existing == pattern)
+        {
+            return false;
+        }
+        self.custom_patterns.push(pattern.to_owned());
+        true
+    }
+
+    pub(crate) fn remove_custom_pattern(&mut self, pattern: &str) -> bool {
+        let count = self.custom_patterns.len();
+        self.custom_patterns.retain(|existing| existing != pattern);
+        self.custom_patterns.len() != count
+    }
+
     pub fn extra_exclusions(&self) -> BTreeSet<String> {
         self.subfolders
             .iter()
@@ -1278,7 +1375,10 @@ impl WizardDraft {
 
     /// Whether Location step checks all pass.
     pub fn location_valid(&self) -> bool {
-        !self.location_checks.is_empty() && self.location_checks.iter().all(|c| c.ok)
+        !self.location_check_pending
+            && !self.local_path.is_empty()
+            && !self.location_checks.is_empty()
+            && self.location_checks.iter().all(|c| c.ok)
     }
 
     /// Whether Recovery step checks all pass.
@@ -1508,7 +1608,7 @@ pub enum UiCommand {
         mapping_id: MappingId,
         minutes: u32,
     },
-    ConnectDemoAccount,
+    ConnectDemoAccount(Option<AccountId>),
     ConnectDrive {
         account_id: AccountId,
         display_name: String,
@@ -1544,9 +1644,11 @@ pub enum UiCommand {
     WizardCancelFolderSize,
     WizardSetRemotePath(String),
     WizardSetLocalPath(String),
+    DemoPreviewLocationCheck(String),
     WizardToggleSubfolder(String),
     WizardToggleDefaultExclusions,
     WizardAddPattern(String),
+    WizardRemovePattern(String),
     WizardSetLocalRecoveryPath(String),
     WizardSetReviewScenario(ReviewScenario),
     WizardSetNoOtherSyncConfirmed(bool),

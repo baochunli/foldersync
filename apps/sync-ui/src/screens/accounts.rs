@@ -3,10 +3,10 @@
 
 use std::path::PathBuf;
 
-use nsh_base::input;
+use nsh_base::{Input, input};
 use nsh_core::{file_dialog::OpenDialog, prelude::*};
 use sync_core::AccountId;
-use sync_manager::SecretString;
+use sync_manager::{SecretString, platform::validate_safe_path_id};
 
 use crate::contract::{
     AccountSnapshot, AccountStatus, IconKind, ScreenRoute, Tone, UiCommand, UiSnapshot,
@@ -25,7 +25,6 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
     dynamic(move || {
         let snap = ctrl.snapshot.get();
         let p = Palette::current();
-        let c_connect = ctrl.clone();
         let is_demo = snap.is_demo_mode;
 
         let mut root = view().flex_col().w_full().gap(px(BLOCK_GAP)).child(
@@ -96,7 +95,7 @@ pub fn accounts_view(ctrl: AppController) -> impl IntoElement {
                         } else {
                             view().into_element()
                         })
-                        .child(connection_buttons(c_connect, &snap, form)),
+                        .child(connection_buttons(&snap, form)),
                 ),
         );
 
@@ -140,7 +139,7 @@ pub(super) fn wizard_account_controls(ctrl: AppController) -> impl IntoElement {
                     .items_center()
                     .flex_wrap()
                     .gap(px(8.0))
-                    .child(connection_buttons(ctrl.clone(), &snap, form))
+                    .child(connection_buttons(&snap, form))
                     .child(app_button(
                         "Open Accounts",
                         BtnKind::Ghost,
@@ -157,17 +156,12 @@ pub(super) fn wizard_account_controls(ctrl: AppController) -> impl IntoElement {
     })
 }
 
-fn connection_buttons(
-    ctrl: AppController,
-    snap: &UiSnapshot,
-    form: Signal<Option<AccountForm>>,
-) -> View {
-    let is_demo = snap.is_demo_mode;
+fn connection_buttons(snap: &UiSnapshot, form: Signal<Option<AccountForm>>) -> View {
     view()
         .flex_row()
         .flex_wrap()
         .gap(px(8.0))
-        .child(if is_demo {
+        .child(if snap.is_demo_mode {
             view().into_element()
         } else {
             app_button(
@@ -190,13 +184,7 @@ fn connection_buttons(
                 snap.account_operation_pending,
                 Some(IconKind::Plus),
                 None,
-                move || {
-                    if is_demo {
-                        ctrl.send(UiCommand::ConnectDemoAccount)
-                    } else {
-                        form.set(Some(AccountForm::Connect));
-                    }
-                },
+                move || form.set(Some(AccountForm::Connect)),
             )
             .test_id("accounts-connect-btn"),
         )
@@ -223,6 +211,7 @@ fn drive_setup_form(
     let source = signal(None::<PathBuf>);
     let p = Palette::current();
     let is_import = mode == AccountForm::Import;
+    let is_demo = ctrl.snapshot.get_untracked().is_demo_mode;
     let mut body = card()
         .child(card_title(if is_import {
             "Import a Google Drive remote"
@@ -232,21 +221,37 @@ fn drive_setup_form(
         .child(
             text(if is_import {
                 "Choose an unencrypted export containing the remote you want to import."
+            } else if is_demo {
+                "Choose an Account ID to simulate connecting Google Drive."
             } else {
                 "Enter your desktop OAuth client details and the shared parent folder ID."
             })
             .text_color(p.muted),
         )
-        .child(account_field("Account ID", account_id))
-        .child(account_field("Account display name", display_name))
-        .child(account_field(
-            if is_import {
-                "Shared parent folder ID (optional)"
-            } else {
-                "Shared parent folder ID"
-            },
-            parent,
+        .child(kv_row(
+            "Account ID",
+            view()
+                .flex_col()
+                .gap(px(4.0))
+                .child(account_input("Account ID", account_id).test_id("accounts-account-id"))
+                .child(
+                    text("Choose a name for this Mac (e.g. personal). Use 1–128 A–Z, a–z, 0–9, - or _. Start with a letter or digit.")
+                        .text_size(px(S_SMALL))
+                        .text_color(p.muted),
+                ),
         ));
+    if !is_demo {
+        body = body
+            .child(account_field("Account display name", display_name))
+            .child(account_field(
+                if is_import {
+                    "Shared parent folder ID (optional)"
+                } else {
+                    "Shared parent folder ID"
+                },
+                parent,
+            ));
+    }
     if is_import {
         body = body.child(account_field("Remote name", remote)).child(
             view()
@@ -286,7 +291,7 @@ fn drive_setup_form(
                     .into_element()
                 })),
         );
-    } else {
+    } else if !is_demo {
         body = body
             .child(account_field("OAuth client ID", client_id))
             .child(kv_row(
@@ -309,90 +314,100 @@ fn drive_setup_form(
 
     body.child(dynamic(move || {
         let have = |value: Signal<String>| !value.get().trim().is_empty();
-        let valid = have(account_id)
-            && have(display_name)
-            && if is_import {
-                have(remote) && source.get().is_some()
-            } else {
-                have(parent) && have(client_id) && !secret.with(|value| value.is_empty())
-            };
+        let valid_id = account_id.with(|value| validate_safe_path_id("account_id", value).is_ok());
+        let details_valid = if is_import {
+            have(remote) && source.get().is_some()
+        } else {
+            have(parent) && have(client_id) && !secret.with(|value| value.is_empty())
+        };
+        let valid = valid_id && (is_demo || have(display_name) && details_valid);
         let c_submit = ctrl.clone();
         view()
             .flex_row()
             .gap(px(8.0))
-            .child(app_button(
-                "Cancel",
-                BtnKind::Default,
-                true,
-                false,
-                None,
-                None,
-                move || {
-                    secret.set(SecretString::new(""));
-                    form.set(None);
-                },
-            ))
-            .child(app_button(
-                if is_import {
-                    "Import remote"
-                } else {
-                    "Open browser to sign in"
-                },
-                BtnKind::Primary,
-                true,
-                !valid,
-                None,
-                None,
-                move || {
-                    let id = AccountId::new(account_id.get_untracked().trim());
-                    let display_name = display_name.get_untracked().trim().to_owned();
-                    let parent = parent.get_untracked().trim().to_owned();
-                    if is_import {
-                        let Some(path) = source.get_untracked() else {
-                            return;
-                        };
-                        c_submit.send(UiCommand::ImportDrive {
-                            account_id: id,
-                            display_name,
-                            source_config_path: path,
-                            source_remote_name: remote.get_untracked().trim().to_owned(),
-                            root_folder_id: (!parent.is_empty()).then_some(parent),
-                        });
-                    } else {
-                        let client_secret = secret.get_untracked();
+            .child(
+                app_button(
+                    "Cancel",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || {
                         secret.set(SecretString::new(""));
-                        c_submit.send(UiCommand::ConnectDrive {
-                            account_id: id,
-                            display_name,
-                            root_folder_id: parent,
-                            client_id: client_id.get_untracked().trim().to_owned(),
-                            client_secret,
-                        });
-                    }
-                    form.set(None);
-                },
-            ))
+                        form.set(None);
+                    },
+                )
+                .test_id("accounts-cancel-btn"),
+            )
+            .child(
+                app_button(
+                    if is_import {
+                        "Import remote"
+                    } else if is_demo {
+                        "Continue to demo sign-in"
+                    } else {
+                        "Open browser to sign in"
+                    },
+                    BtnKind::Primary,
+                    true,
+                    !valid,
+                    None,
+                    None,
+                    move || {
+                        let id = AccountId::new(account_id.get_untracked());
+                        let display_name = display_name.get_untracked().trim().to_owned();
+                        let parent = parent.get_untracked().trim().to_owned();
+                        if is_demo {
+                            c_submit.send(UiCommand::ConnectDemoAccount(Some(id)));
+                        } else if is_import {
+                            let Some(path) = source.get_untracked() else {
+                                return;
+                            };
+                            c_submit.send(UiCommand::ImportDrive {
+                                account_id: id,
+                                display_name,
+                                source_config_path: path,
+                                source_remote_name: remote.get_untracked().trim().to_owned(),
+                                root_folder_id: (!parent.is_empty()).then_some(parent),
+                            });
+                        } else {
+                            let client_secret = secret.get_untracked();
+                            secret.set(SecretString::new(""));
+                            c_submit.send(UiCommand::ConnectDrive {
+                                account_id: id,
+                                display_name,
+                                root_folder_id: parent,
+                                client_id: client_id.get_untracked().trim().to_owned(),
+                                client_secret,
+                            });
+                        }
+                        form.set(None);
+                    },
+                )
+                .test_id("accounts-submit-btn"),
+            )
             .into_element()
     }))
 }
 
 fn account_field(label: &'static str, value: Signal<String>) -> View {
+    kv_row(label, account_input(label, value))
+}
+
+fn account_input(label: &'static str, value: Signal<String>) -> Input {
     let p = Palette::current();
-    kv_row(
-        label,
-        input()
-            .placeholder(label)
-            .flex_1()
-            .min_h(px(28.0))
-            .px(px(8.0))
-            .rounded(px(7.0))
-            .bg(p.bg)
-            .border_1()
-            .border_color(p.border)
-            .focus_visible(focus_ring)
-            .on_change(move |text: &str| value.set(text.to_owned()))
-            .into_element(),
-    )
+    input()
+        .placeholder(label)
+        .flex_1()
+        .min_h(px(28.0))
+        .px(px(8.0))
+        .rounded(px(7.0))
+        .bg(p.bg)
+        .border_1()
+        .border_color(p.border)
+        .focus_visible(focus_ring)
+        .on_change(move |text: &str| value.set(text.to_owned()))
 }
 
 fn authorization_card(ctrl: AppController, snap: &UiSnapshot) -> View {

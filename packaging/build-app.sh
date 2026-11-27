@@ -6,6 +6,7 @@ set -euo pipefail
 #       at Contents/Helpers/rclone, plus its SHA-256 manifest at Contents/Resources/rclone-manifest.json
 #   (b) the Finder Sync extension at Contents/PlugIns/FolderSyncFinder.appex
 #   (c) verbatim third-party license/NOTICE files at Contents/Resources/Notices/
+#   (d) an optional application icon at Contents/Resources/AppIcon.icns
 # Then sign strictly inner -> outer (default ad hoc "-"; --sign <identity> for Developer ID)
 # and verify with `codesign --verify --deep --strict`.
 #
@@ -22,6 +23,7 @@ SIGN_IDENTITY="-"
 ARCH="$(uname -m)"
 NSH_BIN="${NSH_BIN:-$HOME/.local/bin/nsh}"
 DEV_SHARED_DIR=0
+ICON_SOURCE="${FOLDERSYNC_ICON:-}"
 
 usage() {
   cat <<EOF
@@ -37,6 +39,8 @@ Options:
                       non-"-" enables --options runtime --timestamp)
   --arch <arch>       Target architecture: arm64 or x86_64 (default: host arch)
   --nsh-bin <path>    Path to pinned NSH 0.6.1 CLI (default: \$HOME/.local/bin/nsh)
+  --icon <path>       Optional PNG (at least 512x512) or .icns outside the repo,
+                      e.g. /path/to/FolderSync-icon.png (default: \$FOLDERSYNC_ICON)
   --dev-shared-dir    Create a fresh disposable state directory under <repo>/target/
                       with an absolute-path temporary exception for its finder/ child
   -h, --help          Show this help
@@ -50,6 +54,13 @@ while [[ $# -gt 0 ]]; do
     --sign) SIGN_IDENTITY="$2"; shift 2 ;;
     --arch) ARCH="$2"; shift 2 ;;
     --nsh-bin) NSH_BIN="$2"; shift 2 ;;
+    --icon)
+      if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+        echo "Error: --icon requires a PNG or .icns path." >&2
+        exit 2
+      fi
+      ICON_SOURCE="$2"; shift 2
+      ;;
     --dev-shared-dir) DEV_SHARED_DIR=1; shift ;;
     --shared-dir)
       echo "Error: arbitrary --shared-dir paths are not permitted; use --dev-shared-dir to create a fresh directory under target/." >&2
@@ -132,6 +143,26 @@ PY
 validate_contained_in_target "target" "${REPO_ROOT}/target"
 validate_contained_in_target "--out" "$OUT_DIR"
 
+if [[ -n "$ICON_SOURCE" ]]; then
+  ICON_SOURCE="$(python3 - "$REPO_ROOT" "$ICON_SOURCE" <<'PY'
+import sys
+from pathlib import Path
+
+repo, source = map(Path, sys.argv[1:])
+try:
+    icon = source.resolve(strict=True)
+except OSError as error:
+    sys.exit(f"Error: cannot resolve icon input: {error}")
+if (not icon.is_file() or icon.is_relative_to(repo)
+        or any(ord(c) < 32 or ord(c) == 127 for c in str(icon))):
+    sys.exit("Error: icon input must be a file outside the repository with no control characters in its path.")
+if icon.suffix.lower() not in {".png", ".icns"}:
+    sys.exit("Error: icon input must be a PNG or an .icns file.")
+print(icon)
+PY
+)"
+fi
+
 if [[ ! -x "$NSH_BIN" ]]; then
   echo "Error: pinned NSH binary not found or not executable at $NSH_BIN" >&2
   echo "Install NSH 0.6.1 via: curl -fsSL https://nsh.dev/install.sh | NSH_VERSION=v0.6.1 sh" >&2
@@ -185,6 +216,28 @@ mkdir -p "$OUT_DIR"
 WORK_STAGE="$(mktemp -d "${OUT_DIR}/.stage.XXXXXXXX")"
 trap 'rm -rf "$WORK_STAGE"' EXIT
 
+BUNDLE_ICON="${WORK_STAGE}/AppIcon.icns"
+case "$ICON_SOURCE" in
+  *.[pP][nN][gG])
+    ICON_MASTER="${WORK_STAGE}/AppIcon-1024.png"
+    ICONSET="${WORK_STAGE}/AppIcon.iconset"
+    swiftc "${SCRIPT_DIR}/render-icon.swift" -o "${WORK_STAGE}/render-icon"
+    "${WORK_STAGE}/render-icon" "$ICON_SOURCE" "$ICON_MASTER"
+    mkdir "$ICONSET"
+    for size in 16 32 128 256 512; do
+      sips -z "$size" "$size" "$ICON_MASTER" --out "${ICONSET}/icon_${size}x${size}.png" >/dev/null
+      retina_size=$((size * 2))
+      sips -z "$retina_size" "$retina_size" "$ICON_MASTER" \
+        --out "${ICONSET}/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns -o "$BUNDLE_ICON" "$ICONSET"
+    ;;
+  *.[iI][cC][nN][sS])
+    iconutil -c iconset -o "${WORK_STAGE}/AppIcon.iconset" "$ICON_SOURCE"
+    cp "$ICON_SOURCE" "$BUNDLE_ICON"
+    ;;
+esac
+
 echo "==> Packaging NSH macOS app (${BUNDLE_ID}, arch=${ARCH})"
 "$NSH_BIN" package \
   --target macos \
@@ -199,8 +252,9 @@ if [[ ! -d "$STAGED_APP" ]]; then
   exit 1
 fi
 
-APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "${STAGED_APP}/Contents/Info.plist")"
-APP_BUILD="$(plutil -extract CFBundleVersion raw "${STAGED_APP}/Contents/Info.plist")"
+APP_PLIST="${STAGED_APP}/Contents/Info.plist"
+APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP_PLIST")"
+APP_BUILD="$(plutil -extract CFBundleVersion raw "$APP_PLIST")"
 
 echo "==> Embedding pinned rclone at Contents/Helpers/rclone"
 mkdir -p "${STAGED_APP}/Contents/Helpers"
@@ -248,6 +302,12 @@ for notice_file in \
     exit 1
   fi
 done
+
+if [[ -n "$ICON_SOURCE" ]]; then
+  echo "==> Embedding application icon at Contents/Resources/AppIcon.icns"
+  cp "$BUNDLE_ICON" "${STAGED_APP}/Contents/Resources/AppIcon.icns"
+  plutil -replace CFBundleIconFile -string AppIcon "$APP_PLIST"
+fi
 
 SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
 SIGN_MODE="adhoc"

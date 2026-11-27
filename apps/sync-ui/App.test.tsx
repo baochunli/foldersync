@@ -4,6 +4,17 @@ import { expect, open, test } from "nsh/test";
 
 const DESKTOP = { width: 1120, height: 760, platform: "macos" as const };
 
+async function startDemoSignIn(app: Awaited<ReturnType<typeof open>>) {
+  await app.press("id:accounts-connect-btn");
+  await app.type("id:accounts-account-id", "work-2");
+  await app.press("id:accounts-submit-btn");
+}
+
+async function pickDemoFolder(app: Awaited<ReturnType<typeof open>>) {
+  await app.press("id:wizard-step-3");
+  await app.press("id:wizard-demo-valid-folder");
+}
+
 test("Overview shows every state label, actions, Sync now verb, and Paper Mono path nodes", async () => {
   const app = await open(".", DESKTOP);
   const allTexts = app.texts();
@@ -11,7 +22,7 @@ test("Overview shows every state label, actions, Sync now verb, and Paper Mono p
 
   // Header + summary + Sync now verb everywhere (never "Run now")
   expect(allTexts).toContain("Overview");
-  expect(allTexts).toContain("Sync ready mappings");
+  expect(allTexts).toContain("Sync all now");
   expect(allTexts).toContain("Add mapping…");
   expect(allTexts).toContain("Sync now");
   expect(joined).not.toContain("Run now");
@@ -26,7 +37,7 @@ test("Overview shows every state label, actions, Sync now verb, and Paper Mono p
   expect(allTexts).toContain("Not connected");
   expect(allTexts).toContain("Free space unknown");
   expect(allTexts).toContain("ArchiveSSD");
-  expect(allTexts).toContain("Low space: 260 GB free of 8 TB");
+  expect(allTexts).toContain("Low space: 26 GB free of 8 TB");
 
   // Every Readiness × Execution × Intent state label from spec §6
   expect(joined).toContain("Last completed at 14:38");
@@ -113,6 +124,7 @@ test("Add-mapping review blocks both-populated with no Start first sync button",
   expect(app.texts()).toContain("Which Google account holds the folder?");
 
   // Jump to step 6 (Review)
+  await pickDemoFolder(app);
   await app.press("id:wizard-step-6");
   expect(app.texts()).toContain("Review “Projects”");
   expect(app.shows("id:wizard-start-first-sync-btn")).toBe(true);
@@ -190,6 +202,46 @@ test("Mapping schedule, volume, and subfolder change review; Activity raw log to
 
   await app.press("id:activity-raw-log-toggle");
   expect(app.shows("id:activity-raw-log-body")).toBe(true);
+});
+
+test("Custom exclusions can be removed individually from a new mapping", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+
+  await app.type("id:wizard-pattern-input", ".git/");
+  await app.press("id:wizard-add-pattern-btn");
+  await app.type("id:wizard-pattern-input", "*.bak");
+  await app.press("id:wizard-add-pattern-btn");
+  expect(app.texts()).toContain(".git/");
+  await app.press("id:remove-pattern-.git/");
+  expect(app.texts()).not.toContain(".git/");
+  expect(app.shows("id:remove-pattern-*.bak")).toBe(true);
+
+  await app.type("id:wizard-pattern-input", ".DS_Store");
+  await app.press("id:wizard-add-pattern-btn");
+  await app.press("id:wizard-default-exclusions-toggle");
+  expect(app.texts()).toContain(".DS_Store");
+  expect(app.shows("id:remove-pattern-.DS_Store")).toBe(false);
+});
+
+test("Removing an existing custom exclusion requires filter review and confirmation", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:open-detail-family");
+  await app.press("id:change-subfolders-btn");
+  await app.press("id:remove-pattern-*.lrdata/");
+  expect(app.texts()).not.toContain("*.lrdata/");
+  await app.press("id:filter-change-preview");
+  expect(app.texts().join("\n")).toContain("Removed exclusions\n*.lrdata/");
+  expect(app.enabled("id:filter-change-confirm")).toBe(false);
+  await app.press("id:filter-change-consent");
+  expect(app.enabled("id:filter-change-confirm")).toBe(true);
+  await app.press("id:filter-change-confirm");
+  expect(app.texts().join("\n")).toContain("First sync");
+  await app.press("id:nav-overview");
+  await app.press("id:open-detail-family");
+  expect(app.texts().join("\n")).not.toContain("*.lrdata/");
 });
 
 test("Preferences Diagnostics shows engine flags only there and Welcome states render", async () => {
@@ -302,6 +354,7 @@ test("Both populated block recovers when choosing a valid replacement folder and
   const app = await open(".", DESKTOP);
 
   await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
   await app.press("id:wizard-step-6");
   expect(app.texts()).toContain("Review “Projects”");
 
@@ -355,7 +408,7 @@ test("Deferred UI fixes: resumable draft, new folder, queue order, conflict pres
 
   // #10: Cancel reconnect on Connected account restores Connected; Connect account adds a new account
   await app.press("id:nav-accounts");
-  await app.press("id:accounts-connect-btn");
+  await startDemoSignIn(app);
   await app.press("id:accounts-simulate-signin-btn");
   expect(app.texts().join("\n")).toContain("work-2");
 
@@ -368,6 +421,7 @@ test("Deferred UI fixes: resumable draft, new folder, queue order, conflict pres
   await app.type("id:wizard-new-folder-name", "New-Folder");
   await app.press("id:wizard-create-folder-btn");
   expect(app.texts().join("\n")).toContain("New-Folder");
+  await pickDemoFolder(app);
   await app.press("id:wizard-step-6");
   expect(app.texts().join("\n")).toContain("First sync: upload to the cloud");
   expect(app.texts().join("\n")).toContain("creates a new access marker file");
@@ -383,11 +437,66 @@ test("Accounts show sign-in, browser wait, and connected states", async () => {
   const app = await open(".", DESKTOP);
   await app.press("id:nav-accounts");
   expect(app.texts().join("\n")).toContain("Sign-in required");
-  await app.press("id:accounts-connect-btn");
+  await startDemoSignIn(app);
   expect(app.texts().join("\n")).toContain("Connect Google Drive");
   expect(app.texts().join("\n")).toContain("Finish signing in in your browser");
   await app.press("id:accounts-simulate-signin-btn");
   expect(app.texts().join("\n")).toContain("work-2");
+});
+
+test("Connect Google Drive explains and validates Account ID before sign-in", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:nav-accounts");
+  await app.press("id:accounts-connect-btn");
+  expect(app.texts().join("\n")).toContain("Choose a name for this Mac (e.g. personal)");
+
+  const submit = "id:accounts-submit-btn";
+  const field = "id:accounts-account-id";
+  expect(app.enabled(submit)).toBe(false);
+  for (const invalid of ["-personal", "_personal", "my account", "a/b", "équipe", "a".repeat(129)]) {
+    await app.type(field, invalid);
+    expect(app.enabled(submit)).toBe(false);
+    await app.press("id:accounts-cancel-btn");
+    await app.press("id:accounts-connect-btn");
+  }
+  await app.type(field, "a".repeat(128));
+  expect(app.enabled(submit)).toBe(true);
+  await app.press("id:accounts-cancel-btn");
+  await app.press("id:accounts-connect-btn");
+  await app.type(field, "1-work_2");
+  expect(app.enabled(submit)).toBe(true);
+  await app.press(submit);
+  await app.press("id:accounts-simulate-signin-btn");
+  expect(app.texts().join("\n")).toContain("1-work_2");
+});
+
+test("Location shows guidance, disk-check progress, and completed results", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await app.press("id:wizard-step-3");
+
+  const next = "id:wizard-continue-btn";
+  expect(app.texts()).toContain("Choose a folder to see its disk and free space.");
+  expect(app.shows("id:wizard-location-capacity")).toBe(false);
+  expect(app.shows("id:wizard-location-checks")).toBe(false);
+  expect(app.enabled(next)).toBe(false);
+
+  await app.press("id:wizard-demo-checking-folder");
+  expect(app.texts()).toContain("/Volumes/WorkSSD/Projects");
+  expect(app.texts()).toContain("Checking disk and free space…");
+  expect(app.shows("id:wizard-location-capacity")).toBe(false);
+  expect(app.shows("id:wizard-location-checks")).toBe(false);
+  expect(app.enabled(next)).toBe(false);
+  expect(app.enabled("id:wizard-step-4")).toBe(false);
+
+  await app.press("id:wizard-demo-invalid-root");
+  expect(app.texts().join("\n")).toContain("top of the volume");
+  expect(app.texts()).not.toContain("Checking disk and free space…");
+  expect(app.enabled(next)).toBe(false);
+
+  await app.press("id:wizard-demo-valid-folder");
+  expect(app.shows("id:wizard-location-capacity")).toBe(true);
+  expect(app.enabled(next)).toBe(true);
 });
 
 test("Folder choices show on-demand size, cancellation, and measurement failure", async () => {
@@ -424,10 +533,17 @@ test("New folder refuses a duplicate name in Data", async () => {
 test("Cancel sign-in clears the browser waiting card", async () => {
   const app = await open(".", DESKTOP);
   await app.press("id:nav-accounts");
-  await app.press("id:accounts-connect-btn");
+  await startDemoSignIn(app);
   await app.press("id:accounts-cancel-reconnect-btn");
   expect(app.texts()).not.toContain("Finish signing in in your browser");
   expect(app.texts()).not.toContain("work-2");
+});
+
+test("Low-space advisory names the synced mappings and omits off-volume recovery", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:nav-attention");
+  expect(app.texts()).toContain("Cause: Archive and Photos-Archive sync to ArchiveSSD.");
+  expect(app.texts()).not.toContain("Reveal recovery folder");
 });
 
 test("Overview and Detail show the next check and distinguish the wrong disk", async () => {

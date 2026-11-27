@@ -461,7 +461,10 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                     );
             }
         }
-        AttentionKind::LowSpaceAdvisory { recovery_path, .. } => {
+        AttentionKind::LowSpaceAdvisory {
+            recovery_path: Some(recovery_path),
+            ..
+        } => {
             let rp = recovery_path.clone();
             let c_rec = ctrl.clone();
             actions = actions.child(app_button(
@@ -476,6 +479,10 @@ fn attention_card(ctrl: AppController, snap: &UiSnapshot, item: &AttentionItem) 
                 },
             ));
         }
+        AttentionKind::LowSpaceAdvisory {
+            recovery_path: None,
+            ..
+        } => {}
     }
 
     c.child(actions)

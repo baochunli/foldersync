@@ -77,7 +77,7 @@ pub fn welcome_view(ctrl: AppController, snap: &UiSnapshot) -> View {
                     None,
                     move || {
                         if is_demo {
-                            ctrl_connect.send(UiCommand::ConnectDemoAccount);
+                            ctrl_connect.send(UiCommand::ConnectDemoAccount(None));
                         } else {
                             ctrl_connect.navigate(crate::contract::ScreenRoute::Accounts);
                         }

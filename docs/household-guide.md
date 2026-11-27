@@ -6,13 +6,19 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
 ## Set up your first folder
 
 1. Ask the owner for the desktop OAuth client details and shared parent folder
-   ID. In **Accounts**, choose **Connect Google Drive…**, fill in the form, and
-   choose **Open browser to sign in**. Use your own Google account and wait for
-   **Connected**. Let the owner set up the client and sharing first.
+   ID. In **Accounts**, choose **Connect Google Drive…**. For **Account ID**,
+   choose a name for this Mac, such as `personal`. Use 1–128 letters (A–Z or
+   a–z), digits, hyphens, or underscores, starting with a letter or digit. Fill in
+   the rest of the form and choose **Open browser to sign in**. Use your own
+   Google account and wait for **Connected**. Let the owner set up the client
+   and sharing first.
 2. Choose **Add mapping…** and pick a folder under the shared `Data` folder.
    Compare its estimated size with the free space on the disk you want to use.
-   Connect an external disk before selecting a folder on it.
+   Connect an external disk before selecting a folder on it. After choosing a
+   local folder, wait for the disk and free-space checks before continuing.
 3. Under **Choose what to include**, clear the subfolders you want to skip.
+   Use **Pattern (optional)** and **Add** for a custom exclusion. Use
+   **Remove** beside a pattern to take it out of the selection.
    Choose a local location for **Recovery copies**. Leave room for both synced
    files and earlier versions.
 4. Review the direction of the first sync. Use an empty destination for an
@@ -26,16 +32,19 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
   minutes by default while the app is running. Edits and deletions can sync
   in either direction. A local edit can trigger an earlier check. Choose
   **Sync now** to request a run, or adjust **Check schedule** in the mapping’s
-  **Schedule** section.
+  **Schedule** section. Use **Sync all now** in the menu bar or Overview to
+  run every ready mapping.
 - **Pause scheduling** holds automatic runs on this Mac. An active run can
   finish, and **Sync now** still works for eligible mappings. To hold one
   mapping, use its **Pause** button. Use **Resume scheduling** in the sidebar
   for the whole Mac, or **Resume** for a paused mapping.
-- **Change subfolders…** lets you preview a new selection and review its
-  first-sync checks. Files you newly exclude stay on disk. Ask the owner to
-  review the change if both sides already contain files.
-- Closing the window leaves FolderSync running. Use **Show window** in the
-  menu bar to reopen it. **Quit FolderSync** stops new runs and exits the app. If a
+- In **Change subfolders…**, use **Remove** beside a custom pattern, then
+  choose **Review changes**. Check **Removed exclusions** and the first-sync
+  checks before confirming. Files you newly exclude stay on disk. Ask the
+  owner to review the change if both sides already contain files.
+- FolderSync appears in the Dock and app switcher while its window is open.
+  Closing the window leaves it running in the menu bar. Use **Show window**
+  to reopen it. **Quit FolderSync** stops new runs and exits the app. If a
   run is active, **Stop and quit** requests a clean stop. When you plan to
   eject a disk, pause scheduling and wait for the current run to finish first.
 
@@ -59,6 +68,9 @@ on the card for your folder.
   location, leave the mapping held and ask the owner.
 - For **Can’t access** messages, check the disk and folder permissions, then
   choose **Check again**. Ask the owner if the check still fails.
+- A **Low space** advisory names the mappings on the volume that needs space.
+  **Reveal recovery folder** appears when one of those mappings keeps its
+  recovery folder on that volume.
 - For **Sign-in required**, choose **Reconnect…** in **Accounts** and sign in again
   with the same Google account. If macOS Keychain is locked, unlock your login
   keychain and choose **Check access**. Ask the owner if access still fails.

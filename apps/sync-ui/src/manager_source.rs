@@ -40,7 +40,7 @@ use sync_manager::{
     ManagerConfig, ManagerError, ManagerEvent, MappingStatusSnapshot, NoopFinderNotifier,
     OperationCanceller, OperationHandle, RecoveryCopySide, RunRecord, SecretString,
     SideClassification, SkippedCollection, StatusSnapshot, SyncManager, ValidatedFinderAction,
-    detect_volume_identity, disk_space_for_path, inspect_local_endpoint_detailed,
+    detect_volume_identity, inspect_local_endpoint_detailed,
 };
 
 use crate::{
@@ -51,7 +51,7 @@ use crate::{
         MappingSnapshot, PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData,
         RecoveryCopyItem, ReviewScenario, RunPhase, RunRecordSnapshot, ScheduledCheck, ScreenRoute,
         StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts,
-        VolumeSnapshot, WizardDraft, WizardStep, format_bytes,
+        VolumeSnapshot, WizardDraft, WizardStep, format_bytes, is_low_space,
     },
     system_actions::{
         LaunchAtLoginOutcome, SystemActionOutcome, SystemActionRequest, SystemActions,
@@ -635,7 +635,20 @@ fn manager_worker_main(
         for cmd in cmds {
             match cmd {
                 WorkerCmd::Command(ui_cmd) => {
+                    let check_local_path = matches!(&ui_cmd, UiCommand::WizardSetLocalPath(_));
                     let (nav, sys_req) = handle_ui_command(&mut state, ui_cmd);
+                    if check_local_path {
+                        if !state.wizard.local_path.is_empty() {
+                            // Publish the path without waiting on any of the inventory probes.
+                            let pending = {
+                                let mut cached = latest_cached.lock().unwrap();
+                                cached.wizard = state.wizard.clone();
+                                cached.clone()
+                            };
+                            ui_slot.publish_snapshot(pending);
+                        }
+                        recompute_real_wizard_inventory(&mut state);
+                    }
                     need_emit = true;
                     if let Some(route) = nav {
                         ui_slot.push_control(UiControlEvent::Navigate(route));
@@ -1425,7 +1438,7 @@ fn handle_ui_command(
             }
             (None, None)
         }
-        UiCommand::ConnectDemoAccount => (None, None),
+        UiCommand::ConnectDemoAccount(_) => (None, None),
         UiCommand::CancelReconnect => {
             if let Some(canceller) = state.authorization_canceller.take() {
                 state.authorization_url = None;
@@ -1738,6 +1751,9 @@ fn handle_ui_command(
         UiCommand::WizardSetLocalPath(path) => {
             let p = PathBuf::from(path.trim());
             state.wizard.local_path = path.trim().to_owned();
+            state.wizard.location_check_pending = !state.wizard.local_path.is_empty();
+            state.wizard.location_checks.clear();
+            state.wizard.volume_free_bytes = None;
             if state.wizard.local_recovery_path.is_empty()
                 && let Some(parent) = p.parent()
                 && let Some(name) = p.file_name().and_then(|n| n.to_str())
@@ -1756,9 +1772,9 @@ fn handle_ui_command(
                 }
             }
             invalidate_wizard_confirmation(&mut state.wizard);
-            recompute_real_wizard_inventory(state);
             (None, None)
         }
+        UiCommand::DemoPreviewLocationCheck(_) => (None, None),
         UiCommand::WizardToggleSubfolder(sub_id) => {
             if sub_id == "root" {
                 let next = !state
@@ -1773,12 +1789,7 @@ fn handle_ui_command(
             } else if let Some(node) = state.wizard.subfolders.iter_mut().find(|n| n.id == sub_id) {
                 node.included = !node.included;
             }
-            invalidate_wizard_confirmation(&mut state.wizard);
-            if state.wizard.changing_subfolders {
-                state.filter_preview = None;
-            } else {
-                recompute_real_wizard_inventory(state);
-            }
+            wizard_exclusions_changed(state);
             (None, None)
         }
         UiCommand::WizardToggleDefaultExclusions => {
@@ -1786,15 +1797,14 @@ fn handle_ui_command(
             (None, None)
         }
         UiCommand::WizardAddPattern(pattern) => {
-            let trimmed = pattern.trim().to_owned();
-            if !trimmed.is_empty() && !state.wizard.custom_patterns.contains(&trimmed) {
-                state.wizard.custom_patterns.push(trimmed);
-                invalidate_wizard_confirmation(&mut state.wizard);
-                if state.wizard.changing_subfolders {
-                    state.filter_preview = None;
-                } else {
-                    recompute_real_wizard_inventory(state);
-                }
+            if state.wizard.add_custom_pattern(&pattern) {
+                wizard_exclusions_changed(state);
+            }
+            (None, None)
+        }
+        UiCommand::WizardRemovePattern(pattern) => {
+            if state.wizard.remove_custom_pattern(&pattern) {
+                wizard_exclusions_changed(state);
             }
             (None, None)
         }
@@ -2194,6 +2204,15 @@ fn show_stopped_first_sync(wizard: &mut WizardDraft) {
             Some("First sync stopped. Open the mapping to review its setup.".to_owned());
     } else {
         wizard.step = WizardStep::Review;
+    }
+}
+
+fn wizard_exclusions_changed(state: &mut WorkerState) {
+    invalidate_wizard_confirmation(&mut state.wizard);
+    if state.wizard.changing_subfolders {
+        state.filter_preview = None;
+    } else {
+        recompute_real_wizard_inventory(state);
     }
 }
 
@@ -2969,20 +2988,25 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
     let trimmed_local = state.wizard.local_path.trim().to_owned();
     let local_path = PathBuf::from(&trimmed_local);
 
-    // Real volume detection (rejects volume roots; reports real kind/ID or "unknown", HIGH #2).
-    if trimmed_local.is_empty() {
-        state.wizard.volume_name = "unknown".to_owned();
-        state.wizard.volume_fs = "unknown".to_owned();
-        loc_checks.push(LocationCheck {
-            ok: false,
-            message: "Choose an existing local folder on this Mac.".to_owned(),
-        });
+    if !trimmed_local.is_empty()
+        && state.wizard.drive_collection.is_some()
+        && drive_size_holds_wizard_account(state)
+    {
+        // The canceled measurement still owns the account. Its completion resumes this check.
+        state.wizard.location_check_pending = true;
+        return;
+    }
+    state.wizard.location_check_pending = false;
+
+    let volume_space = if trimmed_local.is_empty() {
+        None
     } else {
         match detect_volume_identity(&local_path) {
             Ok(det) => {
                 state.wizard.volume_name = det.display_name;
                 state.wizard.volume_kind = det.identity.kind;
                 state.wizard.volume_fs = det.filesystem;
+                Some(det.space)
             }
             Err(err) => {
                 state.wizard.volume_name = "unknown".to_owned();
@@ -2991,13 +3015,10 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
                     ok: false,
                     message: err.cause(),
                 });
+                None
             }
         }
-    }
-
-    let volume_space = (!trimmed_local.is_empty() && loc_checks.is_empty())
-        .then(|| disk_space_for_path(&local_path))
-        .flatten();
+    };
     state.wizard.volume_free_bytes = volume_space.map(|space| space.free_bytes);
     if let Some(space) = volume_space {
         state.wizard.volume_free_gb = space.free_bytes / 1_000_000_000;
@@ -3008,12 +3029,7 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
     let mut remote_inv_res = None;
     let mut layout_err = None;
 
-    if state.wizard.drive_collection.is_some() && drive_size_holds_wizard_account(state) {
-        loc_checks.push(LocationCheck {
-            ok: false,
-            message: "Finishing the canceled size check before checking setup…".to_owned(),
-        });
-    } else if let Some(mgr) = &state.mgr
+    if let Some(mgr) = &state.mgr
         && let Ok(cmd) = build_add_mapping_from_wizard(state)
     {
         let editing_id = state.wizard.editing_mapping_id.as_ref();
@@ -3149,7 +3165,7 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
             None
         }
         None => {
-            if !state.wizard.has_cloud_folder() {
+            if !trimmed_local.is_empty() && !state.wizard.has_cloud_folder() {
                 loc_checks.push(LocationCheck {
                     ok: false,
                     message: "Choose a folder from the account before continuing.".to_owned(),
@@ -3659,7 +3675,7 @@ fn build_volume_snapshot(
             let f_gb = space.free_bytes / 1_000_000_000;
             let used = space.total_bytes.saturating_sub(space.free_bytes);
             let pct = (u128::from(used) * 100 / u128::from(space.total_bytes.max(1))) as u8;
-            let low = f_gb < 10 || pct >= 95;
+            let low = is_low_space(space.free_bytes, pct);
             (
                 t_gb,
                 f_gb,
@@ -3685,7 +3701,6 @@ fn build_volume_snapshot(
         used_percent,
         low_space,
         last_seen_label: None,
-        recovery_root_label: None,
     }
 }
 
@@ -3831,29 +3846,12 @@ fn build_real_attention_items(
             Readiness::Unconfigured | Readiness::NeedsInitialization => {}
         }
     }
-    for v in volumes {
-        if v.connected && v.low_space {
-            items.push(AttentionItem {
-                id: format!("attn-space-{}", v.identity.stable_id),
-                priority: AttentionPriority::LowSpaceAdvisory,
-                mapping_id: None,
-                mapping_name: None,
-                pill_label: "Low space".to_owned(),
-                pill_tone: Tone::Attn,
-                icon: IconKind::Alert,
-                is_error_accent: false,
-                title: format!("{} · {} free", v.display_name, v.free_label),
-                cause: format!("{} is running low on free space.", v.display_name),
-                what_did: "No recovery copies were removed automatically.".to_owned(),
-                next_step: "Free space on the drive so syncs and recovery copies have room."
-                    .to_owned(),
-                kind: AttentionKind::LowSpaceAdvisory {
-                    volume_name: v.display_name.clone(),
-                    recovery_path: v.recovery_root_label.clone().unwrap_or_default(),
-                },
-            });
-        }
-    }
+    items.extend(volumes.iter().filter_map(|volume| {
+        AttentionItem::low_space_advisory(volume, mappings, |path| {
+            detect_volume_identity(Path::new(path))
+                .is_ok_and(|recovery| recovery.identity == volume.identity)
+        })
+    }));
     items.sort_by_key(|i| i.priority);
     items
 }
@@ -3978,15 +3976,13 @@ fn default_real_wizard() -> WizardDraft {
         remote_folder_path: None,
         drive_collection: None,
         local_path: String::new(),
+        location_check_pending: false,
         volume_name: "unknown".to_owned(),
         volume_kind: VolumeKind::Internal,
         volume_fs: "unknown".to_owned(),
         volume_free_gb: 0,
         volume_total_gb: 1,
-        location_checks: vec![LocationCheck {
-            ok: false,
-            message: "Choose an existing local folder on this Mac.".to_owned(),
-        }],
+        location_checks: Vec::new(),
         subfolders: Vec::new(),
         custom_patterns: Vec::new(),
         show_default_exclusions: false,
