@@ -1,25 +1,35 @@
 # FolderSync
 
-FolderSync is a macOS desktop app for syncing selected Google Drive folders
-with local directories. Each folder can have a different local destination,
-including an external disk.
+FolderSync is a macOS desktop app that syncs selected Google Drive folders
+in both directions. Each Drive folder can sync to a different local folder,
+including one on an external disk. Finder shows badges on your mapped folders.
 
-**Use disposable data during prototype qualification.** The desktop app uses the live
-manager by default. It supports Drive account setup, selective folder sync,
-automatic scheduling after first sync, run and recovery inspection, and Finder
-status badges on mapped folder roots. Set `FOLDERSYNC_DEMO=1` or pass `--demo`
-to open the in-memory demo. `sync-cli` supports Drive account checks and local
-sync fixtures with an explicit `--state-dir <dir>`.
+**FolderSync is a prototype. Use only files you have backed up elsewhere.
+Start with one small folder.**
 
-Local fixtures exercise sync behavior. The owner still needs to qualify real
-Google Drive OAuth and transfers, two-account sharing, physical disk unplug
-behavior, Developer ID signing and notarization, and the household pilot.
+[Get started](docs/getting-started.md)
+
+1. Build and install FolderSync on your Mac.
+2. Set up a Google OAuth client and a Drive parent folder.
+3. Connect your account and sync one small folder.
+
+## Desktop interface (`apps/sync-ui`)
+
+The desktop app uses the live manager by default. It supports Drive account
+setup, selective folder sync, automatic scheduling after first sync, run and
+recovery inspection, and Finder status badges on mapped folder roots. Set
+`FOLDERSYNC_DEMO=1` or pass `--demo` to open the in-memory demo. `sync-cli`
+supports Drive account checks and local sync fixtures with an explicit
+`--state-dir <dir>`.
+
+Use disposable data during prototype qualification. Local fixtures exercise
+sync behavior. The owner still needs to qualify real Google Drive OAuth and
+transfers, two-account sharing, physical disk unplug behavior, Developer ID
+signing and notarization, and the household pilot.
 See the [qualification checklist](docs/qualification.md).
 
 - [Household guide](docs/household-guide.md)
 - [Pilot, rollback, and maintenance](docs/pilot-and-rollback.md)
-
-## Desktop interface (`apps/sync-ui`)
 
 The GUI uses NSH 0.6.1 with macOS system sans-serif typography and bundles
 Paper Mono for paths, IDs, and logs. Set `FOLDERSYNC_STATE_DIR` for isolated

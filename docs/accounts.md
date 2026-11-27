@@ -110,6 +110,12 @@ shutdown timeout. The desktop wizard's account controls are wired separately.
 
 ## Step 1: Create your own Google OAuth client
 
+After you create a client for the desktop app, continue with
+[Drive folder setup](getting-started.md#prepare-your-google-drive-folders).
+If only your Google account will use the client, follow Google's
+[Personal mode setup](https://support.google.com/cloud/answer/15544987)
+for a Desktop app client and enable the Drive API in that project.
+
 Rclone's shared Google Drive OAuth client is being retired during 2026. Create
 your own personal OAuth client before connecting a real Drive account:
 
@@ -133,6 +139,7 @@ your own personal OAuth client before connecting a real Drive account:
      to continue.
 
    [Google audience and publishing settings](https://support.google.com/cloud/answer/15549945)
+   [Google branding requirements for external production apps](https://support.google.com/cloud/answer/15549049)
 5. Under **Clients → Create client**, choose **Desktop app** and create the
    client. Copy the **Client ID** and **Client secret** immediately or
    download the client JSON. Google may only show the full secret at
@@ -158,7 +165,9 @@ your own personal OAuth client before connecting a real Drive account:
      `rm -f "$SECRET_FILE"`.
 
 FolderSync defaults to the `drive` scope because `drive.file` does not cover
-preexisting arbitrary Drive files.
+preexisting arbitrary Drive files. In **Data Access**, add
+`https://www.googleapis.com/auth/drive` to your project's requested scopes.
+[Google consent screen and scope setup](https://developers.google.com/workspace/guides/configure-oauth-consent#choose-scopes)
 
 ## Step 2: Create a disposable shared parent folder
 
