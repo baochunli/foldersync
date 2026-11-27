@@ -857,12 +857,11 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
     let c_pick = ctrl.clone();
     let c_bad = ctrl.clone();
     let c_good = ctrl.clone();
-    let vol_kind_str = match draft.volume_kind {
-        VolumeKind::Internal => "internal",
-        VolumeKind::External => "external",
-    };
-
-    let mut checks_col = view().flex_col().gap(px(6.0)).pt(px(8.0));
+    let mut checks_col = view()
+        .flex_col()
+        .gap(px(6.0))
+        .pt(px(8.0))
+        .test_id("wizard-location-checks");
     checks_col = checks_col.child(section_label("Checks"));
     for chk in &draft.location_checks {
         checks_col = checks_col.child(
@@ -888,27 +887,166 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
         );
     }
 
-    let space_line = draft.volume_free_bytes.map_or_else(
-        || "Free space unknown".to_owned(),
-        |free| {
-            let free_now = format_bytes(free);
-            match (draft.review_scenario, draft.cloud_total_bytes) {
-                (ReviewScenario::CloudToLocal, Some(bytes)) if bytes > free => {
-                    format!(
-                        "{free_now} free · download needs about {}",
-                        format_bytes(bytes)
-                    )
-                }
-                (ReviewScenario::CloudToLocal, Some(bytes)) => {
-                    format!(
-                        "{free_now} free now · about {} free after the first sync",
-                        format_bytes(free - bytes)
-                    )
-                }
-                _ => format!("{free_now} free"),
-            }
-        },
+    let mut loc_card = card().child(
+        view()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                text("Local folder")
+                    .w(px(120.0))
+                    .text_size(px(S_COMPACT))
+                    .text_color(p.muted),
+            )
+            .child(mono_text(draft.local_path.clone(), S_SMALL, p.fg).test_id("wizard-local-path"))
+            .child(
+                app_button(
+                    "Choose folder…",
+                    BtnKind::Default,
+                    true,
+                    false,
+                    None,
+                    None,
+                    move || {
+                        let c = c_pick.clone();
+                        let answer = pick_paths(
+                            OpenDialog::folders()
+                                .title("Choose local folder")
+                                .button_label("Choose"),
+                        );
+                        spawn(async move {
+                            if let Ok(Some(paths)) = answer.await
+                                && let Some(first) = paths.first()
+                            {
+                                c.send(UiCommand::WizardSetLocalPath(
+                                    first.to_string_lossy().into_owned(),
+                                ));
+                            }
+                        });
+                    },
+                )
+                .test_id("wizard-choose-folder-btn"),
+            ),
     );
+
+    if draft.local_path.is_empty() {
+        loc_card = loc_card
+            .child(text("Choose a folder to see its disk and free space.").text_color(p.muted));
+    } else if draft.location_check_pending {
+        const CHECKING: &str = "Checking disk and free space…";
+        loc_card = loc_card.child(
+            view()
+                .flex_col()
+                .gap(px(6.0))
+                .child(text(CHECKING).text_color(p.muted))
+                .child(progress_bar(None, 4.0, CHECKING)),
+        );
+    } else {
+        if let Some(free) = draft.volume_free_bytes {
+            loc_card = loc_card.child(render_location_capacity(draft, free));
+        }
+        if !draft.location_checks.is_empty() {
+            loc_card = loc_card.child(checks_col);
+        }
+    }
+
+    if is_demo {
+        let usual_path = format!("/Volumes/WorkSSD/{}", draft.selected_folder);
+        let replacement = if draft.location_check_pending {
+            draft.local_path.clone()
+        } else if draft.review_scenario == ReviewScenario::BothPopulated
+            && draft.local_path == usual_path
+        {
+            format!("{usual_path}-New")
+        } else {
+            usual_path
+        };
+        let pending_path = replacement.clone();
+        loc_card = loc_card.child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .pt(px(8.0))
+                .border_t_1()
+                .border_color(p.hair)
+                .child(
+                    text("Demo check preview:")
+                        .text_size(px(S_CAPTION))
+                        .text_color(p.muted),
+                )
+                .child(
+                    app_button(
+                        "Checking disk",
+                        BtnKind::Ghost,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            ctrl.send(UiCommand::DemoPreviewLocationCheck(pending_path.clone()));
+                        },
+                    )
+                    .test_id("wizard-demo-checking-folder"),
+                )
+                .child(
+                    app_button(
+                        "Valid folder",
+                        BtnKind::Ghost,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            c_good.send(UiCommand::WizardSetLocalPath(replacement.clone()));
+                        },
+                    )
+                    .test_id("wizard-demo-valid-folder"),
+                )
+                .child(
+                    app_button(
+                        "Test volume root error",
+                        BtnKind::Ghost,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            c_bad
+                                .send(UiCommand::WizardSetLocalPath("/Volumes/WorkSSD".to_owned()));
+                        },
+                    )
+                    .test_id("wizard-demo-invalid-root"),
+                ),
+        );
+    }
+
+    loc_card
+}
+
+fn render_location_capacity(draft: &WizardDraft, free: u64) -> View {
+    let p = Palette::current();
+    let vol_kind_str = match draft.volume_kind {
+        VolumeKind::Internal => "internal",
+        VolumeKind::External => "external",
+    };
+
+    let free_now = format_bytes(free);
+    let space_line = match (draft.review_scenario, draft.cloud_total_bytes) {
+        (ReviewScenario::CloudToLocal, Some(bytes)) if bytes > free => {
+            format!(
+                "{free_now} free · download needs about {}",
+                format_bytes(bytes)
+            )
+        }
+        (ReviewScenario::CloudToLocal, Some(bytes)) => {
+            format!(
+                "{free_now} free now · about {} free after the first sync",
+                format_bytes(free - bytes)
+            )
+        }
+        _ => format!("{free_now} free"),
+    };
     let used_pct = draft
         .volume_total_gb
         .saturating_sub(draft.volume_free_gb)
@@ -917,50 +1055,10 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
         .map(|v| v as u8)
         .unwrap_or(31);
 
-    let mut loc_card = card()
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap(px(12.0))
-                .child(
-                    text("Local folder")
-                        .w(px(120.0))
-                        .text_size(px(S_COMPACT))
-                        .text_color(p.muted),
-                )
-                .child(
-                    mono_text(draft.local_path.clone(), S_SMALL, p.fg).test_id("wizard-local-path"),
-                )
-                .child(
-                    app_button(
-                        "Choose folder…",
-                        BtnKind::Default,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || {
-                            let c = c_pick.clone();
-                            let answer = pick_paths(
-                                OpenDialog::folders()
-                                    .title("Choose local folder")
-                                    .button_label("Choose"),
-                            );
-                            spawn(async move {
-                                if let Ok(Some(paths)) = answer.await
-                                    && let Some(first) = paths.first()
-                                {
-                                    c.send(UiCommand::WizardSetLocalPath(
-                                        first.to_string_lossy().into_owned(),
-                                    ));
-                                }
-                            });
-                        },
-                    )
-                    .test_id("wizard-choose-folder-btn"),
-                ),
-        )
+    view()
+        .flex_col()
+        .gap(px(8.0))
+        .test_id("wizard-location-capacity")
         .child(
             view()
                 .flex_row()
@@ -1005,56 +1103,6 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
                         ),
                 ),
         )
-        .child(checks_col);
-
-    if is_demo {
-        loc_card = loc_card.child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .pt(px(8.0))
-                .border_t_1()
-                .border_color(p.hair)
-                .child(
-                    text("Demo check preview:")
-                        .text_size(px(S_CAPTION))
-                        .text_color(p.muted),
-                )
-                .child(
-                    app_button("Valid folder", BtnKind::Ghost, true, false, None, None, {
-                        let replacement = if draft.review_scenario == ReviewScenario::BothPopulated
-                            && draft.local_path == "/Volumes/WorkSSD/Projects"
-                        {
-                            "/Volumes/WorkSSD/Projects-New".to_owned()
-                        } else {
-                            "/Volumes/WorkSSD/Projects".to_owned()
-                        };
-                        move || {
-                            c_good.send(UiCommand::WizardSetLocalPath(replacement.clone()));
-                        }
-                    })
-                    .test_id("wizard-demo-valid-folder"),
-                )
-                .child(
-                    app_button(
-                        "Test volume root error",
-                        BtnKind::Ghost,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || {
-                            c_bad
-                                .send(UiCommand::WizardSetLocalPath("/Volumes/WorkSSD".to_owned()));
-                        },
-                    )
-                    .test_id("wizard-demo-invalid-root"),
-                ),
-        );
-    }
-
-    loc_card
 }
 
 fn render_step_subfolders(
@@ -1245,15 +1293,18 @@ fn render_step_subfolders(
                         .text_size(px(S_SMALL))
                         .text_color(p.fg),
                 )
-                .child(link_button(
-                    if draft.show_default_exclusions {
-                        "Hide list"
-                    } else {
-                        "Show list"
-                    },
-                    S_SMALL,
-                    move || c_toggle_def.send(UiCommand::WizardToggleDefaultExclusions),
-                )),
+                .child(
+                    link_button(
+                        if draft.show_default_exclusions {
+                            "Hide list"
+                        } else {
+                            "Show list"
+                        },
+                        S_SMALL,
+                        move || c_toggle_def.send(UiCommand::WizardToggleDefaultExclusions),
+                    )
+                    .test_id("wizard-default-exclusions-toggle"),
+                ),
         );
 
     if draft.show_default_exclusions {
@@ -1282,6 +1333,7 @@ fn render_step_subfolders(
                 .gap(px(6.0))
                 .child(
                     input()
+                        .test_id("wizard-pattern-input")
                         .flex_1()
                         .min_h(px(28.0))
                         .px(px(8.0))
@@ -1298,27 +1350,51 @@ fn render_step_subfolders(
                         .value(move || pattern_input.get())
                         .on_change(move |val: &str| pattern_input.set(val.to_owned())),
                 )
-                .child(app_button(
-                    "Add",
-                    BtnKind::Default,
-                    true,
-                    false,
-                    None,
-                    None,
-                    move || {
-                        let pat = pattern_input.get_untracked();
-                        c_add_pat.send(UiCommand::WizardAddPattern(pat));
-                        pattern_input.set(String::new());
-                    },
-                )),
+                .child(
+                    app_button(
+                        "Add",
+                        BtnKind::Default,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            let pat = pattern_input.get_untracked();
+                            c_add_pat.send(UiCommand::WizardAddPattern(pat));
+                            pattern_input.set(String::new());
+                        },
+                    )
+                    .test_id("wizard-add-pattern-btn"),
+                ),
         );
 
-    if !draft.custom_patterns.is_empty() {
-        side_card = side_card.child(mono_text(
-            format!("Added: {}", draft.custom_patterns.join(", ")),
-            S_TINY,
-            p.muted,
-        ));
+    for pattern in &draft.custom_patterns {
+        let c_remove = ctrl.clone();
+        let removed = pattern.clone();
+        side_card = side_card.child(
+            view()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(6.0))
+                .child(mono_text(pattern.clone(), S_SMALL, p.fg).min_w(px(0.0)))
+                .child(
+                    app_button(
+                        "Remove",
+                        BtnKind::Ghost,
+                        true,
+                        false,
+                        None,
+                        None,
+                        move || {
+                            c_remove.send(UiCommand::WizardRemovePattern(removed.clone()));
+                        },
+                    )
+                    .flex_none()
+                    .accessibility_label(format!("Remove {pattern}"))
+                    .test_id(&format!("remove-pattern-{pattern}")),
+                ),
+        );
     }
 
     let name_check = if draft.found_name_issues.is_empty() {
@@ -2259,7 +2335,11 @@ fn render_wizard_footer(
         let next_disabled = !draft.can_visit_step(next)
             || (draft.step == WizardStep::Account && !account_ready)
             || (draft.step == WizardStep::Folder && !folder_ready);
-        let tip = if draft.step == WizardStep::Location && !draft.location_valid() {
+        let tip = if draft.step == WizardStep::Location
+            && !draft.local_path.is_empty()
+            && !draft.location_check_pending
+            && !draft.location_valid()
+        {
             Some("Fix the location checks first")
         } else if draft.step == WizardStep::Recovery && !draft.recovery_valid() {
             Some("Fix the recovery folder checks first")

@@ -19,9 +19,9 @@ use crate::contract::{
     AttentionPriority, CloudFolderCandidate, DemoActivityPhase, DemoPreset, FinderExtensionStatus,
     FolderSize, IconKind, InspectedRunSnapshot, LocationCheck, MappingSnapshot,
     PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem,
-    ReviewScenario, RunPhase, RunRecordSnapshot, ScheduledCheck, ScreenRoute, StatusModifier,
-    SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardDraft,
-    WizardStep,
+    ReviewScenario, RunPhase, RunRecordSnapshot, SYNC_ALL_NOW_LABEL, ScheduledCheck, ScreenRoute,
+    StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts,
+    VolumeSnapshot, WizardDraft, WizardStep, is_low_space,
 };
 use crate::system_actions::{RecordingSystemActions, SystemActions};
 
@@ -29,7 +29,6 @@ use crate::system_actions::{RecordingSystemActions, SystemActions};
 pub struct DemoSource {
     snapshot: RefCell<UiSnapshot>,
     next_event_id: RefCell<u64>,
-    next_account_seq: RefCell<u32>,
     prior_account_status: RefCell<BTreeMap<AccountId, AccountStatus>>,
     system_actions: Arc<dyn SystemActions>,
 }
@@ -53,7 +52,6 @@ impl DemoSource {
         Self {
             snapshot: RefCell::new(snap),
             next_event_id: RefCell::new(100),
-            next_account_seq: RefCell::new(2),
             prior_account_status: RefCell::new(BTreeMap::new()),
             system_actions,
         }
@@ -169,7 +167,7 @@ impl DemoSource {
                                     mapping_name: m.display_name.clone(),
                                     volume_name: m.volume_name.clone(),
                                     started_label: "14:46".to_owned(),
-                                    trigger_label: "Sync ready mappings".to_owned(),
+                                    trigger_label: SYNC_ALL_NOW_LABEL.to_owned(),
                                     phase: RunPhase::Scanning { elapsed_secs: 1 },
                                 });
                             } else {
@@ -197,7 +195,7 @@ impl DemoSource {
                         self.push_event(
                             &mut snap,
                             "14:46",
-                            format!("{started}: run started (Sync ready mappings)"),
+                            format!("{started}: run started ({SYNC_ALL_NOW_LABEL})"),
                             None,
                         );
                     }
@@ -726,15 +724,11 @@ impl DemoSource {
                     );
                 }
             }
-            UiCommand::ConnectDemoAccount => {
-                if snap.accounts.is_empty() {
-                    *snap = build_snapshot(DemoPreset::WelcomeNoMappings);
-                } else {
-                    let mut seq = self.next_account_seq.borrow_mut();
-                    let new_id = AccountId::new(format!("work-{}", *seq));
-                    *seq += 1;
-                    snap.reconnecting_account = Some(new_id);
-                }
+            UiCommand::ConnectDemoAccount(Some(id)) => {
+                snap.reconnecting_account = Some(id);
+            }
+            UiCommand::ConnectDemoAccount(None) => {
+                *snap = build_snapshot(DemoPreset::WelcomeNoMappings);
             }
             UiCommand::AddLocalFixtureAccount {
                 id,
@@ -943,10 +937,18 @@ impl DemoSource {
             }
             UiCommand::WizardSetLocalPath(path) => {
                 snap.wizard.local_path = path;
+                snap.wizard.location_check_pending = false;
                 snap.wizard.no_other_sync_confirmed = false;
                 rederive_wizard_scenario(&mut snap);
                 sync_wizard_volume_from_path(&mut snap);
                 recompute_wizard_checks(&mut snap);
+            }
+            UiCommand::DemoPreviewLocationCheck(path) => {
+                snap.wizard.local_path = path;
+                snap.wizard.location_check_pending = true;
+                snap.wizard.location_checks.clear();
+                snap.wizard.volume_free_bytes = None;
+                snap.wizard.no_other_sync_confirmed = false;
             }
             UiCommand::WizardToggleSubfolder(sub_id) => {
                 if sub_id == "root" {
@@ -971,10 +973,15 @@ impl DemoSource {
                 snap.wizard.show_default_exclusions = !snap.wizard.show_default_exclusions;
             }
             UiCommand::WizardAddPattern(pattern) => {
-                let trimmed = pattern.trim().to_owned();
-                if !trimmed.is_empty() && !snap.wizard.custom_patterns.contains(&trimmed) {
-                    snap.wizard.custom_patterns.push(trimmed);
+                if snap.wizard.add_custom_pattern(&pattern) {
                     snap.wizard.no_other_sync_confirmed = false;
+                    snap.wizard.filter_review = None;
+                }
+            }
+            UiCommand::WizardRemovePattern(pattern) => {
+                if snap.wizard.remove_custom_pattern(&pattern) {
+                    snap.wizard.no_other_sync_confirmed = false;
+                    snap.wizard.filter_review = None;
                 }
             }
             UiCommand::WizardSetLocalRecoveryPath(path) => {
@@ -1461,7 +1468,8 @@ fn apply_wizard_folder_selection(snap: &mut UiSnapshot, folder: &str) {
         .find(|c| c.name == folder)
         .cloned();
     snap.wizard.selected_folder = folder.to_owned();
-    snap.wizard.local_path = format!("/Volumes/WorkSSD/{folder}");
+    snap.wizard.local_path.clear();
+    snap.wizard.location_check_pending = false;
     snap.wizard.local_recovery_path = format!("/Volumes/WorkSSD/FolderSyncRecovery/{folder}");
     snap.wizard.cloud_recovery_path = format!(
         "{}:Recovery/{}/{}",
@@ -1808,12 +1816,16 @@ fn rederive_wizard_scenario(snap: &mut UiSnapshot) {
 }
 
 fn sync_wizard_volume_from_path(snap: &mut UiSnapshot) {
+    if snap.wizard.local_path.is_empty() || is_volume_root(&snap.wizard.local_path) {
+        snap.wizard.volume_free_bytes = None;
+        return;
+    }
     if let Some(vol) = resolve_volume_for_path(&snap.wizard.local_path, &snap.volumes).cloned() {
         snap.wizard.volume_name = vol.display_name;
         snap.wizard.volume_kind = vol.identity.kind;
         snap.wizard.volume_fs = vol.filesystem;
         snap.wizard.volume_free_gb = vol.free_gb;
-        snap.wizard.volume_free_bytes = Some(vol.free_gb * 1_000_000_000);
+        snap.wizard.volume_free_bytes = vol.free_bytes;
         snap.wizard.volume_total_gb = vol.total_gb;
     }
 }
@@ -1851,7 +1863,17 @@ pub fn evaluate_location_checks(
     review_scenario: ReviewScenario,
 ) -> Vec<LocationCheck> {
     let norm = normalize_path(path);
-    let vol_root = is_volume_root(&norm);
+    if norm.is_empty() {
+        return Vec::new();
+    }
+    if is_volume_root(&norm) {
+        return vec![LocationCheck {
+            ok: false,
+            message: format!(
+                "{norm} is the top of the volume. Choose or create a folder inside it."
+            ),
+        }];
+    }
     let resolved_vol = resolve_volume_for_path(&norm, volumes);
     let vol_connected = resolved_vol.is_some_and(|v| v.connected);
     let vol_name = resolved_vol
@@ -1863,11 +1885,8 @@ pub fn evaluate_location_checks(
         .filter(|m| !m.is_variant_showcase)
         .find(|m| paths_overlap(&norm, &m.local_path));
 
-    let exists_and_empty_ok =
-        !norm.is_empty() && vol_connected && review_scenario != ReviewScenario::BothPopulated;
-    let exists_and_empty_msg = if norm.is_empty() {
-        "Choose a local folder before continuing.".to_owned()
-    } else if !vol_connected {
+    let exists_and_empty_ok = vol_connected && review_scenario != ReviewScenario::BothPopulated;
+    let exists_and_empty_msg = if !vol_connected {
         format!("{vol_name} is not connected in this demo snapshot. Choose a connected volume.")
     } else if review_scenario == ReviewScenario::BothPopulated {
         "Both the local folder and cloud folder already contain files. Choose an empty local folder.".to_owned()
@@ -1908,16 +1927,6 @@ pub fn evaluate_location_checks(
                     m.display_name, m.local_path
                 ),
                 None => "Not inside another mapping, and no mapping is inside it.".to_owned(),
-            },
-        },
-        LocationCheck {
-            ok: !vol_root,
-            message: if vol_root {
-                format!(
-                    "{norm} is the top of the volume. Choose or create a folder inside it, such as {norm}/Projects."
-                )
-            } else {
-                "Not the top of the volume.".to_owned()
             },
         },
         LocationCheck {
@@ -2084,11 +2093,10 @@ fn recount_account_mappings(snap: &mut UiSnapshot) {
 }
 
 fn default_wizard_draft(skip_account: bool) -> WizardDraft {
-    let local_path = "/Volumes/WorkSSD/Projects".to_owned();
     WizardDraft {
         changing_subfolders: false,
         filter_review: None,
-        volume_free_bytes: Some(1_400_000_000_000),
+        volume_free_bytes: None,
         step: if skip_account {
             WizardStep::Folder
         } else {
@@ -2100,7 +2108,8 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         remote_folder_path: None,
         drive_collection: None,
         location_checks: Vec::new(),
-        local_path,
+        local_path: String::new(),
+        location_check_pending: false,
         volume_name: "WorkSSD".to_owned(),
         volume_kind: VolumeKind::External,
         volume_fs: "APFS".to_owned(),
@@ -2164,9 +2173,8 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             free_label: "212 GB".to_owned(),
             total_label: "994 GB".to_owned(),
             used_percent: 79,
-            low_space: false,
+            low_space: is_low_space(212_000_000_000, 79),
             last_seen_label: None,
-            recovery_root_label: Some("~/FolderSyncRecovery".to_owned()),
         },
         VolumeSnapshot {
             identity: vol_work.clone(),
@@ -2179,9 +2187,8 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             free_label: "1.4 TB".to_owned(),
             total_label: "2 TB".to_owned(),
             used_percent: 30,
-            low_space: false,
+            low_space: is_low_space(1_400_000_000_000, 30),
             last_seen_label: None,
-            recovery_root_label: Some("/Volumes/WorkSSD/FolderSyncRecovery".to_owned()),
         },
         VolumeSnapshot {
             identity: vol_photo.clone(),
@@ -2196,7 +2203,6 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             used_percent: 0,
             low_space: false,
             last_seen_label: Some("yesterday at 21:10".to_owned()),
-            recovery_root_label: Some("/Volumes/PhotoSSD/FolderSyncRecovery".to_owned()),
         },
         VolumeSnapshot {
             identity: vol_archive.clone(),
@@ -2204,14 +2210,13 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             filesystem: "APFS".to_owned(),
             connected: true,
             total_gb: 8000,
-            free_gb: 260,
-            free_bytes: Some(260_000_000_000),
-            free_label: "260 GB".to_owned(),
+            free_gb: 26,
+            free_bytes: Some(26_000_000_000),
+            free_label: "26 GB".to_owned(),
             total_label: "8 TB".to_owned(),
-            used_percent: 97,
-            low_space: true,
+            used_percent: 99,
+            low_space: is_low_space(26_000_000_000, 99),
             last_seen_label: None,
-            recovery_root_label: Some("/Volumes/ArchiveSSD/FolderSyncRecovery".to_owned()),
         },
     ];
 
@@ -2748,7 +2753,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             "4.6 TB",
             "4.6 TB",
             Vec::new(),
-            "/Volumes/ArchiveSSD/FolderSyncRecovery/Archive",
+            "/Volumes/WorkSSD/FolderSyncRecovery/Archive",
             "14.2 GB · 7 runs",
             "household:Recovery/archive/studio-mac",
             Vec::new(),
@@ -2783,7 +2788,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             "3.1 TB",
             "3.1 TB",
             Vec::new(),
-            "/Volumes/ArchiveSSD/FolderSyncRecovery/Photos-Archive",
+            "/Volumes/WorkSSD/FolderSyncRecovery/Photos-Archive",
             "6.1 GB · 4 runs",
             "household:Recovery/photos-archive/studio-mac",
             Vec::new(),
@@ -3369,39 +3374,32 @@ pub fn rebuild_attention(snap: &mut UiSnapshot) {
         }
     }
 
-    // Advisory: low free space on connected volumes hosting mappings.
-    for vol in &snap.volumes {
-        if vol.connected && vol.low_space && !snap.mappings_for_volume(&vol.identity).is_empty() {
-            items.push(AttentionItem {
-                id: format!("attn-space-{}", vol.identity.stable_id),
-                priority: AttentionPriority::LowSpaceAdvisory,
-                mapping_id: None,
-                mapping_name: None,
-                pill_label: "Low space".to_owned(),
-                pill_tone: Tone::Attn,
-                icon: IconKind::Bang,
-                is_error_accent: false,
-                title: format!("{} · {} free", vol.display_name, vol.free_label),
-                cause: format!(
-                    "Recovery copies for mappings on {} are kept on that drive, which is nearly full.",
-                    vol.display_name
-                ),
-                what_did: "FolderSync doesn't delete recovery copies by itself.".to_owned(),
-                next_step: format!(
-                    "Free space on {}, or move older recovery copies elsewhere after checking them.",
-                    vol.display_name
-                ),
-                kind: AttentionKind::LowSpaceAdvisory {
-                    volume_name: vol.display_name.clone(),
-                    recovery_path: vol
-                        .recovery_root_label
-                        .clone()
-                        .unwrap_or_else(|| "/Volumes/ArchiveSSD/FolderSyncRecovery".to_owned()),
-                },
-            });
-        }
-    }
+    items.extend(snap.volumes.iter().filter_map(|volume| {
+        AttentionItem::low_space_advisory(volume, &snap.mappings, |path| {
+            resolve_volume_for_path(path, &snap.volumes)
+                .is_some_and(|recovery| recovery.identity == volume.identity)
+        })
+    }));
 
     items.sort_by_key(|item| item.priority);
     snap.attention_items = items;
+}
+
+#[cfg(test)]
+#[test]
+fn low_space_recovery_folder_matches_mapping_volume() {
+    let mut snap = build_snapshot(DemoPreset::AllStates);
+    let archive = snap
+        .mappings
+        .iter_mut()
+        .find(|m| m.id.as_str() == "archive")
+        .unwrap();
+    let on_volume = "/Volumes/ArchiveSSD/FolderSyncRecovery/Archive";
+    archive.local_recovery_path = on_volume.to_owned();
+    rebuild_attention(&mut snap);
+
+    assert!(snap.attention_items.iter().any(|item| matches!(
+        &item.kind,
+        AttentionKind::LowSpaceAdvisory { recovery_path: Some(path), .. } if path == on_volume
+    )));
 }

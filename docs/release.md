@@ -17,6 +17,18 @@ packaging/build-app.sh
 
 Output is physically validated inside `<repo>/target/` with zero symlinked components before any directory creation, copy, or removal (default `target/package/FolderSync.app`). The script never installs to `/Applications` and never registers with `pluginkit`.
 
+To supply an app icon at build time, pass a PNG at least 512×512 pixels or an
+`.icns` file stored outside the repository.
+
+```bash
+packaging/build-app.sh --icon /path/to/FolderSync-icon.png
+```
+
+You can also set `FOLDERSYNC_ICON` to the file path. `--icon` takes precedence.
+For PNG input the build centers the artwork on a light rounded tile and
+generates the `.icns` before signing. With neither setting, the bundle uses
+the system’s default app icon.
+
 ### Bundle Layout
 
 `packaging/build-app.sh` invokes `~/.local/bin/nsh package --target macos --id dev.foldersync.app` on `apps/sync-ui`, then embeds and verifies:
@@ -26,6 +38,7 @@ Output is physically validated inside `<repo>/target/` with zero symlinked compo
 | `Contents/MacOS/FolderSync` | NSH 0.6.1 pure-Rust macOS executable (`CFBundleIdentifier = dev.foldersync.app`) |
 | `Contents/Helpers/rclone` | Pinned `rclone` `1.76.0` executable copied from `.tools/rclone/1.76.0/rclone` after SHA-256 verification against `packaging/qualification-manifest.toml` |
 | `Contents/Resources/rclone-manifest.json` | Sealed metadata recording rclone version, platform, fixed relative path (`Contents/Helpers/rclone`), upstream archive SHA-256, upstream executable SHA-256, and post-signing helper SHA-256 |
+| `Contents/Resources/AppIcon.icns` | Optional app icon referenced by `CFBundleIconFile` |
 | `Contents/PlugIns/FolderSyncFinder.appex` | Sandboxed macOS Finder Sync extension (`CFBundleIdentifier = dev.foldersync.app.finder-extension`, `FolderSyncHostBundleIdentifier = dev.foldersync.app`) |
 | `Contents/Resources/Notices/` | `NOTICE.txt`, `FOLDERSYNC-LICENSE.txt` (MIT), verbatim `NSH-LICENSE-APACHE-2.0.txt` (NSH `v0.6.1`), verbatim `RCLONE-LICENSE-MIT.txt` (rclone `v1.76.0`), and `PAPER-MONO-OFL.txt` (SIL OFL 1.1). Exact upstream URLs and SHA-256 digests are recorded in [`packaging/notices/SOURCES.md`](../packaging/notices/SOURCES.md). |
 

@@ -23,10 +23,12 @@ use nsh_core::{
     },
     prelude::*,
 };
+#[cfg(target_os = "macos")]
+use nsh_platform_macos::objc2_app_kit::NSApplicationActivationPolicy;
 
 use crate::contract::{
-    IconKind, ScreenRoute, Tone, UiCommand, selected_stop_target, selected_sync_now_target,
-    should_show_window_at_launch,
+    IconKind, SYNC_ALL_NOW_LABEL, ScreenRoute, Tone, UiCommand, selected_stop_target,
+    selected_sync_now_target, should_show_window_at_launch,
 };
 use crate::demo::DemoSource;
 use crate::manager_source::{ManagerSource, ManagerSourceConfig, UiControlEvent};
@@ -109,6 +111,40 @@ pub fn marshal_to_main_thread(work: impl FnOnce() + Send + 'static) {
     drop(run_on_main_thread(work));
 }
 
+#[cfg(target_os = "macos")]
+fn activation_policy_for_window(visible: bool, minimized: bool) -> NSApplicationActivationPolicy {
+    if visible || minimized {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn update_activation_policy(policy: NSApplicationActivationPolicy) {
+    use nsh_platform_macos::{
+        objc2::MainThreadMarker,
+        objc2_app_kit::{NSApplication, NSRunningApplication},
+    };
+
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+    // Leave command-line and background NSH test hosts alone.
+    if NSRunningApplication::currentApplication().activationPolicy()
+        == NSApplicationActivationPolicy::Prohibited
+    {
+        return;
+    }
+    let app = NSApplication::sharedApplication(main_thread);
+    if app.activationPolicy() != policy
+        && app.setActivationPolicy(policy)
+        && policy == NSApplicationActivationPolicy::Regular
+    {
+        app.activate();
+    }
+}
+
 /// The FolderSync desktop application root component.
 #[component]
 pub fn App() -> impl IntoElement {
@@ -128,6 +164,15 @@ pub fn App() -> impl IntoElement {
     let win = main_window();
     win.on_close_press(move |_| {
         main_window().hide();
+    });
+    #[cfg(target_os = "macos")]
+    effect(move || {
+        let (visible, minimized) = win
+            .state()
+            .map(|state| (state.visible, state.minimized))
+            .unwrap_or_default();
+        let policy = activation_policy_for_window(visible, minimized);
+        marshal_to_main_thread(move || update_activation_policy(policy));
     });
 
     // Spec §3: `nsh.json` starts the window hidden (`defaultVisible: false`).
@@ -258,7 +303,7 @@ pub fn App() -> impl IntoElement {
                         main_window().show();
                         main_window().focus();
                     }),
-                    MenuItem::new("Sync ready mappings")
+                    MenuItem::new(SYNC_ALL_NOW_LABEL)
                         .disabled(ready_count == 0 || quitting)
                         .on_select(move || {
                             c_sync.send(UiCommand::SyncReadyMappings);
@@ -628,6 +673,9 @@ mod tests {
     #[test]
     fn wizard_review_blocks_both_populated() {
         let demo = DemoSource::new(DemoPreset::AllStates);
+        demo.dispatch(UiCommand::WizardSetLocalPath(
+            "/Volumes/WorkSSD/Projects".to_owned(),
+        ));
         let snap = demo.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
         assert!(snap.wizard.can_start_first_sync());
 
@@ -635,6 +683,21 @@ mod tests {
             ReviewScenario::BothPopulated,
         ));
         assert!(!blocked.wizard.can_start_first_sync());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_policy_tracks_open_and_hidden_windows() {
+        use super::{NSApplicationActivationPolicy, activation_policy_for_window};
+
+        for (visible, minimized, expected) in [
+            (true, false, NSApplicationActivationPolicy::Regular),
+            (false, false, NSApplicationActivationPolicy::Accessory),
+            (true, false, NSApplicationActivationPolicy::Regular),
+            (false, true, NSApplicationActivationPolicy::Regular),
+        ] {
+            assert_eq!(activation_policy_for_window(visible, minimized), expected);
+        }
     }
 
     #[test]

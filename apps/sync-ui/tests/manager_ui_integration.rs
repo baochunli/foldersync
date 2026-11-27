@@ -1062,6 +1062,9 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
         !s.cloud_catalog.is_empty() || s.cloud_catalog_error.is_some()
     });
     assert_eq!(catalog.cloud_catalog_error, None);
+    assert!(catalog.wizard.local_path.is_empty());
+    assert!(catalog.wizard.location_checks.is_empty());
+    assert!(!catalog.wizard.location_valid());
     let collection = catalog.cloud_catalog[0].collection.clone().unwrap();
     assert_eq!(collection.folder_id, "research-id");
     assert_eq!(collection.ancestor_ids, ["parent-id", "data-id"]);
@@ -1083,6 +1086,7 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
     });
     assert_eq!(runner.size.stop_calls(), 1);
     assert_eq!(location.action_error, None);
+    assert!(!location.wizard.location_check_pending);
     assert!(
         location.wizard.location_valid(),
         "{:?}",

@@ -131,10 +131,15 @@ them to Git.
    verifies the first sync. The default deletion limit stops a run that
    would delete more than 10% of tracked files. Check both folders and your
    backup if a run stops.
-7. In macOS **System Settings → General → Login Items & Extensions**, open
-   the **Finder** extensions and enable **FolderSync Finder**. On macOS 14,
-   look under **Privacy & Security → Extensions**. In Finder, open the
-   parent folder. The badge appears on the mapped folder itself.
+7. In macOS **System Settings → General → Login Items & Extensions**, scroll
+   to **Extensions** and turn on FolderSync's Finder extension. Recent macOS
+   versions list it under **File Providers** as **FolderSync**, not under
+   **Finder**. On macOS 14, look under **Privacy & Security → Extensions**.
+   You can also enable it in Terminal with
+   `pluginkit -e use -i dev.foldersync.app.finder-extension`.
+   Then relaunch Finder (hold Option, right-click Finder in the Dock, and
+   choose **Relaunch**) and open the parent folder. The badge appears on the
+   mapped folder itself.
 
 ## Update FolderSync
 
