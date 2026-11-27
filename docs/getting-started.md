@@ -101,19 +101,22 @@ them to Git.
    account. Return to FolderSync and wait for **Connected**. If macOS asks
    for access to the FolderSync item in your login Keychain, choose
    **Always Allow**.
-3. In **Overview**, choose **Add mapping…**. Pick one folder from `Data`
-   and a local folder. Connect your external disk first if you're using one.
-   Compare the download size with the disk's free space. Under
-   **Choose what to include**, clear any subfolders you want to skip.
+3. In **Overview**, choose **Choose a folder…** to start your first mapping.
+   Pick one folder from `Data` and a local folder. Connect your external disk
+   first if you're using one. Compare the download size with the disk's free
+   space. Under **Choose what to include**, clear any subfolders you want to skip.
    Don't map a local folder that another sync client, such as Google Drive
    for Desktop, already manages.
-4. Start with an empty destination. Choose the direction that matches
-   where your files are now.
 
-   | Where your files are | Destination | First sync |
+   Once you have a mapping, **Add mapping…** appears in **Overview**. You can
+   also choose **Mappings** → **Add mapping…** from the menu bar.
+4. Start with an empty destination. FolderSync determines the first-sync
+   direction based on which folder is empty.
+
+   | Where your files are | Destination | Message in Review |
    | --- | --- | --- |
-   | On this Mac | An empty folder inside Drive's `Data` | Upload to Drive |
-   | In Drive | An empty local folder | Download to your Mac |
+   | On this Mac | An empty folder inside Drive's `Data` | **First sync: upload to the cloud** |
+   | In Drive | An empty local folder | **First sync: download from the cloud** |
 
    If both folders contain files, use a new empty destination and keep both
    existing copies while you decide which files to sync.
@@ -122,11 +125,12 @@ them to Git.
    You can choose a different local recovery folder outside every synced
    folder. Cloud copies go under `Recovery/<Drive-folder-ID>` in your Drive
    parent.
-6. Review the direction and confirm that no other sync app manages the local
-   folder. When the checks pass, choose **Start first sync**. FolderSync
-   starts checking the mapping automatically after it verifies the first
-   sync. The default deletion limit stops a run that would delete more than
-   10% of tracked files. Check both folders and your backup if a run stops.
+6. In **Review**, check the direction shown and confirm that no other sync
+   app manages the local folder. Choose **Start first sync** when the
+   checks pass. FolderSync starts checking the mapping automatically after it
+   verifies the first sync. The default deletion limit stops a run that
+   would delete more than 10% of tracked files. Check both folders and your
+   backup if a run stops.
 7. In macOS **System Settings → General → Login Items & Extensions**, open
    the **Finder** extensions and enable **FolderSync Finder**. On macOS 14,
    look under **Privacy & Security → Extensions**. In Finder, open the
