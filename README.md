@@ -13,6 +13,62 @@ Start with one small folder.**
 2. Set up a Google OAuth client and a Drive parent folder.
 3. Connect your account and sync one small folder.
 
+## Sign, notarize, and update
+
+`packaging/build-app.sh` signs ad hoc by default. Use that build on the Mac
+that built it. Each rebuild changes the signature, so expect macOS to ask for
+Keychain access again.
+
+1. For distribution, your team's **Account Holder** must create the local
+   Developer ID Application certificate. In Xcode, open **Settings → Accounts**
+   and select your account and team. Choose **Manage Certificates → + →
+   Developer ID Application**. You can also create a certificate signing
+   request in Keychain Access and upload it under **Certificates** on the
+   Apple Developer site.
+   [Apple's certificate instructions](https://developer.apple.com/help/account/certificates/create-developer-id-certificates)
+2. Check the signing identity with `security find-identity -v -p codesigning`.
+   If it appears only without `-v`, install Apple's
+   [Developer ID G2 intermediate certificate](https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer)
+   in your login Keychain and check again. Build from the repository root.
+
+   ```sh
+   packaging/build-app.sh --sign "Developer ID Application: <Name> (<TEAM_ID>)"
+   ```
+
+3. Create the notary profile once. Enter the app-specific password at the
+   secure prompt. Never put it on the command line.
+
+   ```sh
+   xcrun notarytool store-credentials "foldersync-notary" \
+     --apple-id "<apple-id>" --team-id "<TEAM_ID>"
+   ```
+
+4. Submit the signed build and staple its ticket.
+
+   ```sh
+   packaging/notarize.sh --app target/package/FolderSync.app \
+     --keychain-profile foldersync-notary
+   ```
+
+| Where the rebuilt app will run | What to do after each rebuild |
+| --- | --- |
+| The build Mac only, copied with `ditto` | No notarization needed. |
+| Another Mac, via AirDrop, download, or a shared drive | Sign with Developer ID and notarize each build. The ticket covers that exact signed build. |
+
+With the same Developer ID signing identity and bundle ID, Keychain
+**Always Allow** and the **FolderSync Finder** setting normally carry over.
+
+Before replacing the app, choose **Pause scheduling**, let active runs
+finish, then choose **Quit FolderSync**. Move the old app to the Trash and
+copy the new bundle to Applications.
+
+```sh
+ditto target/package/FolderSync.app /Applications/FolderSync.app
+```
+
+See the [release guide](docs/release.md) for interactive credential setup and
+the full release checklist.
+
 ## Desktop interface (`apps/sync-ui`)
 
 The desktop app uses the live manager by default. It supports Drive account
