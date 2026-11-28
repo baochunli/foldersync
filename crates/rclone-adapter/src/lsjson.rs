@@ -249,7 +249,14 @@ impl LsJsonRequest {
         manifest: &QualificationManifest,
         runner: &dyn ProcessRunner,
     ) -> Result<RunOutput, LsJsonError> {
-        run_qualified(&self.engine, &self.config_path, args, manifest, runner)
+        run_qualified(
+            &self.engine,
+            &self.config_path,
+            args,
+            manifest,
+            runner,
+            None,
+        )
     }
 
     fn run_command(
@@ -288,12 +295,12 @@ impl LsJsonRequest {
         subpath: &str,
         runner: &dyn ProcessRunner,
     ) -> Result<Vec<String>, LsJsonError> {
-        let mut args = vec![
+        let mut args = self.with_config_args(vec![
             "lsjson".into(),
             self.target(subpath)?,
             "--max-depth".into(),
             "1".into(),
-        ];
+        ]);
         if self.is_drive {
             args.extend([
                 "--drive-skip-gdocs=false".into(),
@@ -302,7 +309,7 @@ impl LsJsonRequest {
                 "--drive-skip-dangling-shortcuts=false".into(),
             ]);
         }
-        let output = self.run_command(args, runner)?;
+        let output = self.run(args, &QualificationManifest::embedded()?, runner)?;
         Ok(parse_lsjson_entries(&complete_stdout(&output)?)?
             .into_iter()
             .map(|entry| entry.name)
@@ -404,6 +411,72 @@ impl LsJsonRequest {
             runner,
         )?;
         Ok(())
+    }
+
+    /// Uses the same rclone filter parser as bisync's frozen filters file.
+    pub fn list_filtered_remote(
+        &self,
+        subpath: &str,
+        filters_file: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        self.list_filtered(self.target(subpath)?, filters_file, true, runner)
+    }
+
+    pub fn list_filtered_local(
+        &self,
+        root: &Path,
+        filters_file: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        if !root.is_absolute() {
+            return Err(RequestError::RelativePath {
+                field: "inventory_root",
+                path: root.into(),
+            }
+            .into());
+        }
+        self.list_filtered(root.into(), filters_file, false, runner)
+    }
+
+    fn list_filtered(
+        &self,
+        target: OsString,
+        filters_file: &Path,
+        remote: bool,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        let mut args = vec![
+            "lsjson".into(),
+            target,
+            "--recursive".into(),
+            "--filter-from".into(),
+            filters_file.into(),
+            "--no-mimetype".into(),
+        ];
+        // Drive supplies MD5 as object metadata. It is needed to recognize the
+        // pinned engine's scratch filenames on the local destination.
+        if remote && self.is_drive {
+            args.extend([
+                "--fast-list".into(),
+                "--hash".into(),
+                "--hash-type".into(),
+                "MD5".into(),
+            ]);
+        }
+        let output = run_qualified(
+            &self.engine,
+            &self.config_path,
+            self.with_config_args(args),
+            &QualificationManifest::embedded()?,
+            runner,
+            Some(OutputLimits {
+                max_lines: 1_000_002,
+                max_total_bytes: 256 * 1024 * 1024,
+                ..Default::default()
+            }),
+        )?;
+        parse_filtered_inventory(output)
     }
 
     /// Counts supported objects without retrieving file contents.
@@ -525,6 +598,7 @@ pub fn check_filtered(
         args,
         &QualificationManifest::embedded()?,
         runner,
+        None,
     )?;
     let captured = output.output;
     if captured.dropped_lines != 0 || captured.truncated_lines != 0 {
@@ -608,6 +682,7 @@ fn run_qualified(
     args: Vec<OsString>,
     manifest: &QualificationManifest,
     runner: &dyn ProcessRunner,
+    limits: Option<OutputLimits>,
 ) -> Result<RunOutput, LsJsonError> {
     verify_binary_identity_with_manifest(engine, manifest)?;
     verify_executable_metadata(engine)?;
@@ -615,19 +690,22 @@ fn run_qualified(
     // Recursive inventory holds one JSON record per file. Keep it bounded
     // independently of diagnostic output so ordinary build trees fit while
     // incomplete inventories still fail closed.
-    let options = if args.first().is_some_and(|arg| arg == "lsjson")
-        && args.iter().any(|arg| arg == "--recursive")
-    {
-        SpawnOptions {
-            limits: OutputLimits {
+    let limits = limits.unwrap_or_else(|| {
+        if args.first().is_some_and(|arg| arg == "lsjson")
+            && args.iter().any(|arg| arg == "--recursive")
+        {
+            OutputLimits {
                 max_total_bytes: 64 * 1024 * 1024,
                 max_lines: 250_000,
                 ..OutputLimits::default()
-            },
-            ..SpawnOptions::default()
+            }
+        } else {
+            OutputLimits::default()
         }
-    } else {
-        SpawnOptions::default()
+    });
+    let options = SpawnOptions {
+        limits,
+        ..SpawnOptions::default()
     };
     let spec = ProcessSpec {
         program: engine.path().to_path_buf(),
@@ -649,6 +727,53 @@ fn run_qualified(
         });
     }
     Ok(output)
+}
+
+fn parse_filtered_inventory(output: RunOutput) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+    let incomplete = || LsJsonError::ParseJson {
+        reason: "rclone did not return a complete file inventory".into(),
+    };
+    if output.output.dropped_lines != 0 || output.output.truncated_lines != 0 {
+        return Err(incomplete());
+    }
+    // Pinned lsjson writes a JSON array with one object per line. Consume the
+    // captured lines directly so a large scan does not need another text buffer.
+    let mut lines = output
+        .output
+        .lines
+        .into_iter()
+        .filter(|line| line.stream == StreamKind::Stdout)
+        .map(|line| line.text);
+    let first = lines.next().ok_or_else(incomplete)?;
+    if first.trim() != "[" {
+        return parse_lsjson_entries(&first).and_then(|entries| {
+            if !first.trim().starts_with('[') || lines.next().is_some() {
+                Err(incomplete())
+            } else {
+                Ok(entries)
+            }
+        });
+    }
+    let mut entries = Vec::new();
+    let mut previous_had_comma = true;
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        if line == "]" && (entries.is_empty() || !previous_had_comma) && lines.next().is_none() {
+            return Ok(entries);
+        }
+        if !previous_had_comma {
+            return Err(incomplete());
+        }
+        previous_had_comma = line.ends_with(',');
+        let entry =
+            serde_json::from_str(line.strip_suffix(',').unwrap_or(line)).map_err(|err| {
+                LsJsonError::ParseJson {
+                    reason: err.to_string(),
+                }
+            })?;
+        entries.push(entry);
+    }
+    Err(incomplete())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

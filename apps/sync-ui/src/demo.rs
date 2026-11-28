@@ -285,12 +285,64 @@ impl DemoSource {
                 }
                 rebuild_attention(&mut snap);
             }
+            UiCommand::ResumeFirstSync(id) => {
+                snap.action_error = None;
+                if let Some(active) = &snap.active_run {
+                    snap.action_error = Some(format!(
+                        "Wait for {} to finish or stop it before resuming first sync.",
+                        active.mapping_name
+                    ));
+                } else if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == id)
+                    && let StatusModifier::StoppedFirstSync(stopped) = &m.modifier
+                {
+                    let progress = TransferProgress {
+                        files_transferred: stopped
+                            .files_copied
+                            .min(stopped.total_files.unwrap_or(u64::MAX)),
+                        expected_files: stopped.total_files,
+                        ..Default::default()
+                    };
+                    m.state.execution = Execution::Running;
+                    m.modifier = StatusModifier::None;
+                    m.available_actions = available_actions(&m.state);
+                    let name = m.display_name.clone();
+                    let volume_name = m.volume_name.clone();
+                    let account = m.account_id.clone();
+                    snap.wizard = default_wizard_draft(true);
+                    snap.wizard.step = WizardStep::FirstSync;
+                    snap.wizard.editing_mapping_id = Some(id.clone());
+                    snap.wizard.first_sync_mapping_id = Some(id.clone());
+                    snap.wizard.selected_folder = name.clone();
+                    snap.wizard.selected_account = account;
+                    snap.wizard.volume_name = volume_name.clone();
+                    snap.wizard.first_sync_elapsed_secs = 0;
+                    snap.wizard.review_scenario = ReviewScenario::LocalToCloud;
+                    snap.active_run = Some(ActiveRunSnapshot {
+                        run_id: RunId::new(format!("run-resume-{id}")),
+                        mapping_id: id,
+                        mapping_name: name.clone(),
+                        volume_name,
+                        started_label: "14:46".into(),
+                        trigger_label: "First sync".into(),
+                        phase: RunPhase::Transferring {
+                            elapsed_secs: 0,
+                            progress,
+                        },
+                    });
+                    self.push_event(
+                        &mut snap,
+                        "14:46",
+                        format!("{name}: first sync resumed (demo)"),
+                        None,
+                    );
+                }
+            }
             UiCommand::StopRun(id) => {
                 if snap.wizard.first_sync_mapping_id.as_ref() == Some(&id)
                     && snap
                         .active_run
                         .as_ref()
-                        .is_some_and(|run| matches!(&run.phase, RunPhase::CreatingArchive { .. }))
+                        .is_some_and(|run| run.mapping_id == id)
                 {
                     drop(snap);
                     return self.dispatch(UiCommand::WizardStopFirstSync);
@@ -1204,8 +1256,18 @@ impl DemoSource {
                 }
             }
             UiCommand::WizardStopFirstSync => {
-                // #3: Stop an in-progress first sync honestly and return to Review.
                 if let Some(mid) = snap.wizard.first_sync_mapping_id.clone() {
+                    let preparing_archive = snap.archives.iter().any(|archive| {
+                        archive.mapping_id == mid && archive.state != ArchiveState::Complete
+                    });
+                    let progress = snap
+                        .active_run
+                        .as_ref()
+                        .filter(|run| run.mapping_id == mid)
+                        .and_then(ActiveRunSnapshot::transfer_progress);
+                    let files_copied = progress.map_or(0, |progress| progress.files_transferred);
+                    let total_files = progress.and_then(|progress| progress.expected_files);
+                    let changing_subfolders = snap.wizard.changing_subfolders;
                     snap.archives.retain(|archive| {
                         archive.mapping_id != mid || archive.state == ArchiveState::Complete
                     });
@@ -1213,8 +1275,16 @@ impl DemoSource {
                         m.state = MappingState::new(
                             Readiness::NeedsInitialization,
                             Execution::Idle,
-                            Intent::Enabled,
+                            m.state.intent,
                         );
+                        if !preparing_archive && !changing_subfolders {
+                            m.modifier =
+                                StatusModifier::StoppedFirstSync(sync_manager::StoppedFirstSync {
+                                    files_copied,
+                                    total_files,
+                                    cause: None,
+                                });
+                        }
                         m.available_actions = available_actions(&m.state);
                     }
                     if snap
@@ -1225,17 +1295,18 @@ impl DemoSource {
                         snap.active_run = None;
                         promote_next_queued(&mut snap);
                     }
+                    if preparing_archive {
+                        snap.wizard.step = WizardStep::Review;
+                        snap.wizard.no_other_sync_confirmed = false;
+                        recompute_wizard_checks(&mut snap);
+                    } else if changing_subfolders {
+                        snap.wizard.first_sync_error = Some(
+                            "Subfolder update stopped. Open the mapping to review its setup."
+                                .to_owned(),
+                        );
+                    }
                 }
                 snap.wizard.first_sync_completed = false;
-                snap.wizard.first_sync_error = Some(
-                    "First sync stopped before completion. You can review and start again."
-                        .to_owned(),
-                );
-                if !snap.wizard.changing_subfolders {
-                    snap.wizard.step = WizardStep::Review;
-                    snap.wizard.no_other_sync_confirmed = false;
-                    recompute_wizard_checks(&mut snap);
-                }
             }
             UiCommand::WizardCompleteDemoArchive => {
                 let build_excluded = snap.wizard.custom_patterns.iter().any(|p| p == "build/**");
@@ -3414,6 +3485,20 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
                 true,
             ),
         ]);
+    }
+
+    if let Some(notes) = mappings.iter().find(|m| m.id.as_str() == "notes-init") {
+        let mut stopped = notes.clone();
+        stopped.id = MappingId::new("notes-stopped");
+        stopped.display_name = "Recipes".to_owned();
+        stopped.cloud_path = "household:Data/Recipes".to_owned();
+        stopped.local_path = "~/FolderSync/Recipes".to_owned();
+        stopped.modifier = StatusModifier::StoppedFirstSync(sync_manager::StoppedFirstSync {
+            files_copied: 3,
+            total_files: Some(8),
+            cause: None,
+        });
+        mappings.push(stopped);
     }
 
     let active_run = Some(ActiveRunSnapshot {

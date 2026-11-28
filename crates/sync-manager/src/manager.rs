@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -18,8 +18,9 @@ use std::{
 
 use chrono::{DateTime, TimeDelta, Utc};
 use rclone_adapter::{
-    AuthUrlCallback, BackupDir2, InitPreference, LogEvent, Outcome, OutputLimits, OutputLine,
-    Path2, ProcessControl, RunMode, SpawnOptions, StreamKind, classify_run_outcome, parse_log_line,
+    AuthUrlCallback, BackupDir2, InitPreference, LogEvent, LsJsonRequest, Outcome, OutputLimits,
+    OutputLine, Path2, ProcessControl, RealProcessRunner, RunMode, SpawnOptions, StreamKind,
+    classify_run_outcome, parse_log_line,
 };
 use serde::{Deserialize, Serialize};
 use sync_core::{
@@ -56,11 +57,11 @@ use crate::{
         ValidatedFinderAction, claim_finder_action_files,
     },
     init::{
-        DetailedEndpointInventory, DetectedVolume, EndpointInventory, decide_init_direction,
-        detect_volume_identity, detect_volume_with, establish_drive_marker,
+        DetailedEndpointInventory, DetectedVolume, EndpointInventory, ResumeInventory,
+        decide_init_direction, detect_volume_identity, detect_volume_with, establish_drive_marker,
         establish_local_pair_markers, inspect_drive_endpoint, inspect_local_endpoint,
-        inspect_local_endpoint_detailed, render_filters_file, verify_drive_marker,
-        verify_endpoint_access_marker,
+        inspect_local_endpoint_detailed, read_marker_bytes, render_filters_file,
+        verify_drive_marker_with_runner, verify_endpoint_access_marker, verify_first_sync_subset,
     },
     launcher::{BisyncLauncher, LaunchPlan, LaunchStopper, RealBisyncLauncher},
     platform::{
@@ -77,7 +78,7 @@ use crate::{
     snapshot::{
         ArchiveState, ArchiveStatus, DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, FolderSizeSnapshot,
         FolderSizeStatus, ManagerEvent, MappingCounters, MappingStatusSnapshot, SnapshotReceiver,
-        StatusSnapshot,
+        StatusSnapshot, StoppedFirstSync,
     },
     store::{
         AccountRecord, DeviceRecord, GenerationRecord, MappingRecord, RecoveryCaseRecord,
@@ -501,6 +502,9 @@ pub enum ManagerCommand {
     /// Asynchronous initialization: returns immediately and runs inventory/engine
     /// preflight on the background worker thread.
     StartInitialize(InitializeCommand),
+    ResumeFirstSync {
+        mapping_id: MappingId,
+    },
     RunNow {
         mapping_id: MappingId,
     },
@@ -1042,12 +1046,18 @@ enum QueuedJobKind {
     Prepared {
         generation_id: GenerationId,
         mode: RunMode,
-        expected: Option<RunInventory>,
+        first_sync: Option<FirstSyncRequest>,
     },
     InitializePreflight {
         expected_direction: Option<InitPreference>,
         attempt_id: u64,
     },
+}
+
+#[derive(Debug, Clone)]
+enum FirstSyncRequest {
+    Fresh { inventory: RunInventory },
+    Resume(Box<RunRecord>),
 }
 
 #[derive(Debug, Clone)]
@@ -1937,7 +1947,14 @@ impl SyncManager {
                 self.handle_add_mapping(*add, true, BTreeSet::new())
             }
             ManagerCommand::Initialize(init) => self.handle_initialize(init),
-            ManagerCommand::StartInitialize(init) => self.handle_start_initialize(init),
+            ManagerCommand::StartInitialize(init) => self.handle_start_initialize(init, false),
+            ManagerCommand::ResumeFirstSync { mapping_id } => self.handle_start_initialize(
+                InitializeCommand {
+                    mapping_id,
+                    expected_direction: None,
+                },
+                true,
+            ),
             ManagerCommand::RunNow { mapping_id } => self.handle_run_now(mapping_id),
             ManagerCommand::SyncReadyMappings => self.handle_sync_ready_mappings(),
             ManagerCommand::Pause { mapping_id } => self.handle_pause(mapping_id),
@@ -2016,6 +2033,16 @@ impl SyncManager {
         cmd: InitializeCommand,
     ) -> Result<CommandAcceptance, ManagerError> {
         self.execute(ManagerCommand::StartInitialize(cmd))
+    }
+
+    /// Queue a subset check and a second check at the existing initialization launch boundary.
+    pub fn resume_first_sync(
+        &self,
+        mapping_id: impl Into<MappingId>,
+    ) -> Result<CommandAcceptance, ManagerError> {
+        self.execute(ManagerCommand::ResumeFirstSync {
+            mapping_id: mapping_id.into(),
+        })
     }
 
     pub fn run_now(
@@ -3226,8 +3253,16 @@ impl SyncManager {
     fn handle_start_initialize(
         &self,
         cmd: InitializeCommand,
+        resume: bool,
     ) -> Result<CommandAcceptance, ManagerError> {
         let mut guard = self.inner.state.lock().unwrap();
+        if guard.shutdown {
+            return Err(ManagerError::InvalidState {
+                mapping_id: cmd.mapping_id,
+                cause: "FolderSync is shutting down.".into(),
+                next_step: "Reopen FolderSync to continue.".into(),
+            });
+        }
         if guard.storage_blocked_mappings.contains(&cmd.mapping_id) {
             return Err(ManagerError::Storage {
                 cause: format!(
@@ -3306,8 +3341,35 @@ impl SyncManager {
                 })?;
         validate_safe_path_id("mapping_id", mapping.id.as_str())?;
 
-        if mapping.state.readiness() != Readiness::NeedsInitialization
-            || mapping.state.execution != Execution::Idle
+        if guard.filter_change_running(&mapping.id)
+            || filter_change::hold(&guard.store, &mapping.id)?.is_some()
+        {
+            return Err(filter_change::rejected(
+                "Finish or restore the subfolder update before starting first sync.",
+            ));
+        }
+
+        let resume_attempt = if resume {
+            let open_cases = guard.store.list_open_recovery_cases(&mapping.id)?;
+            let attempt = guard.store.get_latest_run_for_mapping(&mapping.id)?;
+            let attempt =
+                stopped_first_sync(&mapping, attempt.as_ref(), &open_cases).ok_or_else(|| {
+                    resume_state_error(
+                        &mapping,
+                        "This mapping has no first sync that can be resumed.",
+                    )
+                })?;
+            let direction =
+                first_sync_direction(attempt).expect("stopped first sync has a direction");
+            resume_generation(&guard.store, &mapping, attempt, direction)?;
+            Some((attempt.clone(), direction))
+        } else {
+            None
+        };
+
+        if !resume
+            && (mapping.state.readiness() != Readiness::NeedsInitialization
+                || mapping.state.execution != Execution::Idle)
         {
             return Err(ManagerError::InvalidState {
                 mapping_id: mapping.id.clone(),
@@ -3338,9 +3400,16 @@ impl SyncManager {
         guard.job_queue.push_back(QueuedJob {
             automatic: false,
             mapping_id: mapping.id.clone(),
-            kind: QueuedJobKind::InitializePreflight {
-                expected_direction: cmd.expected_direction,
-                attempt_id,
+            kind: match resume_attempt {
+                Some((run, direction)) => QueuedJobKind::Prepared {
+                    generation_id: run.generation_id.clone(),
+                    mode: RunMode::Initialize(direction),
+                    first_sync: Some(FirstSyncRequest::Resume(Box::new(run))),
+                },
+                None => QueuedJobKind::InitializePreflight {
+                    expected_direction: cmd.expected_direction,
+                    attempt_id,
+                },
             },
         });
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
@@ -3366,7 +3435,7 @@ impl SyncManager {
                 !mapping.archive_folders.is_empty() && !mapping.scheduling_enabled
             })
         {
-            return self.handle_start_initialize(cmd);
+            return self.handle_start_initialize(cmd, false);
         }
         // Phase 1 (short lock): validate state, claim preflight reservation, capture inputs, then DROP mutex!
         let snapshot_inputs = {
@@ -3549,7 +3618,9 @@ impl SyncManager {
             kind: QueuedJobKind::Prepared {
                 generation_id: gen_id,
                 mode: RunMode::Initialize(direction),
-                expected: Some(preflight.expected),
+                first_sync: Some(FirstSyncRequest::Fresh {
+                    inventory: preflight.expected,
+                }),
             },
         });
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
@@ -3709,7 +3780,7 @@ impl SyncManager {
             kind: QueuedJobKind::Prepared {
                 generation_id: gen_id,
                 mode: RunMode::Normal,
-                expected: None,
+                first_sync: None,
             },
         });
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
@@ -3791,7 +3862,7 @@ impl SyncManager {
                 kind: QueuedJobKind::Prepared {
                     generation_id: gen_id,
                     mode: RunMode::Normal,
-                    expected: None,
+                    first_sync: None,
                 },
             });
             queued_ids.push(mapping.id);
@@ -4008,7 +4079,7 @@ impl SyncManager {
                 kind: QueuedJobKind::Prepared {
                     generation_id: gen_id,
                     mode: RunMode::Normal,
-                    expected: None,
+                    first_sync: None,
                 },
             });
             self.inner.worker_cv.notify_all();
@@ -5103,7 +5174,7 @@ fn schedule_tick(
             kind: QueuedJobKind::Prepared {
                 generation_id: generation,
                 mode: RunMode::Normal,
-                expected: None,
+                first_sync: None,
             },
         });
         queued = true;
@@ -5214,6 +5285,11 @@ fn drive_endpoint_error(error: AccountError) -> EndpointCheckError {
         AccountError::FolderNotFound { .. }
         | AccountError::FolderIdMismatch { .. }
         | AccountError::AmbiguousDuplicate { .. } => Some(ObservedEvent::EndpointChanged),
+        AccountError::Manager(error)
+            if matches!(error.as_ref(), ManagerError::AccessMarkerConflict { .. }) =>
+        {
+            Some(ObservedEvent::EndpointChanged)
+        }
         _ => None,
     };
     (event, Box::new(drive_error(error)))
@@ -5235,16 +5311,12 @@ fn verify_drive_generation(
             next_step: "Review the Drive collection selected for this mapping.".into(),
         }));
     }
-    drive_recovery_directory(drive, mapping, false, &|| false)
-        .map_err(|error| (None, Box::new(error)))?;
+    drive_recovery_directory(drive, mapping, false, &|| false).map_err(drive_endpoint_error)?;
     drive
         .verify_collection(&mapping.collection)
         .map_err(drive_endpoint_error)?;
-    verify_drive_marker(drive, &mapping.collection).map_err(|error| {
-        let event = matches!(error, ManagerError::AccessMarkerConflict { .. })
-            .then_some(ObservedEvent::EndpointChanged);
-        (event, Box::new(error))
-    })?;
+    verify_drive_marker_with_runner(drive, &mapping.collection, &drive.runner)
+        .map_err(drive_endpoint_error)?;
     Ok(())
 }
 
@@ -5740,6 +5812,7 @@ fn reconcile_startup_state(
         run.outcome_kind = Some("interrupted".to_string());
         run.outcome_detail = Some(cause.clone());
         run.last_verified_phase = phase;
+        read_interrupted_first_sync_progress(state_dir, &mut run);
 
         let updated_mapping = if let Some(mut mapping) = store.get_mapping(&run.mapping_id)? {
             let next = apply_event(
@@ -6137,6 +6210,99 @@ fn prepare_confirmed_archives(
     Ok(())
 }
 
+fn first_sync_direction(run: &RunRecord) -> Option<InitPreference> {
+    match run.mode.as_str() {
+        "init_path1" => Some(InitPreference::Path1),
+        "init_path2" => Some(InitPreference::Path2),
+        _ => None,
+    }
+}
+
+fn first_sync_was_stopped(run: &RunRecord) -> bool {
+    matches!(run.outcome_kind.as_deref(), Some("first_sync_stopped" | "canceled_before_spawn"))
+        // Earlier versions persisted the signal and mode but no separate user
+        // Stop outcome. Crash reconciliation persists a different phase and detail.
+        || (run.last_verified_phase == "completed"
+            && run.outcome_kind.as_deref() == Some("interrupted")
+            && run.outcome_detail.as_deref() == Some("Signal received: interrupt"))
+}
+
+fn stopped_first_sync<'a>(
+    mapping: &MappingRecord,
+    run: Option<&'a RunRecord>,
+    open_cases: &[RecoveryCaseRecord],
+) -> Option<&'a RunRecord> {
+    run.filter(|run| {
+        mapping.active_generation_id.is_none()
+            && mapping.state.readiness() != Readiness::Unconfigured
+            && matches!(
+                mapping.state.execution,
+                Execution::Idle | Execution::Interrupted
+            )
+            && run.finished_at.is_some()
+            && run.outcome_kind.as_deref() != Some("success")
+            && first_sync_direction(run).is_some()
+            && !open_cases.iter().any(|case| {
+                matches!(
+                    case.reason_kind.as_str(),
+                    "orphan_ambiguous"
+                        | "orphan_running"
+                        | "shutdown_timeout"
+                        | "child_identity_persist_failed"
+                        | FILTER_MIGRATION_HOLD
+                )
+            })
+    })
+}
+
+fn resume_state_error(mapping: &MappingRecord, cause: &str) -> ManagerError {
+    ManagerError::InvalidState {
+        mapping_id: mapping.id.clone(),
+        cause: cause.to_owned(),
+        next_step: "Preserve both folders and review the first-sync setup.".into(),
+    }
+}
+
+fn resume_generation(
+    store: &SqliteStateStore,
+    mapping: &MappingRecord,
+    run: &RunRecord,
+    direction: InitPreference,
+) -> Result<GenerationRecord, ManagerError> {
+    let changed = || {
+        resume_state_error(
+            mapping,
+            "The mapping or its exclusions have changed since first sync stopped.",
+        )
+    };
+    let generation = store
+        .get_generation(&run.generation_id)?
+        .ok_or_else(changed)?;
+    let mut exclusions: BTreeSet<_> = mapping.exclusions.iter().cloned().collect();
+    exclusions.extend(archive_staging_filter(&mapping.archive_folders));
+    let expected_direction = match direction {
+        InitPreference::Path1 => "path1",
+        InitPreference::Path2 => "path2",
+    };
+    if mapping.active_generation_id.is_some()
+        || run.mapping_id != mapping.id
+        || generation.mapping_id != mapping.id
+        || generation.generation_number + 1 != store.next_generation_number(&mapping.id)?
+        || generation.initial_direction.as_deref() != Some(expected_direction)
+        || generation.config.effective_filters != exclusions
+        || generation.config.local_binding != mapping.local_binding
+        || generation.config.recovery_policy.max_delete_percent.value()
+            != mapping.max_delete_percent
+        || generation.fingerprint != generation.config.fingerprint().to_hex()
+        || generation.workdir_path != run.workdir_path
+        || generation.config.path2 != mapping.remote_endpoint_value
+        || generation.config.selected_folder_id != mapping.collection.folder_id
+    {
+        return Err(changed());
+    }
+    Ok(generation)
+}
+
 fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapshot, ManagerError> {
     let store = &guard.store;
     let scheduling_paused = guard.scheduling_paused;
@@ -6266,6 +6432,30 @@ fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapsh
         {
             text = "Last run failed — retry manually".to_string();
         }
+        let resume_run = stopped_first_sync(&m, latest_run.as_ref(), &open_cases);
+        let resume_run = if let Some(run) = resume_run
+            && let Some(direction) = first_sync_direction(run)
+        {
+            match resume_generation(store, &m, run, direction) {
+                Ok(_) => Some(run),
+                Err(ManagerError::InvalidState { .. }) => None,
+                Err(err) => return Err(err),
+            }
+        } else {
+            None
+        };
+        let stopped_first_sync = resume_run.map(|run| StoppedFirstSync {
+            files_copied: run
+                .files_transferred
+                .saturating_add(run.files_already_present),
+            total_files: run.first_sync_total_files,
+            cause: (!first_sync_was_stopped(run))
+                .then(|| run.outcome_detail.clone())
+                .flatten(),
+        });
+        if let Some(stopped) = &stopped_first_sync {
+            text = stopped.status_text();
+        }
         let mut actions = available_actions(&m.state);
         if underway.is_some() {
             actions.retain(|action| *action != sync_core::AvailableAction::ForceStop);
@@ -6340,6 +6530,7 @@ fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapsh
             last_run_outcome: m.last_run_outcome,
             last_run_completed_at: m.last_run_completed_at,
             last_run_summary: m.last_run_summary_text,
+            stopped_first_sync,
             unreviewed_conflict_run_id: m.unreviewed_conflict_run_id,
             unreviewed_conflict_paths,
             exclusions: m.exclusions,
@@ -6454,8 +6645,8 @@ fn drive_recovery_directory(
     mapping: &MappingRecord,
     create: bool,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<String, ManagerError> {
-    validate_drive_folder_id(&mapping.collection.folder_id).map_err(drive_error)?;
+) -> Result<String, AccountError> {
+    validate_drive_folder_id(&mapping.collection.folder_id)?;
     validate_safe_path_id("device_id", mapping.device_id.as_str())?;
     let mut parent = String::new();
     for name in [
@@ -6468,11 +6659,8 @@ fn drive_recovery_directory(
         } else {
             format!("{parent}/{name}")
         };
-        let inspect = || -> Result<bool, ManagerError> {
-            let entries = drive
-                .request
-                .list_entries(&parent, false, &drive.runner)
-                .map_err(|err| drive_error(err.into()))?;
+        let inspect = || -> Result<bool, AccountError> {
+            let entries = drive.request.list_entries(&parent, false, &drive.runner)?;
             let mut matches = entries
                 .iter()
                 .filter(|entry| entry.name.eq_ignore_ascii_case(name));
@@ -6494,22 +6682,20 @@ fn drive_recovery_directory(
                         "The Drive recovery folder `{path}` is ambiguous or overlaps a synced folder."
                     ),
                     next_step: "Review the Recovery folder under the shared parent.".into(),
-                }),
+                }.into()),
             }
         };
         let mut present = inspect()?;
         if !present && create && !is_cancelled() {
-            drive
-                .request
-                .mkdir(&path, &drive.runner)
-                .map_err(|err| drive_error(err.into()))?;
+            drive.request.mkdir(&path, &drive.runner)?;
             present = inspect()?;
         }
         if !present {
             return Err(ManagerError::PreflightRejected {
                 cause: format!("The Drive recovery folder `{path}` is unavailable."),
                 next_step: "Check access to the Recovery folder under the shared parent.".into(),
-            });
+            }
+            .into());
         }
         parent = path;
     }
@@ -6768,7 +6954,8 @@ fn run_init_preflight_unlocked(
                 next_step: "Verify permissions on the recovery drive and retry.".into(),
             })?;
             verify_recovery_root(inner.volume_probe.as_ref(), &mapping.local_recovery_root)?;
-            let recovery = drive_recovery_directory(&drive, mapping, true, is_cancelled)?;
+            let recovery = drive_recovery_directory(&drive, mapping, true, is_cancelled)
+                .map_err(drive_error)?;
             if is_cancelled() {
                 return Ok(None);
             }
@@ -7025,7 +7212,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                     QueuedJobKind::Prepared {
                         generation_id,
                         mode,
-                        expected,
+                        first_sync,
                     } => {
                         match claim_and_prepare_locked(
                             &inner,
@@ -7033,7 +7220,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                             &job.mapping_id,
                             generation_id,
                             *mode,
-                            *expected,
+                            first_sync.as_ref(),
                         ) {
                             Ok(Some(prepared)) => {
                                 guard.worker_busy = true;
@@ -7178,7 +7365,9 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                                         &mapping_id,
                                         &gen_id,
                                         mode,
-                                        Some(out.expected),
+                                        Some(&FirstSyncRequest::Fresh {
+                                            inventory: out.expected,
+                                        }),
                                     ) {
                                         Ok(opt) => opt,
                                         Err(err) => {
@@ -7302,6 +7491,7 @@ struct PreparedRun {
     mode_label: String,
     is_init: bool,
     expected: Option<RunInventory>,
+    is_resume: bool,
     log_file: fs::File,
 }
 
@@ -7313,7 +7503,7 @@ fn claim_and_prepare_locked(
     mapping_id: &MappingId,
     generation_id: &GenerationId,
     mode: RunMode,
-    expected: Option<RunInventory>,
+    first_sync: Option<&FirstSyncRequest>,
 ) -> Result<Option<PreparedRun>, ManagerError> {
     if guard.shutdown || guard.storage_blocked_mappings.contains(mapping_id) {
         return Ok(None);
@@ -7330,6 +7520,10 @@ fn claim_and_prepare_locked(
         return Ok(None);
     }
     let is_init = matches!(mode, RunMode::Initialize(_));
+    let resume_from = match first_sync {
+        Some(FirstSyncRequest::Resume(run)) => Some(run.as_ref()),
+        _ => None,
+    };
     if !is_init
         && (mapping.state.intent == Intent::Paused
             || mapping.state.readiness() != Readiness::Ready
@@ -7341,7 +7535,10 @@ fn claim_and_prepare_locked(
         let _ = publish_updated_snapshot(inner, guard);
         return Ok(None);
     }
-    if is_init && mapping.state.readiness() != Readiness::NeedsInitialization {
+    if is_init
+        && resume_from.is_none()
+        && mapping.state.readiness() != Readiness::NeedsInitialization
+    {
         mapping.state.execution = Execution::Idle;
         mapping.updated_at = inner.clock.now_rfc3339();
         guard.store.update_mapping_runtime(&mapping)?;
@@ -7364,7 +7561,7 @@ fn claim_and_prepare_locked(
         mapping,
         generation_id,
         RunPurpose::Bisync(mode),
-        expected,
+        first_sync,
     )
     .map(Some)
 }
@@ -7381,7 +7578,7 @@ fn prepare_run_locked(
     mut mapping: MappingRecord,
     generation_id: &GenerationId,
     purpose: RunPurpose,
-    expected: Option<RunInventory>,
+    first_sync: Option<&FirstSyncRequest>,
 ) -> Result<PreparedRun, ManagerError> {
     let mode = match purpose {
         RunPurpose::Bisync(mode) => mode,
@@ -7389,14 +7586,21 @@ fn prepare_run_locked(
     };
     let is_init =
         matches!(mode, RunMode::Initialize(_)) && !guard.filter_change_running(&mapping.id);
-    let generation =
+    let resume_from = match first_sync {
+        Some(FirstSyncRequest::Resume(run)) => Some(run.as_ref()),
+        _ => None,
+    };
+    let generation = if let (Some(run), RunMode::Initialize(direction)) = (resume_from, mode) {
+        resume_generation(&guard.store, &mapping, run, direction)?
+    } else {
         guard
             .store
             .get_generation(generation_id)?
             .ok_or_else(|| ManagerError::NotFound {
                 cause: format!("Generation `{generation_id}` is missing."),
                 next_step: "Inspect mapping configuration.".to_string(),
-            })?;
+            })?
+    };
     let account = guard
         .store
         .get_account(&mapping.account_id)?
@@ -7419,15 +7623,21 @@ fn prepare_run_locked(
         &mapping.remote_endpoint_kind,
         &mapping.remote_endpoint_value,
     )?;
+    let backup_run = resume_from.map_or(&run_id, |run| &run.id);
+    // A resume row retains the same backup arguments across subsequent retries.
+    let backup_id = resume_from
+        .and_then(|run| run.backup_dir1.file_name().and_then(|part| part.to_str()))
+        .unwrap_or(backup_run.as_str());
+    validate_safe_path_id("backup_run_id", backup_id)?;
     let backup_dir1 = mapping
         .local_recovery_root
         .join(mapping.id.as_str())
-        .join(run_id.as_str());
+        .join(backup_id);
     let (backup_dir2, backup_dir2_str) = match &remote_ep {
         RemoteEndpoint::LocalDir(_) => {
             let p = Path::new(&mapping.cloud_recovery_path)
                 .join(mapping.device_id.as_str())
-                .join(run_id.as_str());
+                .join(backup_id);
             let s = p.to_string_lossy().into_owned();
             (BackupDir2::LocalDir(p), s)
         }
@@ -7437,7 +7647,7 @@ fn prepare_run_locked(
                 .split_once(':')
                 .map(|(_, rest)| rest)
                 .unwrap_or(mapping.cloud_recovery_path.as_str());
-            let path = format!("{prefix}/{}/{}", mapping.device_id, run_id);
+            let path = format!("{prefix}/{}/{backup_id}", mapping.device_id);
             let s = format!("{remote}:{path}");
             (
                 BackupDir2::Remote {
@@ -7448,6 +7658,15 @@ fn prepare_run_locked(
             )
         }
     };
+
+    if let Some(prior) = resume_from
+        && (prior.backup_dir1 != backup_dir1 || prior.backup_dir2 != backup_dir2_str)
+    {
+        return Err(resume_state_error(
+            &mapping,
+            "The first-sync recovery folders have changed.",
+        ));
+    }
 
     let mode_label = match purpose {
         RunPurpose::MoveExcluded => "filter_move",
@@ -7488,6 +7707,15 @@ fn prepare_run_locked(
         last_verified_phase: "pre_spawn".to_string(),
         files_checked: 0,
         files_transferred: 0,
+        first_sync_total_files: match first_sync {
+            Some(FirstSyncRequest::Fresh { inventory }) => Some(inventory.files),
+            Some(FirstSyncRequest::Resume(run)) => run.first_sync_total_files,
+            None => None,
+        },
+        files_already_present: resume_from.map_or(0, |run| {
+            run.files_already_present
+                .saturating_add(run.files_transferred)
+        }),
         bytes_transferred: 0,
         conflict_count: 0,
     };
@@ -7538,7 +7766,11 @@ fn prepare_run_locked(
         plan,
         mode_label,
         is_init,
-        expected,
+        expected: match first_sync {
+            Some(FirstSyncRequest::Fresh { inventory }) => Some(*inventory),
+            _ => None,
+        },
+        is_resume: resume_from.is_some(),
         log_file,
     })
 }
@@ -7757,6 +7989,16 @@ fn abort_endpoint_check_failed_locked(
         );
     }
     let _ = publish_updated_snapshot(inner, guard);
+    if outcome_kind == "preflight_failed" && first_sync_direction(&run).is_some() {
+        inner
+            .event_bus
+            .publish_event(ManagerEvent::PreflightFailed {
+                mapping_id: run.mapping_id.clone(),
+                cause: err.cause(),
+                next_step: err.next_step(),
+                timestamp: now.clone(),
+            });
+    }
     inner.event_bus.publish_event(ManagerEvent::RunFinished {
         mapping_id: run.mapping_id,
         run_id: run.id,
@@ -7871,6 +8113,234 @@ fn launch_cancellation(guard: &SharedState, run_id: &RunId) -> Option<bool> {
     }
 }
 
+fn inspect_resume_subset(
+    inner: &ManagerInner,
+    mapping: &MappingRecord,
+    generation: &GenerationRecord,
+    plan: &LaunchPlan,
+    drive: Option<&LockedDrive<'_>>,
+) -> Result<ResumeInventory, AccountError> {
+    let local = &generation.config.path1;
+    let remote = Path::new(&generation.config.path2);
+    let filters = &generation.filters_file_path;
+    reject_symlinks_under_root("filters", &inner.state_dir, filters)?;
+    reject_symlinks_under_root(
+        "filter checksum",
+        &inner.state_dir,
+        &filters.with_extension("txt.md5"),
+    )?;
+    let expected = render_filters_file(&generation.config.effective_filters);
+    let mut actual = Vec::new();
+    let read_result = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(filters)
+        .and_then(|file| {
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other("filters are not an ordinary file"));
+            }
+            file.take(expected.len() as u64 + 1)
+                .read_to_end(&mut actual)
+        });
+    if read_result.is_err() || actual != expected.as_bytes() {
+        return Err(resume_state_error(
+            mapping,
+            "The saved first-sync filters have changed or cannot be read.",
+        )
+        .into());
+    }
+
+    let marker_error =
+        || resume_state_error(mapping, "The first-sync access markers no longer match.");
+    let local_marker =
+        read_marker_bytes(&local.join(ACCESS_MARKER_FILENAME)).map_err(|_| marker_error())?;
+    let (local_entries, remote_entries) = if let Some(drive) = drive {
+        let collection = &mapping.collection;
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let runner = rclone_adapter::ControlledProcessRunner {
+            runner: drive.runner.runner,
+            control: &control,
+        };
+        if verify_drive_marker_with_runner(drive, collection, &runner)? != local_marker {
+            return Err(marker_error().into());
+        }
+        (
+            drive.request.list_filtered_local(local, filters, &runner)?,
+            drive
+                .request
+                .list_filtered_remote(&collection.display_path, filters, &runner)?,
+        )
+    } else {
+        if read_marker_bytes(&remote.join(ACCESS_MARKER_FILENAME)).map_err(|_| marker_error())?
+            != local_marker
+        {
+            return Err(marker_error().into());
+        }
+        let engine = inner.accounts.qualify_engine()?;
+        let request = LsJsonRequest::new(engine, plan.config_path.clone(), "fixture", false, None)?;
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let runner = rclone_adapter::ControlledProcessRunner {
+            runner: &RealProcessRunner,
+            control: &control,
+        };
+        (
+            request.list_filtered_local(local, filters, &runner)?,
+            request.list_filtered_local(remote, filters, &runner)?,
+        )
+    };
+    match plan.mode {
+        RunMode::Initialize(InitPreference::Path1) => verify_first_sync_subset(
+            &local_entries,
+            &remote_entries,
+            local,
+            remote,
+            drive.is_none(),
+            drive.is_some(),
+        ),
+        RunMode::Initialize(InitPreference::Path2) => verify_first_sync_subset(
+            &remote_entries,
+            &local_entries,
+            remote,
+            local,
+            true,
+            drive.is_some(),
+        ),
+        RunMode::Normal => unreachable!("only initialization is resumable"),
+    }
+    .map_err(Into::into)
+}
+
+fn archive_owned_resume_partials(
+    prepared: &PreparedRun,
+    inventory: ResumeInventory,
+) -> Result<(), ManagerError> {
+    if inventory.partials.is_empty() {
+        return Ok(());
+    }
+    let (destination, recovery_root, backup) = match prepared.plan.mode {
+        RunMode::Initialize(InitPreference::Path1) => (
+            Path::new(&prepared.generation.config.path2),
+            Path::new(&prepared.mapping.cloud_recovery_path),
+            Path::new(&prepared.run.backup_dir2),
+        ),
+        RunMode::Initialize(InitPreference::Path2) => (
+            prepared.generation.config.path1.as_path(),
+            prepared.mapping.local_recovery_root.as_path(),
+            prepared.run.backup_dir1.as_path(),
+        ),
+        RunMode::Normal => unreachable!("only initialization is resumable"),
+    };
+    let io_error = |err: io::Error| ManagerError::Io {
+        cause: format!("Could not preserve an interrupted rclone staging file: {err}."),
+        next_step:
+            "Make sure the recovery folder is writable and on the same disk as the destination."
+                .into(),
+    };
+    reject_symlinks_under_root("resume recovery", recovery_root, backup)?;
+    let paths = inventory
+        .partials
+        .into_iter()
+        .map(|(relative, size)| {
+            let source = reject_symlinks_under_root(
+                "interrupted transfer",
+                destination,
+                &destination.join(&relative),
+            )?;
+            let meta = fs::symlink_metadata(&source).map_err(io_error)?;
+            if !meta.is_file() || meta.len() != size {
+                return Err(resume_state_error(
+                    &prepared.mapping,
+                    "An interrupted transfer changed during verification.",
+                ));
+            }
+            Ok((source, relative))
+        })
+        .collect::<Result<Vec<_>, ManagerError>>()?;
+    fs::create_dir_all(backup).map_err(io_error)?;
+    let archive = backup.join(format!("partials-{}", prepared.run.id));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&archive)
+        .map_err(io_error)?;
+    for (source, relative) in paths {
+        let target = archive.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(io_error)?;
+        }
+        fs::rename(source, target).map_err(io_error)?;
+    }
+    Ok(())
+}
+
+fn preserve_prior_first_sync_lock(
+    inner: &ManagerInner,
+    prepared: &PreparedRun,
+) -> Result<(), ManagerError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct LockEvidence {
+        #[serde(rename = "PID")]
+        pid: String,
+        session: String,
+    }
+
+    let workdir = &prepared.plan.workdir;
+    reject_symlinks_under_root("first-sync workdir", &inner.state_dir, workdir)?;
+    let invalid = || {
+        resume_state_error(
+            &prepared.mapping,
+            "FolderSync could not prove that the first-sync work directory lock is stale.",
+        )
+    };
+    let mut lock = None;
+    for entry in fs::read_dir(workdir).map_err(|_| invalid())? {
+        let entry = entry.map_err(|_| invalid())?;
+        let kind = entry.file_type().map_err(|_| invalid())?;
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(invalid());
+        }
+        if entry.path().extension().is_some_and(|ext| ext == "lck") {
+            if lock.is_some() || !kind.is_file() {
+                return Err(invalid());
+            }
+            lock = Some(entry.path());
+        }
+    }
+    let Some(lock) = lock else {
+        return Ok(());
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock)
+        .map_err(|_| invalid())?;
+    let evidence: LockEvidence = serde_json::from_reader(file.take(4096)).map_err(|_| invalid())?;
+    let pid = evidence.pid.parse().map_err(|_| invalid())?;
+    let runs = inner
+        .state
+        .lock()
+        .unwrap()
+        .store
+        .list_runs_for_mapping(&prepared.mapping.id)?;
+    if Path::new(&evidence.session) != lock.with_extension("")
+        || !runs.iter().any(|run| {
+            run.finished_at.is_some()
+                && run.child_pid == Some(pid)
+                && run.generation_id == prepared.generation.id
+                && &run.workdir_path == workdir
+                && probe_orphan_liveness(inner.process_inspector.as_ref(), pid, Some(run))
+                    == Some(false)
+        })
+        || inner
+            .process_inspector
+            .find_processes_referencing_workdir(workdir)
+            .is_some_and(|pids| !pids.is_empty())
+    {
+        return Err(invalid());
+    }
+    fs::rename(&lock, prepared.run.run_dir.join("interrupted-bisync.lck")).map_err(|_| invalid())
+}
+
 fn execute_prepared_job(
     inner: &Arc<ManagerInner>,
     mut prepared: PreparedRun,
@@ -7918,9 +8388,55 @@ fn execute_prepared_job(
             return;
         }
     };
-    if let Some(drive) = verified_drive.or(drive.as_ref()) {
+    let drive = verified_drive.or(drive.as_ref());
+    if let Some(drive) = drive {
         prepared.plan.config_path = drive.account.config_path.clone();
         prepared.plan.password_command = drive.request.password_command().cloned();
+    }
+
+    let resume = prepared.is_resume;
+    if resume {
+        let identity = drive.map_or(Ok(()), |drive| {
+            verify_drive_generation(drive, &prepared.mapping, &prepared.generation)
+        });
+        let first_check = identity
+            .and_then(|()| {
+                inspect_resume_subset(
+                    inner,
+                    &prepared.mapping,
+                    &prepared.generation,
+                    &prepared.plan,
+                    drive,
+                )
+                .map_err(drive_endpoint_error)
+            })
+            .and_then(|inventory| {
+                // Check Stop/shutdown before preserving any scratch evidence.
+                let guard = inner.state.lock().unwrap();
+                if launch_cancellation(&guard, &prepared.run.id).is_some() {
+                    return Ok(());
+                }
+                drop(guard);
+                preserve_prior_first_sync_lock(inner, &prepared)
+                    .and_then(|()| archive_owned_resume_partials(&prepared, inventory))
+                    .map_err(|err| (None, Box::new(err)))
+            });
+        if let Err((event, err)) = first_check {
+            let mut guard = inner.state.lock().unwrap();
+            if let Some(forced) = launch_cancellation(&guard, &prepared.run.id) {
+                abort_before_spawn_locked(inner, &mut guard, prepared.run, forced);
+            } else {
+                abort_endpoint_check_failed_locked(
+                    inner,
+                    &mut guard,
+                    prepared.run,
+                    event,
+                    *err,
+                    volume,
+                );
+            }
+            return;
+        }
     }
 
     // Qualify engine and construct the request outside the state mutex.
@@ -7932,12 +8448,89 @@ fn execute_prepared_job(
         }
     };
 
+    // Validate filesystem inputs outside the mutex. Recheck the active run
+    // and cancellation under the lock immediately before spawn and PID commit.
+    let volume = observe_binding(inner.volume_probe.as_ref(), &prepared.mapping.local_binding);
+    let verify_backups = || {
+        reject_symlinks_under_root(
+            "backup_dir1",
+            &prepared.mapping.local_recovery_root,
+            &prepared.run.backup_dir1,
+        )?;
+        if prepared.mapping.remote_endpoint_kind == "local_dir" {
+            reject_symlinks_under_root(
+                "backup_dir2",
+                Path::new(&prepared.mapping.cloud_recovery_path),
+                Path::new(&prepared.run.backup_dir2),
+            )?;
+        }
+        Ok(())
+    };
+    let verification =
+        verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)
+            .and_then(|()| verify_backups().map_err(|err| (None, Box::new(err))))
+            .and_then(|()| {
+                if verified_drive.is_none()
+                    && let Some(drive) = drive
+                {
+                    verify_drive_generation(drive, &prepared.mapping, &prepared.generation)?;
+                }
+                Ok(())
+            });
+    let verification = verification.and_then(|()| {
+        if !resume {
+            return Ok(None);
+        }
+        let inventory = inspect_resume_subset(
+            inner,
+            &prepared.mapping,
+            &prepared.generation,
+            &prepared.plan,
+            drive,
+        )
+        .map_err(drive_endpoint_error)?;
+        if !inventory.partials.is_empty() {
+            return Err((
+                None,
+                Box::new(resume_state_error(
+                    &prepared.mapping,
+                    "A new interrupted transfer appeared while checking the destination.",
+                )),
+            ));
+        }
+        Ok(Some(inventory))
+    });
+    let mut run = prepared.run;
+    let mut expected = prepared.expected;
+    let mut bytes_already_present = 0;
+    match verification {
+        Ok(Some(inventory)) => {
+            run.first_sync_total_files = Some(inventory.total_files);
+            run.files_already_present = inventory.files_already_present;
+            bytes_already_present = inventory.bytes_already_present;
+            expected = inventory.total_bytes.map(|bytes| RunInventory {
+                files: inventory.total_files,
+                bytes,
+            });
+        }
+        Ok(None) => {}
+        Err((event, err)) => {
+            let mut guard = inner.state.lock().unwrap();
+            if let Some(forced) = launch_cancellation(&guard, &run.id) {
+                abort_before_spawn_locked(inner, &mut guard, run, forced);
+            } else {
+                abort_endpoint_check_failed_locked(inner, &mut guard, run, event, *err, volume);
+            }
+            return;
+        }
+    }
+    let files_already_present = run.files_already_present;
+    let first_sync_total_files = run.first_sync_total_files;
     let (line_tx, line_rx) = mpsc::sync_channel::<OutputLine>(1024);
     let forwarder_inner = Arc::clone(inner);
-    let fwd_mapping = prepared.run.mapping_id.clone();
-    let fwd_run = prepared.run.id.clone();
+    let fwd_mapping = run.mapping_id.clone();
+    let fwd_run = run.id.clone();
     let mut log_file = prepared.log_file;
-    let expected = prepared.expected;
     // Stream valid NDJSON lines to disk live during the run (HIGH #8) and emit
     // live transfer progress events from parsed rclone JSON stats (HIGH #14).
     let forwarder = thread::spawn(move || {
@@ -7969,9 +8562,12 @@ fn execute_prepared_job(
                             mapping_id: fwd_mapping.clone(),
                             run_id: fwd_run.clone(),
                             bytes_transferred: max_bytes,
+                            bytes_already_present,
                             expected_bytes: expected.map(|total| total.bytes),
-                            expected_files: expected.map(|total| total.files),
+                            expected_files: first_sync_total_files,
                             files_transferred: max_transfers,
+                            files_already_present,
+                            first_sync_total_files,
                             files_checked: max_checks,
                             timestamp: ts.clone(),
                         });
@@ -7998,34 +8594,6 @@ fn execute_prepared_job(
         let _ = log_file.sync_all();
     });
 
-    // Validate filesystem inputs outside the mutex. Recheck the active run
-    // and cancellation under the lock immediately before spawn and PID commit.
-    let volume = observe_binding(inner.volume_probe.as_ref(), &prepared.mapping.local_binding);
-    let verify_backups = || {
-        reject_symlinks_under_root(
-            "backup_dir1",
-            &prepared.mapping.local_recovery_root,
-            &prepared.run.backup_dir1,
-        )?;
-        if prepared.mapping.remote_endpoint_kind == "local_dir" {
-            reject_symlinks_under_root(
-                "backup_dir2",
-                Path::new(&prepared.mapping.cloud_recovery_path),
-                Path::new(&prepared.run.backup_dir2),
-            )?;
-        }
-        Ok(())
-    };
-    let verification =
-        verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)
-            .and_then(|()| verify_backups().map_err(|err| (None, Box::new(err))))
-            .and_then(|()| {
-                if let Some(drive) = &drive {
-                    verify_drive_generation(drive, &prepared.mapping, &prepared.generation)?;
-                }
-                Ok(())
-            });
-    let mut run = prepared.run;
     let launched = {
         let mut guard = inner.state.lock().unwrap();
         if let Some(is_force_stopped) = launch_cancellation(&guard, &run.id) {
@@ -8036,11 +8604,10 @@ fn execute_prepared_job(
             let _ = forwarder.join();
             return;
         }
-
-        if let Err((event, err)) = verification {
+        if resume && let Err(err) = guard.store.update_first_sync_progress(&run) {
             drop(prepared_launch);
             drop(line_tx);
-            abort_endpoint_check_failed_locked(inner, &mut guard, run, event, *err, volume);
+            abort_endpoint_check_failed_locked(inner, &mut guard, run, None, err, volume);
             drop(guard);
             let _ = forwarder.join();
             return;
@@ -8134,13 +8701,59 @@ fn execute_prepared_job(
         );
     }
 
+    if resume {
+        inner.event_bus.publish_event(ManagerEvent::RunProgress {
+            mapping_id: run.mapping_id.clone(),
+            run_id: run.id.clone(),
+            bytes_transferred: 0,
+            bytes_already_present,
+            expected_bytes: expected.map(|total| total.bytes),
+            expected_files: first_sync_total_files,
+            files_transferred: 0,
+            files_already_present,
+            first_sync_total_files,
+            files_checked: 0,
+            timestamp: inner.clock.now_rfc3339(),
+        });
+    }
+
     // 4. Wait for child completion without holding the manager state lock.
     let wait_res = launched.wait();
     let _ = forwarder.join();
 
     match wait_res {
         Ok(run_out) => {
-            finalize_completed_run(inner, run, &prepared.mapping, prepared.is_init, run_out);
+            // Recount local fixtures when a stopped process exits before its
+            // final stats interval. A Drive stop completes from recorded
+            // evidence. Resume gets a fresh verified count.
+            let observe_stopped = prepared.is_init && drive.is_none() && {
+                let guard = inner.state.lock().unwrap();
+                !guard.shutdown
+                    && guard.active_run.as_ref().is_some_and(|active| {
+                        active.stop_requested && !active.volume_lost && !active.force_stopped
+                    })
+            };
+            let stopped_inventory = if observe_stopped {
+                inspect_resume_subset(
+                    inner,
+                    &prepared.mapping,
+                    &prepared.generation,
+                    &prepared.plan,
+                    drive,
+                )
+                .ok()
+            } else {
+                None
+            };
+            finalize_completed_run(
+                inner,
+                run,
+                &prepared.mapping,
+                prepared.is_init,
+                resume,
+                run_out,
+                stopped_inventory,
+            );
         }
         Err(err) => {
             finish_with_launch_error(inner, run, err);
@@ -8404,26 +9017,82 @@ fn map_adapter_outcome(
     }
 }
 
+fn first_sync_transfer_counts(
+    lines: impl IntoIterator<Item = impl AsRef<str>>,
+    is_init: bool,
+) -> (u64, u64, u64) {
+    let mut checked = 0;
+    let mut transferred = 0;
+    let mut bytes = 0;
+    let mut copied = BTreeSet::new();
+    for line in lines {
+        if let LogEvent::Structured(ev) = parse_log_line(line.as_ref()) {
+            if is_init
+                && ev.plain_msg.starts_with("Copied")
+                && let Some(path) = ev.object.filter(|path| path != ACCESS_MARKER_FILENAME)
+            {
+                copied.insert(path);
+            }
+            if let Some(stats) = ev.stats {
+                checked = checked.max(stats.checks);
+                transferred = transferred.max(stats.transfers);
+                bytes = bytes.max(stats.bytes);
+            }
+        }
+    }
+    (checked, transferred.max(copied.len() as u64), bytes)
+}
+
+fn read_interrupted_first_sync_progress(state_dir: &Path, run: &mut RunRecord) {
+    #[derive(Deserialize)]
+    struct LoggedLine {
+        raw: String,
+    }
+
+    if first_sync_direction(run).is_none()
+        || reject_symlinks_under_root("first-sync log", state_dir, &run.log_path).is_err()
+    {
+        return;
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&run.log_path)
+    else {
+        return;
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return;
+    }
+    // Startup can recover an observed count even if rclone died between
+    // statistics intervals. A verified inventory supersedes it on Resume.
+    let lines = BufReader::new(file.take(128 * 1024 * 1024))
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| {
+            serde_json::from_str::<LoggedLine>(&line)
+                .ok()
+                .map(|line| line.raw)
+        });
+    let (checked, transferred, bytes) = first_sync_transfer_counts(lines, true);
+    run.files_checked = run.files_checked.max(checked);
+    run.files_transferred = run.files_transferred.max(transferred);
+    run.bytes_transferred = run.bytes_transferred.max(bytes);
+}
+
 fn finalize_completed_run(
     inner: &ManagerInner,
     mut run: RunRecord,
     mapping: &MappingRecord,
     is_init: bool,
+    is_resume: bool,
     run_out: rclone_adapter::RunOutput,
+    stopped_inventory: Option<ResumeInventory>,
 ) {
-    let mut files_checked = 0u64;
-    let mut files_transferred = 0u64;
-    let mut bytes_transferred = 0u64;
-
-    for line in &run_out.output.lines {
-        if let LogEvent::Structured(ev) = parse_log_line(&line.text)
-            && let Some(stats) = ev.stats
-        {
-            files_checked = files_checked.max(stats.checks);
-            files_transferred = files_transferred.max(stats.transfers);
-            bytes_transferred = bytes_transferred.max(stats.bytes);
-        }
-    }
+    let (files_checked, mut files_transferred, bytes_transferred) = first_sync_transfer_counts(
+        run_out.output.lines.iter().map(|line| line.text.as_str()),
+        is_init,
+    );
 
     // Rewrite disk output.ndjson atomically from the adapter's lossless retained
     // output buffer (up to its bounds), refusing any symlinks under state_dir (HIGH #2, #8).
@@ -8464,6 +9133,7 @@ fn finalize_completed_run(
         .as_ref()
         .is_some_and(|a| a.timed_out_during_shutdown);
     let already_force_stopped = guard.active_run.as_ref().is_some_and(|a| a.force_stopped);
+    let stop_requested = guard.active_run.as_ref().is_some_and(|a| a.stop_requested);
     let observed_loss = guard
         .active_run
         .as_ref()
@@ -8476,7 +9146,7 @@ fn finalize_completed_run(
     }
 
     let volume_lost = observed_loss || !matches!(volume, BoundVolume::Present(_));
-    let (core_outcome, outcome_kind, outcome_detail, conflict_paths, recovery_seed) =
+    let (core_outcome, mut outcome_kind, mut outcome_detail, conflict_paths, mut recovery_seed) =
         if volume_lost && !already_force_stopped {
             let cause = "The local disk disconnected while synchronization was active.".to_owned();
             (
@@ -8496,6 +9166,27 @@ fn finalize_completed_run(
             map_adapter_outcome(&classified)
         };
 
+    let stopped = is_init
+        && stop_requested
+        && !volume_lost
+        && !already_force_stopped
+        && core_outcome == RunOutcome::Interrupted;
+    if stopped {
+        outcome_kind = "first_sync_stopped";
+        outcome_detail = "First sync stopped.".into();
+        recovery_seed = None;
+        if let Some(inventory) = stopped_inventory {
+            run.first_sync_total_files = Some(inventory.total_files);
+            // The verified destination count supersedes transfer counters, which
+            // may count marker work or lag behind the last completed copy.
+            files_transferred = inventory
+                .files_already_present
+                .saturating_sub(run.files_already_present);
+            run.files_already_present = run
+                .files_already_present
+                .min(inventory.files_already_present);
+        }
+    }
     let now = inner.clock.now_rfc3339();
     run.status = match core_outcome {
         RunOutcome::Success | RunOutcome::SuccessWithConflicts => "completed".to_string(),
@@ -8544,9 +9235,32 @@ fn finalize_completed_run(
             } else if is_init && matches!(core_outcome, RunOutcome::Success) {
                 mapping.active_generation_id = Some(run.generation_id.clone());
                 mapping.state.execution = Execution::Idle;
+                if is_resume {
+                    if matches!(volume, BoundVolume::Present(_)) {
+                        mapping.state =
+                            apply_event(mapping.state, ObservedEvent::VolumeAvailable).state;
+                    }
+                    mapping.state = apply_event(
+                        mapping.state,
+                        ObservedEvent::RecoveryCompleted {
+                            next_readiness: sync_core::PostRecoveryReadiness::NeedsInitialization,
+                        },
+                    )
+                    .state;
+                    mapping.state =
+                        apply_event(mapping.state, ObservedEvent::EndpointValidated).state;
+                    mapping.state =
+                        apply_event(mapping.state, ObservedEvent::AuthenticationRestored).state;
+                }
                 mapping.state =
                     apply_event(mapping.state, ObservedEvent::InitializationCompleted).state;
                 mapping.scheduling_enabled = true;
+            } else if stopped {
+                mapping.state = MappingState::new(
+                    Readiness::NeedsInitialization,
+                    Execution::Idle,
+                    mapping.state.intent,
+                );
             } else {
                 mapping.state =
                     apply_event(mapping.state, ObservedEvent::RunFinished(core_outcome)).state;

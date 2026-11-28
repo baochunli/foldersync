@@ -11,6 +11,7 @@ keychain-test-helper = []
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+crc32fast = "1"
 directories = "6"
 libc = "0.2"
 notify = "8.2"

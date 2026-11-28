@@ -456,8 +456,24 @@ impl LiveRunProgress {
         files: u64,
         expected_bytes: Option<u64>,
         expected_files: Option<u64>,
+        (bytes_already_present, files_already_present): (u64, u64),
     ) {
         const RATE_WINDOW: Duration = Duration::from_secs(120);
+        if self.samples.len() == 1 {
+            // Start the rate at the verified offset so already-copied files
+            // contribute to completion without inflating this attempt's rate.
+            self.samples[0] = (
+                self.started_at,
+                bytes_already_present,
+                files_already_present,
+            );
+        }
+        let bytes = bytes
+            .saturating_add(bytes_already_present)
+            .min(expected_bytes.unwrap_or(u64::MAX));
+        let files = files
+            .saturating_add(files_already_present)
+            .min(expected_files.unwrap_or(u64::MAX));
         let progress = &mut self.transfer;
         progress.bytes_transferred = progress.bytes_transferred.max(bytes);
         progress.files_transferred = progress.files_transferred.max(files);
@@ -477,8 +493,10 @@ impl LiveRunProgress {
         if sample_secs == 0.0 {
             return;
         }
-        let bytes_per_second = (progress.bytes_transferred - previous_bytes) as f64 / sample_secs;
-        let files_per_second = (progress.files_transferred - previous_files) as f64 / sample_secs;
+        let bytes_per_second =
+            progress.bytes_transferred.saturating_sub(previous_bytes) as f64 / sample_secs;
+        let files_per_second =
+            progress.files_transferred.saturating_sub(previous_files) as f64 / sample_secs;
         progress.bytes_per_second = Some(bytes_per_second.round() as u64);
         progress.eta_seconds = None;
         if now.duration_since(self.started_at) >= RATE_WINDOW {
@@ -522,6 +540,7 @@ fn live_transfer_waits_two_minutes_then_uses_the_slower_trailing_rate() {
         30,
         Some(3_600),
         Some(600),
+        (0, 0),
     );
     assert_eq!(run.transfer.eta_seconds, None);
     run.record(
@@ -530,6 +549,7 @@ fn live_transfer_waits_two_minutes_then_uses_the_slower_trailing_rate() {
         60,
         Some(3_600),
         Some(600),
+        (0, 0),
     );
     assert_eq!(run.transfer.eta_seconds, Some(1_080));
     run.record(
@@ -538,6 +558,7 @@ fn live_transfer_waits_two_minutes_then_uses_the_slower_trailing_rate() {
         180,
         Some(3_600),
         Some(600),
+        (0, 0),
     );
     assert_eq!(run.transfer.eta_seconds, Some(420));
     run.record(
@@ -546,10 +567,31 @@ fn live_transfer_waits_two_minutes_then_uses_the_slower_trailing_rate() {
         100,
         Some(3_600),
         Some(600),
+        (0, 0),
     );
     assert_eq!(run.transfer.bytes_transferred, 2_400);
     assert_eq!(run.transfer.files_transferred, 180);
     assert_eq!(run.transfer.eta_seconds, None);
+}
+
+#[cfg(test)]
+#[test]
+fn live_transfer_counts_already_present_files_without_boosting_the_rate() {
+    let start = Instant::now();
+    let mut run = LiveRunProgress::new(MappingId::new("test"), RunId::new("resume"), start);
+    run.record(start, 0, 0, Some(800), Some(8), (300, 3));
+    assert_eq!(run.transfer.line(), "300 B of 800 B · 3 of 8 files");
+    run.record(
+        start + Duration::from_secs(120),
+        100,
+        1,
+        Some(800),
+        Some(8),
+        (300, 3),
+    );
+    assert_eq!(run.transfer.files_transferred, 4);
+    assert_eq!(run.transfer.bytes_per_second, Some(1));
+    assert_eq!(run.transfer.eta_seconds, Some(480));
 }
 
 enum AccountOperation {
@@ -1023,6 +1065,8 @@ fn manager_worker_main(
                         state.wizard.first_sync_completed = true;
                         state.wizard.first_sync_stopping = false;
                     }
+                } else if m.stopped_first_sync.is_some() {
+                    state.wizard.first_sync_stopping = false;
                 } else if state.wizard.first_sync_stopping
                     && m.execution == Execution::Idle
                     && m.readiness == Readiness::NeedsInitialization
@@ -1144,6 +1188,9 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
             files_transferred,
             expected_bytes,
             expected_files,
+            bytes_already_present,
+            files_already_present,
+            first_sync_total_files,
             ..
         } => {
             let now = Instant::now();
@@ -1160,7 +1207,8 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                     bytes_transferred,
                     files_transferred,
                     expected_bytes,
-                    expected_files,
+                    first_sync_total_files.or(expected_files),
+                    (bytes_already_present, files_already_present),
                 );
             }
             if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
@@ -1202,9 +1250,12 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                 if outcome == "success" {
                     state.wizard.first_sync_completed = true;
                     state.wizard.first_sync_stopping = false;
-                } else if state.wizard.first_sync_stopping {
-                    show_stopped_first_sync(state);
-                } else {
+                } else if matches!(
+                    outcome.as_str(),
+                    "first_sync_stopped" | "canceled_before_spawn"
+                ) {
+                    state.wizard.first_sync_stopping = false;
+                } else if outcome != "preflight_failed" {
                     // Surface terminal engine failures in the wizard (HIGH #4).
                     state.wizard.first_sync_stopping = false;
                     state.wizard.first_sync_error = Some(format!(
@@ -1379,6 +1430,38 @@ fn handle_ui_command(
         UiCommand::ResumeMapping(id) => {
             if let Some(mgr) = &state.mgr {
                 record_mgr_result(state, mgr.resume(id));
+            }
+            (None, None)
+        }
+        UiCommand::ResumeFirstSync(id) => {
+            let Some(mgr) = &state.mgr else {
+                return (None, None);
+            };
+            match mgr.resume_first_sync(id.clone()) {
+                Ok(acceptance) => {
+                    if let Some(mapping) = acceptance.snapshot.mappings.iter().find(|m| m.id == id)
+                    {
+                        let direction = mapping
+                            .last_run_id
+                            .as_ref()
+                            .and_then(|rid| mgr.get_run(rid).ok().flatten())
+                            .map(|run| run.mode);
+                        state.wizard = default_real_wizard();
+                        state.wizard.editing_mapping_id = Some(id.clone());
+                        state.wizard.selected_account = mapping.account_id.clone();
+                        state.wizard.selected_folder = mapping.display_name.clone();
+                        state.wizard.volume_name = mapping.volume_name.clone();
+                        state.wizard.review_scenario = match direction.as_deref() {
+                            Some("init_path2") => ReviewScenario::CloudToLocal,
+                            _ => ReviewScenario::LocalToCloud,
+                        };
+                        begin_first_sync(state, id);
+                    }
+                    return (Some(ScreenRoute::AddMapping), None);
+                }
+                Err(err) => {
+                    state.action_error = Some(format!("{} {}", err.cause(), err.next_step()))
+                }
             }
             (None, None)
         }
@@ -2172,14 +2255,13 @@ fn handle_ui_command(
             {
                 match mgr.stop_run(mid.clone()) {
                     Ok(acceptance) => {
-                        let already_idle = acceptance
-                            .snapshot
-                            .mappings
-                            .iter()
-                            .find(|m| m.id == mid)
-                            .is_some_and(|m| m.execution == Execution::Idle);
-                        if already_idle {
-                            show_stopped_first_sync(state);
+                        let mapping = acceptance.snapshot.mappings.iter().find(|m| m.id == mid);
+                        if let Some(mapping) = mapping.filter(|m| m.execution == Execution::Idle) {
+                            if mapping.stopped_first_sync.is_some() {
+                                state.wizard.first_sync_stopping = false;
+                            } else {
+                                show_stopped_first_sync(state);
+                            }
                         } else {
                             // Wait for the stop result before jumping back to Review (HIGH #4).
                             state.wizard.first_sync_stopping = true;
@@ -3836,6 +3918,8 @@ fn project_ui_snapshot(
                 .map_or(StatusModifier::None, |entry| StatusModifier::QueuedBehind {
                     active_name: entry.display_name.clone(),
                 })
+        } else if let Some(stopped) = &m.stopped_first_sync {
+            StatusModifier::StoppedFirstSync(stopped.clone())
         } else if m.readiness == Readiness::RecoveryRequired {
             StatusModifier::RecoveryCause {
                 kind: RecoveryCauseKind::Interrupted,
@@ -3885,7 +3969,9 @@ fn project_ui_snapshot(
             } else if m.execution == Execution::Stopping {
                 RunPhase::Stopping { elapsed_secs }
             } else if let Some(p) = live
-                && (p.transfer.bytes_transferred > 0 || p.transfer.files_transferred > 0)
+                && (p.transfer.bytes_transferred > 0
+                    || p.transfer.files_transferred > 0
+                    || p.transfer.expected_files.is_some_and(|total| total > 0))
             {
                 RunPhase::Transferring {
                     progress: p.transfer.clone(),
@@ -4133,6 +4219,11 @@ fn project_run_record(r: RunRecord) -> RunRecordSnapshot {
             Tone::Attn,
             IconKind::Bang,
         ),
+        Some("first_sync_stopped") => (
+            "First sync stopped".to_owned(),
+            Tone::Neutral,
+            IconKind::Stop,
+        ),
         Some("interrupted" | "force_stopped" | "canceled_before_spawn") => {
             ("Interrupted".to_owned(), Tone::Err, IconKind::Octagon)
         }
@@ -4177,6 +4268,11 @@ fn build_real_attention_items(
 ) -> Vec<AttentionItem> {
     let mut items = Vec::new();
     for m in mappings {
+        if matches!(&m.modifier, StatusModifier::StoppedFirstSync(stopped) if stopped.cause.is_none())
+            && m.state.readiness() == Readiness::RecoveryRequired
+        {
+            continue;
+        }
         match m.state.readiness() {
             Readiness::AuthenticationRequired => {
                 items.push(AttentionItem {
@@ -4209,7 +4305,13 @@ fn build_real_attention_items(
                     icon: IconKind::Octagon,
                     is_error_accent: true,
                     title: format!("{} · recovery required", m.display_name),
-                    cause: "An earlier run was interrupted or hit a safety stop.".to_owned(),
+                    cause: match &m.modifier {
+                        StatusModifier::StoppedFirstSync(stopped) => stopped.cause.clone(),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        "An earlier run was interrupted or hit a safety stop.".to_owned()
+                    }),
                     what_did:
                         "Kept the sync state and recovery copies intact and held this mapping."
                             .to_owned(),

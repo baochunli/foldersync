@@ -17,6 +17,8 @@ use sync_manager::{
     ArchiveStatus, ExclusionMatch, FilterMigrationPhase, init::SuggestedFolderInventory,
 };
 
+use sync_manager::StoppedFirstSync;
+
 pub(crate) const SYNC_ALL_NOW_LABEL: &str = "Sync all now";
 
 /// Top-level route shown in the main window content area.
@@ -155,16 +157,18 @@ pub struct TransferProgress {
 
 impl TransferProgress {
     pub fn percent(&self) -> Option<u8> {
-        self.expected_bytes.filter(|total| *total > 0).map(|total| {
-            (u128::from(self.bytes_transferred) * 100 / u128::from(total)).min(99) as u8
-        })
+        let (done, total) = self.expected_bytes.map_or(
+            (self.files_transferred, self.expected_files.unwrap_or(0)),
+            |total| (self.bytes_transferred, total),
+        );
+        (total > 0).then(|| (u128::from(done) * 100 / u128::from(total)).min(99) as u8)
     }
 
     pub fn line(&self) -> String {
         let bytes = format_bytes(self.bytes_transferred);
         let files = format_count(self.files_transferred);
-        match self.expected_bytes.zip(self.expected_files) {
-            Some((total_bytes, total_files)) if total_bytes > 0 || total_files > 0 => {
+        match (self.expected_bytes, self.expected_files) {
+            (Some(total_bytes), Some(total_files)) if total_bytes > 0 || total_files > 0 => {
                 let total_bytes = format_bytes(total_bytes).replace(".0 ", " ");
                 let unit = if total_files == 1 { "file" } else { "files" };
                 let total_files = format_count(total_files);
@@ -174,6 +178,10 @@ impl TransferProgress {
                     line.push_str(&format!(" · about {} left", format_eta(eta)));
                 }
                 line
+            }
+            (None, Some(total)) => {
+                let unit = if total == 1 { "file" } else { "files" };
+                format!("{files} of {} {unit} copied", format_count(total))
             }
             _ => {
                 let unit = if self.files_transferred == 1 {
@@ -288,6 +296,7 @@ pub enum StatusModifier {
         expected_id: String,
         found_id: String,
     },
+    StoppedFirstSync(StoppedFirstSync),
     /// Recovery cause detail.
     RecoveryCause {
         kind: RecoveryCauseKind,
@@ -701,6 +710,25 @@ impl MappingSnapshot {
                 show_force_stop: false,
                 show_pause: intent == Intent::Enabled,
                 show_resume: intent == Intent::Paused,
+                is_draft: false,
+                needs_init: false,
+                sync_now_tooltip: None,
+            };
+        }
+
+        if let StatusModifier::StoppedFirstSync(stopped) = &self.modifier {
+            return PresentedStatus {
+                pill_label: None,
+                pill_tone: Tone::Neutral,
+                icon: IconKind::Stop,
+                status_line: stopped.status_text(),
+                why_line: stopped.cause.clone(),
+                secondary_link: None,
+                sync_now_enabled: false,
+                show_stop: false,
+                show_force_stop: false,
+                show_pause: false,
+                show_resume: false,
                 is_draft: false,
                 needs_init: false,
                 sync_now_tooltip: None,
@@ -1836,6 +1864,7 @@ pub enum UiCommand {
     SyncReadyMappings,
     PauseMapping(MappingId),
     ResumeMapping(MappingId),
+    ResumeFirstSync(MappingId),
     StopRun(MappingId),
     ForceStopRun(MappingId),
     SetSchedulingPaused(bool),

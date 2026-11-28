@@ -132,6 +132,34 @@ Initialization uses the same validated base profile, except:
   `--resync-mode path2` (remote has data, local is empty) is emitted instead.
 - Ordinary runs never carry `--resync` or `--resync-mode`.
 
+### Interrupted first-sync qualification
+
+Resume uses the original direction, work directory, frozen filters, and
+backup paths. Both before request preparation and immediately before
+launch, FolderSync requires the destination's included files to match a
+subset of the source by path, size, and modification time. Local-to-local
+checks compare exact times. With Drive, the allowed difference is strictly
+less than 1 ms, matching rclone's Drive timestamp precision. FolderSync
+checks paths from both inventories for symlink ancestors on local endpoints.
+Drive Resume uses `--fast-list`, and Drive Stop uses the saved transfer
+evidence so completion does not wait for another inventory. Scheduling
+becomes eligible only after normal bisync verification succeeds.
+
+First sync and resume share a concurrent-writer window. The local backend
+looks for an existing destination before staging a copy and publishes the
+staged file with a rename. If someone creates that pathname after the
+check, the rename can replace it. In both preferred directions a
+local-to-local fixture reproduced replacement with exit status 0 and
+empty recovery folders, even with `--immutable` and
+`--no-update-modtime`. Keep the destination folder unchanged until the
+first sync finishes, including when resuming.
+
+The opt-in test `rclone_can_replace_a_file_created_during_first_sync_publish`
+in `crates/sync-manager/tests/local_rclone_e2e.rs` records this behavior on
+disposable local directories.
+[Resync copy passes](https://github.com/rclone/rclone/blob/v1.76.0/cmd/bisync/resync.go#L104-L119) ·
+[Local file publication](https://github.com/rclone/rclone/blob/v1.76.0/backend/local/local.go#L1114-L1148)
+
 ### Comparison policy and known `--compare size,modtime` limitation (§10)
 
 The initial profile uses `--compare size,modtime` and retains normal

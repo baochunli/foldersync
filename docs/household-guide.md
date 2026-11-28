@@ -31,7 +31,12 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
    the setup checks pass. The first-sync screen shows elapsed time,
    transferred bytes and files, and a progress bar. The bar fills as bytes
    transfer when the expected byte total is known. FolderSync can estimate
-   time left after two minutes.
+   time left after two minutes. Keep the destination folder unchanged until
+   first sync finishes, and ask others with access to wait before editing it.
+5. If the first sync stops, choose **Resume first sync** on the mapping.
+   FolderSync checks that the files already on the destination still match
+   the source and that the folder selection still matches the original setup.
+   If a check fails, preserve both folders and review the paths shown.
 
 ## Archive finished folders during setup
 
@@ -48,8 +53,9 @@ included files, including Git repository data within included folders. The
 complete original moves to **FolderSync Archived Originals** on the same
 disk, outside the mapping. The ZIP takes its place in the mapping and syncs
 as an ordinary file. First-sync progress shows ZIP creation before upload
-and then counts each ZIP as one file at its on-disk size. Keep the source
-folders quiet while the ZIPs are made.
+and then counts each ZIP as one file at its on-disk size. Resuming a stopped
+transfer reuses the finished ZIPs. Keep the source folders quiet while the
+ZIPs are made.
 
 If the holding folder is inaccessible or the ZIP name is already in use,
 review the error before starting. If the app stops during a move, reopen

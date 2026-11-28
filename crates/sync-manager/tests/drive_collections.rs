@@ -35,6 +35,7 @@ struct FixtureRunner {
     pre_move_check_fault: Mutex<Option<CheckFault>>,
     post_move_check_fault: Mutex<Option<(usize, CheckFault)>>,
     stop_after_first_move: Mutex<Option<mpsc::Sender<()>>>,
+    fake_first_bisync: AtomicBool,
 }
 
 enum CheckFault {
@@ -93,6 +94,7 @@ impl ProcessRunner for FixtureRunner {
         }
         let directory_listing = args.iter().any(|arg| arg == "--dirs-only");
         if directory_listing && !self.synthesize_drive_ids
+            || command == "bisync" && self.fake_first_bisync.swap(false, Ordering::Relaxed)
             || command == "config"
             || command == "size" && args.iter().any(|arg| arg == "household:Data/Slow")
         {
@@ -208,6 +210,7 @@ impl Fixture {
             pre_move_check_fault: Mutex::new(None),
             post_move_check_fault: Mutex::new(None),
             stop_after_first_move: Mutex::new(None),
+            fake_first_bisync: AtomicBool::new(false),
         });
         let state = root.join("state");
         let account_dir = state.join("accounts/drive");
@@ -571,6 +574,83 @@ fn initialize_research(fx: &Fixture, expected_direction: rclone_adapter::InitPre
 }
 
 #[test]
+fn first_resume_drive_check_preserves_endpoint_and_authentication_failures() {
+    let Some(fx) = Fixture::new(true) else { return };
+    let mapping = fx.mapping("local", "research-id", "Data/Research");
+    fs::write(fx.root().join("local/note"), b"from local").unwrap();
+    fx.listing(&RESEARCH);
+    fx.manager.add_mapping(mapping).unwrap();
+    for _ in 0..3 {
+        fx.listing(&RESEARCH);
+    }
+    fx.runner.fake_first_bisync.store(true, Ordering::Relaxed);
+    fx.runner.fake.push_run(FakeRunScript {
+        wait_for_stop: true,
+        exit_status_on_stop: Some(rclone_adapter::ExitStatusInfo {
+            code: None,
+            signal: Some(libc::SIGINT),
+        }),
+        ..Default::default()
+    });
+    let events = fx.manager.subscribe_events(64);
+    let id = MappingId::new("local");
+    fx.manager
+        .initialize(InitializeCommand {
+            mapping_id: id.clone(),
+            expected_direction: Some(rclone_adapter::InitPreference::Path1),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !matches!(
+        events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap(),
+        ManagerEvent::RunStarted { .. }
+    ) {}
+    fx.manager.stop_run(id.clone()).unwrap();
+    let stopped = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(
+        stopped.mappings[0].readiness,
+        Readiness::NeedsInitialization
+    );
+
+    fx.listing(&[("Research", "replacement-id")]);
+    fx.manager.resume_first_sync(id.clone()).unwrap();
+    let endpoint = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+
+    fx.runner.fake.push_run(FakeRunScript {
+        lines: vec![OutputLine {
+            stream: StreamKind::Stderr,
+            text: "oauth2: invalid_grant".into(),
+            truncated: false,
+        }],
+        exit_status: rclone_adapter::ExitStatusInfo {
+            code: Some(1),
+            signal: None,
+        },
+        ..Default::default()
+    });
+    fx.manager.resume_first_sync(id.clone()).unwrap();
+    let authentication = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let runs = fx.manager.list_runs(&id).unwrap();
+    assert!(runs[..2].iter().all(|run| run.child_pid.is_none()));
+    assert_eq!(endpoint.mappings[0].readiness, Readiness::EndpointChanged);
+    assert_eq!(
+        authentication.mappings[0].readiness,
+        Readiness::AuthenticationRequired
+    );
+}
+
+#[test]
 fn scheduled_drive_run_retries_after_account_lock_contention() {
     let Some(fx) = Fixture::new(true) else { return };
     fs::create_dir(fx.root().join("local")).unwrap();
@@ -919,6 +999,7 @@ fn assert_held_filter_change(fx: &Fixture, original: &MappingStatusSnapshot) {
     let snapshot = fx.manager.snapshot();
     let mapping = &snapshot.mappings[0];
     assert!(mapping.filter_migration_held);
+    assert!(mapping.stopped_first_sync.is_none());
     assert_eq!(mapping.readiness, Readiness::RecoveryRequired);
     assert_eq!(mapping.active_generation_id, original.active_generation_id);
     assert_eq!(mapping.exclusions, original.exclusions);
@@ -927,6 +1008,12 @@ fn assert_held_filter_change(fx: &Fixture, original: &MappingStatusSnapshot) {
     assert_eq!(mapping.next_poll_at, None);
     assert!(fx.manager.run_now("local").is_err());
     assert!(fx.manager.complete_recovery("local", true).is_err());
+    let resume_error = fx.manager.resume_first_sync("local").unwrap_err();
+    assert!(
+        resume_error
+            .cause()
+            .contains("Finish or restore the subfolder update")
+    );
     assert!(
         fx.manager
             .inspect_recovery("local")
