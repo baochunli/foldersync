@@ -142,6 +142,56 @@ test("Add-mapping review blocks both-populated with no Start first sync button",
   expect(app.shows("id:wizard-start-first-sync-btn")).toBe(false);
 });
 
+test("Archive suggestions are selected individually and listed on Review", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-6");
+  await app.press("id:review-variant-upload");
+  await app.press("id:wizard-step-4");
+
+  expect(app.shows("id:wizard-archive-Field-Data")).toBe(true);
+  expect(app.shows("id:wizard-archive-Reports")).toBe(true);
+  const choices = app.texts().join("\n");
+  expect(choices).toContain("Upload as one archive");
+  expect(choices).toContain("4,000 files · 9.8 GB");
+  expect(choices).toContain("Time saved");
+  expect(choices).toContain("Last change");
+
+  await app.press("id:wizard-archive-Reports");
+  await app.press("id:wizard-step-6");
+  const review = app.texts().join("\n");
+  expect(review).toContain("Upload as archives");
+  expect(review).toContain("Field-Data.zip");
+  expect(review).not.toContain("Reports.zip");
+  expect(review).toContain("4,000 files · 9.8 GB");
+  expect(review).toContain("Each folder is replaced by one .zip in this folder and in Google Drive, so every Mac gets the same .zip.");
+  expect(review).toContain("The original folder is moved to /Volumes/WorkSSD/FolderSync Archived Originals/Projects; delete it there when you no longer need it.");
+  expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
+});
+
+test("Demo creates archives before first sync and lists the originals afterward", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-6");
+  await app.press("id:review-variant-upload");
+  await app.press("id:wizard-step-4");
+  await app.press("id:wizard-archive-Reports");
+  await app.press("id:wizard-step-6");
+  await app.press("id:wizard-no-other-sync-checkbox");
+  await app.press("id:wizard-start-first-sync-btn");
+  expect(app.texts().join("\n")).toContain("Creating archive Field-Data · 2.5 of 9.8 GB");
+  expect(app.texts().join("\n")).not.toContain("Uploading to the cloud");
+  await app.press("id:wizard-demo-complete-archive-btn");
+  expect(app.texts().join("\n")).toContain("Uploading to the cloud");
+  await app.press("id:wizard-demo-complete-first-sync-btn");
+  await app.press("id:wizard-open-completed-mapping-btn");
+  expect(app.texts().join("\n")).toContain("Archived originals");
+  expect(app.texts().join("\n")).toContain("Field-Data · 9.8 GB");
+  expect(app.shows("id:reveal-archive-original-Field-Data")).toBe(true);
+});
+
 test("Interactive Pause/Resume, Scheduling hold banner, and window close keep-alive work", async () => {
   const app = await open(".", DESKTOP);
 

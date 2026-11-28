@@ -13,6 +13,7 @@ use sync_core::{DEFAULT_MAX_DELETE_PERCENT, MappingId, Readiness};
 
 use crate::contract::{
     IconKind, MappingSnapshot, ScreenRoute, StatusLink, StatusModifier, UiCommand, UiSnapshot,
+    format_bytes,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -775,7 +776,7 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .pt(px(4.0)),
         );
 
-    view()
+    let mut content = view()
         .flex_col()
         .w_full()
         .gap(px(14.0))
@@ -844,16 +845,56 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                 .w_full()
                 .child(locations_card)
                 .child(subfolders_card),
-        )
-        .child(recent_runs_card)
-        .child(
-            view()
-                .flex_row()
-                .gap(px(14.0))
-                .w_full()
-                .child(schedule_card)
-                .child(recovery_card),
-        )
+        );
+    let originals: Vec<_> = snap
+        .archives
+        .iter()
+        .filter(|archive| archive.mapping_id == m.id)
+        .filter_map(|archive| {
+            Some((
+                &archive.folder,
+                archive.holding_path.as_ref()?,
+                archive.original_bytes?,
+            ))
+        })
+        .collect();
+    if !originals.is_empty() {
+        let mut original_card = card().child(card_title("Archived originals"));
+        for (folder, path, bytes) in originals {
+            let reveal_path = path.to_string_lossy().into_owned();
+            let sender = ctrl.clone();
+            original_card = original_card.child(
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(text(format!("{folder} · {}", format_bytes(bytes))))
+                    .child(
+                        app_button(
+                            "Reveal in Finder",
+                            BtnKind::Default,
+                            true,
+                            false,
+                            None,
+                            None,
+                            move || sender.send(UiCommand::RevealPath(reveal_path.clone())),
+                        )
+                        .accessibility_label(format!("Reveal {folder} in Finder"))
+                        .test_id(&format!("reveal-archive-original-{folder}")),
+                    ),
+            );
+        }
+        content = content.child(original_card);
+    }
+    content.child(recent_runs_card).child(
+        view()
+            .flex_row()
+            .gap(px(14.0))
+            .w_full()
+            .child(schedule_card)
+            .child(recovery_card),
+    )
 }
 
 fn policy_bullet(line: &str) -> View {

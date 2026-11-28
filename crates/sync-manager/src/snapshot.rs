@@ -105,6 +105,25 @@ pub enum FolderSizeStatus {
     Failed { cause: String },
 }
 
+/// Local archive preparation and retained-original status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveState {
+    Pending,
+    Creating { bytes: u64, total: u64 },
+    Failed { cause: String },
+    Complete,
+}
+
+/// One confirmed archive and its retained original, where available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveStatus {
+    pub mapping_id: MappingId,
+    pub folder: String,
+    pub state: ArchiveState,
+    pub holding_path: Option<PathBuf>,
+    pub original_bytes: Option<u64>,
+}
+
 /// Immutable manager-wide snapshot published to UI/CLI subscribers (§16).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
@@ -120,6 +139,8 @@ pub struct StatusSnapshot {
     pub mappings: Vec<MappingStatusSnapshot>,
     #[serde(default)]
     pub folder_sizes: Vec<FolderSizeSnapshot>,
+    #[serde(default)]
+    pub archives: Vec<ArchiveStatus>,
 }
 
 /// Bounded activity and diagnostic events emitted by the manager.

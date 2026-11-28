@@ -7,10 +7,12 @@ use nsh_base::{
 };
 use nsh_core::{file_dialog::OpenDialog, prelude::*};
 use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, VolumeKind};
+use sync_manager::ArchiveState;
 
 use crate::contract::{
     AccountStatus, FolderSize, IconKind, ReviewScenario, ScreenRoute, Tone, UiCommand, UiSnapshot,
-    WizardDraft, WizardStep, format_bytes, format_duration,
+    WizardDraft, WizardStep, archive_percent, archive_progress_label, format_bytes,
+    format_duration,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -1468,28 +1470,99 @@ fn render_step_subfolders(
             "Duplicate names or case/Unicode clashes stop the run for review.",
         ));
 
-    view()
-        .flex_col()
-        .w_full()
-        .gap(px(14.0))
-        .child(
-            view()
-                .flex_row()
-                .items_start()
-                .gap(px(16.0))
-                .w_full()
-                .child(tree_card)
-                .child(side_card),
-        )
-        .child(
-            view()
-                .flex_row()
-                .items_stretch()
-                .gap(px(14.0))
-                .w_full()
-                .child(found_card)
-                .child(supported_card),
-        )
+    let mut content = view().flex_col().w_full().gap(px(14.0)).child(
+        view()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .w_full()
+            .child(tree_card)
+            .child(side_card),
+    );
+    if !draft.archive_suggestions.is_empty() {
+        let mut suggestions = card().child(card_title("Upload as one archive"));
+        for item in &draft.archive_suggestions {
+            let sender = ctrl.clone();
+            let folder = item.name.clone();
+            let checked = !draft.declined_archives.contains(&folder);
+            let last_changed = chrono::DateTime::from_timestamp(item.last_changed_unix_secs, 0)
+                .map(|date| date.format("%b %-d, %Y").to_string())
+                .unwrap_or_else(|| "Unknown".to_owned());
+            let saved_minutes = item.estimated_seconds_saved.div_ceil(300) * 5;
+            let saved = if saved_minutes < 60 {
+                format!("{saved_minutes} min")
+            } else {
+                format!("{} hr {} min", saved_minutes / 60, saved_minutes % 60)
+            };
+            suggestions = suggestions.child(
+                checkbox()
+                    .test_id(&format!("wizard-archive-{}", item.name))
+                    .checked(checked)
+                    .flex_row()
+                    .items_start()
+                    .gap(px(10.0))
+                    .cursor_pointer()
+                    .focus_visible(focus_ring)
+                    .indicator_style(move |s| {
+                        s.w(px(16.0))
+                            .h(px(16.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(if checked { p.primary } else { p.border })
+                            .bg(if checked { p.primary } else { p.bg })
+                            .items_center()
+                            .justify_center()
+                    })
+                    .indicator(if checked {
+                        icon(IconKind::Check, 11.0, p.primary_fg).into_element()
+                    } else {
+                        view().into_element()
+                    })
+                    .on_change(move |_: &bool| {
+                        sender.send(UiCommand::WizardToggleArchive(folder.clone()));
+                    })
+                    .child(
+                        view()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(text(item.name.clone()).font_weight(W_TITLE))
+                            .child(
+                                text(archive_file_summary(item.file_count, item.bytes))
+                                    .text_color(p.fg),
+                            )
+                            .child(
+                                text(format!(
+                                    "Last change {last_changed} · Time saved about {saved}"
+                                ))
+                                .text_size(px(S_SMALL))
+                                .text_color(p.muted),
+                            ),
+                    ),
+            );
+        }
+        content = content.child(suggestions);
+    }
+    content.child(
+        view()
+            .flex_row()
+            .items_stretch()
+            .gap(px(14.0))
+            .w_full()
+            .child(found_card)
+            .child(supported_card),
+    )
+}
+
+fn archive_file_summary(files: u64, bytes: u64) -> String {
+    let plain = files.to_string();
+    let mut count = String::new();
+    for (index, digit) in plain.chars().enumerate() {
+        if index > 0 && (plain.len() - index).is_multiple_of(3) {
+            count.push(',');
+        }
+        count.push(digit);
+    }
+    format!("{count} files · {}", format_bytes(bytes))
 }
 
 fn render_step_recovery(ctrl: AppController, draft: &WizardDraft) -> View {
@@ -1935,7 +2008,38 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
     if is_demo {
         root = root.child(scenario_bar);
     }
-    root = root.child(sides).child(direction_card).child(details);
+    root = root.child(sides).child(direction_card);
+    if draft.selected_archives().next().is_some() {
+        let mut archives = card().child(card_title("Upload as archives"));
+        let (files, bytes) = draft.selected_archives().fold((0_u64, 0_u64), |acc, item| {
+            (
+                acc.0.saturating_add(item.file_count),
+                acc.1.saturating_add(item.bytes),
+            )
+        });
+        for item in draft.selected_archives() {
+            archives = archives.child(text(format!("{}.zip", item.name)).text_color(p.fg));
+        }
+        archives = archives.child(text(archive_file_summary(files, bytes)).text_color(p.fg));
+        if let Some(holding) = &draft.archive_holding_folder {
+            archives = archives.child(text(format!(
+                "Each folder is replaced by one .zip in this folder and in Google Drive, so every Mac gets the same .zip. The original folder is moved to {}; delete it there when you no longer need it.",
+                holding.display()
+            )).text_color(p.muted));
+        }
+        for error in &draft.archive_errors {
+            archives = archives.child(check_row(IconKind::Octagon, p.err, error));
+        }
+        if draft.archive_holding_folder.is_none() && draft.archive_errors.is_empty() {
+            archives = archives.child(check_row(
+                IconKind::Octagon,
+                p.err,
+                "Could not check where the original folders will be kept.",
+            ));
+        }
+        root = root.child(archives);
+    }
+    root = root.child(details);
     if draft.download_exceeds_free_space() {
         root = root.child(
             accented_card(p.err_bd)
@@ -2010,6 +2114,29 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
     let c_open_detail = ctrl.clone();
     let c_demo_finish = ctrl.clone();
     let elapsed = format_duration(draft.first_sync_elapsed_secs);
+    let archives = || {
+        snap.archives
+            .iter()
+            .filter(|entry| draft.first_sync_mapping_id.as_ref() == Some(&entry.mapping_id))
+    };
+    let archive_progress = archives()
+        .find_map(|entry| match entry.state {
+            ArchiveState::Creating { bytes, total } => Some((
+                archive_progress_label(&entry.folder, bytes, total),
+                archive_percent(bytes, total),
+            )),
+            _ => None,
+        })
+        .or_else(|| {
+            archives()
+                .find(|entry| entry.state == ArchiveState::Pending)
+                .map(|entry| {
+                    (
+                        format!("Preparing to create archive {}", entry.folder),
+                        None,
+                    )
+                })
+        });
 
     // #4: Direction-accurate verb and progress text.
     let (verb, in_flight_line) = match draft.review_scenario {
@@ -2091,8 +2218,12 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             .child(check_row(IconKind::Check, p.ok, "Checked the result"))
             .child(check_row(IconKind::Check, p.ok, finish_mode_done));
     } else {
-        let active_line = if draft.first_sync_stopping {
+        let active_line = if draft.first_sync_stopping && archive_progress.is_some() {
+            text("Stopping archive creation…")
+        } else if draft.first_sync_stopping {
             emphasized_line("Stopping", format!(" first sync… · elapsed {elapsed}"))
+        } else if let Some((label, _)) = &archive_progress {
+            text(label.clone())
         } else if !preflight_done {
             text(format!(
                 "Checking folders before syncing… · elapsed {elapsed}"
@@ -2118,13 +2249,18 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                             .gap(px(6.0))
                             .child(active_line.tabular_nums())
                             .child(progress_bar(
-                                if snap.is_demo_mode {
+                                if let Some((_, percent)) = &archive_progress {
+                                    *percent
+                                } else if snap.is_demo_mode {
                                     Some(f32::from(draft.first_sync_percent))
                                 } else {
                                     None
                                 },
                                 6.0,
-                                format!("{verb} {}", draft.selected_folder),
+                                archive_progress.as_ref().map_or_else(
+                                    || format!("{verb} {}", draft.selected_folder),
+                                    |(label, _)| label.clone(),
+                                ),
                             )),
                     ),
             )
@@ -2188,6 +2324,19 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                 move || c_open_detail.navigate(ScreenRoute::MappingDetail(mid.clone())),
             )
             .test_id("wizard-open-completed-mapping-btn"),
+        );
+    } else if snap.is_demo_mode && archive_progress.is_some() {
+        footer_btns = footer_btns.child(
+            app_button(
+                "Finish archive (demo)",
+                BtnKind::Primary,
+                true,
+                false,
+                None,
+                None,
+                move || c_demo_finish.send(UiCommand::WizardCompleteDemoArchive),
+            )
+            .test_id("wizard-demo-complete-archive-btn"),
         );
     } else if snap.is_demo_mode {
         footer_btns = footer_btns.child(
@@ -2312,6 +2461,8 @@ fn render_wizard_footer(
                 Some("Fix the failing recovery location checks first")
             } else if draft.download_exceeds_free_space() {
                 Some("Leave out more subfolders or choose another volume")
+            } else if !draft.archives_reviewed() {
+                Some("Resolve the archive checks first")
             } else if !draft.no_other_sync_confirmed {
                 Some("Confirm the checkbox first")
             } else {
@@ -2319,7 +2470,11 @@ fn render_wizard_footer(
             };
             row = row.child(
                 app_button(
-                    "Start first sync",
+                    if draft.selected_archives().next().is_some() {
+                        "Create archives and start first sync"
+                    } else {
+                        "Start first sync"
+                    },
                     BtnKind::Primary,
                     false,
                     !can_start,

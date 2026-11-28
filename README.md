@@ -120,6 +120,12 @@ and file count before choosing subfolder exclusions. FolderSync compares that
 estimate with free space on known volumes and checks the chosen destination
 again during setup. Review the first sync before starting it.
 
+The wizard can suggest ZIPs for finished subfolders with at least 2,000
+included files and no included file changed in the past 12 months. Review
+which originals will move into the same disk’s **FolderSync Archived
+Originals** folder. Other Macs receive the same verified ZIPs through
+ordinary two-way sync. [Using FolderSync](docs/household-guide.md)
+
 ## Development
 
 macOS 14 or later is the first desktop target. The non-UI crates are built in

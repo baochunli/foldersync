@@ -9,9 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use chrono::{DateTime, Utc};
 use rclone_adapter::{InitPreference, LsJsonEntry};
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, VolumeIdentity,
+    archive::{ArchiveSuggestion, archive_suggestion},
     validate_names,
 };
 
@@ -123,6 +125,7 @@ pub struct DetailedEndpointInventory {
     pub marker_conflict: Option<String>,
     pub marker_conflict_path: Option<PathBuf>,
     pub subfolders: Vec<SubfolderInventory>,
+    pub archive_suggestions: Vec<ArchiveSuggestion>,
     pub symlinks: Vec<String>,
     pub special_files: Vec<String>,
     pub name_findings: Vec<String>,
@@ -164,6 +167,7 @@ pub fn inspect_local_endpoint_detailed(
     let mut marker_conflict_path = None;
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
+    let mut archive_totals = BTreeMap::new();
     let mut top_subfolders: std::collections::BTreeMap<String, SubfolderInventory> =
         std::collections::BTreeMap::new();
 
@@ -182,6 +186,7 @@ pub fn inspect_local_endpoint_detailed(
         &mut file_count,
         &mut total_bytes,
         &mut top_subfolders,
+        &mut archive_totals,
     )?;
 
     let findings = validate_names(&all_relative_paths);
@@ -194,6 +199,13 @@ pub fn inspect_local_endpoint_detailed(
         SideClassification::HasData
     };
 
+    let archive_suggestions = archive_totals
+        .into_iter()
+        .filter_map(|(name, (count, bytes, latest))| {
+            archive_suggestion(name, count, bytes, latest, Utc::now().timestamp())
+        })
+        .collect();
+
     Ok(DetailedEndpointInventory {
         root: root.to_path_buf(),
         classification,
@@ -204,6 +216,7 @@ pub fn inspect_local_endpoint_detailed(
         marker_conflict,
         marker_conflict_path,
         subfolders: top_subfolders.into_values().collect(),
+        archive_suggestions,
         symlinks,
         special_files,
         name_findings,
@@ -227,6 +240,7 @@ fn walk_detailed(
     file_count: &mut usize,
     total_bytes: &mut u64,
     top_subfolders: &mut std::collections::BTreeMap<String, SubfolderInventory>,
+    archive_totals: &mut BTreeMap<String, (u64, u64, i64)>,
 ) -> Result<(), ManagerError> {
     let entries = fs::read_dir(current).map_err(|err| ManagerError::Io {
         cause: format!("Failed to read directory `{}`: {err}.", current.display()),
@@ -308,6 +322,25 @@ fn walk_detailed(
         }
 
         if let Some(top) = top_subdir
+            && ft.is_file()
+            && !archive_excluded(&rel, exclusions)
+        {
+            // Treat an unreadable mtime as recent so a folder with missing evidence is
+            // never suggested as finished.
+            let timestamp = meta
+                .modified()
+                .map(|time| DateTime::<Utc>::from(time).timestamp())
+                .unwrap_or(i64::MAX);
+            let (count, bytes, latest) =
+                archive_totals
+                    .entry(top.to_owned())
+                    .or_insert((0, 0, i64::MIN));
+            *count += 1;
+            *bytes = bytes.saturating_add(meta.len());
+            *latest = (*latest).max(timestamp);
+        }
+
+        if let Some(top) = top_subdir
             && let Some(sub) = top_subfolders.get_mut(top)
         {
             if ft.is_dir() {
@@ -339,6 +372,7 @@ fn walk_detailed(
                 file_count,
                 total_bytes,
                 top_subfolders,
+                archive_totals,
             )?;
         }
     }
@@ -404,6 +438,9 @@ pub fn matches_exclusion_pattern(rel_path: &str, pattern: &str) -> bool {
 
 /// Glob matcher where `*` matches any char except `/` and `**` matches across `/`.
 fn rclone_glob_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains(['*', '?']) {
+        return pattern == text;
+    }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let mut memo = vec![vec![None; t.len() + 1]; p.len() + 1];
@@ -424,10 +461,52 @@ fn glob_dp(p: &[char], t: &[char], pi: usize, ti: usize, memo: &mut [Vec<Option<
         glob_dp(p, t, pi + 1, ti, memo)
             || (ti < t.len() && t[ti] != '/' && glob_dp(p, t, pi, ti + 1, memo))
     } else {
-        ti < t.len() && p[pi] == t[ti] && glob_dp(p, t, pi + 1, ti + 1, memo)
+        ti < t.len()
+            && (p[pi] == t[ti] || (p[pi] == '?' && t[ti] != '/'))
+            && glob_dp(p, t, pi + 1, ti + 1, memo)
     };
     memo[pi][ti] = Some(res);
     res
+}
+
+// Directory exclusions use a trailing slash or a recursive glob. Ordinary file
+// patterns match at the end of a path or a slash-delimited suffix.
+pub(crate) fn archive_excluded(path: &str, exclusions: &BTreeSet<String>) -> bool {
+    let matches = |pattern: &str, path: &str| match pattern.strip_prefix('/') {
+        Some(pattern) => rclone_glob_match(pattern, path),
+        None => {
+            rclone_glob_match(pattern, path)
+                || path
+                    .match_indices('/')
+                    .any(|(i, _)| rclone_glob_match(pattern, &path[i + 1..]))
+        }
+    };
+    // Preserve repository internals inside included project folders.
+    let git_root = path
+        .split('/')
+        .scan(0, |offset, segment| {
+            let start = *offset;
+            *offset += segment.len() + 1;
+            Some((start, segment))
+        })
+        .find_map(|(start, segment)| (segment == ".git").then_some(start));
+    exclusions.iter().any(|pattern| {
+        let directory_pattern = pattern.ends_with('/') || pattern.contains("**");
+        let normalized;
+        let pattern = if pattern.ends_with('/') {
+            normalized = format!("{pattern}**");
+            &normalized
+        } else {
+            pattern
+        };
+        if git_root.is_none() && matches(pattern, path) {
+            return true;
+        }
+        directory_pattern
+            && path.match_indices('/').any(|(i, _)| {
+                git_root.is_none_or(|git_root| i < git_root) && matches(pattern, &path[..=i])
+            })
+    })
 }
 
 fn is_excluded(rel_path: &str, exclusions: &BTreeSet<String>) -> bool {
@@ -920,6 +999,7 @@ pub(crate) fn inspect_drive_endpoint(
             marker_conflict: None,
             marker_conflict_path: None,
             subfolders: subfolders.into_values().collect(),
+            archive_suggestions: Vec::new(),
             symlinks: Vec::new(),
             special_files: Vec::new(),
             first_name_finding_next_step: findings.first().map(|finding| finding.next_step.clone()),

@@ -6,13 +6,16 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use sync_core::archive::ArchiveSuggestion;
 use sync_core::{
     AccountId, Execution, Intent, LastRunSummary, MappingId, MappingState, ObservedEvent,
     PostRecoveryReadiness, Readiness, RunId, RunOutcome, UserAction, VolumeIdentity, VolumeKind,
     WallTime, apply_event, apply_user_action, available_actions,
 };
+use sync_manager::{ArchiveState, ArchiveStatus};
 
 use crate::contract::{
     AccountSnapshot, AccountStatus, ActiveRunSnapshot, ActivityEvent, AttentionItem, AttentionKind,
@@ -277,6 +280,15 @@ impl DemoSource {
                 rebuild_attention(&mut snap);
             }
             UiCommand::StopRun(id) => {
+                if snap.wizard.first_sync_mapping_id.as_ref() == Some(&id)
+                    && snap
+                        .active_run
+                        .as_ref()
+                        .is_some_and(|run| matches!(&run.phase, RunPhase::CreatingArchive { .. }))
+                {
+                    drop(snap);
+                    return self.dispatch(UiCommand::WizardStopFirstSync);
+                }
                 let mut event_msg = None;
                 if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == id) {
                     let res = apply_user_action(m.state, UserAction::StopRun);
@@ -547,6 +559,7 @@ impl DemoSource {
             UiCommand::RemoveMapping(id) | UiCommand::DiscardDraft(id) => {
                 if let Some(pos) = snap.mappings.iter().position(|m| m.id == id) {
                     let removed = snap.mappings.remove(pos);
+                    snap.archives.retain(|entry| entry.mapping_id != removed.id);
                     snap.queue_order.retain(|q| q != &removed.id);
                     if snap
                         .active_run
@@ -858,6 +871,9 @@ impl DemoSource {
             }
             UiCommand::WizardSelectAccount(acct) => {
                 cancel_demo_size(&mut snap);
+                if snap.wizard.selected_account != acct {
+                    snap.wizard.reset_archive_choices();
+                }
                 snap.wizard.selected_account = acct;
                 snap.wizard.no_other_sync_confirmed = false;
                 snap.wizard.cloud_recovery_path = format!(
@@ -936,6 +952,9 @@ impl DemoSource {
                 recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSetLocalPath(path) => {
+                if snap.wizard.local_path != path {
+                    snap.wizard.reset_archive_choices();
+                }
                 snap.wizard.local_path = path;
                 snap.wizard.location_check_pending = false;
                 snap.wizard.no_other_sync_confirmed = false;
@@ -969,6 +988,9 @@ impl DemoSource {
                 snap.wizard.no_other_sync_confirmed = false;
                 recompute_wizard_checks(&mut snap);
             }
+            UiCommand::WizardToggleArchive(folder) => {
+                snap.wizard.toggle_archive(folder);
+            }
             UiCommand::WizardToggleDefaultExclusions => {
                 snap.wizard.show_default_exclusions = !snap.wizard.show_default_exclusions;
             }
@@ -976,12 +998,14 @@ impl DemoSource {
                 if snap.wizard.add_custom_pattern(&pattern) {
                     snap.wizard.no_other_sync_confirmed = false;
                     snap.wizard.filter_review = None;
+                    recompute_wizard_checks(&mut snap);
                 }
             }
             UiCommand::WizardRemovePattern(pattern) => {
                 if snap.wizard.remove_custom_pattern(&pattern) {
                     snap.wizard.no_other_sync_confirmed = false;
                     snap.wizard.filter_review = None;
+                    recompute_wizard_checks(&mut snap);
                 }
             }
             UiCommand::WizardSetLocalRecoveryPath(path) => {
@@ -1004,8 +1028,13 @@ impl DemoSource {
                         snap.wizard.blocked_populated_pair = None;
                         snap.wizard.cloud_file_count = Some(0);
                         snap.wizard.cloud_total_bytes = Some(0);
-                        snap.wizard.local_file_count = Some(812);
-                        snap.wizard.local_total_bytes = Some(4_200_000_000);
+                        if snap.wizard.selected_folder == "Projects" {
+                            snap.wizard.local_file_count = Some(7_312);
+                            snap.wizard.local_total_bytes = Some(18_600_000_000);
+                        } else {
+                            snap.wizard.local_file_count = Some(812);
+                            snap.wizard.local_total_bytes = Some(4_200_000_000);
+                        }
                     }
                     ReviewScenario::BothPopulated => {
                         snap.wizard.blocked_populated_pair = Some((
@@ -1044,7 +1073,10 @@ impl DemoSource {
             UiCommand::WizardStartFirstSync => {
                 // #3: Create/update a real mapping and start its first sync cleanly.
                 recompute_wizard_checks(&mut snap);
-                if snap.wizard.can_start_first_sync() {
+                if snap.wizard.can_start_first_sync()
+                    && (snap.wizard.step == WizardStep::Review
+                        || snap.wizard.selected_archives().next().is_none())
+                {
                     let id = upsert_wizard_mapping(
                         &mut snap,
                         MappingState::new(
@@ -1055,6 +1087,24 @@ impl DemoSource {
                     );
                     let name = snap.wizard.selected_folder.clone();
                     let vol_name = snap.wizard.volume_name.clone();
+                    let archives: Vec<_> =
+                        snap.wizard
+                            .selected_archives()
+                            .filter(|item| {
+                                !snap.archives.iter().any(|entry| {
+                                    entry.mapping_id == id && entry.folder == item.name
+                                })
+                            })
+                            .map(|item| ArchiveStatus {
+                                mapping_id: id.clone(),
+                                folder: item.name.clone(),
+                                state: ArchiveState::Pending,
+                                holding_path: None,
+                                original_bytes: None,
+                            })
+                            .collect();
+                    let preparing_archives = !archives.is_empty();
+                    snap.archives.extend(archives);
                     snap.wizard.editing_mapping_id = Some(id.clone());
                     snap.wizard.first_sync_mapping_id = Some(id.clone());
                     snap.wizard.first_sync_completed = false;
@@ -1067,16 +1117,30 @@ impl DemoSource {
                             33
                         };
                     snap.wizard.first_sync_elapsed_secs = 21 * 60 + 40;
-                    if snap.active_run.is_none() {
+                    if snap.active_run.is_none() || preparing_archives {
+                        if let Some(previous) = snap.active_run.take()
+                            && previous.mapping_id != id
+                            && let Some(mapping) = snap
+                                .mappings
+                                .iter_mut()
+                                .find(|m| m.id == previous.mapping_id)
+                        {
+                            mapping.state.execution = Execution::Queued;
+                            mapping.available_actions = available_actions(&mapping.state);
+                            snap.queue_order.insert(0, previous.mapping_id);
+                        }
                         snap.active_run = Some(ActiveRunSnapshot {
                             run_id: RunId::new(format!("run-init-{id}")),
-                            mapping_id: id,
+                            mapping_id: id.clone(),
                             mapping_name: name.clone(),
                             volume_name: vol_name,
                             started_label: "14:46".to_owned(),
                             trigger_label: "First sync".to_owned(),
                             phase: RunPhase::Scanning { elapsed_secs: 1 },
                         });
+                    }
+                    if preparing_archives {
+                        start_next_demo_archive(&mut snap, &id);
                     }
                     recount_account_mappings(&mut snap);
                     self.push_event(
@@ -1090,6 +1154,9 @@ impl DemoSource {
             UiCommand::WizardStopFirstSync => {
                 // #3: Stop an in-progress first sync honestly and return to Review.
                 if let Some(mid) = snap.wizard.first_sync_mapping_id.clone() {
+                    snap.archives.retain(|archive| {
+                        archive.mapping_id != mid || archive.state == ArchiveState::Complete
+                    });
                     if let Some(m) = snap.mappings.iter_mut().find(|m| m.id == mid) {
                         m.state = MappingState::new(
                             Readiness::NeedsInitialization,
@@ -1114,11 +1181,32 @@ impl DemoSource {
                 );
                 if !snap.wizard.changing_subfolders {
                     snap.wizard.step = WizardStep::Review;
+                    snap.wizard.no_other_sync_confirmed = false;
+                    recompute_wizard_checks(&mut snap);
+                }
+            }
+            UiCommand::WizardCompleteDemoArchive => {
+                if let Some(mid) = snap.wizard.first_sync_mapping_id.clone()
+                    && let Some(holding) = snap.wizard.archive_holding_folder.clone()
+                    && let Some(archive) = snap.archives.iter_mut().find(|archive| {
+                        archive.mapping_id == mid
+                            && matches!(archive.state, ArchiveState::Creating { .. })
+                    })
+                    && let ArchiveState::Creating { total, .. } = archive.state
+                {
+                    archive.holding_path = Some(holding.join(&archive.folder));
+                    archive.original_bytes = Some(total);
+                    archive.state = ArchiveState::Complete;
+                    start_next_demo_archive(&mut snap, &mid);
                 }
             }
             UiCommand::WizardCompleteDemoFirstSync => {
                 // #3: Finish the demo first sync into a real Ready mapping.
-                if let Some(mid) = snap.wizard.first_sync_mapping_id.clone() {
+                if let Some(mid) = snap.wizard.first_sync_mapping_id.clone()
+                    && !snap.archives.iter().any(|archive| {
+                        archive.mapping_id == mid && archive.state != ArchiveState::Complete
+                    })
+                {
                     let mut completed_name = snap.wizard.selected_folder.clone();
                     let mut vol_name = snap.wizard.volume_name.clone();
                     snap.queue_order.retain(|queued| queued != &mid);
@@ -1299,6 +1387,7 @@ impl DemoSource {
             UiCommand::DemoTickElapsed => {
                 if let Some(run) = &mut snap.active_run {
                     match &mut run.phase {
+                        RunPhase::CreatingArchive { .. } | RunPhase::StoppingArchive => {}
                         RunPhase::Scanning { elapsed_secs }
                         | RunPhase::TransferringKnown { elapsed_secs, .. }
                         | RunPhase::TransferringUnknown { elapsed_secs, .. }
@@ -1344,6 +1433,36 @@ impl DemoSource {
             },
         );
         snap.recent_events.truncate(200);
+    }
+}
+
+fn start_next_demo_archive(snap: &mut UiSnapshot, mapping: &MappingId) {
+    let next = snap
+        .archives
+        .iter_mut()
+        .find(|entry| &entry.mapping_id == mapping && entry.state == ArchiveState::Pending);
+    let phase = if let Some(entry) = next
+        && let Some(suggestion) = snap
+            .wizard
+            .archive_suggestions
+            .iter()
+            .find(|item| item.name == entry.folder)
+    {
+        let total = suggestion.bytes;
+        let bytes = total / 4;
+        entry.state = ArchiveState::Creating { bytes, total };
+        RunPhase::CreatingArchive {
+            folder: entry.folder.clone(),
+            bytes,
+            total,
+        }
+    } else {
+        RunPhase::Scanning { elapsed_secs: 1 }
+    };
+    if let Some(run) = &mut snap.active_run
+        && &run.mapping_id == mapping
+    {
+        run.phase = phase;
     }
 }
 
@@ -1468,6 +1587,7 @@ fn apply_wizard_folder_selection(snap: &mut UiSnapshot, folder: &str) {
         .find(|c| c.name == folder)
         .cloned();
     snap.wizard.selected_folder = folder.to_owned();
+    snap.wizard.reset_archive_choices();
     snap.wizard.local_path.clear();
     snap.wizard.location_check_pending = false;
     snap.wizard.local_recovery_path = format!("/Volumes/WorkSSD/FolderSyncRecovery/{folder}");
@@ -1852,6 +1972,53 @@ fn recompute_wizard_checks(snap: &mut UiSnapshot) {
         &other_mappings,
         &snap.volumes,
     );
+    let draft = &mut snap.wizard;
+    draft.archive_suggestions.clear();
+    draft.archive_holding_folder = None;
+    if !draft.changing_subfolders
+        && draft.selected_folder == "Projects"
+        && draft.review_scenario == ReviewScenario::LocalToCloud
+        && !draft.local_path.is_empty()
+    {
+        draft.archive_suggestions = [
+            ("Field-Data", 4_000, 9_800_000_000),
+            ("Reports", 2_500, 3_300_000_000),
+        ]
+        .into_iter()
+        .filter(|(folder, _, _)| {
+            draft
+                .subfolders
+                .iter()
+                .any(|node| node.name == *folder && node.included)
+                && !draft
+                    .custom_patterns
+                    .iter()
+                    .any(|pattern| pattern.trim_start_matches('/') == format!("{folder}/**"))
+                && !snap.archives.iter().any(|entry| {
+                    Some(&entry.mapping_id) == draft.editing_mapping_id.as_ref()
+                        && entry.folder == *folder
+                        && entry.state == ArchiveState::Complete
+                })
+        })
+        .map(|(folder, file_count, bytes)| ArchiveSuggestion {
+            name: folder.to_owned(),
+            file_count,
+            bytes,
+            last_changed_unix_secs: 1_654_041_600,
+            estimated_seconds_saved: file_count * 2 / 5,
+        })
+        .collect();
+        let volume_root = if draft.volume_kind == VolumeKind::Internal {
+            PathBuf::from("/")
+        } else {
+            PathBuf::from("/Volumes").join(&draft.volume_name)
+        };
+        draft.archive_holding_folder = Some(
+            volume_root
+                .join("FolderSync Archived Originals")
+                .join(&draft.selected_folder),
+        );
+    }
 }
 
 /// Evaluates Location step checks against the chosen path and demo fixtures.
@@ -1890,6 +2057,8 @@ pub fn evaluate_location_checks(
         format!("{vol_name} is not connected in this demo snapshot. Choose a connected volume.")
     } else if review_scenario == ReviewScenario::BothPopulated {
         "Both the local folder and cloud folder already contain files. Choose an empty local folder.".to_owned()
+    } else if review_scenario == ReviewScenario::LocalToCloud {
+        "Folder exists and contains files (per demo fixture).".to_owned()
     } else {
         "Folder exists and contains no files (per demo fixture).".to_owned()
     };
@@ -2116,6 +2285,10 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         volume_free_gb: 1400,
         volume_total_gb: 2000,
         subfolders: demo_subfolders_for_folder("Projects", Some(18.6)),
+        archive_suggestions: Vec::new(),
+        declined_archives: Default::default(),
+        archive_holding_folder: None,
+        archive_errors: Vec::new(),
         custom_patterns: Vec::new(),
         show_default_exclusions: false,
         local_recovery_path: "/Volumes/WorkSSD/FolderSyncRecovery/Projects".to_owned(),
@@ -2344,6 +2517,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             volumes,
             mappings: Vec::new(),
             active_run: None,
+            archives: Vec::new(),
             queue_order: Vec::new(),
             attention_items: Vec::new(),
             recent_events: Vec::new(),
@@ -2388,6 +2562,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
             volumes,
             mappings: Vec::new(),
             active_run: None,
+            archives: Vec::new(),
             queue_order: Vec::new(),
             attention_items: Vec::new(),
             recent_events: Vec::new(),
@@ -3111,6 +3286,7 @@ fn build_snapshot(preset: DemoPreset) -> UiSnapshot {
         volumes,
         mappings,
         active_run,
+        archives: Vec::new(),
         queue_order: Vec::new(),
         attention_items: Vec::new(),
         recent_events,

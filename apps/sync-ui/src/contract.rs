@@ -5,12 +5,15 @@
 //! command lines.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
+use sync_core::archive::ArchiveSuggestion;
 use sync_core::{
     AccountId, AvailableAction, CloudCollection, DEFAULT_EXCLUSIONS, Execution, Intent,
     LastRunSummary, MappingId, MappingState, Readiness, RunId, VolumeIdentity, VolumeKind,
     available_actions, status_text,
 };
+use sync_manager::ArchiveStatus;
 
 pub(crate) const SYNC_ALL_NOW_LABEL: &str = "Sync all now";
 
@@ -98,7 +101,13 @@ pub enum IconKind {
 /// Active transfer progress phase shown on Activity and Overview.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunPhase {
+    CreatingArchive {
+        folder: String,
+        bytes: u64,
+        total: u64,
+    },
     /// Listing and comparing both sides: indeterminate bar + elapsed time only.
+    StoppingArchive,
     Scanning {
         /// Elapsed seconds since the run started.
         elapsed_secs: u64,
@@ -498,6 +507,9 @@ impl MappingSnapshot {
 
         // 1. Stopping
         if execution == Execution::Stopping {
+            let stopping_archive = active_run.is_some_and(|run| {
+                run.mapping_id == self.id && matches!(run.phase, RunPhase::StoppingArchive)
+            });
             let elapsed = active_run
                 .filter(|r| r.mapping_id == self.id)
                 .and_then(|r| match r.phase {
@@ -509,12 +521,20 @@ impl MappingSnapshot {
                 pill_label: Some("Stopping".to_owned()),
                 pill_tone: Tone::Neutral,
                 icon: IconKind::Stop,
-                status_line: format!("Stopping · {elapsed}"),
-                why_line: Some("Letting the current step finish (about 90 seconds)".to_owned()),
+                status_line: if stopping_archive {
+                    "Stopping archive".to_owned()
+                } else {
+                    format!("Stopping · {elapsed}")
+                },
+                why_line: Some(if stopping_archive {
+                    "Finishing archive cleanup".to_owned()
+                } else {
+                    "Letting the current step finish (about 90 seconds)".to_owned()
+                }),
                 secondary_link: None,
                 sync_now_enabled: false,
                 show_stop: false,
-                show_force_stop: true,
+                show_force_stop: !stopping_archive,
                 show_pause: intent == Intent::Enabled,
                 show_resume: intent == Intent::Paused,
                 is_draft: false,
@@ -528,6 +548,11 @@ impl MappingSnapshot {
             let run_line = active_run
                 .filter(|r| r.mapping_id == self.id)
                 .map(|r| match &r.phase {
+                    RunPhase::CreatingArchive {
+                        folder,
+                        bytes,
+                        total,
+                    } => archive_progress_label(folder, *bytes, *total),
                     RunPhase::Scanning { elapsed_secs } => {
                         format!(
                             "Scanning {} · {}",
@@ -543,6 +568,7 @@ impl MappingSnapshot {
                     RunPhase::TransferringUnknown {
                         transferred_label, ..
                     } => format!("Transferring · {transferred_label} so far"),
+                    RunPhase::StoppingArchive => "Stopping archive".to_owned(),
                     RunPhase::Stopping { elapsed_secs } => {
                         format!("Stopping · {}", format_mm_ss(*elapsed_secs))
                     }
@@ -1190,6 +1216,19 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+pub(crate) fn archive_progress_label(folder: &str, bytes: u64, total: u64) -> String {
+    const GB: f64 = 1_000_000_000.0;
+    format!(
+        "Creating archive {folder} · {:.1} of {:.1} GB",
+        bytes as f64 / GB,
+        total as f64 / GB
+    )
+}
+
+pub(crate) fn archive_percent(bytes: u64, total: u64) -> Option<f32> {
+    (total > 0).then(|| (bytes.min(total) as f64 * 100.0 / total as f64) as f32)
+}
+
 /// One node in the Wizard Step 4 subfolder selection tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubfolderNode {
@@ -1260,6 +1299,10 @@ pub struct WizardDraft {
     pub volume_total_gb: u64,
     pub location_checks: Vec<LocationCheck>,
     pub subfolders: Vec<SubfolderNode>,
+    pub archive_suggestions: Vec<ArchiveSuggestion>,
+    pub declined_archives: BTreeSet<String>,
+    pub archive_holding_folder: Option<PathBuf>,
+    pub archive_errors: Vec<String>,
     pub custom_patterns: Vec<String>,
     pub show_default_exclusions: bool,
     pub local_recovery_path: String,
@@ -1299,6 +1342,47 @@ pub struct WizardDraft {
 impl WizardDraft {
     pub fn has_cloud_folder(&self) -> bool {
         self.remote_folder_path.is_some() || self.drive_collection.is_some()
+    }
+
+    pub(crate) fn selected_archives(&self) -> impl Iterator<Item = &ArchiveSuggestion> {
+        self.archive_suggestions
+            .iter()
+            .filter(|item| !self.declined_archives.contains(&item.name))
+    }
+
+    pub(crate) fn selected_archive_names(&self) -> BTreeSet<String> {
+        self.selected_archives()
+            .map(|item| item.name.clone())
+            .collect()
+    }
+
+    pub(crate) fn toggle_archive(&mut self, folder: String) {
+        if self.changing_subfolders
+            || self.step != WizardStep::Subfolders
+            || !self
+                .archive_suggestions
+                .iter()
+                .any(|item| item.name == folder)
+        {
+            return;
+        }
+        if !self.declined_archives.remove(&folder) {
+            self.declined_archives.insert(folder);
+        }
+        self.no_other_sync_confirmed = false;
+        self.reviewed_fingerprint = None;
+    }
+
+    pub(crate) fn reset_archive_choices(&mut self) {
+        self.archive_suggestions.clear();
+        self.declined_archives.clear();
+        self.archive_holding_folder = None;
+        self.archive_errors.clear();
+    }
+
+    pub(crate) fn archives_reviewed(&self) -> bool {
+        self.selected_archives().next().is_none()
+            || (self.archive_errors.is_empty() && self.archive_holding_folder.is_some())
     }
 
     /// Estimated selection size, including files directly inside the root folder.
@@ -1414,6 +1498,7 @@ impl WizardDraft {
             && self.recovery_valid()
             && self.review_scenario != ReviewScenario::BothPopulated
             && !self.download_exceeds_free_space()
+            && self.archives_reviewed()
             && self.no_other_sync_confirmed
     }
 }
@@ -1465,6 +1550,7 @@ pub struct UiSnapshot {
     pub volumes: Vec<VolumeSnapshot>,
     pub mappings: Vec<MappingSnapshot>,
     pub active_run: Option<ActiveRunSnapshot>,
+    pub archives: Vec<ArchiveStatus>,
     /// Actual ordered queue of waiting mapping IDs (front first, #6).
     pub queue_order: Vec<MappingId>,
     pub active_job_mapping_id: Option<MappingId>,
@@ -1646,6 +1732,7 @@ pub enum UiCommand {
     WizardSetLocalPath(String),
     DemoPreviewLocationCheck(String),
     WizardToggleSubfolder(String),
+    WizardToggleArchive(String),
     WizardToggleDefaultExclusions,
     WizardAddPattern(String),
     WizardRemovePattern(String),
@@ -1656,6 +1743,7 @@ pub enum UiCommand {
     WizardStartFirstSync,
     WizardStopFirstSync,
     WizardCompleteDemoFirstSync,
+    WizardCompleteDemoArchive,
     WizardReset,
     WizardLeave,
     DemoFailFolderSize,
@@ -1712,7 +1800,12 @@ pub fn selected_stop_target(route: &ScreenRoute, snap: &UiSnapshot) -> Option<Ma
         ScreenRoute::Activity => snap
             .active_run
             .as_ref()
-            .filter(|r| !matches!(r.phase, RunPhase::Stopping { .. }))
+            .filter(|r| {
+                !matches!(
+                    r.phase,
+                    RunPhase::Stopping { .. } | RunPhase::StoppingArchive
+                )
+            })
             .map(|r| r.mapping_id.clone()),
         _ => None,
     }

@@ -8,7 +8,7 @@ use sync_core::{MappingId, RunId};
 
 use crate::contract::{
     ActiveRunSnapshot, DemoActivityPhase, IconKind, RunPhase, ScreenRoute, Tone, UiCommand,
-    format_duration, format_mm_ss,
+    archive_percent, archive_progress_label, format_duration, format_mm_ss,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -579,6 +579,34 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
     let c_force = ctrl.clone();
 
     match &run.phase {
+        RunPhase::StoppingArchive => card()
+            .child(card_title(run.mapping_name.clone()))
+            .child(text("Stopping archive"))
+            .child(text("Finishing archive cleanup").text_size(px(S_SMALL))),
+        RunPhase::CreatingArchive {
+            folder,
+            bytes,
+            total,
+        } => {
+            let label = archive_progress_label(folder, *bytes, *total);
+            card()
+                .border_color(p.run_bd)
+                .child(card_title(run.mapping_name.clone()))
+                .child(text(label.clone()))
+                .child(progress_bar(archive_percent(*bytes, *total), 6.0, label))
+                .child(
+                    app_button(
+                        "Stop",
+                        BtnKind::Default,
+                        false,
+                        false,
+                        Some(IconKind::Stop),
+                        None,
+                        move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
+                    )
+                    .test_id("activity-stop-btn"),
+                )
+        }
         RunPhase::Scanning { elapsed_secs } => {
             let base_secs = *elapsed_secs;
             let elapsed_sig = ctrl.elapsed_offset;
