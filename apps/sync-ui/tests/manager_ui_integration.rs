@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use nsh_app_sync_ui::{
@@ -346,6 +346,54 @@ fn new_mapping_applies_only_observed_suggestions_before_review_and_first_sync() 
     );
     mgr.dispatch(UiCommand::WizardStopFirstSync);
     wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.active_run.is_none());
+    mgr.shutdown();
+}
+
+#[test]
+fn automatic_build_exclusion_updates_archive_eligibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    let finished = local_folder.join("Finished");
+    fs::create_dir_all(finished.join("project/build")).unwrap();
+    let old = fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_000));
+    for name in (0..1999)
+        .map(|i| format!("{i}.txt"))
+        .chain(["project/build/old.o".to_owned()])
+    {
+        let path = finished.join(name);
+        fs::write(&path, b"old").unwrap();
+        fs::File::open(path).unwrap().set_times(old).unwrap();
+    }
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        Arc::new(FakeBisyncLauncher::new()),
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    configure_fixture_wizard(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.local_file_count.is_some()
+    });
+    assert_eq!(snap.wizard.custom_patterns, ["build/**"]);
+    assert_eq!(snap.wizard.local_file_count, Some(1_999));
+    assert!(snap.wizard.archive_suggestions.is_empty());
+
+    mgr.dispatch(UiCommand::WizardRemovePattern("build/**".to_owned()));
+    let snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.custom_patterns.is_empty()
+    });
+    let [suggestion] = snap.wizard.archive_suggestions.as_slice() else {
+        panic!("expected one archive suggestion");
+    };
+    assert_eq!(suggestion.name, "Finished");
+    assert_eq!(suggestion.file_count, 2_000);
     mgr.shutdown();
 }
 

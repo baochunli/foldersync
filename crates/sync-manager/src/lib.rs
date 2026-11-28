@@ -3,6 +3,9 @@
 //! publication/action handling for FolderSync.
 
 pub mod accounts;
+mod archive_setup;
+mod archive_transaction;
+mod archive_writer;
 pub mod clock;
 pub mod error;
 pub mod finder;
@@ -21,6 +24,7 @@ pub use accounts::{
     DriveAuthorization, ImportAccountRequest, PasswordCommandFactory,
     RESERVED_LOCAL_FIXTURE_ACCOUNT_ID, SkippedCollection,
 };
+pub use archive_transaction::ArchivedOriginal;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use error::ManagerError;
 pub use finder::{
@@ -58,8 +62,8 @@ pub use secrets::{
     SystemSecretStore, run_credential_helper, scoped_credential_key, validate_credential_key,
 };
 pub use snapshot::{
-    FolderSizeSnapshot, FolderSizeStatus, ManagerEvent, MappingCounters, MappingStatusSnapshot,
-    SnapshotReceiver, StatusSnapshot,
+    ArchiveState, ArchiveStatus, FolderSizeSnapshot, FolderSizeStatus, ManagerEvent,
+    MappingCounters, MappingStatusSnapshot, SnapshotReceiver, StatusSnapshot,
 };
 pub use store::{
     AccountRecord, DeviceRecord, GenerationRecord, MappingRecord, RecoveryCaseRecord, RunRecord,

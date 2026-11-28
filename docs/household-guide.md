@@ -33,6 +33,33 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
    transfer when the expected byte total is known. FolderSync can estimate
    time left after two minutes.
 
+## Archive finished folders during setup
+
+Under **Choose what to include**, FolderSync suggests **Upload as one
+archive** for an immediate subfolder with at least 2,000 included files and
+no included file modified in the past 12 months. The count applies your
+exclusions, including any suggested build and cache folders you keep
+excluded. Clear any archive suggestion you want to keep as ordinary files.
+**Review** shows the selected archives and where the originals will go.
+
+When you start first sync, FolderSync checks that the disk has room to make
+and verify each ZIP while the original is still present. ZIPs contain the
+included files, including Git repository data within included folders. The
+complete original moves to **FolderSync Archived Originals** on the same
+disk, outside the mapping. The ZIP takes its place in the mapping and syncs
+as an ordinary file. First-sync progress shows ZIP creation before upload
+and then counts each ZIP as one file at its on-disk size. Keep the source
+folders quiet while the ZIPs are made.
+
+If the holding folder is inaccessible or the ZIP name is already in use,
+review the error before starting. If the app stops during a move, reopen
+FolderSync with the same disk connected so it can recover the archive before
+you resume first sync.
+
+Open the mapping’s **Archived originals** section to see their sizes and
+reveal them in Finder. FolderSync keeps the originals until you remove them
+yourself. Open a ZIP to retrieve an included file.
+
 ## Everyday use
 
 - After a successful first sync, FolderSync checks both folders every five

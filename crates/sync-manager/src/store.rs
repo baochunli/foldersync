@@ -1,6 +1,9 @@
 //! Durable SQLite state store with forward-only `schema_migrations` and the §6 entities.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use chrono::{SecondsFormat, Utc};
 use rclone_adapter::ProcessStartTime;
@@ -18,7 +21,7 @@ use crate::{
 };
 
 /// Current highest SQLite schema migration version supported by this build.
-pub const LATEST_SCHEMA_VERSION: i64 = 3;
+pub const LATEST_SCHEMA_VERSION: i64 = 4;
 
 struct Migration {
     version: i64,
@@ -177,6 +180,11 @@ WHERE EXISTS (
 );
 "#,
     },
+    Migration {
+        version: 4,
+        name: "confirmed_first_sync_archives",
+        sql: "ALTER TABLE mappings ADD COLUMN archive_folders_json TEXT NOT NULL DEFAULT '[]';",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +223,8 @@ pub struct MappingRecord {
     pub state: MappingState,
     pub active_generation_id: Option<GenerationId>,
     pub exclusions: Vec<String>,
+    #[serde(default)]
+    pub archive_folders: BTreeSet<String>,
     pub max_delete_percent: u8,
     pub last_run_id: Option<RunId>,
     pub last_run_outcome: Option<RunOutcome>,
@@ -717,6 +727,8 @@ impl SqliteStateStore {
             .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
         let exclusions_json = serde_json::to_string(&m.exclusions)
             .map_err(|e| storage_err("Failed to serialize exclusions", e))?;
+        let archive_folders_json = serde_json::to_string(&m.archive_folders)
+            .map_err(|e| storage_err("Failed to serialize confirmed archives", e))?;
         let last_outcome_json = m
             .last_run_outcome
             .map(|o| serde_json::to_string(&o))
@@ -736,10 +748,10 @@ impl SqliteStateStore {
                     active_generation_id, exclusions_json, max_delete_percent,
                     last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
                     unreviewed_conflict_run_id,
-                    created_at, updated_at
+                    created_at, updated_at, archive_folders_json
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
                 )",
                 params![
                     m.id.as_str(),
@@ -772,6 +784,7 @@ impl SqliteStateStore {
                     m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                     m.created_at,
                     m.updated_at,
+                    archive_folders_json,
                 ],
             )
             .map_err(|e| storage_err("Failed to insert mapping record", e))?;
@@ -785,6 +798,8 @@ impl SqliteStateStore {
             .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
         let exclusions_json = serde_json::to_string(&m.exclusions)
             .map_err(|e| storage_err("Failed to serialize exclusions", e))?;
+        let archive_folders_json = serde_json::to_string(&m.archive_folders)
+            .map_err(|e| storage_err("Failed to serialize confirmed archives", e))?;
         self.conn
             .execute(
                 "UPDATE mappings SET
@@ -807,7 +822,8 @@ impl SqliteStateStore {
                     execution = ?18,
                     exclusions_json = ?19,
                     max_delete_percent = ?20,
-                    updated_at = ?21
+                    updated_at = ?21,
+                    archive_folders_json = ?22
                  WHERE id = ?1",
                 params![
                     m.id.as_str(),
@@ -831,6 +847,7 @@ impl SqliteStateStore {
                     exclusions_json,
                     i64::from(m.max_delete_percent),
                     m.updated_at,
+                    archive_folders_json,
                 ],
             )
             .map_err(|e| storage_err("Failed to update draft mapping record", e))?;
@@ -1013,6 +1030,10 @@ impl SqliteStateStore {
             .as_deref()
             .and_then(|s| serde_json::from_str::<RunOutcome>(s).ok());
 
+        let archives_json: String = row.get(30)?;
+        let archive_folders = serde_json::from_str(&archives_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(30, rusqlite::types::Type::Text, Box::new(e))
+        })?;
         Ok(MappingRecord {
             id: MappingId::new(row.get::<_, String>(0)?),
             device_id: DeviceId::new(row.get::<_, String>(1)?),
@@ -1039,6 +1060,7 @@ impl SqliteStateStore {
             state,
             active_generation_id: row.get::<_, Option<String>>(20)?.map(GenerationId::new),
             exclusions,
+            archive_folders,
             max_delete_percent: row.get::<_, i64>(22)? as u8,
             last_run_id: row.get::<_, Option<String>>(23)?.map(RunId::new),
             last_run_outcome,
@@ -1066,7 +1088,7 @@ impl SqliteStateStore {
                         active_generation_id, exclusions_json, max_delete_percent,
                         last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
                         unreviewed_conflict_run_id,
-                        created_at, updated_at
+                        created_at, updated_at, archive_folders_json
                  FROM mappings WHERE id = ?1",
                 params![mapping_id.as_str()],
                 Self::map_mapping_row,
@@ -1089,7 +1111,7 @@ impl SqliteStateStore {
                         active_generation_id, exclusions_json, max_delete_percent,
                         last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
                         unreviewed_conflict_run_id,
-                        created_at, updated_at
+                        created_at, updated_at, archive_folders_json
                  FROM mappings ORDER BY created_at ASC, id ASC",
             )
             .map_err(|e| storage_err("Failed to prepare list_mappings", e))?;
@@ -1935,6 +1957,7 @@ mod tests {
             state: MappingState::new(Readiness::Ready, Execution::Running, Intent::Enabled),
             active_generation_id: None,
             exclusions: vec![],
+            archive_folders: BTreeSet::new(),
             max_delete_percent: 10,
             last_run_id: None,
             last_run_outcome: None,

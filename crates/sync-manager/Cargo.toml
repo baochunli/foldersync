@@ -22,6 +22,7 @@ sync-core = { path = "../sync-core" }
 tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 sha2 = "0.10"

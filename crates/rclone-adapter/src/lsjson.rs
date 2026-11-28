@@ -300,6 +300,34 @@ impl LsJsonRequest {
         parse_lsjson_entries(&complete_stdout(&output)?)
     }
 
+    /// Lists immediate sibling names for a collision check, including Drive
+    /// shortcuts and native documents hidden by the ordinary sync policy.
+    pub fn list_sibling_names(
+        &self,
+        subpath: &str,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<String>, LsJsonError> {
+        let mut args = self.with_config_args(vec![
+            "lsjson".into(),
+            self.target(subpath)?,
+            "--max-depth".into(),
+            "1".into(),
+        ]);
+        if self.is_drive {
+            args.extend([
+                "--drive-skip-gdocs=false".into(),
+                "--drive-show-all-gdocs".into(),
+                "--drive-skip-shortcuts=false".into(),
+                "--drive-skip-dangling-shortcuts=false".into(),
+            ]);
+        }
+        let output = self.run(args, &QualificationManifest::embedded()?, runner)?;
+        Ok(parse_lsjson_entries(&complete_stdout(&output)?)?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect())
+    }
+
     /// Counts supported objects without retrieving file contents.
     pub fn size(
         &self,

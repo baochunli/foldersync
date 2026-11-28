@@ -7,6 +7,7 @@
 
 #![deny(missing_docs)]
 
+pub mod archive;
 pub mod generation;
 pub mod model;
 pub mod policy;

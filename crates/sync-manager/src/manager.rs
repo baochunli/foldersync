@@ -41,6 +41,14 @@ use crate::{
         DRIVE_COMMAND_TIMEOUT, DriveAccountResult, DriveAuthorization, LockedDrive,
         validate_drive_folder_id,
     },
+    archive_setup::{
+        archive_inputs, archive_rejected, check_archive_selection, collection_name, remote_names,
+        still_eligible,
+    },
+    archive_transaction::{
+        ARCHIVE_PARTIAL_SUFFIX, ArchiveJournal, ArchivedOriginal, holding_folder,
+    },
+    archive_writer::{estimated_zip_size, verify_zip, write_zip},
     clock::{Clock, SystemClock},
     error::ManagerError,
     finder::{
@@ -67,8 +75,9 @@ use crate::{
         network_addresses,
     },
     snapshot::{
-        DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, FolderSizeSnapshot, FolderSizeStatus,
-        ManagerEvent, MappingCounters, MappingStatusSnapshot, SnapshotReceiver, StatusSnapshot,
+        ArchiveState, ArchiveStatus, DEFAULT_EVENT_BUFFER_CAPACITY, EventBus, FolderSizeSnapshot,
+        FolderSizeStatus, ManagerEvent, MappingCounters, MappingStatusSnapshot, SnapshotReceiver,
+        StatusSnapshot,
     },
     store::{
         AccountRecord, DeviceRecord, GenerationRecord, MappingRecord, RecoveryCaseRecord,
@@ -242,6 +251,8 @@ pub struct PreflightPreview {
     pub local_inventory: Result<DetailedEndpointInventory, String>,
     pub remote_inventory: Result<DetailedEndpointInventory, String>,
     pub direction: Result<InitPreference, String>,
+    pub archive_errors: Vec<String>,
+    pub archive_holding_folder: Option<PathBuf>,
 }
 
 /// Proposed exclusion changes and an advisory first-sync preview.
@@ -1106,6 +1117,9 @@ struct SharedState {
     preflight_mapping: Option<MappingId>,
     next_init_attempt_id: u64,
     active_init_attempt: Option<(MappingId, u64)>,
+    archive_originals: ArchivedOriginals,
+    archive_problems: ArchiveProblems,
+    archive_progress: Option<ArchiveStatus>,
     cancelled_init_attempts: BTreeSet<u64>,
     scheduling_paused: bool,
     schedules: Schedules,
@@ -1259,6 +1273,8 @@ impl SyncManager {
             &event_bus,
         )?;
 
+        let (archive_originals, archive_problems) =
+            recover_setup_archives(&state_dir, &store, volume_probe.as_ref())?;
         let scheduling_paused = store.scheduling_paused(&device.id)?;
         let opened_at = config.clock.now_utc();
         let schedules = restore_schedules(&store, opened_at)?;
@@ -1271,6 +1287,7 @@ impl SyncManager {
             scheduling_paused,
             mappings: Vec::new(),
             folder_sizes: Vec::new(),
+            archives: Vec::new(),
         });
 
         let mut account_config =
@@ -1302,6 +1319,9 @@ impl SyncManager {
                 preflight_mapping: None,
                 next_init_attempt_id: 0,
                 active_init_attempt: None,
+                archive_originals,
+                archive_problems,
+                archive_progress: None,
                 cancelled_init_attempts: BTreeSet::new(),
                 scheduling_paused,
                 schedules,
@@ -1468,11 +1488,21 @@ impl SyncManager {
         cmd: &AddMappingCommand,
         editing_id: Option<&MappingId>,
     ) -> Result<PreflightPreview, ManagerError> {
+        self.preflight_mapping_preview_with_archives(cmd, editing_id, &BTreeSet::new())
+    }
+
+    /// Previews explicitly selected archives without writing to either endpoint.
+    pub fn preflight_mapping_preview_with_archives(
+        &self,
+        cmd: &AddMappingCommand,
+        editing_id: Option<&MappingId>,
+        archive_folders: &BTreeSet<String>,
+    ) -> Result<PreflightPreview, ManagerError> {
         let local_path = cmd.local_binding.resolved_path();
         let detected_volume = detect_volume_with(self.inner.volume_probe.as_ref(), &local_path)
             .map_err(|e| e.cause());
 
-        let (existing, device_id) = {
+        let (existing, device_id, previous_archives) = {
             let guard = self.inner.state.lock().unwrap();
             let list: Vec<MappingRecord> = guard
                 .store
@@ -1480,7 +1510,14 @@ impl SyncManager {
                 .into_iter()
                 .filter(|m| editing_id != Some(&m.id))
                 .collect();
-            (list, guard.device.id.clone())
+            (
+                list,
+                guard.device.id.clone(),
+                editing_id
+                    .and_then(|id| guard.archive_originals.get(id))
+                    .cloned()
+                    .unwrap_or_default(),
+            )
         };
 
         let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
@@ -1520,7 +1557,10 @@ impl SyncManager {
             .map(|err| err.cause());
         }
 
-        let exclusions = effective_exclusions(&cmd.extra_exclusions)?;
+        let mut exclusions = effective_exclusions(&cmd.extra_exclusions)?;
+        if !archive_folders.is_empty() {
+            exclusions.insert(format!("*{ARCHIVE_PARTIAL_SUFFIX}"));
+        }
 
         let local_inventory =
             inspect_local_endpoint_detailed(&local_path, &collection, &exclusions)
@@ -1567,12 +1607,83 @@ impl SyncManager {
             (_, Err(e)) => Err(format!("Can't check destination folder: {e}")),
         };
 
+        let mut archive_errors = Vec::new();
+        let archive_volume = if archive_folders.is_empty()
+            && local_inventory
+                .as_ref()
+                .is_ok_and(|inventory| inventory.archive_suggestions.is_empty())
+        {
+            None
+        } else {
+            self.inner.volume_probe.probe(&local_path).ok()
+        };
+        let archive_holding_folder = archive_volume
+            .as_ref()
+            .map(|volume| holding_folder(&volume.mount_path, collection_name(&collection)));
+        let pending: Vec<_> = archive_folders
+            .iter()
+            .filter(|folder| {
+                !previous_archives
+                    .iter()
+                    .any(|record| &record.subfolder == *folder)
+            })
+            .collect();
+        if !pending.is_empty() {
+            if let Some(volume) = archive_volume {
+                let check = || -> Result<(), ManagerError> {
+                    let root = fs::canonicalize(&local_path).map_err(|err| {
+                        archive_rejected(format!("Could not inspect the archive source: {err}."))
+                    })?;
+                    let holding = holding_folder(&volume.mount_path, collection_name(&collection));
+                    validate_archive_layout(
+                        &holding,
+                        &existing,
+                        &remote_endpoint,
+                        &self.inner.state_dir,
+                        self.inner.finder_writer.dir(),
+                    )?;
+                    let names = remote_names(&remote_endpoint, drive.as_ref(), &collection)?;
+                    for folder in pending {
+                        if !local_inventory.as_ref().is_ok_and(|inventory| {
+                            inventory
+                                .archive_suggestions
+                                .iter()
+                                .any(|item| &item.name == folder)
+                        }) {
+                            archive_errors.push(format!(
+                                "`{folder}` no longer meets the archive suggestion requirements."
+                            ));
+                        }
+                        if let Err(err) = check_archive_selection(
+                            &root,
+                            &volume.mount_path,
+                            &collection,
+                            folder,
+                            &exclusions,
+                            &names,
+                        ) {
+                            archive_errors.push(err.cause());
+                        }
+                    }
+                    Ok(())
+                };
+                if let Err(err) = check() {
+                    archive_errors.push(err.cause());
+                }
+            } else {
+                archive_errors
+                    .push("Could not verify the volume for the archived originals.".into());
+            }
+        }
+
         Ok(PreflightPreview {
             detected_volume,
             layout_error,
             local_inventory,
             remote_inventory,
             direction,
+            archive_errors,
+            archive_holding_folder,
         })
     }
 
@@ -1713,8 +1824,12 @@ impl SyncManager {
 
     pub fn execute(&self, cmd: ManagerCommand) -> Result<CommandAcceptance, ManagerError> {
         match cmd {
-            ManagerCommand::AddMapping(add) => self.handle_add_mapping(*add, false),
-            ManagerCommand::SaveDraftMapping(add) => self.handle_add_mapping(*add, true),
+            ManagerCommand::AddMapping(add) => {
+                self.handle_add_mapping(*add, false, BTreeSet::new())
+            }
+            ManagerCommand::SaveDraftMapping(add) => {
+                self.handle_add_mapping(*add, true, BTreeSet::new())
+            }
             ManagerCommand::Initialize(init) => self.handle_initialize(init),
             ManagerCommand::StartInitialize(init) => self.handle_start_initialize(init),
             ManagerCommand::RunNow { mapping_id } => self.handle_run_now(mapping_id),
@@ -1749,6 +1864,34 @@ impl SyncManager {
 
     pub fn add_mapping(&self, cmd: AddMappingCommand) -> Result<CommandAcceptance, ManagerError> {
         self.execute(ManagerCommand::AddMapping(Box::new(cmd)))
+    }
+
+    /// Persists archive selections made on the wizard's Review step. Archive
+    /// preparation starts only when the mapping's first sync is started.
+    pub fn add_mapping_with_archives(
+        &self,
+        cmd: AddMappingCommand,
+        archive_folders: BTreeSet<String>,
+    ) -> Result<CommandAcceptance, ManagerError> {
+        if !archive_folders.is_empty() {
+            let preview = self.preflight_mapping_preview_with_archives(
+                &cmd,
+                Some(&cmd.id),
+                &archive_folders,
+            )?;
+            if let Some(cause) = preview.archive_errors.into_iter().next() {
+                return Err(archive_rejected(cause));
+            }
+            if let Some(cause) = preview.layout_error {
+                return Err(archive_rejected(cause));
+            }
+            if preview.direction.map_err(archive_rejected)? != InitPreference::Path1 {
+                return Err(archive_rejected(
+                    "Archives require an empty first-sync destination.",
+                ));
+            }
+        }
+        self.handle_add_mapping(cmd, false, archive_folders)
     }
 
     pub fn save_draft_mapping(
@@ -2752,6 +2895,7 @@ impl SyncManager {
         &self,
         mut cmd: AddMappingCommand,
         is_draft: bool,
+        mut archive_folders: BTreeSet<String>,
     ) -> Result<CommandAcceptance, ManagerError> {
         validate_safe_path_id("mapping_id", cmd.id.as_str())?;
         validate_safe_path_id("account_id", cmd.account_id.as_str())?;
@@ -2818,6 +2962,41 @@ impl SyncManager {
         volume.check(&cmd.id, &cmd.local_binding)?;
         let mut guard = self.inner.state.lock().unwrap();
         let existing_same = guard.store.get_mapping(&cmd.id)?;
+        if guard
+            .archive_progress
+            .as_ref()
+            .is_some_and(|archive| archive.mapping_id == cmd.id)
+        {
+            return Err(archive_rejected(
+                "Wait for the archive job to finish before editing setup.",
+            ));
+        }
+        if let Some(existing) = &existing_same
+            && (!existing.archive_folders.is_empty()
+                || guard.archive_originals.contains_key(&cmd.id))
+        {
+            let journal = setup_archive_journal(&self.inner.state_dir, existing);
+            let completed = guard.archive_originals.get(&cmd.id);
+            if journal.has_pending()? {
+                return Err(archive_rejected(
+                    "An unfinished archive needs recovery. Restart FolderSync before editing this setup.",
+                ));
+            }
+            if let Some(completed) = completed
+                && !completed.is_empty()
+            {
+                if existing.local_binding != cmd.local_binding
+                    || existing.collection != cmd.collection
+                    || existing.account_id != cmd.account_id
+                {
+                    return Err(archive_rejected(
+                        "An archive has already been prepared for this folder and destination.",
+                    ));
+                }
+                archive_folders.extend(completed.iter().map(|item| item.subfolder.clone()));
+            }
+        }
+
         let updating_draft = match &existing_same {
             Some(m) if m.state.readiness() == Readiness::Unconfigured => true,
             Some(m)
@@ -2900,6 +3079,7 @@ impl SyncManager {
             state: initial_state,
             active_generation_id: None,
             exclusions: effective_exclusions.into_iter().collect(),
+            archive_folders,
             max_delete_percent: max_del.value(),
             last_run_id: None,
             last_run_outcome: None,
@@ -3069,6 +3249,19 @@ impl SyncManager {
     }
 
     fn handle_initialize(&self, cmd: InitializeCommand) -> Result<CommandAcceptance, ManagerError> {
+        if self
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .store
+            .get_mapping(&cmd.mapping_id)?
+            .is_some_and(|mapping| {
+                !mapping.archive_folders.is_empty() && !mapping.scheduling_enabled
+            })
+        {
+            return self.handle_start_initialize(cmd);
+        }
         // Phase 1 (short lock): validate state, claim preflight reservation, capture inputs, then DROP mutex!
         let snapshot_inputs = {
             let mut guard = self.inner.state.lock().unwrap();
@@ -3730,6 +3923,10 @@ impl SyncManager {
             .active_run
             .as_ref()
             .is_some_and(|a| a.mapping_id == mapping.id)
+            || guard
+                .archive_progress
+                .as_ref()
+                .is_some_and(|a| a.mapping_id == mapping.id)
         {
             return Err(ManagerError::InvalidState {
                 mapping_id,
@@ -3781,12 +3978,21 @@ impl SyncManager {
             }
         }
 
+        let journal = setup_archive_journal(&self.inner.state_dir, &mapping);
+        if journal.has_pending()? {
+            return Err(archive_rejected(
+                "An unfinished archive needs recovery. Restart FolderSync before removing this mapping.",
+            ));
+        }
         guard.job_queue.retain(|j| j.mapping_id != mapping.id);
         guard.storage_blocked_mappings.remove(&mapping.id);
         // Deletes only DB records; local folder, cloud folder, and recovery copies stay untouched (§7).
         guard.store.delete_mapping_cascade(&mapping.id)?;
+        journal.forget_completed()?;
         guard.volumes.remove(&mapping.id);
         guard.schedules.remove(&mapping.id);
+        guard.archive_originals.remove(&mapping.id);
+        guard.archive_problems.remove(&mapping.id);
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
         self.inner.idle_cv.notify_all();
 
@@ -5500,13 +5706,340 @@ fn reconcile_startup_state(
     Ok(())
 }
 
+fn setup_archive_journal(state_dir: &Path, mapping: &MappingRecord) -> ArchiveJournal {
+    ArchiveJournal::new(state_dir, &mapping.id)
+}
+
+type ArchivedOriginals = BTreeMap<MappingId, Vec<ArchivedOriginal>>;
+type ArchiveProblems = BTreeMap<MappingId, String>;
+
+fn recover_setup_archives(
+    state_dir: &Path,
+    store: &SqliteStateStore,
+    probe: &dyn VolumeProbe,
+) -> Result<(ArchivedOriginals, ArchiveProblems), ManagerError> {
+    let mut originals = BTreeMap::new();
+    let mut problems = BTreeMap::new();
+    for mapping in store.list_mappings()? {
+        if mapping.archive_folders.is_empty() {
+            continue;
+        }
+        let journal = setup_archive_journal(state_dir, &mapping);
+        let result = (|| {
+            if journal.has_pending()? {
+                let volume = observe_binding(probe, &mapping.local_binding);
+                volume.check(&mapping.id, &mapping.local_binding)?;
+                let root = validate_local_binding(&mapping.local_binding, &StdPathResolver)?;
+                journal.recover(&root)?;
+            }
+            journal.originals()
+        })();
+        match result {
+            Ok(records) if !records.is_empty() => {
+                originals.insert(mapping.id, records);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                problems.insert(mapping.id, err.cause());
+            }
+        }
+    }
+    Ok((originals, problems))
+}
+
+fn validate_archive_layout(
+    holding: &Path,
+    mappings: &[MappingRecord],
+    remote: &RemoteEndpoint,
+    state_dir: &Path,
+    finder_dir: &Path,
+) -> Result<(), ManagerError> {
+    let holding = resolve_absolute_path("archived originals", holding)?;
+    let check = |path: &Path| -> Result<(), ManagerError> {
+        let path = resolve_absolute_path("archive layout", path)?;
+        if paths_overlap(&holding, &path) {
+            return Err(archive_rejected(format!(
+                "The archived-originals folder `{}` overlaps `{}`.",
+                holding.display(),
+                path.display()
+            )));
+        }
+        Ok(())
+    };
+    check(state_dir)?;
+    check(finder_dir)?;
+    if let RemoteEndpoint::LocalDir(path) = remote {
+        check(path)?;
+    }
+    for mapping in mappings {
+        check(&mapping.local_binding.resolved_path())?;
+        if mapping.remote_endpoint_kind == "local_dir" {
+            check(Path::new(&mapping.remote_endpoint_value))?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_confirmed_archives(
+    inner: &ManagerInner,
+    mapping: &MappingRecord,
+    account: &AccountRecord,
+    all_mappings: &[MappingRecord],
+    root: &Path,
+    remote: &RemoteEndpoint,
+    exclusions: &BTreeSet<String>,
+    expected_direction: Option<InitPreference>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), ManagerError> {
+    let journal = setup_archive_journal(&inner.state_dir, mapping);
+    let volume = observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding);
+    let volume = volume.check(&mapping.id, &mapping.local_binding)?;
+    journal.recover(root)?;
+    let originals = journal.originals()?;
+    let pending: Vec<_> = mapping
+        .archive_folders
+        .iter()
+        .filter(|folder| !originals.iter().any(|record| &record.subfolder == *folder))
+        .collect();
+    {
+        let mut guard = inner.state.lock().unwrap();
+        guard
+            .archive_originals
+            .insert(mapping.id.clone(), originals);
+        guard.archive_problems.remove(&mapping.id);
+    }
+    if pending.is_empty() || cancelled() {
+        return Ok(());
+    }
+
+    let holding_root = holding_folder(&volume.mount_path, collection_name(&mapping.collection));
+    let other_mappings: Vec<_> = all_mappings
+        .iter()
+        .filter(|other| other.id != mapping.id)
+        .cloned()
+        .collect();
+    validate_archive_layout(
+        &holding_root,
+        &other_mappings,
+        remote,
+        &inner.state_dir,
+        inner.finder_writer.dir(),
+    )?;
+    let plans = {
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = if matches!(remote, RemoteEndpoint::DriveRemote { .. }) {
+            let drive = inner
+                .accounts
+                .locked_drive(&account.id, &control)
+                .map_err(drive_error)?;
+            drive_mapping_configuration_matches(&drive, mapping, &account.remote_root_folder_id)?;
+            drive
+                .verify_collection(&mapping.collection)
+                .map_err(drive_error)?;
+            Some(drive)
+        } else {
+            None
+        };
+        let names = remote_names(remote, drive.as_ref(), &mapping.collection)?;
+        let plans = pending
+            .iter()
+            .map(|folder| {
+                check_archive_selection(
+                    root,
+                    &volume.mount_path,
+                    &mapping.collection,
+                    folder,
+                    exclusions,
+                    &names,
+                )
+                .map(|holding| (*folder, holding))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Verify the same first-sync preconditions required by the ordinary
+        // onboarding path before making any local archive changes.
+        let local = inspect_local_endpoint(root, &mapping.collection, exclusions)?;
+        let destination = match remote {
+            RemoteEndpoint::LocalDir(remote_root) => {
+                inspect_local_endpoint(remote_root, &mapping.collection, exclusions)?
+            }
+            RemoteEndpoint::DriveRemote { .. } => {
+                let (remote, _) = inspect_drive_endpoint(
+                    drive.as_ref().expect("Drive account resolved"),
+                    &mapping.collection,
+                    exclusions,
+                )?;
+                if let Some(cause) = remote.name_findings.first() {
+                    return Err(archive_rejected(cause.clone()));
+                }
+                EndpointInventory {
+                    root: remote.root,
+                    classification: remote.classification,
+                    item_count: remote.all_items_count,
+                    has_valid_marker: remote.has_valid_marker,
+                    file_count: remote.file_count,
+                    total_bytes: remote.total_bytes,
+                }
+            }
+            RemoteEndpoint::OtherRemote { .. } => {
+                return Err(archive_rejected(
+                    "This destination does not support first sync.",
+                ));
+            }
+        };
+        if decide_init_direction(&mapping.id, &local, &destination, expected_direction)?
+            != InitPreference::Path1
+        {
+            return Err(archive_rejected(
+                "Archives require an empty first-sync destination.",
+            ));
+        }
+        inner.launcher.engine_metadata()?;
+        plans
+    };
+
+    for (folder, holding) in plans {
+        if cancelled() {
+            return Ok(());
+        }
+        observe_binding(inner.volume_probe.as_ref(), &mapping.local_binding)
+            .check(&mapping.id, &mapping.local_binding)?;
+        let inputs = archive_inputs(root, folder, exclusions, cancelled)?;
+        if !still_eligible(folder, &inputs, inner.clock.now_utc().timestamp()) {
+            return Err(archive_rejected(format!(
+                "`{folder}` no longer meets the archive suggestion requirements."
+            )));
+        }
+        let total = inputs
+            .files
+            .iter()
+            .fold(0u64, |sum, file| sum.saturating_add(file.size));
+        let set_progress = |bytes| -> Result<(), ManagerError> {
+            let mut guard = inner.state.lock().unwrap();
+            guard.archive_progress = Some(ArchiveStatus {
+                mapping_id: mapping.id.clone(),
+                folder: folder.clone(),
+                state: ArchiveState::Creating { bytes, total },
+                holding_path: None,
+                original_bytes: None,
+            });
+            publish_updated_snapshot(inner, &mut guard)?;
+            Ok(())
+        };
+        set_progress(0)?;
+        let result = journal.archive(
+            root,
+            &holding,
+            folder,
+            estimated_zip_size(&inputs.files),
+            cancelled,
+            |out| {
+                let check_stop = |_: u64| {
+                    if cancelled() {
+                        Err(io::ErrorKind::Interrupted.into())
+                    } else {
+                        Ok(())
+                    }
+                };
+                let mut published = Instant::now();
+                write_zip(root, &inputs.files, &mut *out, |bytes| {
+                    check_stop(bytes)?;
+                    if published.elapsed() >= Duration::from_millis(250) {
+                        set_progress(bytes).map_err(io::Error::other)?;
+                        published = Instant::now();
+                    }
+                    Ok(())
+                })
+                .map_err(|err| {
+                    archive_rejected(format!("Could not write `{folder}.zip`: {err}."))
+                })?;
+                set_progress(total)?;
+                verify_zip(&mut *out, &inputs.files, check_stop).map_err(|err| {
+                    archive_rejected(format!("Could not verify `{folder}.zip`: {err}."))
+                })?;
+                if archive_inputs(root, folder, exclusions, cancelled)? != inputs {
+                    return Err(archive_rejected(format!(
+                        "`{folder}` changed while the ZIP was being prepared."
+                    )));
+                }
+                Ok(inputs.original_bytes)
+            },
+        );
+        let was_cancelled = cancelled();
+        let mut guard = inner.state.lock().unwrap();
+        guard.archive_progress = None;
+        match result {
+            Ok(()) => {
+                let originals = journal.originals()?;
+                guard
+                    .archive_originals
+                    .insert(mapping.id.clone(), originals);
+            }
+            Err(err) => {
+                if !was_cancelled {
+                    guard
+                        .archive_problems
+                        .insert(mapping.id.clone(), err.cause());
+                }
+                publish_updated_snapshot(inner, &mut guard)?;
+                return Err(err);
+            }
+        }
+        publish_updated_snapshot(inner, &mut guard)?;
+    }
+    Ok(())
+}
+
 fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapshot, ManagerError> {
     let store = &guard.store;
     let scheduling_paused = guard.scheduling_paused;
     let mappings = store.list_mappings()?;
     let mut views = Vec::with_capacity(mappings.len());
 
-    for m in mappings {
+    let mut archives = Vec::new();
+    for mut m in mappings {
+        let original_records = guard.archive_originals.get(&m.id);
+        let underway = guard
+            .archive_progress
+            .as_ref()
+            .filter(|job| job.mapping_id == m.id);
+        for folder in &m.archive_folders {
+            if let Some(active) = underway.filter(|job| &job.folder == folder) {
+                archives.push(active.clone());
+                continue;
+            }
+            let original = original_records
+                .and_then(|records| records.iter().find(|record| &record.subfolder == folder));
+            let state = if original.is_some() {
+                ArchiveState::Complete
+            } else if let Some(cause) = guard.archive_problems.get(&m.id) {
+                ArchiveState::Failed {
+                    cause: cause.clone(),
+                }
+            } else {
+                ArchiveState::Pending
+            };
+            archives.push(ArchiveStatus {
+                mapping_id: m.id.clone(),
+                folder: folder.clone(),
+                state,
+                holding_path: original
+                    .filter(|record| record.present)
+                    .map(|record| record.path.clone()),
+                original_bytes: original
+                    .filter(|record| record.present)
+                    .map(|record| record.bytes),
+            });
+        }
+        if underway.is_some() {
+            m.state.execution = if guard.active_init_attempt.is_some() {
+                Execution::Running
+            } else {
+                Execution::Stopping
+            };
+        }
+
         let fingerprint = m
             .active_generation_id
             .as_ref()
@@ -5587,7 +6120,10 @@ fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapsh
         {
             text = "Last run failed — retry manually".to_string();
         }
-        let actions = available_actions(&m.state);
+        let mut actions = available_actions(&m.state);
+        if underway.is_some() {
+            actions.retain(|action| *action != sync_core::AvailableAction::ForceStop);
+        }
 
         let counters = MappingCounters {
             files_checked: latest_run.as_ref().map(|r| r.files_checked).unwrap_or(0),
@@ -5656,7 +6192,16 @@ fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapsh
     Ok(StatusSnapshot {
         sequence: guard.snapshot_seq,
         generated_at: clock.now_rfc3339(),
-        active_job_mapping_id: guard.active_run.as_ref().map(|run| run.mapping_id.clone()),
+        active_job_mapping_id: guard
+            .active_run
+            .as_ref()
+            .map(|run| run.mapping_id.clone())
+            .or_else(|| {
+                guard
+                    .archive_progress
+                    .as_ref()
+                    .map(|archive| archive.mapping_id.clone())
+            }),
         queue_order: guard
             .job_queue
             .iter()
@@ -5665,6 +6210,7 @@ fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapsh
         scheduling_paused,
         mappings: views,
         folder_sizes: guard.folder_sizes.values().cloned().collect(),
+        archives,
     })
 }
 
@@ -5902,7 +6448,10 @@ fn run_init_preflight_unlocked(
         mapping.remote_endpoint_kind == "drive_remote",
     )?;
 
-    let effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
+    let mut effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
+    if !mapping.archive_folders.is_empty() {
+        effective_filters.insert(format!("*{ARCHIVE_PARTIAL_SUFFIX}"));
+    }
 
     let mut gen_num = gen_num;
     let mapping_dir = inner.state_dir.join("mappings").join(mapping.id.as_str());
@@ -5939,6 +6488,23 @@ fn run_init_preflight_unlocked(
         &mapping.remote_endpoint_kind,
         &mapping.remote_endpoint_value,
     )?;
+    if !mapping.archive_folders.is_empty() {
+        prepare_confirmed_archives(
+            inner,
+            mapping,
+            account,
+            all_mappings,
+            &canonical_local,
+            &remote_ep,
+            &effective_filters,
+            expected_direction,
+            is_cancelled,
+        )?;
+        if is_cancelled() {
+            return Ok(None);
+        }
+    }
+    // Inventory the final tree after the ZIPs have replaced the original folders.
     let (direction, engine_meta, expected) = match &remote_ep {
         RemoteEndpoint::LocalDir(remote_root) => {
             let local_inv =

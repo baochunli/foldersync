@@ -12,6 +12,12 @@ use crate::validation::{ValidationError, ValidationErrorKind};
 /// Default percentage deletion guard (`10%` of tracked files).
 pub const DEFAULT_MAX_DELETE_PERCENT: u8 = 10;
 
+/// Minimum number of included files in a suggested subfolder archive.
+pub const ARCHIVE_MIN_FILES: u64 = 2_000;
+
+/// Minimum age in calendar months of the newest included file in an archive suggestion.
+pub const ARCHIVE_MIN_AGE_MONTHS: u32 = 12;
+
 /// Filename used as the common rclone bisync access marker on both endpoints.
 pub const ACCESS_MARKER_FILENAME: &str = "RCLONE_TEST";
 
