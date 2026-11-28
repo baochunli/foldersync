@@ -327,6 +327,58 @@ pub const DEFAULT_EXCLUSIONS: &[DefaultExclusion] = &[
     },
 ];
 
+/// Build and cache folders people can choose to exclude during setup.
+pub const SUGGESTED_EXCLUSIONS: &[DefaultExclusion] = &[
+    DefaultExclusion {
+        pattern: "node_modules/**",
+        reason: "Installed JavaScript packages can be restored from the lockfile.",
+    },
+    DefaultExclusion {
+        pattern: ".gradle/**",
+        reason: "Gradle recreates its local build cache.",
+    },
+    DefaultExclusion {
+        pattern: "build/**",
+        reason: "Build tools regenerate their output.",
+    },
+    DefaultExclusion {
+        pattern: "DerivedData/**",
+        reason: "Xcode regenerates intermediate build data.",
+    },
+    DefaultExclusion {
+        pattern: "xcuserdata/**",
+        reason: "Xcode stores per-user settings here.",
+    },
+    DefaultExclusion {
+        pattern: "Pods/**",
+        reason: "CocoaPods reinstalls dependencies from the project configuration.",
+    },
+    DefaultExclusion {
+        pattern: "__pycache__/**",
+        reason: "Python regenerates compiled bytecode.",
+    },
+    DefaultExclusion {
+        pattern: ".venv/**",
+        reason: "Python virtual environments can be recreated locally.",
+    },
+    DefaultExclusion {
+        pattern: ".pytest_cache/**",
+        reason: "pytest regenerates its test cache.",
+    },
+    DefaultExclusion {
+        pattern: ".mypy_cache/**",
+        reason: "mypy regenerates its type-checking cache.",
+    },
+    DefaultExclusion {
+        pattern: ".tox/**",
+        reason: "tox recreates its test environments.",
+    },
+    DefaultExclusion {
+        pattern: ".next/**",
+        reason: "Next.js regenerates its build output.",
+    },
+];
+
 /// Returns the default exclusion patterns as an ordered set.
 pub fn default_exclusion_patterns() -> BTreeSet<String> {
     DEFAULT_EXCLUSIONS

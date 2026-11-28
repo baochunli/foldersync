@@ -34,6 +34,30 @@ pub struct LaunchPlan {
     pub backup_dir2: BackupDir2,
 }
 
+impl LaunchPlan {
+    pub(crate) fn bisync_request(
+        &self,
+        engine: EngineIdentity,
+    ) -> Result<BisyncRequest, ManagerError> {
+        let mut builder = BisyncRequest::builder()
+            .engine(engine)
+            .mode(self.mode)
+            .path1(&self.path1)
+            .path2(self.path2.clone())
+            .config_path(&self.config_path)
+            .workdir(&self.workdir)
+            .filters_file(&self.filters_file)
+            .check_filename(&self.check_filename)
+            .max_delete_percent(self.max_delete_percent)
+            .backup_dir1(&self.backup_dir1)
+            .backup_dir2(self.backup_dir2.clone());
+        if let Some(password_command) = &self.password_command {
+            builder = builder.password_command(password_command.clone());
+        }
+        Ok(builder.build()?)
+    }
+}
+
 /// Engine identity summary recorded in run artifacts and SQLite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineMetadata {
@@ -248,22 +272,7 @@ impl BisyncLauncher for RealBisyncLauncher {
 
     fn prepare(&self, plan: &LaunchPlan) -> Result<PreparedLaunch, ManagerError> {
         let engine = self.resolve_and_qualify()?;
-        let mut builder = BisyncRequest::builder()
-            .engine(engine.clone())
-            .mode(plan.mode)
-            .path1(&plan.path1)
-            .path2(plan.path2.clone())
-            .config_path(&plan.config_path)
-            .workdir(&plan.workdir)
-            .filters_file(&plan.filters_file)
-            .check_filename(&plan.check_filename)
-            .max_delete_percent(plan.max_delete_percent)
-            .backup_dir1(&plan.backup_dir1)
-            .backup_dir2(plan.backup_dir2.clone());
-        if let Some(password_command) = &plan.password_command {
-            builder = builder.password_command(password_command.clone());
-        }
-        let req = builder.build()?;
+        let req = plan.bisync_request(engine.clone())?;
 
         let sanitized_argv = req
             .to_args()

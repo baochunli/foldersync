@@ -42,9 +42,10 @@ pub use launcher::{
 };
 pub use manager::{
     AddMappingCommand, CommandAcceptance, CommandOutcome, ControlledShutdownOutcome,
-    FilterChangePreview, FinderActionDispatch, InitializeCommand, ManagerCommand, ManagerConfig,
-    OperationCanceller, OperationHandle, PreflightPreview, RecoveryCaseView, RecoveryCopyEntry,
-    RecoveryCopySide, RecoveryReport, RemoteEndpoint, SyncManager,
+    ExclusionMatch, FilterChangePreview, FilterMigrationPhase, FinderActionDispatch,
+    InitializeCommand, ManagerCommand, ManagerConfig, OperationCanceller, OperationHandle,
+    PreflightPreview, RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide, RecoveryReport,
+    RemoteEndpoint, SyncManager,
 };
 pub use platform::{
     FakeProcessInspector, LiveProcessInfo, MountedVolume, OsProcessInspector, OsVolumeProbe,

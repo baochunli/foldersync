@@ -103,9 +103,10 @@ estimated next check or retry when one is scheduled. Local changes can prompt
 an earlier check.
 
 Overview and Mapping Detail show reported disk capacity and filesystem.
-Use **Change subfolders…** to review a replacement selection and its first-sync
-checks. Applying the change keeps the previous sync setup and leaves newly
-excluded local files in place.
+Use **Change subfolders…** to review a replacement selection. On an established
+mapping with files on both sides, you can add exclusions, including suggested
+build and cache folders. After catch-up, FolderSync moves matching Drive files
+to Recovery and keeps the copies on this Mac in place.
 
 Accounts supports browser sign-in, import from an explicitly chosen exported
 configuration, reconnect, and checking access to the shared parent folder.

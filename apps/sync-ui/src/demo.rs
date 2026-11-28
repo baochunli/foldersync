@@ -13,15 +13,16 @@ use sync_core::{
     PostRecoveryReadiness, Readiness, RunId, RunOutcome, UserAction, VolumeIdentity, VolumeKind,
     WallTime, apply_event, apply_user_action, available_actions,
 };
+use sync_manager::{ExclusionMatch, FilterMigrationPhase};
 
 use crate::contract::{
     AccountSnapshot, AccountStatus, ActiveRunSnapshot, ActivityEvent, AttentionItem, AttentionKind,
-    AttentionPriority, CloudFolderCandidate, DemoActivityPhase, DemoPreset, FinderExtensionStatus,
-    FolderSize, IconKind, InspectedRunSnapshot, LocationCheck, MappingSnapshot,
-    PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem,
-    ReviewScenario, RunPhase, RunRecordSnapshot, SYNC_ALL_NOW_LABEL, ScheduledCheck, ScreenRoute,
-    StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts,
-    VolumeSnapshot, WizardDraft, WizardStep, is_low_space,
+    AttentionPriority, CloudFolderCandidate, DemoActivityPhase, DemoPreset,
+    FilterMigrationProgress, FinderExtensionStatus, FolderSize, IconKind, InspectedRunSnapshot,
+    LocationCheck, MappingSnapshot, PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData,
+    RecoveryCopyItem, ReviewScenario, RunPhase, RunRecordSnapshot, SYNC_ALL_NOW_LABEL,
+    ScheduledCheck, ScreenRoute, StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot,
+    UnreviewedConflicts, VolumeSnapshot, WizardDraft, WizardStep, is_low_space,
 };
 use crate::system_actions::{RecordingSystemActions, SystemActions};
 
@@ -544,6 +545,7 @@ impl DemoSource {
                 }
                 rebuild_attention(&mut snap);
             }
+            UiCommand::ResolveFilterMigration { .. } => {}
             UiCommand::RemoveMapping(id) | UiCommand::DiscardDraft(id) => {
                 if let Some(pos) = snap.mappings.iter().position(|m| m.id == id) {
                     let removed = snap.mappings.remove(pos);
@@ -645,9 +647,24 @@ impl DemoSource {
                     .chain(m.custom_exclusions.iter().cloned())
                     .collect();
                 let proposed = snap.wizard.extra_exclusions();
+                let added: Vec<_> = proposed.difference(&previous).cloned().collect();
+                let removed: Vec<_> = previous.difference(&proposed).cloned().collect();
+                let narrowing = !added.is_empty() && removed.is_empty();
+                let cloud_move_counts = narrowing.then(|| {
+                    added
+                        .iter()
+                        .map(|pattern| ExclusionMatch {
+                            pattern: pattern.clone(),
+                            file_count: 0,
+                            total_bytes: 0,
+                        })
+                        .collect()
+                });
                 snap.wizard.filter_review = Some(crate::contract::FilterReview {
-                    added: proposed.difference(&previous).cloned().collect(),
-                    removed: previous.difference(&proposed).cloned().collect(),
+                    added,
+                    removed,
+                    narrowing,
+                    cloud_move_counts,
                     checks: vec![
                         LocationCheck {
                             ok: true,
@@ -655,7 +672,11 @@ impl DemoSource {
                         },
                         LocationCheck {
                             ok: true,
-                            message: "Cloud folder checked · download first sync".to_owned(),
+                            message: if narrowing {
+                                "FolderSync will catch up and check the new selection.".to_owned()
+                            } else {
+                                "Cloud folder checked · download first sync".to_owned()
+                            },
                         },
                     ],
                 });
@@ -673,6 +694,16 @@ impl DemoSource {
                         .is_some_and(|review| review.can_apply()) =>
             {
                 if let Some(id) = snap.wizard.editing_mapping_id.clone() {
+                    snap.wizard.filter_migration_progress = snap
+                        .wizard
+                        .filter_review
+                        .as_ref()
+                        .filter(|review| review.narrowing)
+                        .map(|_| FilterMigrationProgress {
+                            phase: FilterMigrationPhase::CatchUp,
+                            moves_drive_files: true,
+                            restoring: false,
+                        });
                     let excluded = snap
                         .wizard
                         .subfolders
@@ -700,6 +731,15 @@ impl DemoSource {
                 }
             }
             UiCommand::PreviewFilterChange | UiCommand::ApplyFilterChange => {}
+            UiCommand::AddSuggestedExclusions => {
+                if snap.wizard.changing_subfolders
+                    && snap.wizard.step == WizardStep::Subfolders
+                    && snap.wizard.add_suggested_exclusions()
+                {
+                    snap.wizard.no_other_sync_confirmed = false;
+                    snap.wizard.filter_review = None;
+                }
+            }
             UiCommand::SetScheduleInterval {
                 mapping_id,
                 minutes,
@@ -2096,6 +2136,7 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
     WizardDraft {
         changing_subfolders: false,
         filter_review: None,
+        filter_migration_progress: None,
         volume_free_bytes: None,
         step: if skip_account {
             WizardStep::Folder
@@ -3199,6 +3240,7 @@ fn make_mapping(
             retry: false,
         }),
         scheduling_enabled: state.readiness() == Readiness::Ready,
+        filter_migration_held: false,
         volume_issue: None,
         included_subfolders,
         total_subfolders,

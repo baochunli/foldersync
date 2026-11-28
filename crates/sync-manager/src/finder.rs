@@ -637,6 +637,8 @@ mod tests {
             execution,
             intent,
             scheduling_enabled: false,
+            filter_migration_held: false,
+            filter_migration_phase: None,
             schedule_interval_secs: 300,
             next_poll_at: None,
             retry_at: None,

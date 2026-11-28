@@ -54,6 +54,10 @@ pub struct MappingStatusSnapshot {
     pub execution: Execution,
     pub intent: Intent,
     pub scheduling_enabled: bool,
+    #[serde(default)]
+    pub filter_migration_held: bool,
+    #[serde(default)]
+    pub filter_migration_phase: Option<crate::manager::FilterMigrationPhase>,
     #[serde(default = "default_schedule_interval_secs")]
     pub schedule_interval_secs: u64,
     #[serde(default)]

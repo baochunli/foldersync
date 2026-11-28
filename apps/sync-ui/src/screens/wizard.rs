@@ -6,11 +6,12 @@ use nsh_base::{
     table_header, table_row,
 };
 use nsh_core::{file_dialog::OpenDialog, prelude::*};
-use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, VolumeKind};
+use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, SUGGESTED_EXCLUSIONS, VolumeKind};
+use sync_manager::FilterMigrationPhase;
 
 use crate::contract::{
-    AccountStatus, FolderSize, IconKind, ReviewScenario, ScreenRoute, Tone, UiCommand, UiSnapshot,
-    WizardDraft, WizardStep, format_bytes, format_duration,
+    AccountStatus, FilterMigrationProgress, FolderSize, IconKind, ReviewScenario, ScreenRoute,
+    Tone, UiCommand, UiSnapshot, WizardDraft, WizardStep, format_bytes, format_duration,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -169,24 +170,54 @@ fn render_filter_change(
         ))
         .child(view().flex_1());
     if let Some(review) = draft.filter_review.as_ref().filter(|_| reviewing) {
+        let narrowing = review.narrowing;
         let mut body = card().child(card_title("Changes for this mapping"));
-        for (label, patterns) in [
-            ("New exclusions", &review.added),
-            ("Removed exclusions", &review.removed),
-        ] {
-            body = body.child(kv_row(
-                label,
-                text(if patterns.is_empty() {
-                    "None".to_owned()
-                } else {
-                    patterns.join(", ")
-                })
-                .text_color(p.fg)
-                .into_element(),
-            ));
+        if let Some(estimates) = &review.cloud_move_counts {
+            body = body.child(section_label("New exclusions"));
+            for estimate in estimates {
+                let count = estimate.file_count;
+                let unit = if count == 1 { "file" } else { "files" };
+                body = body.child(kv_row(
+                    estimate.pattern.clone(),
+                    text(format!(
+                        "{count} {unit} · {}",
+                        format_bytes(estimate.total_bytes)
+                    ))
+                    .text_color(p.fg)
+                    .into_element(),
+                ));
+            }
+        } else {
+            for (label, patterns) in [
+                ("New exclusions", &review.added),
+                ("Removed exclusions", &review.removed),
+            ] {
+                body = body.child(kv_row(
+                    label,
+                    text(if patterns.is_empty() {
+                        "None".to_owned()
+                    } else {
+                        patterns.join(", ")
+                    })
+                    .text_color(p.fg)
+                    .into_element(),
+                ));
+            }
         }
-        body = body.child(text("Previous sync setup is kept. Local copies of newly excluded files stay in place. Applying these changes starts a new first sync.").text_color(p.fg));
-        let mut checks = card().child(card_title("Before first sync"));
+        body = body
+            .child(text("Previous sync setup is kept for recovery.").text_color(p.fg))
+            .child(text(if review.cloud_move_counts.is_some() {
+                "FolderSync stops syncing these folders. Their copies in Google Drive move to the Recovery folder. The copies on this Mac stay. When another Mac syncs these removals, its copies move to its own recovery folder."
+            } else if narrowing {
+                "FolderSync stops syncing the newly excluded files. Both copies stay in place."
+            } else {
+                "Applying these changes starts a new first sync."
+            }).text_color(p.fg));
+        let mut checks = card().child(card_title(if narrowing {
+            "Before updating the selection"
+        } else {
+            "Before first sync"
+        }));
         for check in &review.checks {
             checks = checks.child(check_row(
                 if check.ok {
@@ -229,8 +260,12 @@ fn render_filter_change(
                         view().into_element()
                     })
                     .child(
-                        text("I’ve reviewed the changes and want to start a new first sync.")
-                            .text_color(p.fg),
+                        text(if narrowing {
+                            "I’ve reviewed the changes and want to update this selection."
+                        } else {
+                            "I’ve reviewed the changes and want to start a new first sync."
+                        })
+                        .text_color(p.fg),
                     ),
             );
         }
@@ -246,7 +281,11 @@ fn render_filter_change(
             ))
             .child(
                 app_button(
-                    "Apply and start first sync",
+                    if narrowing {
+                        "Apply changes"
+                    } else {
+                        "Apply and start first sync"
+                    },
                     BtnKind::Primary,
                     false,
                     !can_apply || !draft.no_other_sync_confirmed,
@@ -258,6 +297,27 @@ fn render_filter_change(
             );
         content = content.child(body).child(checks);
     } else {
+        let c_suggest = ctrl.clone();
+        let suggestions_added = SUGGESTED_EXCLUSIONS.iter().all(|suggestion| {
+            draft
+                .custom_patterns
+                .iter()
+                .any(|added| added == suggestion.pattern)
+        });
+        content = content.child(
+            view().items_start().child(
+                app_button(
+                    "Add suggested build and cache exclusions",
+                    BtnKind::Default,
+                    false,
+                    suggestions_added,
+                    None,
+                    suggestions_added.then_some("All suggested exclusions are selected"),
+                    move || c_suggest.send(UiCommand::AddSuggestedExclusions),
+                )
+                .test_id("add-suggested-exclusions"),
+            ),
+        );
         content = content.child(render_step_subfolders(ctrl, draft, pattern_input));
         footer = footer.child(
             app_button(
@@ -1183,10 +1243,14 @@ fn render_step_subfolders(
                                     .gap(px(6.0))
                                     .child(text(label_text).text_color(p.fg))
                                     .child(if !node.included {
-                                        text("· cloud only")
-                                            .text_size(px(S_CAPTION))
-                                            .text_color(p.muted)
-                                            .into_element()
+                                        text(if draft.changing_subfolders {
+                                            "· excluded"
+                                        } else {
+                                            "· cloud only"
+                                        })
+                                        .text_size(px(S_CAPTION))
+                                        .text_color(p.muted)
+                                        .into_element()
                                     } else {
                                         view().into_element()
                                     }),
@@ -1278,7 +1342,11 @@ fn render_step_subfolders(
     let mut side_card = card()
         .w(px(276.0))
         .flex_none()
-        .child(card_title("Will be on this Mac"))
+        .child(card_title(if draft.changing_subfolders {
+            "Selected to sync"
+        } else {
+            "Will be on this Mac"
+        }))
         .child(size_headline)
         .child(text(fit).text_size(px(S_SMALL)).text_color(p.muted))
         .child(view().pt(px(4.0)).child(section_label("Always excluded")))
@@ -1427,7 +1495,7 @@ fn render_step_subfolders(
     let found_card = if draft.changing_subfolders {
         card()
             .flex_1()
-            .child(card_title("Before first sync"))
+            .child(card_title("Before updating the selection"))
             .child(
                 text("Review changes to check both folders and the recovery locations.")
                     .text_color(p.muted),
@@ -2004,6 +2072,7 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
 
 fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
     let draft = &snap.wizard;
+    let migration = draft.filter_migration_progress.as_ref();
     let p = Palette::current();
     let c_stop = ctrl.clone();
     let c_done = ctrl.clone();
@@ -2063,34 +2132,40 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         check_row(IconKind::Dash, p.muted, "Verifying marker files")
     };
 
-    let mut progress_card = card().child(preflight_row).child(marker_row);
-
     let completed_mapping = draft
         .first_sync_mapping_id
         .as_ref()
         .and_then(|id| snap.mapping(id));
-    let finish_mode_done =
-        if completed_mapping.is_some_and(|m| m.state.intent == sync_core::Intent::Paused) {
-            "Automatic sync stays paused for this mapping"
-        } else if snap.scheduling_paused {
-            "Automatic sync is ready when scheduling resumes"
-        } else {
-            "Automatic sync is now on"
-        };
+    let finish_mode_done = if completed_mapping.is_some_and(|m| !m.scheduling_enabled) {
+        "Automatic sync stays off for this mapping"
+    } else if completed_mapping.is_some_and(|m| m.state.intent == sync_core::Intent::Paused) {
+        "Automatic sync stays paused for this mapping"
+    } else if snap.scheduling_paused {
+        "Automatic sync is ready when scheduling resumes"
+    } else {
+        "Automatic sync is now on"
+    };
     let finish_mode_pending = "Enable automatic sync after verification";
+    let mut progress_card = if let Some(migration) = migration {
+        render_filter_migration_rows(migration, draft)
+    } else {
+        card().child(preflight_row).child(marker_row)
+    };
 
     if let Some(err) = &draft.first_sync_error {
         progress_card = progress_card.child(check_row(IconKind::Octagon, p.err, err));
     } else if draft.first_sync_completed {
-        progress_card = progress_card
-            .child(check_row(
-                IconKind::Check,
-                p.ok,
-                &format!("{verb} finished"),
-            ))
-            .child(check_row(IconKind::Check, p.ok, "Checked the result"))
-            .child(check_row(IconKind::Check, p.ok, finish_mode_done));
-    } else {
+        if migration.is_none() {
+            progress_card = progress_card
+                .child(check_row(
+                    IconKind::Check,
+                    p.ok,
+                    &format!("{verb} finished"),
+                ))
+                .child(check_row(IconKind::Check, p.ok, "Checked the result"));
+        }
+        progress_card = progress_card.child(check_row(IconKind::Check, p.ok, finish_mode_done));
+    } else if migration.is_none() {
         let active_line = if draft.first_sync_stopping {
             emphasized_line("Stopping", format!(" first sync… · elapsed {elapsed}"))
         } else if !preflight_done {
@@ -2153,8 +2228,14 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             .first_sync_mapping_id
             .clone()
             .filter(|_| draft.changing_subfolders);
+        let held = changed_mapping
+            .as_ref()
+            .and_then(|id| snap.mapping(id))
+            .is_some_and(|mapping| mapping.filter_migration_held);
         footer_btns = footer_btns.child(app_button(
-            if changed_mapping.is_some() {
+            if held {
+                "Review recovery"
+            } else if changed_mapping.is_some() {
                 "Open mapping"
             } else {
                 "Back to Review"
@@ -2166,7 +2247,11 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             None,
             move || {
                 if let Some(id) = &changed_mapping {
-                    c_back_review.navigate(ScreenRoute::MappingDetail(id.clone()));
+                    if held {
+                        c_back_review.open_recovery(id.clone());
+                    } else {
+                        c_back_review.navigate(ScreenRoute::MappingDetail(id.clone()));
+                    }
                 } else {
                     c_back_review.send(UiCommand::WizardSetStep(WizardStep::Review));
                 }
@@ -2192,7 +2277,11 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
     } else if snap.is_demo_mode {
         footer_btns = footer_btns.child(
             app_button(
-                "Finish first sync (demo)",
+                if migration.is_some() {
+                    "Finish update (demo)"
+                } else {
+                    "Finish first sync (demo)"
+                },
                 BtnKind::Primary,
                 true,
                 false,
@@ -2206,18 +2295,26 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
 
     progress_card = progress_card.child(footer_btns);
 
+    let (title, close_line) = match migration {
+        Some(progress) if progress.restoring => (
+            "Put moved files back",
+            "You can close this window. The restore continues while FolderSync runs.",
+        ),
+        Some(_) => (
+            "Update subfolder selection",
+            "You can close this window. The update continues while FolderSync runs.",
+        ),
+        None => (
+            "First sync",
+            "You can close this window. The first sync continues while FolderSync runs.",
+        ),
+    };
     let mut header_row = view().flex_row().items_end().justify_between().child(
         view()
             .flex_col()
             .gap(px(3.0))
-            .child(page_title(format!(
-                "First sync · {}",
-                draft.selected_folder
-            )))
-            .child(
-                text("You can close this window. The first sync continues while FolderSync runs.")
-                    .text_color(p.muted),
-            ),
+            .child(page_title(format!("{title} · {}", draft.selected_folder)))
+            .child(text(close_line).text_color(p.muted)),
     );
 
     if !draft.first_sync_completed && draft.first_sync_error.is_none() {
@@ -2229,7 +2326,11 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                 false,
                 stopping,
                 Some(IconKind::Stop),
-                stopping.then_some("Waiting for the active first sync to stop"),
+                stopping.then_some(if migration.is_some() {
+                    "Waiting for the subfolder update to stop"
+                } else {
+                    "Waiting for the active first sync to stop"
+                }),
                 move || c_stop.send(UiCommand::WizardStopFirstSync),
             )
             .test_id("wizard-stop-first-sync-btn"),
@@ -2242,6 +2343,38 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         .gap(px(14.0))
         .child(header_row)
         .child(progress_card)
+}
+
+fn render_filter_migration_rows(progress: &FilterMigrationProgress, draft: &WizardDraft) -> View {
+    use FilterMigrationPhase::*;
+
+    let p = Palette::current();
+    let mut steps = Vec::new();
+    if progress.restoring {
+        steps.push((Restoring, "Restore moved files to Google Drive"));
+    } else {
+        steps.push((CatchUp, "Catch up with the current selection"));
+        steps.push((Checking, "Compare the folders with the new selection"));
+        if progress.moves_drive_files {
+            steps.push((MovingToRecovery, "Move excluded cloud files to Recovery"));
+        }
+        steps.push((Rebaseline, "Set up the new selection"));
+    }
+    steps.push((Verifying, "Check the result"));
+
+    let active = steps.iter().position(|(phase, _)| *phase == progress.phase);
+    let mut rows = card();
+    for (index, (_, label)) in steps.into_iter().enumerate() {
+        let row = if draft.first_sync_completed || active.is_some_and(|step| index < step) {
+            check_row(IconKind::Check, p.ok, label)
+        } else if active == Some(index) && draft.first_sync_error.is_none() {
+            check_row(IconKind::Sync, p.run, label)
+        } else {
+            check_row(IconKind::Dash, p.muted, label)
+        };
+        rows = rows.child(row);
+    }
+    rows
 }
 
 fn render_wizard_footer(

@@ -1796,6 +1796,8 @@ impl SqliteStateStore {
         resolved_at: &str,
         resolution_note: &str,
     ) -> Result<(), ManagerError> {
+        let exclusions_json = serde_json::to_string(&m.exclusions)
+            .map_err(|e| storage_err("Failed to serialize exclusions", e))?;
         let state_json = serde_json::to_string(&m.state)
             .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
         let last_outcome_json = m
@@ -1829,7 +1831,8 @@ impl SqliteStateStore {
                 last_run_completed_at = ?10,
                 last_run_summary_text = ?11,
                 unreviewed_conflict_run_id = ?12,
-                updated_at = ?13
+                updated_at = ?13,
+                exclusions_json = ?14
              WHERE id = ?1",
             params![
                 m.id.as_str(),
@@ -1845,6 +1848,7 @@ impl SqliteStateStore {
                 m.last_run_summary_text,
                 m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                 m.updated_at,
+                exclusions_json,
             ],
         )
         .map_err(|e| storage_err("Failed to update mapping state after recovery", e))?;
