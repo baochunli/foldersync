@@ -122,10 +122,13 @@ them to Git.
    existing copies while you decide which files to sync.
 
    In **Choose what to include**, check **Suggested: build and cache folders**.
-   FolderSync pre-excludes matching directories it finds at any depth, such
-   as `build/` or `.venv/`. Choose **Remove** to include a listed folder type
-   or **Remove all suggested** to include them all. **Review** shows the
-   count and size after exclusions.
+   Matching build and cache folders, such as `build/` or `.venv/`, are checked
+   by default and left out of Google Drive. Clear a checkbox to upload that
+   folder type, or use the heading checkbox to change all suggestions.
+   **Review** shows the file count and size of each suggestion still left out.
+   Add custom patterns separated by spaces, commas, or new lines with **Add**
+   or Return. While FolderSync checks a step, it shows what it is checking and
+   pauses step navigation. **Check again** refreshes both folder listings.
 5. In **Recovery copies**, review both paths. The default local path is
    `FolderSyncRecovery/<local-folder-name>` in the mapped folder's parent.
    You can choose a different local recovery folder outside every synced

@@ -189,6 +189,248 @@ pub fn inspect_local_endpoint_detailed(
     collection: &CloudCollection,
     exclusions: &BTreeSet<String>,
 ) -> Result<DetailedEndpointInventory, ManagerError> {
+    inspect_local_endpoint_with_progress(root, collection, exclusions, &mut |_| Ok(()))
+}
+
+pub fn inspect_local_endpoint_with_progress(
+    root: &Path,
+    collection: &CloudCollection,
+    exclusions: &BTreeSet<String>,
+    progress: &mut impl FnMut(usize) -> Result<(), ManagerError>,
+) -> Result<DetailedEndpointInventory, ManagerError> {
+    list_local_endpoint(root, progress)?.inventory(collection, exclusions)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Directory,
+    File,
+    Symlink,
+    Special,
+    Marker,
+}
+
+struct ListedEntry {
+    path: String,
+    kind: EntryKind,
+    size: Option<u64>,
+    modified: i64,
+}
+
+/// Raw endpoint entries and summaries that do not depend on the selection.
+pub(crate) struct EndpointListing {
+    entries: Vec<ListedEntry>,
+    base: DetailedEndpointInventory,
+    pub(crate) root_names: Vec<String>,
+    drive_marker: Option<Vec<u8>>,
+    archives: bool,
+    masks: BTreeMap<String, Vec<u8>>,
+}
+
+impl EndpointListing {
+    fn new(
+        root: PathBuf,
+        entries: Vec<ListedEntry>,
+        drive_marker: Option<Vec<u8>>,
+        archives: bool,
+    ) -> Self {
+        let mut subfolders = BTreeMap::<&str, SubfolderInventory>::new();
+        let mut suggested_folders = BTreeMap::new();
+        let mut special_files = Vec::new();
+        let mut paths = Vec::new();
+        let mut root_names = Vec::new();
+        for entry in &entries {
+            if !entry.path.contains('/') {
+                root_names.push(entry.path.clone());
+                if entry.kind == EntryKind::Directory {
+                    subfolders
+                        .entry(&entry.path)
+                        .or_insert_with(|| SubfolderInventory {
+                            name: entry.path.clone(),
+                            relative_path: entry.path.clone(),
+                            total_bytes: 0,
+                            file_count: 0,
+                            has_children: false,
+                        });
+                }
+            }
+            if entry.kind == EntryKind::Special {
+                special_files.push(entry.path.clone());
+            }
+            if matches!(entry.kind, EntryKind::Directory | EntryKind::File) {
+                paths.push(entry.path.as_str());
+                record_suggested_folder(
+                    &mut suggested_folders,
+                    &entry.path,
+                    entry.kind == EntryKind::Directory,
+                    entry.size,
+                );
+            }
+        }
+        for entry in &entries {
+            if let Some((top, _)) = entry.path.split_once('/')
+                && let Some(folder) = subfolders.get_mut(top)
+            {
+                if entry.kind == EntryKind::Directory {
+                    folder.has_children = true;
+                } else if entry.kind == EntryKind::File {
+                    folder.file_count += 1;
+                    folder.total_bytes = folder.total_bytes.saturating_add(entry.size.unwrap_or(0));
+                }
+            }
+        }
+        let findings = validate_names(&paths);
+        let base = DetailedEndpointInventory {
+            root,
+            classification: if paths.is_empty() {
+                SideClassification::Empty
+            } else {
+                SideClassification::HasData
+            },
+            all_items_count: paths.len(),
+            file_count: 0,
+            total_bytes: 0,
+            has_valid_marker: drive_marker.is_some(),
+            marker_conflict: None,
+            marker_conflict_path: None,
+            subfolders: subfolders.into_values().collect(),
+            suggested_folders,
+            archive_suggestions: Vec::new(),
+            symlinks: Vec::new(),
+            special_files,
+            first_name_finding_next_step: findings.first().map(|finding| finding.next_step.clone()),
+            name_findings: findings.into_iter().map(|finding| finding.cause).collect(),
+        };
+        Self {
+            entries,
+            base,
+            root_names,
+            drive_marker,
+            archives,
+            masks: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn inventory(
+        &mut self,
+        collection: &CloudCollection,
+        exclusions: &BTreeSet<String>,
+    ) -> Result<DetailedEndpointInventory, ManagerError> {
+        // Retain recently selected patterns, including checkbox exclusions that
+        // can be flipped repeatedly. Bound storage for obsolete custom patterns.
+        if self.masks.len() > 64 {
+            self.masks.retain(|pattern, _| exclusions.contains(pattern));
+        }
+        let mut excluded = vec![0u8; self.entries.len()];
+        for pattern in exclusions {
+            let mask = self.masks.entry(pattern.clone()).or_insert_with(|| {
+                let suffix = pattern.strip_prefix('*').filter(|suffix| {
+                    pattern.trim() == pattern && !suffix.contains(['*', '?', '/'])
+                });
+                self.entries
+                    .iter()
+                    .map(|entry| {
+                        if !matches!(entry.kind, EntryKind::File | EntryKind::Symlink) {
+                            return 0;
+                        }
+                        let filtered = u8::from(if let Some(suffix) = suffix {
+                            entry.path.split('/').any(|part| part.ends_with(suffix))
+                        } else {
+                            matches_exclusion_pattern(&entry.path, pattern)
+                        });
+                        let archive_filtered = self.archives
+                            && entry.kind == EntryKind::File
+                            && if let Some(suffix) = suffix {
+                                entry
+                                    .path
+                                    .rsplit('/')
+                                    .next()
+                                    .is_some_and(|name| name.ends_with(suffix))
+                                    && !entry.path.split('/').any(|part| part == ".git")
+                            } else {
+                                archive_pattern_excluded(&entry.path, pattern)
+                            };
+                        filtered | (u8::from(archive_filtered) << 1)
+                    })
+                    .collect()
+            });
+            for (combined, flags) in excluded.iter_mut().zip(mask) {
+                *combined |= *flags;
+            }
+        }
+        let mut result = self.base.clone();
+        let mut archive_totals = BTreeMap::<&str, (u64, u64, i64)>::new();
+        for (entry, flags) in self.entries.iter().zip(excluded) {
+            match entry.kind {
+                EntryKind::File => {
+                    if flags & 1 == 0 {
+                        let size = entry.size.ok_or_else(|| ManagerError::PreflightRejected {
+                            cause: format!(
+                                "The Drive file `{}` did not report a size.",
+                                entry.path
+                            ),
+                            next_step: "Review the file or exclude it before starting first sync."
+                                .into(),
+                        })?;
+                        result.file_count += 1;
+                        result.total_bytes = result.total_bytes.saturating_add(size);
+                    }
+                    if self.archives
+                        && flags & 2 == 0
+                        && !entry.path.ends_with(ARCHIVE_PARTIAL_SUFFIX)
+                        && let Some((top, _)) = entry.path.split_once('/')
+                    {
+                        let (count, bytes, latest) =
+                            archive_totals.entry(top).or_insert((0, 0, i64::MIN));
+                        *count += 1;
+                        *bytes = bytes.saturating_add(entry.size.unwrap_or(0));
+                        *latest = (*latest).max(entry.modified);
+                    }
+                }
+                EntryKind::Symlink if flags & 1 == 0 => result.symlinks.push(entry.path.clone()),
+                EntryKind::Marker if self.archives => {
+                    let path = result.root.join(&entry.path);
+                    let check = if entry.path == ACCESS_MARKER_FILENAME {
+                        fs::symlink_metadata(&path)
+                            .map_err(|err| err.to_string())
+                            .and_then(|meta| {
+                                validate_marker_file(&path, &meta, collection)
+                                    .map_err(|err| err.cause())
+                            })
+                    } else {
+                        Err(format!(
+                            "Existing `{}` at `{}` collides case-insensitively with FolderSync's `{ACCESS_MARKER_FILENAME}` access marker.",
+                            entry.path,
+                            path.display()
+                        ))
+                    };
+                    match check {
+                        Ok(()) => result.has_valid_marker = true,
+                        Err(error) => {
+                            result.marker_conflict = Some(error);
+                            result.marker_conflict_path = Some(path);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let now = Utc::now().timestamp();
+        result.archive_suggestions = archive_totals
+            .into_iter()
+            .filter_map(|(name, (count, bytes, latest))| {
+                archive_suggestion(name.to_owned(), count, bytes, latest, now)
+            })
+            .collect();
+        Ok(result)
+    }
+}
+
+pub(crate) fn list_local_endpoint(
+    root: &Path,
+    progress: &mut impl FnMut(usize) -> Result<(), ManagerError>,
+) -> Result<EndpointListing, ManagerError> {
+    progress(0)?;
     let meta = fs::symlink_metadata(root).map_err(|err| ManagerError::Io {
         cause: format!(
             "Folder `{}` does not exist or cannot be inspected: {err}.",
@@ -208,230 +450,69 @@ pub fn inspect_local_endpoint_detailed(
         });
     }
 
-    let mut all_relative_paths = Vec::new();
-    let mut symlinks = Vec::new();
-    let mut special_files = Vec::new();
-    let mut has_valid_marker = false;
-    let mut marker_conflict = None;
-    let mut marker_conflict_path = None;
-    let mut file_count = 0usize;
-    let mut total_bytes = 0u64;
-    let mut archive_totals = BTreeMap::new();
-    let mut top_subfolders: std::collections::BTreeMap<String, SubfolderInventory> =
-        std::collections::BTreeMap::new();
-    let mut suggested_folders = BTreeMap::new();
-
-    walk_detailed(
-        root,
-        "",
+    let mut entries = Vec::new();
+    let mut file_count = 0;
+    walk_local_entries(root, "", &mut entries, &mut file_count, progress)?;
+    progress(file_count)?;
+    Ok(EndpointListing::new(
+        root.to_path_buf(),
+        entries,
         None,
-        collection,
-        exclusions,
-        &mut all_relative_paths,
-        &mut symlinks,
-        &mut special_files,
-        &mut has_valid_marker,
-        &mut marker_conflict,
-        &mut marker_conflict_path,
-        &mut file_count,
-        &mut total_bytes,
-        &mut top_subfolders,
-        &mut suggested_folders,
-        &mut archive_totals,
-    )?;
-
-    let findings = validate_names(&all_relative_paths);
-    let first_name_finding_next_step = findings.first().map(|f| f.next_step.clone());
-    let name_findings: Vec<String> = findings.into_iter().map(|f| f.cause).collect();
-    let all_items_count = all_relative_paths.len();
-    let classification = if all_items_count == 0 {
-        SideClassification::Empty
-    } else {
-        SideClassification::HasData
-    };
-
-    let archive_suggestions = archive_totals
-        .into_iter()
-        .filter_map(|(name, (count, bytes, latest))| {
-            archive_suggestion(name, count, bytes, latest, Utc::now().timestamp())
-        })
-        .collect();
-
-    Ok(DetailedEndpointInventory {
-        root: root.to_path_buf(),
-        classification,
-        all_items_count,
-        file_count,
-        total_bytes,
-        has_valid_marker,
-        marker_conflict,
-        marker_conflict_path,
-        subfolders: top_subfolders.into_values().collect(),
-        suggested_folders,
-        archive_suggestions,
-        symlinks,
-        special_files,
-        name_findings,
-        first_name_finding_next_step,
-    })
+        true,
+    ))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn walk_detailed(
+fn walk_local_entries(
     current: &Path,
-    rel_prefix: &str,
-    top_subdir: Option<&str>,
-    collection: &CloudCollection,
-    exclusions: &BTreeSet<String>,
-    all_relative_paths: &mut Vec<String>,
-    symlinks: &mut Vec<String>,
-    special_files: &mut Vec<String>,
-    has_valid_marker: &mut bool,
-    marker_conflict: &mut Option<String>,
-    marker_conflict_path: &mut Option<PathBuf>,
+    prefix: &str,
+    entries: &mut Vec<ListedEntry>,
     file_count: &mut usize,
-    total_bytes: &mut u64,
-    top_subfolders: &mut std::collections::BTreeMap<String, SubfolderInventory>,
-    suggested_folders: &mut BTreeMap<&'static str, SuggestedFolderInventory>,
-    archive_totals: &mut BTreeMap<String, (u64, u64, i64)>,
+    progress: &mut impl FnMut(usize) -> Result<(), ManagerError>,
 ) -> Result<(), ManagerError> {
-    let entries = fs::read_dir(current).map_err(|err| ManagerError::Io {
-        cause: format!("Failed to read directory `{}`: {err}.", current.display()),
-        next_step: "Check filesystem permissions on the folder and retry.".to_string(),
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|err| ManagerError::Io {
-            cause: format!(
-                "Failed to read directory entry in `{}`: {err}.",
-                current.display()
-            ),
-            next_step: "Check filesystem permissions and retry.".to_string(),
-        })?;
+    let read_error = |path: &Path, error: std::io::Error| ManagerError::Io {
+        cause: format!("Failed to inspect `{}`: {error}.", path.display()),
+        next_step: "Check filesystem permissions and retry.".to_owned(),
+    };
+    for entry in fs::read_dir(current).map_err(|error| read_error(current, error))? {
+        progress(*file_count)?;
+        let entry = entry.map_err(|error| read_error(current, error))?;
         let path = entry.path();
-        let meta = fs::symlink_metadata(&path).map_err(|err| ManagerError::Io {
-            cause: format!("Failed to inspect `{}`: {err}.", path.display()),
-            next_step: "Check filesystem permissions and retry.".to_string(),
-        })?;
+        let meta = fs::symlink_metadata(&path).map_err(|error| read_error(&path, error))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let rel = if rel_prefix.is_empty() {
-            name.clone()
+        let relative = if prefix.is_empty() {
+            name
         } else {
-            format!("{rel_prefix}/{name}")
+            format!("{prefix}/{name}")
         };
-        let ft = meta.file_type();
-
-        if rel_prefix.is_empty() && name.eq_ignore_ascii_case(ACCESS_MARKER_FILENAME) {
-            if name != ACCESS_MARKER_FILENAME {
-                *marker_conflict = Some(format!(
-                    "Existing `{name}` at `{}` collides case-insensitively with FolderSync's `{ACCESS_MARKER_FILENAME}` access marker.",
-                    path.display()
-                ));
-                *marker_conflict_path = Some(path);
-            } else {
-                match validate_marker_file(&path, &meta, collection) {
-                    Ok(()) => *has_valid_marker = true,
-                    Err(err) => {
-                        *marker_conflict = Some(err.cause());
-                        *marker_conflict_path = Some(path);
-                    }
-                }
-            }
-            continue;
-        }
-
-        if ft.is_symlink() {
-            if !is_excluded(&rel, exclusions) {
-                symlinks.push(rel);
-            }
-            continue;
-        }
-
-        if !ft.is_file() && !ft.is_dir() {
-            special_files.push(rel);
-            continue;
-        }
-
-        if ft.is_dir() && rel_prefix.is_empty() {
-            top_subfolders
-                .entry(name.clone())
-                .or_insert_with(|| SubfolderInventory {
-                    name: name.clone(),
-                    relative_path: rel.clone(),
-                    total_bytes: 0,
-                    file_count: 0,
-                    has_children: false,
-                });
-        }
-
-        // Count ALL ordinary entries for side classification & filename validation so
-        // preview and actual preflight always agree (§9, HIGH #2).
-        all_relative_paths.push(rel.clone());
-        record_suggested_folder(suggested_folders, &rel, ft.is_dir(), Some(meta.len()));
-
-        let excluded = is_excluded(&rel, exclusions);
-        if !excluded && ft.is_file() {
+        let kind = if prefix.is_empty() && relative.eq_ignore_ascii_case(ACCESS_MARKER_FILENAME) {
+            EntryKind::Marker
+        } else if meta.is_dir() {
+            EntryKind::Directory
+        } else if meta.is_file() {
             *file_count += 1;
-            *total_bytes = total_bytes.saturating_add(meta.len());
-        }
-
-        if let Some(top) = top_subdir
-            && ft.is_file()
-            && !archive_excluded(&rel, exclusions)
-        {
-            // Treat an unreadable mtime as recent so a folder with missing evidence is
-            // never suggested as finished.
-            let timestamp = meta
-                .modified()
+            EntryKind::File
+        } else if meta.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else {
+            EntryKind::Special
+        };
+        let modified = if kind == EntryKind::File {
+            meta.modified()
                 .map(|time| DateTime::<Utc>::from(time).timestamp())
-                .unwrap_or(i64::MAX);
-            let (count, bytes, latest) =
-                archive_totals
-                    .entry(top.to_owned())
-                    .or_insert((0, 0, i64::MIN));
-            *count += 1;
-            *bytes = bytes.saturating_add(meta.len());
-            *latest = (*latest).max(timestamp);
-        }
-
-        if let Some(top) = top_subdir
-            && let Some(sub) = top_subfolders.get_mut(top)
-        {
-            if ft.is_dir() {
-                sub.has_children = true;
-            } else if ft.is_file() {
-                sub.file_count += 1;
-                sub.total_bytes = sub.total_bytes.saturating_add(meta.len());
-            }
-        }
-
-        if ft.is_dir() {
-            let next_top = if rel_prefix.is_empty() {
-                Some(name.as_str())
-            } else {
-                top_subdir
-            };
-            walk_detailed(
-                &path,
-                &rel,
-                next_top,
-                collection,
-                exclusions,
-                all_relative_paths,
-                symlinks,
-                special_files,
-                has_valid_marker,
-                marker_conflict,
-                marker_conflict_path,
-                file_count,
-                total_bytes,
-                top_subfolders,
-                suggested_folders,
-                archive_totals,
-            )?;
+                .unwrap_or(i64::MAX)
+        } else {
+            i64::MAX
+        };
+        entries.push(ListedEntry {
+            path: relative.clone(),
+            kind,
+            size: Some(meta.len()),
+            modified,
+        });
+        if kind == EntryKind::Directory {
+            walk_local_entries(&path, &relative, entries, file_count, progress)?;
         }
     }
-
     Ok(())
 }
 
@@ -495,8 +576,21 @@ pub fn matches_exclusion_pattern(rel_path: &str, pattern: &str) -> bool {
 
 /// Glob matcher where `*` matches any char except `/` and `**` matches across `/`.
 fn rclone_glob_match(pattern: &str, text: &str) -> bool {
-    if !pattern.contains(['*', '?']) {
+    let Some(first) = pattern.find(['*', '?']) else {
         return pattern == text;
+    };
+    let last = pattern.rfind(['*', '?']).expect("a wildcard exists");
+    if !text.starts_with(&pattern[..first]) || !text.ends_with(&pattern[last + 1..]) {
+        return false;
+    }
+    if first == 0 && last == 1 && pattern.starts_with("**") {
+        return true; // The literal suffix was checked above.
+    }
+    if pattern.ends_with("**") && first == pattern.len() - 2 && last == pattern.len() - 1 {
+        return true; // The literal prefix was checked above.
+    }
+    if first == last && pattern.as_bytes()[first] == b'*' {
+        return text.len() >= first + pattern.len() - last - 1 && !text.contains('/');
     }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -532,6 +626,12 @@ pub(crate) fn archive_excluded(path: &str, exclusions: &BTreeSet<String>) -> boo
     if path.ends_with(ARCHIVE_PARTIAL_SUFFIX) {
         return true;
     }
+    exclusions
+        .iter()
+        .any(|pattern| archive_pattern_excluded(path, pattern))
+}
+
+fn archive_pattern_excluded(path: &str, pattern: &str) -> bool {
     let matches = |pattern: &str, path: &str| match pattern.strip_prefix('/') {
         Some(pattern) => rclone_glob_match(pattern, path),
         None => {
@@ -543,36 +643,32 @@ pub(crate) fn archive_excluded(path: &str, exclusions: &BTreeSet<String>) -> boo
     };
     // Preserve repository internals inside included project folders.
     let git_root = path
-        .split('/')
-        .scan(0, |offset, segment| {
-            let start = *offset;
-            *offset += segment.len() + 1;
-            Some((start, segment))
+        .contains(".git")
+        .then(|| {
+            path.split('/')
+                .scan(0, |offset, segment| {
+                    let start = *offset;
+                    *offset += segment.len() + 1;
+                    Some((start, segment))
+                })
+                .find_map(|(start, segment)| (segment == ".git").then_some(start))
         })
-        .find_map(|(start, segment)| (segment == ".git").then_some(start));
-    exclusions.iter().any(|pattern| {
-        let directory_pattern = pattern.ends_with('/') || pattern.contains("**");
-        let normalized;
-        let pattern = if pattern.ends_with('/') {
-            normalized = format!("{pattern}**");
-            &normalized
-        } else {
-            pattern
-        };
-        if git_root.is_none() && matches(pattern, path) {
-            return true;
-        }
-        directory_pattern
-            && path.match_indices('/').any(|(i, _)| {
-                git_root.is_none_or(|git_root| i < git_root) && matches(pattern, &path[..=i])
-            })
-    })
-}
-
-fn is_excluded(rel_path: &str, exclusions: &BTreeSet<String>) -> bool {
-    exclusions
-        .iter()
-        .any(|pat| matches_exclusion_pattern(rel_path, pat))
+        .flatten();
+    let directory_pattern = pattern.ends_with('/') || pattern.contains("**");
+    let normalized;
+    let pattern = if pattern.ends_with('/') {
+        normalized = format!("{pattern}**");
+        &normalized
+    } else {
+        pattern
+    };
+    if git_root.is_none() && matches(pattern, path) {
+        return true;
+    }
+    directory_pattern
+        && path.match_indices('/').any(|(i, _)| {
+            git_root.is_none_or(|git_root| i < git_root) && matches(pattern, &path[..=i])
+        })
 }
 
 /// Inspects a local directory tree without following symlinks, delegating directly
@@ -992,91 +1088,50 @@ pub(crate) fn inspect_drive_endpoint(
     collection: &CloudCollection,
     exclusions: &BTreeSet<String>,
 ) -> Result<(DetailedEndpointInventory, Option<Vec<u8>>), ManagerError> {
+    let mut listing = list_drive_endpoint(drive, collection)?;
+    Ok((
+        listing.inventory(collection, exclusions)?,
+        listing.drive_marker,
+    ))
+}
+
+pub(crate) fn list_drive_endpoint(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+) -> Result<EndpointListing, ManagerError> {
     let entries = drive
         .request
         .list_entries(&collection.display_path, true, &drive.runner)
-        .map_err(|err| drive_error(err.into()))?;
+        .map_err(|error| drive_error(error.into()))?;
     let marker =
         read_drive_marker(drive, collection, &entries, &drive.runner).map_err(drive_error)?;
-    let paths: Vec<_> = entries
-        .iter()
-        .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
-        .map(|entry| entry.path.as_str())
-        .collect();
-    let findings = validate_names(&paths);
-    let mut subfolders = BTreeMap::<String, SubfolderInventory>::new();
-    let mut suggested_folders = BTreeMap::new();
-    let mut file_count = 0;
-    let mut total_bytes = 0_u64;
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
-    {
-        if entry.is_dir && !entry.path.contains('/') {
-            subfolders
-                .entry(entry.path.clone())
-                .or_insert_with(|| SubfolderInventory {
-                    name: entry.name.clone(),
-                    relative_path: entry.path.clone(),
-                    total_bytes: 0,
-                    file_count: 0,
-                    has_children: false,
-                });
-        }
-    }
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
-    {
-        let size = u64::try_from(entry.size);
-        record_suggested_folder(&mut suggested_folders, &entry.path, entry.is_dir, size.ok());
-        if !entry.is_dir && !is_excluded(&entry.path, exclusions) {
-            let size = size.map_err(|_| ManagerError::PreflightRejected {
-                cause: format!("The Drive file `{}` did not report a size.", entry.path),
-                next_step: "Review the file or exclude it before starting first sync.".into(),
-            })?;
-            file_count += 1;
-            total_bytes = total_bytes.saturating_add(size);
-        }
-        if let Some((top, _)) = entry.path.split_once('/')
-            && let Some(subfolder) = subfolders.get_mut(top)
-        {
-            if entry.is_dir {
-                subfolder.has_children = true;
+    let entries = entries
+        .into_iter()
+        .map(|entry| {
+            let kind = if entry.path == ACCESS_MARKER_FILENAME {
+                EntryKind::Marker
+            } else if entry.is_dir {
+                EntryKind::Directory
             } else {
-                subfolder.file_count += 1;
-                subfolder.total_bytes = subfolder
-                    .total_bytes
-                    .saturating_add(size.unwrap_or_default());
+                EntryKind::File
+            };
+            ListedEntry {
+                path: entry.path,
+                kind,
+                size: u64::try_from(entry.size).ok(),
+                // Archive eligibility is evaluated only on the Mac.
+                modified: i64::MAX,
             }
-        }
-    }
-    Ok((
-        DetailedEndpointInventory {
-            root: PathBuf::from(format!(
-                "{}:{}",
-                drive.account.remote_name, collection.display_path
-            )),
-            classification: if paths.is_empty() {
-                SideClassification::Empty
-            } else {
-                SideClassification::HasData
-            },
-            all_items_count: paths.len(),
-            file_count,
-            total_bytes,
-            has_valid_marker: marker.is_some(),
-            marker_conflict: None,
-            marker_conflict_path: None,
-            subfolders: subfolders.into_values().collect(),
-            suggested_folders,
-            archive_suggestions: Vec::new(),
-            symlinks: Vec::new(),
-            special_files: Vec::new(),
-            first_name_finding_next_step: findings.first().map(|finding| finding.next_step.clone()),
-            name_findings: findings.into_iter().map(|finding| finding.cause).collect(),
-        },
+        })
+        .collect();
+    Ok(EndpointListing::new(
+        PathBuf::from(format!(
+            "{}:{}",
+            drive.account.remote_name, collection.display_path
+        )),
+        entries,
         marker,
+        false,
     ))
 }
 
@@ -1444,5 +1499,50 @@ mod tests {
             .expect("a missing leaf behind a symlink must never pass subset preflight");
         assert!(error.cause().contains("symbolic link"), "{error}");
         assert!(!outside.join("note.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod wizard_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn refilters_a_large_cached_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let entries = (0..400_000)
+            .map(|i| ListedEntry {
+                path: format!("Project/{i}.txt"),
+                kind: EntryKind::File,
+                size: Some(1),
+                modified: 1_600_000_000,
+            })
+            .collect();
+        let mut listing = EndpointListing::new(root.path().into(), entries, None, true);
+        let collection = CloudCollection {
+            display_path: "Data/Project".into(),
+            folder_id: "project-id".into(),
+            ancestor_ids: vec!["parent-id".into()],
+        };
+        let exclusions = sync_core::default_exclusion_patterns();
+        let initial = listing.inventory(&collection, &exclusions).unwrap();
+        assert_eq!(initial.file_count, 400_000);
+
+        let start = std::time::Instant::now();
+        let mut selected = exclusions.clone();
+        selected.insert("*.txt".into());
+        let excluded = listing.inventory(&collection, &selected).unwrap();
+        assert_eq!(excluded.file_count, 0);
+        eprintln!(
+            "New cached-listing pattern over 400,000 synthetic entries: {:?}",
+            start.elapsed()
+        );
+
+        let start = std::time::Instant::now();
+        let restored = listing.inventory(&collection, &exclusions).unwrap();
+        assert_eq!(restored.file_count, 400_000);
+        eprintln!(
+            "Restoring a cached selection over 400,000 synthetic entries: {:?}",
+            start.elapsed()
+        );
     }
 }

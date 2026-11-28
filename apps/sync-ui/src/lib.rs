@@ -435,7 +435,10 @@ pub fn App() -> impl IntoElement {
     {
         let c_tick = ctrl.clone();
         let tick_task = set_interval(Duration::from_secs(1), move || {
-            if c_tick.snapshot.with_untracked(|s| s.active_run.is_some()) {
+            if c_tick
+                .snapshot
+                .with_untracked(|s| s.active_run.is_some() || s.wizard.transition_check.is_some())
+            {
                 c_tick.elapsed_offset.update(|v| *v = v.saturating_add(1));
             }
         });

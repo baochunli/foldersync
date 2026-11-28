@@ -13,7 +13,7 @@ use crate::validation::{ValidationError, ValidationErrorKind};
 pub const DEFAULT_MAX_DELETE_PERCENT: u8 = 10;
 
 /// Minimum number of included files in a suggested subfolder archive.
-pub const ARCHIVE_MIN_FILES: u64 = 2_000;
+pub const ARCHIVE_MIN_FILES: u64 = 100;
 
 /// Minimum age in calendar months of the newest included file in an archive suggestion.
 pub const ARCHIVE_MIN_AGE_MONTHS: u32 = 12;

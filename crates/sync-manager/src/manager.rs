@@ -47,7 +47,7 @@ use crate::{
         still_eligible,
     },
     archive_transaction::{
-        ARCHIVE_PARTIAL_SUFFIX, ArchiveJournal, ArchivedOriginal, holding_folder,
+        ARCHIVE_PARTIAL_SUFFIX, ArchiveJournal, ArchiveTimestamp, ArchivedOriginal, holding_folder,
     },
     archive_writer::{estimated_zip_size, verify_zip, write_zip},
     clock::{Clock, SystemClock},
@@ -57,11 +57,12 @@ use crate::{
         ValidatedFinderAction, claim_finder_action_files,
     },
     init::{
-        DetailedEndpointInventory, DetectedVolume, EndpointInventory, ResumeInventory,
-        decide_init_direction, detect_volume_identity, detect_volume_with, establish_drive_marker,
-        establish_local_pair_markers, inspect_drive_endpoint, inspect_local_endpoint,
-        inspect_local_endpoint_detailed, read_marker_bytes, render_filters_file,
-        verify_drive_marker_with_runner, verify_endpoint_access_marker, verify_first_sync_subset,
+        DetailedEndpointInventory, DetectedVolume, EndpointInventory, EndpointListing,
+        ResumeInventory, decide_init_direction, detect_volume_identity, detect_volume_with,
+        establish_drive_marker, establish_local_pair_markers, inspect_drive_endpoint,
+        inspect_local_endpoint, list_drive_endpoint, list_local_endpoint, read_marker_bytes,
+        render_filters_file, verify_drive_marker_with_runner, verify_endpoint_access_marker,
+        verify_first_sync_subset,
     },
     launcher::{BisyncLauncher, LaunchPlan, LaunchStopper, RealBisyncLauncher},
     platform::{
@@ -262,6 +263,81 @@ pub struct PreflightPreview {
     pub archive_holding_folder: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+pub enum PreflightPhase {
+    Drive,
+    Local(usize),
+    LocalDestination,
+    Archives,
+}
+
+/// In-memory endpoint listings for one wizard session.
+#[derive(Default)]
+pub struct WizardInventoryCache {
+    local: Option<(PathBuf, EndpointListing)>,
+    fixture: Option<(PathBuf, EndpointListing)>,
+    drive: Option<CachedDriveListing>,
+}
+
+struct CachedDriveListing {
+    account: AccountId,
+    requested: CloudCollection,
+    collection: CloudCollection,
+    remote: RemoteEndpoint,
+    recovery: String,
+    listing: Result<EndpointListing, String>,
+}
+
+impl WizardInventoryCache {
+    pub fn inspect_local(
+        &mut self,
+        root: &Path,
+        collection: &CloudCollection,
+        exclusions: &BTreeSet<String>,
+        progress: &mut impl FnMut(usize) -> Result<(), ManagerError>,
+    ) -> Result<DetailedEndpointInventory, ManagerError> {
+        cached_local_listing(&mut self.local, root, || {
+            list_local_endpoint(root, progress)
+        })?
+        .inventory(collection, exclusions)
+    }
+}
+
+fn cached_local_listing<'a>(
+    cache: &'a mut Option<(PathBuf, EndpointListing)>,
+    root: &Path,
+    list: impl FnOnce() -> Result<EndpointListing, ManagerError>,
+) -> Result<&'a mut EndpointListing, ManagerError> {
+    // Preserve symlink rejection while treating two spellings of the same
+    // directory (for example a parent symlink) as the same wizard path.
+    let real_root = fs::symlink_metadata(root)
+        .ok()
+        .filter(|meta| meta.is_dir())
+        .and_then(|_| fs::canonicalize(root).ok());
+    if real_root.is_none()
+        || cache
+            .as_ref()
+            .is_none_or(|(cached, _)| Some(cached) != real_root.as_ref())
+    {
+        let listing = list()?;
+        *cache = Some((real_root.unwrap_or_else(|| root.to_path_buf()), listing));
+    }
+    Ok(&mut cache.as_mut().expect("listing is cached").1)
+}
+
+/// A validated draft awaiting a commit against the current account and mappings.
+pub struct PreparedDraft(PreparedMapping);
+
+/// Mapping prepared from the fresh wizard inventory and ready for durable setup.
+pub struct PreparedFirstSync(PreparedMapping, BTreeSet<String>);
+
+struct PreparedMapping {
+    command: AddMappingCommand,
+    volume: BoundVolume,
+    max_delete_percent: MaxDeletePercent,
+    verified_account: Option<AccountRecord>,
+}
+
 /// Proposed exclusion changes and an advisory first-sync preview.
 #[derive(Debug, Clone)]
 pub struct FilterChangePreview {
@@ -313,6 +389,23 @@ impl FilterChangePreview {
     pub fn preflight(&self) -> &PreflightPreview {
         &self.preflight
     }
+}
+
+fn validate_archive_preview(preview: PreflightPreview) -> Result<(), ManagerError> {
+    if let Some(cause) = preview
+        .archive_errors
+        .into_iter()
+        .next()
+        .or(preview.layout_error)
+    {
+        return Err(archive_rejected(cause));
+    }
+    if preview.direction.map_err(archive_rejected)? != InitPreference::Path1 {
+        return Err(archive_rejected(
+            "Archives require an empty first-sync destination.",
+        ));
+    }
+    Ok(())
 }
 
 fn effective_exclusions(extra: &BTreeSet<String>) -> Result<BTreeSet<String>, ManagerError> {
@@ -1150,6 +1243,12 @@ pub(crate) fn drive_error(error: AccountError) -> ManagerError {
     }
 }
 
+fn check_preview_cancellation(control: &ProcessControl) -> Result<(), ManagerError> {
+    control
+        .check()
+        .map_err(|error| drive_error(rclone_adapter::LsJsonError::Process(error).into()))
+}
+
 fn account_worker_error(error: io::Error) -> ManagerError {
     ManagerError::Io {
         cause: format!("Could not start the account worker: {error}"),
@@ -1552,6 +1651,43 @@ impl SyncManager {
         editing_id: Option<&MappingId>,
         archive_folders: &BTreeSet<String>,
     ) -> Result<PreflightPreview, ManagerError> {
+        self.preflight_mapping_preview_controlled(
+            cmd,
+            editing_id,
+            archive_folders,
+            &ProcessControl::default(),
+            &mut |_| {},
+        )
+    }
+
+    pub fn preflight_mapping_preview_controlled(
+        &self,
+        cmd: &AddMappingCommand,
+        editing_id: Option<&MappingId>,
+        archive_folders: &BTreeSet<String>,
+        cancellation: &ProcessControl,
+        progress: &mut impl FnMut(PreflightPhase),
+    ) -> Result<PreflightPreview, ManagerError> {
+        self.preflight_mapping_preview_cached(
+            cmd,
+            editing_id,
+            archive_folders,
+            cancellation,
+            progress,
+            &mut WizardInventoryCache::default(),
+        )
+    }
+
+    pub fn preflight_mapping_preview_cached(
+        &self,
+        cmd: &AddMappingCommand,
+        editing_id: Option<&MappingId>,
+        archive_folders: &BTreeSet<String>,
+        cancellation: &ProcessControl,
+        progress: &mut impl FnMut(PreflightPhase),
+        cache: &mut WizardInventoryCache,
+    ) -> Result<PreflightPreview, ManagerError> {
+        check_preview_cancellation(cancellation)?;
         let local_path = cmd.local_binding.resolved_path();
         let detected_volume = detect_volume_with(self.inner.volume_probe.as_ref(), &local_path)
             .map_err(|e| e.cause());
@@ -1574,15 +1710,59 @@ impl SyncManager {
             )
         };
 
-        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
-        let drive = self.mapping_drive(cmd, &control)?;
-        let mut collection = cmd.collection.clone();
-        let (remote_endpoint, cloud_recovery_path) = if let Some(drive) = &drive {
-            collection = drive.verify_collection(&collection).map_err(drive_error)?;
-            drive_mapping_paths(drive, &collection)
-        } else {
-            (cmd.remote_endpoint.clone(), cmd.cloud_recovery_path.clone())
-        };
+        let is_drive = matches!(cmd.remote_endpoint, RemoteEndpoint::DriveRemote { .. });
+        let mut exclusions = effective_exclusions(&cmd.extra_exclusions)?;
+        exclusions.extend(archive_staging_filter(archive_folders));
+        let local = cached_local_listing(&mut cache.local, &local_path, || {
+            list_local_endpoint(&local_path, &mut |count| {
+                progress(PreflightPhase::Local(count));
+                check_preview_cancellation(cancellation)
+            })
+        });
+        check_preview_cancellation(cancellation)?;
+
+        if is_drive
+            && cache.drive.as_ref().is_none_or(|cached| {
+                cached.account != cmd.account_id || cached.requested != cmd.collection
+            })
+        {
+            let control = cancellation.with_fresh_timeout(DRIVE_COMMAND_TIMEOUT);
+            let drive = self
+                .mapping_drive(cmd, &control)?
+                .expect("Drive account resolved");
+            progress(PreflightPhase::Drive);
+            let collection = drive
+                .verify_collection(&cmd.collection)
+                .map_err(drive_error)?;
+            let (remote, recovery) = drive_mapping_paths(&drive, &collection);
+            let listing = list_drive_endpoint(&drive, &collection).map_err(|error| error.cause());
+            check_preview_cancellation(cancellation)?;
+            cache.drive = Some(CachedDriveListing {
+                account: cmd.account_id.clone(),
+                requested: cmd.collection.clone(),
+                collection,
+                remote,
+                recovery,
+                listing,
+            });
+        }
+        let drive = cache.drive.as_mut().filter(|_| is_drive);
+        let (collection, remote_endpoint, cloud_recovery_path) = drive.as_ref().map_or_else(
+            || {
+                (
+                    cmd.collection.clone(),
+                    cmd.remote_endpoint.clone(),
+                    cmd.cloud_recovery_path.clone(),
+                )
+            },
+            |cached| {
+                (
+                    cached.collection.clone(),
+                    cached.remote.clone(),
+                    cached.recovery.clone(),
+                )
+            },
+        );
         let candidate = LayoutCandidate {
             mapping_id: &cmd.id,
             local_binding: &cmd.local_binding,
@@ -1605,35 +1785,48 @@ impl SyncManager {
                 &cmd.account_id,
                 &collection,
                 &device_id,
-                drive.is_some(),
+                is_drive,
             )
             .err()
             .map(|err| err.cause());
         }
 
-        let mut exclusions = effective_exclusions(&cmd.extra_exclusions)?;
-        exclusions.extend(archive_staging_filter(archive_folders));
-
-        let local_inventory =
-            inspect_local_endpoint_detailed(&local_path, &collection, &exclusions)
-                .map_err(|e| e.cause());
-
-        let remote_inventory = match &remote_endpoint {
-            RemoteEndpoint::LocalDir(remote_root) => {
-                inspect_local_endpoint_detailed(remote_root, &collection, &exclusions)
-                    .map_err(|e| e.cause())
+        let (local_inventory, local_names) = match local {
+            Ok(listing) => (
+                listing
+                    .inventory(&collection, &exclusions)
+                    .map_err(|error| error.cause()),
+                listing.root_names.as_slice(),
+            ),
+            Err(error) => (Err(error.cause()), &[][..]),
+        };
+        let remote = match &remote_endpoint {
+            RemoteEndpoint::LocalDir(root) => {
+                cached_local_listing(&mut cache.fixture, root, || {
+                    progress(PreflightPhase::LocalDestination);
+                    list_local_endpoint(root, &mut |_| check_preview_cancellation(cancellation))
+                })
+                .map_err(|error| error.cause())
             }
-            RemoteEndpoint::DriveRemote { .. } => inspect_drive_endpoint(
-                drive.as_ref().expect("Drive account resolved"),
-                &collection,
-                &exclusions,
-            )
-            .map(|(inventory, _)| inventory)
-            .map_err(|err| err.cause()),
+            RemoteEndpoint::DriveRemote { .. } => drive
+                .expect("Drive listing is cached")
+                .listing
+                .as_mut()
+                .map_err(|error| error.clone()),
             RemoteEndpoint::OtherRemote { .. } => {
                 Err("This remote does not support first sync.".into())
             }
         };
+        let (remote_inventory, remote_names) = match remote {
+            Ok(listing) => (
+                listing
+                    .inventory(&collection, &exclusions)
+                    .map_err(|error| error.cause()),
+                listing.root_names.as_slice(),
+            ),
+            Err(error) => (Err(error), &[][..]),
+        };
+        check_preview_cancellation(cancellation)?;
 
         let direction = match (&local_inventory, &remote_inventory) {
             (Ok(l), Ok(r)) => {
@@ -1681,6 +1874,7 @@ impl SyncManager {
             })
             .collect();
         if !pending.is_empty() {
+            progress(PreflightPhase::Archives);
             if let Some(volume) = archive_volume {
                 let check = || -> Result<(), ManagerError> {
                     let root = fs::canonicalize(&local_path).map_err(|err| {
@@ -1694,8 +1888,8 @@ impl SyncManager {
                         &self.inner.state_dir,
                         self.inner.finder_writer.dir(),
                     )?;
-                    let names = remote_names(&remote_endpoint, drive.as_ref(), &collection)?;
                     for folder in pending {
+                        check_preview_cancellation(cancellation)?;
                         if !local_inventory.as_ref().is_ok_and(|inventory| {
                             inventory
                                 .archive_suggestions
@@ -1712,7 +1906,8 @@ impl SyncManager {
                             &collection,
                             folder,
                             &exclusions,
-                            &names,
+                            remote_names,
+                            Some(local_names),
                         ) {
                             archive_errors.push(err.cause());
                         }
@@ -1744,7 +1939,22 @@ impl SyncManager {
     pub fn propose_filter_change(
         &self,
         mapping_id: &MappingId,
+        extra_exclusions: BTreeSet<String>,
+    ) -> Result<FilterChangePreview, ManagerError> {
+        self.propose_filter_change_controlled(
+            mapping_id,
+            extra_exclusions,
+            &ProcessControl::default(),
+            &mut |_| {},
+        )
+    }
+
+    pub fn propose_filter_change_controlled(
+        &self,
+        mapping_id: &MappingId,
         mut extra_exclusions: BTreeSet<String>,
+        cancellation: &ProcessControl,
+        progress: &mut impl FnMut(PreflightPhase),
     ) -> Result<FilterChangePreview, ManagerError> {
         let mapping = lookup_mapping(&self.inner.state.lock().unwrap().store, mapping_id)?;
         let previous_generation_id =
@@ -1779,7 +1989,13 @@ impl SyncManager {
             max_delete_percent: mapping.max_delete_percent,
             schedule_interval: Duration::from_secs(mapping.schedule_interval_secs),
         };
-        let preflight = self.preflight_mapping_preview(&cmd, Some(mapping_id))?;
+        let preflight = self.preflight_mapping_preview_controlled(
+            &cmd,
+            Some(mapping_id),
+            &BTreeSet::new(),
+            cancellation,
+            progress,
+        )?;
         let mut preview = FilterChangePreview {
             mapping_id: mapping_id.clone(),
             previous_generation_id,
@@ -1798,6 +2014,7 @@ impl SyncManager {
                 &cmd,
                 &old,
                 &preview.added_exclusions,
+                cancellation,
             )?);
         }
         Ok(preview)
@@ -2002,19 +2219,41 @@ impl SyncManager {
                 Some(&cmd.id),
                 &archive_folders,
             )?;
-            if let Some(cause) = preview.archive_errors.into_iter().next() {
-                return Err(archive_rejected(cause));
-            }
-            if let Some(cause) = preview.layout_error {
-                return Err(archive_rejected(cause));
-            }
-            if preview.direction.map_err(archive_rejected)? != InitPreference::Path1 {
-                return Err(archive_rejected(
-                    "Archives require an empty first-sync destination.",
-                ));
-            }
+            validate_archive_preview(preview)?;
         }
         self.handle_add_mapping(cmd, false, archive_folders)
+    }
+
+    /// Reuse the wizard's fresh Start inventory when checking the exact archive selection.
+    pub fn prepare_first_sync_mapping(
+        &self,
+        cmd: AddMappingCommand,
+        archives: BTreeSet<String>,
+        cancellation: &ProcessControl,
+        cache: &mut WizardInventoryCache,
+    ) -> Result<PreparedFirstSync, ManagerError> {
+        if !archives.is_empty() {
+            let preview = self.preflight_mapping_preview_cached(
+                &cmd,
+                Some(&cmd.id),
+                &archives,
+                cancellation,
+                &mut |_| {},
+                cache,
+            )?;
+            validate_archive_preview(preview)?;
+        }
+        let control = cancellation.with_fresh_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = self.mapping_drive(&cmd, &control)?;
+        self.prepare_mapping(cmd, drive.as_ref())
+            .map(|prepared| PreparedFirstSync(prepared, archives))
+    }
+
+    pub fn commit_prepared_first_sync(
+        &self,
+        prepared: PreparedFirstSync,
+    ) -> Result<CommandAcceptance, ManagerError> {
+        self.commit_mapping(prepared.0, false, prepared.1)
     }
 
     pub fn save_draft_mapping(
@@ -2022,6 +2261,23 @@ impl SyncManager {
         cmd: AddMappingCommand,
     ) -> Result<CommandAcceptance, ManagerError> {
         self.execute(ManagerCommand::SaveDraftMapping(Box::new(cmd)))
+    }
+
+    pub fn prepare_draft_mapping(
+        &self,
+        cmd: AddMappingCommand,
+        cancellation: &ProcessControl,
+    ) -> Result<PreparedDraft, ManagerError> {
+        let control = cancellation.with_fresh_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = self.mapping_drive(&cmd, &control)?;
+        self.prepare_mapping(cmd, drive.as_ref()).map(PreparedDraft)
+    }
+
+    pub fn commit_prepared_draft(
+        &self,
+        draft: PreparedDraft,
+    ) -> Result<CommandAcceptance, ManagerError> {
+        self.commit_mapping(draft.0, true, BTreeSet::new())
     }
 
     pub fn initialize(&self, cmd: InitializeCommand) -> Result<CommandAcceptance, ManagerError> {
@@ -2206,6 +2462,17 @@ impl SyncManager {
             .map_err(drive_error)
     }
 
+    pub fn list_collection_candidates_controlled(
+        &self,
+        account: &AccountId,
+        cancellation: &ProcessControl,
+    ) -> Result<CollectionListing, ManagerError> {
+        self.inner
+            .accounts
+            .list_collection_candidates_controlled(account, cancellation)
+            .map_err(drive_error)
+    }
+
     /// Creates and resolves one immediate child of Data on this account.
     pub fn create_collection_folder(
         &self,
@@ -2290,6 +2557,7 @@ impl SyncManager {
                 status.updated_at = inner.clock.now_utc();
                 status.status = match &measured {
                     Ok(status) => status.clone(),
+                    Err(ManagerError::AccountBusy { .. }) => FolderSizeStatus::AccountBusy,
                     Err(error) => FolderSizeStatus::Failed {
                         cause: error.cause(),
                     },
@@ -3026,10 +3294,24 @@ impl SyncManager {
 
     fn handle_add_mapping(
         &self,
-        mut cmd: AddMappingCommand,
+        cmd: AddMappingCommand,
         is_draft: bool,
-        mut archive_folders: BTreeSet<String>,
+        archive_folders: BTreeSet<String>,
     ) -> Result<CommandAcceptance, ManagerError> {
+        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let drive = self.mapping_drive(&cmd, &control)?;
+        self.commit_mapping(
+            self.prepare_mapping(cmd, drive.as_ref())?,
+            is_draft,
+            archive_folders,
+        )
+    }
+
+    fn prepare_mapping(
+        &self,
+        mut cmd: AddMappingCommand,
+        drive: Option<&LockedDrive<'_>>,
+    ) -> Result<PreparedMapping, ManagerError> {
         validate_safe_path_id("mapping_id", cmd.id.as_str())?;
         validate_safe_path_id("account_id", cmd.account_id.as_str())?;
 
@@ -3045,19 +3327,16 @@ impl SyncManager {
 
         // Local root must already exist (never auto-create missing roots).
         validate_local_binding(&cmd.local_binding, &StdPathResolver)?;
-        let local_recovery_root =
+        cmd.local_recovery_root =
             resolve_absolute_path("local_recovery_root", &cmd.local_recovery_root)?;
-        // Account lock precedes the state mutex and remains held through the mapping commit.
-        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
-        let drive = self.mapping_drive(&cmd, &control)?;
-        if let Some(drive) = &drive {
+        if let Some(drive) = drive {
             cmd.collection = drive
                 .verify_collection(&cmd.collection)
                 .map_err(drive_error)?;
             (cmd.remote_endpoint, cmd.cloud_recovery_path) =
                 drive_mapping_paths(drive, &cmd.collection);
         }
-        let (remote_endpoint, cloud_recovery_path) = match cmd.remote_endpoint {
+        (cmd.remote_endpoint, cmd.cloud_recovery_path) = match cmd.remote_endpoint {
             RemoteEndpoint::LocalDir(remote_dir) => {
                 if !remote_dir.is_dir() {
                     return Err(ManagerError::Io {
@@ -3093,6 +3372,26 @@ impl SyncManager {
 
         let volume = observe_binding(self.inner.volume_probe.as_ref(), &cmd.local_binding);
         volume.check(&cmd.id, &cmd.local_binding)?;
+        Ok(PreparedMapping {
+            command: cmd,
+            volume,
+            max_delete_percent: max_del,
+            verified_account: drive.map(|drive| drive.account.clone()),
+        })
+    }
+
+    fn commit_mapping(
+        &self,
+        prepared: PreparedMapping,
+        is_draft: bool,
+        mut archive_folders: BTreeSet<String>,
+    ) -> Result<CommandAcceptance, ManagerError> {
+        let PreparedMapping {
+            command: cmd,
+            volume,
+            max_delete_percent,
+            verified_account,
+        } = prepared;
         let mut guard = self.inner.state.lock().unwrap();
         let existing_same = guard.store.get_mapping(&cmd.id)?;
         if guard
@@ -3150,11 +3449,20 @@ impl SyncManager {
             }
             None => false,
         };
-        if guard.store.get_account(&cmd.account_id)?.is_none() {
+        let Some(account) = guard.store.get_account(&cmd.account_id)? else {
             return Err(ManagerError::NotFound {
                 cause: format!("Account `{}` is not configured.", cmd.account_id),
                 next_step: "Connect or register the account before adding mappings for it."
                     .to_string(),
+            });
+        };
+        if verified_account
+            .as_ref()
+            .is_some_and(|verified| verified != &account)
+        {
+            return Err(ManagerError::PreflightRejected {
+                cause: "The Drive account changed while FolderSync was checking the draft.".into(),
+                next_step: "Check the account and try saving again.".into(),
             });
         }
 
@@ -3167,9 +3475,9 @@ impl SyncManager {
         let candidate = LayoutCandidate {
             mapping_id: &cmd.id,
             local_binding: &cmd.local_binding,
-            remote_endpoint: remote_endpoint.clone(),
-            local_recovery_root: local_recovery_root.clone(),
-            cloud_recovery_path: &cloud_recovery_path,
+            remote_endpoint: cmd.remote_endpoint.clone(),
+            local_recovery_root: cmd.local_recovery_root.clone(),
+            cloud_recovery_path: &cmd.cloud_recovery_path,
         };
         validate_complete_layout(
             &existing,
@@ -3183,12 +3491,12 @@ impl SyncManager {
             &cmd.account_id,
             &cmd.collection,
             &guard.device.id,
-            drive.is_some(),
+            verified_account.is_some(),
         )?;
 
         let effective_exclusions = effective_exclusions(&cmd.extra_exclusions)?;
 
-        let (remote_kind, remote_value) = remote_endpoint.to_db_cols();
+        let (remote_kind, remote_value) = cmd.remote_endpoint.to_db_cols();
         let now = self.inner.clock.now_rfc3339();
         let initial_readiness = if is_draft {
             Readiness::Unconfigured
@@ -3205,15 +3513,15 @@ impl SyncManager {
             local_binding: cmd.local_binding,
             remote_endpoint_kind: remote_kind,
             remote_endpoint_value: remote_value,
-            local_recovery_root,
-            cloud_recovery_path,
+            local_recovery_root: cmd.local_recovery_root,
+            cloud_recovery_path: cmd.cloud_recovery_path,
             schedule_interval_secs: cmd.schedule_interval.as_secs(),
             scheduling_enabled: false,
             state: initial_state,
             active_generation_id: None,
             exclusions: configured_exclusions(effective_exclusions, &archive_folders),
             archive_folders,
-            max_delete_percent: max_del.value(),
+            max_delete_percent: max_delete_percent.value(),
             last_run_id: None,
             last_run_outcome: None,
             last_run_completed_at: None,
@@ -6071,6 +6379,7 @@ fn prepare_confirmed_archives(
                     folder,
                     exclusions,
                     &names,
+                    None,
                 )
                 .map(|holding| (*folder, holding))
             })
@@ -6182,7 +6491,15 @@ fn prepare_confirmed_archives(
                         "`{folder}` changed while the ZIP was being prepared."
                     )));
                 }
-                Ok(inputs.original_bytes)
+                let newest_file = inputs
+                    .files
+                    .iter()
+                    .max_by_key(|file| (file.modified_secs, file.modified_nanos))
+                    .map(|file| ArchiveTimestamp {
+                        seconds: file.modified_secs,
+                        nanos: file.modified_nanos,
+                    });
+                Ok((inputs.original_bytes, newest_file))
             },
         );
         let was_cancelled = cancelled();
@@ -9366,5 +9683,59 @@ mod tests {
         let ep = RemoteEndpoint::LocalDir(PathBuf::from("/tmp/remote"));
         let (k, v) = ep.to_db_cols();
         assert_eq!(RemoteEndpoint::from_db_cols(&k, &v).unwrap(), ep);
+    }
+
+    #[test]
+    fn wizard_listing_walks_only_on_path_change_or_explicit_refresh() {
+        let scratch = tempfile::tempdir().unwrap();
+        let left = scratch.path().join("left");
+        let right = scratch.path().join("right");
+        for path in [&left, &right] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("note.txt"), b"fixture").unwrap();
+        }
+        let mut reads = 0;
+        let mut cache = None;
+        let collection = CloudCollection {
+            display_path: "Data/Notes".into(),
+            folder_id: "notes-id".into(),
+            ancestor_ids: vec!["parent-id".into()],
+        };
+        let start = Instant::now();
+        for indexes in [0, 1, 0, 1, 0] {
+            let result = cached_local_listing(&mut cache, &left, || {
+                reads += 1;
+                list_local_endpoint(&left, &mut |_| Ok(()))
+            })
+            .unwrap()
+            .inventory(
+                &collection,
+                &if indexes == 0 {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from(["*.txt".into()])
+                },
+            )
+            .unwrap();
+            assert_eq!(result.file_count, 1 - indexes);
+        }
+        assert_eq!(reads, 1);
+        eprintln!(
+            "One fixture walk plus five projections took {:?}",
+            start.elapsed()
+        );
+        cached_local_listing(&mut cache, &right, || {
+            reads += 1;
+            list_local_endpoint(&right, &mut |_| Ok(()))
+        })
+        .unwrap();
+        assert_eq!(reads, 2);
+        let mut fresh = None;
+        cached_local_listing(&mut fresh, &right, || {
+            reads += 1;
+            list_local_endpoint(&right, &mut |_| Ok(()))
+        })
+        .unwrap();
+        assert_eq!(reads, 3);
     }
 }

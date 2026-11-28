@@ -96,6 +96,7 @@ pub enum IconKind {
     Key,
     Dash,
     Folder,
+    Archive,
     Plus,
     Play,
     Stop,
@@ -1314,6 +1315,7 @@ pub struct CloudFolderCandidate {
 pub enum FolderSize {
     Unmeasured,
     Calculating,
+    WaitingForAccount(String),
     Known {
         bytes: u64,
         files: Option<u64>,
@@ -1421,6 +1423,31 @@ pub struct FilterMigrationProgress {
     pub restoring: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WizardCheck {
+    pub label: String,
+    pub files_counted: usize,
+    pub started: std::time::Instant,
+    pub keep_content: bool,
+    pub saving_draft: bool,
+    pub waiting: bool,
+    pub holder: Option<MappingId>,
+}
+
+impl WizardCheck {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            files_counted: 0,
+            started: std::time::Instant::now(),
+            keep_content: false,
+            saving_draft: false,
+            waiting: false,
+            holder: None,
+        }
+    }
+}
+
 /// Draft state for the 6-step Add-mapping flow.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WizardDraft {
@@ -1438,6 +1465,7 @@ pub struct WizardDraft {
     pub drive_collection: Option<CloudCollection>,
     pub local_path: String,
     pub location_check_pending: bool,
+    pub(crate) transition_check: Option<WizardCheck>,
     pub volume_name: String,
     pub volume_kind: VolumeKind,
     pub volume_fs: String,
@@ -1488,14 +1516,44 @@ pub struct WizardDraft {
 }
 
 impl WizardDraft {
+    pub fn waiting_for_account(&self) -> bool {
+        self.transition_check
+            .as_ref()
+            .is_some_and(|check| check.waiting)
+    }
+
     pub fn has_cloud_folder(&self) -> bool {
         self.remote_folder_path.is_some() || self.drive_collection.is_some()
     }
 
+    pub(crate) fn transition_label(
+        &self,
+        target: WizardStep,
+        catalog_empty: bool,
+        sizing: bool,
+    ) -> Option<&'static str> {
+        if target == self.step || self.changing_subfolders {
+            return None;
+        }
+        if target == WizardStep::Folder && catalog_empty {
+            Some("Loading folders from the account…")
+        } else if target >= WizardStep::Location && (!self.local_path.is_empty() || sizing) {
+            Some(
+                if self.step == WizardStep::Folder && (self.drive_collection.is_some() || sizing) {
+                    "Checking the Google Drive folder…"
+                } else {
+                    "Checking disk and free space…"
+                },
+            )
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn selected_archives(&self) -> impl Iterator<Item = &ArchiveSuggestion> {
-        self.archive_suggestions
-            .iter()
-            .filter(|item| !self.declined_archives.contains(&item.name))
+        self.archive_suggestions.iter().filter(|item| {
+            self.archive_folder_included(&item.name) && !self.declined_archives.contains(&item.name)
+        })
     }
 
     pub(crate) fn selected_archive_names(&self) -> BTreeSet<String> {
@@ -1504,9 +1562,33 @@ impl WizardDraft {
             .collect()
     }
 
+    pub(crate) fn archive_folder_included(&self, name: &str) -> bool {
+        self.subfolders
+            .iter()
+            .any(|node| node.depth == 1 && node.name == name && node.included)
+    }
+
+    pub(crate) fn set_all_archives(&mut self, selected: bool) {
+        if self.changing_subfolders || self.step != WizardStep::Subfolders {
+            return;
+        }
+        for item in &self.archive_suggestions {
+            if self.archive_folder_included(&item.name) {
+                if selected {
+                    self.declined_archives.remove(&item.name);
+                } else {
+                    self.declined_archives.insert(item.name.clone());
+                }
+            }
+        }
+        self.no_other_sync_confirmed = false;
+        self.reviewed_fingerprint = None;
+    }
+
     pub(crate) fn toggle_archive(&mut self, folder: String) {
         if self.changing_subfolders
             || self.step != WizardStep::Subfolders
+            || !self.archive_folder_included(&folder)
             || !self
                 .archive_suggestions
                 .iter()
@@ -1571,45 +1653,74 @@ impl WizardDraft {
                 .find(|entry| entry.pattern == pattern)
         {
             self.dismissed_suggestions.insert(entry.pattern);
-            self.suggested_folders.remove(pattern);
         }
         self.custom_patterns.len() != count
+    }
+
+    pub(crate) fn suggestion_excluded(&self, pattern: &str) -> bool {
+        self.custom_patterns.iter().any(|added| added == pattern)
+    }
+
+    pub(crate) fn set_suggestion(&mut self, pattern: &str, excluded: bool) -> bool {
+        let Some((&pattern, _)) = self.suggested_folders.get_key_value(pattern) else {
+            return false;
+        };
+        if excluded {
+            self.dismissed_suggestions.remove(pattern);
+            self.add_custom_pattern(pattern)
+        } else {
+            self.remove_custom_pattern(pattern)
+        }
+    }
+
+    pub(crate) fn set_all_suggestions(&mut self, excluded: bool) -> bool {
+        let patterns: Vec<_> = self.suggested_folders.keys().copied().collect();
+        let mut changed = false;
+        for pattern in patterns {
+            changed |= self.set_suggestion(pattern, excluded);
+        }
+        changed
+    }
+
+    pub(crate) fn add_pattern_list(&mut self, input: &str) -> bool {
+        let Ok(patterns) = parse_wizard_patterns(input) else {
+            return false;
+        };
+        let mut changed = false;
+        for pattern in patterns {
+            changed |= if self.suggested_folders.contains_key(pattern) {
+                self.set_suggestion(pattern, true)
+            } else {
+                self.add_custom_pattern(pattern)
+            };
+        }
+        changed
     }
 
     pub(crate) fn update_suggestions(
         &mut self,
         observed: BTreeMap<&'static str, SuggestedFolderInventory>,
     ) {
-        if !self.suggest_exclusions {
-            return;
+        if self.suggest_exclusions {
+            self.custom_patterns.retain(|pattern| {
+                !self.suggested_folders.contains_key(pattern.as_str())
+                    || self.dismissed_suggestions.contains(pattern.as_str())
+            });
         }
-        self.custom_patterns
-            .retain(|pattern| !self.suggested_folders.contains_key(pattern.as_str()));
         self.suggested_folders = observed
             .into_iter()
             .filter(|(pattern, stats)| {
                 stats.folder_count > 0
-                    && !self.dismissed_suggestions.contains(pattern)
-                    && self.add_custom_pattern(pattern)
+                    && (!self.suggest_exclusions
+                        || self.dismissed_suggestions.contains(pattern)
+                        || self.add_custom_pattern(pattern))
             })
             .collect();
     }
 
     pub(crate) fn reset_suggestions(&mut self) {
-        self.dismissed_suggestions.clear();
         self.update_suggestions(BTreeMap::new());
-    }
-
-    pub(crate) fn remove_all_suggested(&mut self) -> bool {
-        if self.suggested_folders.is_empty() {
-            return false;
-        }
-        self.custom_patterns
-            .retain(|pattern| !self.suggested_folders.contains_key(pattern.as_str()));
-        self.dismissed_suggestions
-            .extend(self.suggested_folders.keys().copied());
-        self.suggested_folders.clear();
-        true
+        self.dismissed_suggestions.clear();
     }
 
     pub(crate) fn add_suggested_exclusions(&mut self) -> bool {
@@ -1702,6 +1813,50 @@ impl WizardDraft {
             && self.archives_reviewed()
             && self.no_other_sync_confirmed
     }
+}
+
+pub(crate) fn parse_wizard_patterns(input: &str) -> Result<Vec<&str>, &'static str> {
+    let mut patterns = Vec::new();
+    for pattern in input
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .filter(|p| !p.is_empty())
+    {
+        if !valid_wizard_pattern(pattern) {
+            return Err(
+                "Check the pattern for unmatched brackets, braces, or an incomplete escape.",
+            );
+        }
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
+    Ok(patterns)
+}
+
+fn valid_wizard_pattern(pattern: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut braces = 0usize;
+    for ch in pattern.chars() {
+        if ch.is_control() {
+            return false;
+        }
+        if escaped {
+            escaped = false;
+        } else {
+            match ch {
+                '\\' => escaped = true,
+                ']' if in_class => in_class = false,
+                _ if in_class => {}
+                '[' => in_class = true,
+                '{' => braces += 1,
+                '}' if braces > 0 => braces -= 1,
+                '}' | ']' => return false,
+                _ => {}
+            }
+        }
+    }
+    !escaped && !in_class && braces == 0
 }
 
 /// Finder Sync extension status shown in Preferences → General.
@@ -1938,16 +2093,24 @@ pub enum UiCommand {
     WizardSetRemotePath(String),
     WizardSetLocalPath(String),
     DemoPreviewLocationCheck(String),
+    DemoPreviewWizardCheck,
+    DemoFinishWizardCheck,
     WizardToggleSubfolder(String),
     WizardToggleArchive(String),
+    WizardSetAllArchives(bool),
     WizardToggleDefaultExclusions,
     WizardAddPattern(String),
     WizardRemovePattern(String),
-    WizardRemoveAllSuggested,
+    WizardSetSuggestion {
+        pattern: String,
+        excluded: bool,
+    },
+    WizardSetAllSuggestions(bool),
     WizardSetLocalRecoveryPath(String),
     WizardSetReviewScenario(ReviewScenario),
     WizardSetNoOtherSyncConfirmed(bool),
     WizardSaveDraft,
+    WizardCheckAgain,
     WizardStartFirstSync,
     WizardStopFirstSync,
     WizardCompleteDemoFirstSync,

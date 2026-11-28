@@ -5,14 +5,14 @@ use nsh_base::{
     button, checkbox, input, radio, radio_group, table, table_body, table_cell, table_head,
     table_header, table_row,
 };
-use nsh_core::{file_dialog::OpenDialog, prelude::*};
+use nsh_core::{SubmitBehavior, file_dialog::OpenDialog, prelude::*};
 use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, SUGGESTED_EXCLUSIONS, VolumeKind};
-use sync_manager::{ArchiveState, FilterMigrationPhase};
+use sync_manager::{ArchiveState, FilterMigrationPhase, init::SuggestedFolderInventory};
 
 use crate::contract::{
     AccountStatus, FilterMigrationProgress, FolderSize, IconKind, ReviewScenario, ScreenRoute,
     Tone, UiCommand, UiSnapshot, WizardDraft, WizardStep, archive_percent, archive_progress_label,
-    format_bytes, format_count, format_duration,
+    format_bytes, format_count, format_duration, parse_wizard_patterns,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -25,6 +25,7 @@ use crate::theme::{
 /// Renders the Add-mapping wizard inside the main content area (sidebar stays visible).
 pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
     let pattern_input = signal(String::new());
+    let pattern_error = signal(None::<&'static str>);
     let new_folder_open = signal(false);
     let new_folder_name = signal(String::new());
     dynamic(move || {
@@ -42,7 +43,8 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
         }
 
         if draft.changing_subfolders {
-            return render_filter_change(ctrl.clone(), draft, pattern_input).into_element();
+            return render_filter_change(ctrl.clone(), &snap, pattern_input, pattern_error)
+                .into_element();
         }
 
         let (title, subtitle) = match draft.step {
@@ -86,17 +88,31 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
             header = header.child(text(sub).text_color(p.muted));
         }
 
-        let body = match draft.step {
-            WizardStep::Account => render_step_account(ctrl.clone(), &snap),
-            WizardStep::Folder => {
-                render_step_folder(ctrl.clone(), &snap, new_folder_open, new_folder_name)
-            }
-            WizardStep::Location => render_step_location(ctrl.clone(), draft, snap.is_demo_mode),
-            WizardStep::Subfolders => render_step_subfolders(ctrl.clone(), draft, pattern_input),
-            WizardStep::Recovery => render_step_recovery(ctrl.clone(), draft),
-            WizardStep::Review => render_step_review(ctrl.clone(), draft, snap.is_demo_mode),
-            WizardStep::FirstSync => render_first_sync(ctrl.clone(), &snap),
-        };
+        let mut body = view().flex_col().gap(px(12.0));
+        if draft.transition_check.is_some() {
+            body = body.child(render_wizard_check(ctrl.clone(), &snap));
+        }
+        if draft
+            .transition_check
+            .as_ref()
+            .is_none_or(|check| check.keep_content)
+        {
+            body = body.child(match draft.step {
+                WizardStep::Account => render_step_account(ctrl.clone(), &snap),
+                WizardStep::Folder => {
+                    render_step_folder(ctrl.clone(), &snap, new_folder_open, new_folder_name)
+                }
+                WizardStep::Location => {
+                    render_step_location(ctrl.clone(), draft, snap.is_demo_mode)
+                }
+                WizardStep::Subfolders => {
+                    render_step_subfolders(ctrl.clone(), draft, pattern_input, pattern_error)
+                }
+                WizardStep::Recovery => render_step_recovery(ctrl.clone(), draft),
+                WizardStep::Review => render_step_review(ctrl.clone(), draft, snap.is_demo_mode),
+                WizardStep::FirstSync => render_first_sync(ctrl.clone(), &snap),
+            });
+        }
 
         let account_ready = snap
             .accounts
@@ -109,6 +125,7 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
             skip_account,
             account_ready,
             folder_ready,
+            snap.is_demo_mode,
         );
 
         view()
@@ -133,11 +150,54 @@ pub fn wizard_view(ctrl: AppController) -> impl IntoElement {
     })
 }
 
+fn render_wizard_check(ctrl: AppController, snap: &UiSnapshot) -> View {
+    let check = snap
+        .wizard
+        .transition_check
+        .as_ref()
+        .expect("wizard check is active");
+    let p = Palette::current();
+    let elapsed_offset = ctrl.elapsed_offset;
+    let started = check.started;
+    let label = check.label.clone();
+    let files = check.files_counted;
+    let mut body = card()
+        .test_id("wizard-transition-check")
+        .child(dynamic(move || {
+            let _ = elapsed_offset.get();
+            let elapsed = started.elapsed().as_secs();
+            let mut line = label.clone();
+            if files > 0 {
+                line.push_str(&format!(" {} so far", format_count(files as u64)));
+            }
+            if elapsed >= 5 {
+                line.push_str(&format!(" · {}:{:02}", elapsed / 60, elapsed % 60));
+            }
+            text(line).text_color(p.muted).into_element()
+        }))
+        .child(progress_bar(None, 4.0, check.label.clone()));
+    if let Some(id) = &check.holder
+        && snap.mapping(id).is_some_and(|mapping| {
+            mapping
+                .presented_status(snap.active_run.as_ref(), snap.scheduling_paused)
+                .show_stop
+        })
+    {
+        let id = id.clone();
+        body = body.child(link_button("Stop that sync", S_SMALL, move || {
+            ctrl.send(UiCommand::StopRun(id.clone()))
+        }));
+    }
+    body
+}
+
 fn render_filter_change(
     ctrl: AppController,
-    draft: &WizardDraft,
+    snap: &UiSnapshot,
     pattern_input: Signal<String>,
+    pattern_error: Signal<Option<&'static str>>,
 ) -> View {
+    let draft = &snap.wizard;
     let Some(mapping_id) = draft.editing_mapping_id.clone() else {
         return view();
     };
@@ -170,6 +230,31 @@ fn render_filter_change(
             move || c_back.navigate(ScreenRoute::MappingDetail(mapping_id.clone())),
         ))
         .child(view().flex_1());
+    if let Some(check) = &draft.transition_check {
+        if check.waiting {
+            let c = ctrl.clone();
+            footer = footer.child(app_button(
+                "Back",
+                BtnKind::Default,
+                false,
+                false,
+                None,
+                None,
+                move || c.send(UiCommand::WizardSetStep(WizardStep::Subfolders)),
+            ));
+        }
+        return content
+            .child(render_wizard_check(ctrl, snap))
+            .child(footer.child(app_button(
+                "Checking…",
+                BtnKind::Primary,
+                false,
+                true,
+                None,
+                None,
+                || {},
+            )));
+    }
     if let Some(review) = draft.filter_review.as_ref().filter(|_| reviewing) {
         let narrowing = review.narrowing;
         let mut body = card().child(card_title("Changes for this mapping"));
@@ -308,7 +393,7 @@ fn render_filter_change(
         content = content.child(
             view().items_start().child(
                 app_button(
-                    "Add suggested build and cache exclusions",
+                    "Leave out build and cache folders",
                     BtnKind::Default,
                     false,
                     suggestions_added,
@@ -319,7 +404,12 @@ fn render_filter_change(
                 .test_id("add-suggested-exclusions"),
             ),
         );
-        content = content.child(render_step_subfolders(ctrl, draft, pattern_input));
+        content = content.child(render_step_subfolders(
+            ctrl,
+            draft,
+            pattern_input,
+            pattern_error,
+        ));
         footer = footer.child(
             app_button(
                 "Review changes",
@@ -349,7 +439,7 @@ fn step_indicator(ctrl: AppController, draft: &WizardDraft) -> View {
     for (step, label) in WizardStep::SIX_STEPS {
         let is_current = step == current;
         let is_done = step < current;
-        let can_visit = draft.can_visit_step(step);
+        let can_visit = draft.transition_check.is_none() && draft.can_visit_step(step);
         let (pill_bg, pill_bd, pill_fg) = if is_current {
             (p.accent_soft, p.primary, p.primary)
         } else {
@@ -563,6 +653,7 @@ fn render_step_folder(
                     text(match &item.size {
                         FolderSize::Unmeasured => "Not measured".to_owned(),
                         FolderSize::Calculating => "Calculating…".to_owned(),
+                        FolderSize::WaitingForAccount(_) => "Waiting…".to_owned(),
                         FolderSize::Known { bytes, .. } => format_bytes(*bytes),
                         FolderSize::Failed { .. } => "Unavailable".to_owned(),
                     })
@@ -763,7 +854,12 @@ fn render_step_folder(
                 )
                 .child(body),
         )
-        .child(folder_footer);
+        .child(folder_footer)
+        .child(if let Some(notice) = &snap.status_notice {
+            text(notice.clone()).text_color(p.muted).into_element()
+        } else {
+            view().into_element()
+        });
 
     let selected_size = snap
         .cloud_catalog
@@ -782,6 +878,7 @@ fn render_step_folder(
         }
         Some(FolderSize::Calculating) => "Calculating the selected folder’s size…".to_owned(),
         Some(FolderSize::Failed { cause }) => cause.clone(),
+        Some(FolderSize::WaitingForAccount(label)) => label.clone(),
         Some(FolderSize::Unmeasured) => "Select the folder again to calculate its size.".to_owned(),
         None => "Choose a folder to compare its size with available space.".to_owned(),
     };
@@ -806,6 +903,13 @@ fn render_step_folder(
                 .text_size(px(S_CAPTION))
                 .text_color(p.muted),
         );
+    }
+    if matches!(selected_size, Some(FolderSize::WaitingForAccount(_))) {
+        let c = ctrl.clone();
+        let folder = selected_folder.clone();
+        fit_card = fit_card.child(link_button("Try again", S_SMALL, move || {
+            c.send(UiCommand::WizardSelectFolder(folder.clone()))
+        }));
     }
     if selected_size == Some(&FolderSize::Calculating) {
         let c = ctrl.clone();
@@ -993,6 +1097,8 @@ fn render_step_location(ctrl: AppController, draft: &WizardDraft, is_demo: bool)
     if draft.local_path.is_empty() {
         loc_card = loc_card
             .child(text("Choose a folder to see its disk and free space.").text_color(p.muted));
+    } else if draft.transition_check.is_some() {
+        // The enclosing step already shows progress.
     } else if draft.location_check_pending {
         const CHECKING: &str = "Checking disk and free space…";
         loc_card = loc_card.child(
@@ -1166,10 +1272,124 @@ fn render_location_capacity(draft: &WizardDraft, free: u64) -> View {
         )
 }
 
+fn suggestion_stats(counts: &SuggestedFolderInventory) -> String {
+    let folders = format_count(counts.folder_count as u64);
+    let folder_label = if counts.folder_count == 1 {
+        "folder"
+    } else {
+        "folders"
+    };
+    let files = format_count(counts.file_count as u64);
+    let file_label = if counts.file_count == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let size = counts
+        .total_bytes
+        .map_or_else(|| "size unknown".to_owned(), format_bytes);
+    format!("{folders} {folder_label}, {files} {file_label}, {size}")
+}
+
+fn render_suggestions(ctrl: AppController, draft: &WizardDraft) -> View {
+    let p = Palette::current();
+    let selected = draft
+        .suggested_folders
+        .keys()
+        .filter(|pattern| draft.suggestion_excluded(pattern))
+        .count();
+    let all = selected == draft.suggested_folders.len();
+    let c_all = ctrl.clone();
+    let mut section = view().flex_col().gap(px(6.0))
+        .child(suggestion_checkbox(all, selected > 0 && !all)
+            .test_id("wizard-suggestions-checkbox")
+            .on_change(move |_: &bool| c_all.send(UiCommand::WizardSetAllSuggestions(!all)))
+            .child(section_label("Left out of Google Drive: build and cache folders")))
+        .child(text("FolderSync suggests leaving these out. They are rebuilt by your tools and would slow the first sync.")
+            .text_size(px(S_SMALL)).text_color(p.muted));
+    for suggestion in SUGGESTED_EXCLUSIONS {
+        let Some(counts) = draft.suggested_folders.get(suggestion.pattern) else {
+            continue;
+        };
+        let pattern = suggestion.pattern;
+        let excluded = draft.suggestion_excluded(pattern);
+        let c = ctrl.clone();
+        section = section.child(
+            suggestion_checkbox(excluded, false)
+                .test_id(&format!("wizard-suggestion-{pattern}"))
+                .on_change(move |value: &bool| {
+                    c.send(UiCommand::WizardSetSuggestion {
+                        pattern: pattern.to_owned(),
+                        excluded: *value,
+                    })
+                })
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(mono_text(pattern.trim_end_matches("**"), S_SMALL, p.fg))
+                        .child(
+                            text(suggestion_stats(counts))
+                                .text_size(px(S_SMALL))
+                                .text_color(p.fg),
+                        )
+                        .child(
+                            text(suggestion.reason)
+                                .text_size(px(S_TINY))
+                                .text_color(p.muted),
+                        )
+                        .child(
+                            text(if excluded { "Left out" } else { "Will upload" })
+                                .text_size(px(S_TINY))
+                                .text_color(p.muted),
+                        ),
+                ),
+        );
+    }
+    section
+}
+
+fn suggestion_checkbox(checked: bool, mixed: bool) -> nsh_base::CheckboxElement {
+    let p = Palette::current();
+    checkbox()
+        .checked(checked)
+        .indeterminate(mixed)
+        .flex_row()
+        .items_start()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .focus_visible(focus_ring)
+        .indicator_style(move |s| {
+            s.w(px(16.0))
+                .h(px(16.0))
+                .flex_none()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(if checked || mixed {
+                    p.primary
+                } else {
+                    p.border
+                })
+                .bg(if checked || mixed { p.primary } else { p.bg })
+                .items_center()
+                .justify_center()
+        })
+        .indicator(if checked {
+            icon(IconKind::Check, 11.0, p.primary_fg).into_element()
+        } else if mixed {
+            view().w(px(8.0)).h(px(2.0)).bg(p.primary_fg).into_element()
+        } else {
+            view().into_element()
+        })
+}
+
 fn render_step_subfolders(
     ctrl: AppController,
     draft: &WizardDraft,
     pattern_input: Signal<String>,
+    pattern_error: Signal<Option<&'static str>>,
 ) -> View {
     let p = Palette::current();
     // Fallback table of checkboxes with indentation per §5.4 (reliable keyboard focus & accessibility)
@@ -1187,89 +1407,134 @@ fn render_step_subfolders(
         };
         let label_text = format!("{chevron}{}", node.name);
 
+        let item = (node.depth == 1 && node.included)
+            .then(|| {
+                draft
+                    .archive_suggestions
+                    .iter()
+                    .find(|item| item.name == node.name)
+            })
+            .flatten();
         body = body.child(
             table_row()
                 .w_full()
-                .items_center()
-                .justify_between()
+                .flex_col()
+                .gap(px(6.0))
                 .py(px(7.0))
                 .pr(px(12.0))
                 .pl(px(indent))
                 .border_t_1()
                 .border_color(p.hair)
                 .child(
-                    table_cell().flex_1().child(
-                        checkbox()
-                            .test_id(&format!("subfolder-{}", node.id))
-                            .disabled(node.depth == 0 && !node.has_children)
-                            .checked(if node.depth == 0 && node.has_children {
-                                draft
-                                    .subfolders
-                                    .iter()
-                                    .filter(|n| n.depth == 1)
-                                    .all(|n| n.included)
-                            } else {
-                                node.included
-                            })
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .cursor_pointer()
-                            .focus_visible(focus_ring)
-                            .indicator_style({
-                                let inc = node.included;
-                                move |s| {
-                                    s.w(px(16.0))
-                                        .h(px(16.0))
-                                        .rounded(px(4.0))
-                                        .border_1()
-                                        .border_color(if inc { p.primary } else { p.border })
-                                        .bg(if inc { p.primary } else { p.bg })
-                                        .items_center()
-                                        .justify_center()
-                                }
-                            })
-                            .indicator(if node.included {
-                                icon(IconKind::Check, 11.0, p.primary_fg).into_element()
-                            } else {
-                                view().into_element()
-                            })
-                            .on_change(move |_: &bool| {
-                                c.send(UiCommand::WizardToggleSubfolder(node_id.clone()));
-                            })
-                            .child(
-                                view()
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .w_full()
+                        .justify_between()
+                        .child(
+                            table_cell().flex_1().min_w(px(0.0)).child(
+                                checkbox()
+                                    .test_id(&format!("subfolder-{}", node.id))
+                                    .disabled(node.depth == 0 && !node.has_children)
+                                    .checked(if node.depth == 0 && node.has_children {
+                                        draft
+                                            .subfolders
+                                            .iter()
+                                            .filter(|n| n.depth == 1)
+                                            .all(|n| n.included)
+                                    } else {
+                                        node.included
+                                    })
                                     .flex_row()
                                     .items_center()
-                                    .gap(px(6.0))
-                                    .child(text(label_text).text_color(p.fg))
-                                    .child(if !node.included {
-                                        text(if draft.changing_subfolders {
-                                            "· excluded"
-                                        } else {
-                                            "· cloud only"
-                                        })
-                                        .text_size(px(S_CAPTION))
-                                        .text_color(p.muted)
-                                        .into_element()
+                                    .gap(px(8.0))
+                                    .cursor_pointer()
+                                    .focus_visible(focus_ring)
+                                    .indicator_style({
+                                        let inc = node.included;
+                                        move |s| {
+                                            s.w(px(16.0))
+                                                .h(px(16.0))
+                                                .rounded(px(4.0))
+                                                .border_1()
+                                                .border_color(if inc {
+                                                    p.primary
+                                                } else {
+                                                    p.border
+                                                })
+                                                .bg(if inc { p.primary } else { p.bg })
+                                                .items_center()
+                                                .justify_center()
+                                        }
+                                    })
+                                    .indicator(if node.included {
+                                        icon(IconKind::Check, 11.0, p.primary_fg).into_element()
                                     } else {
                                         view().into_element()
-                                    }),
+                                    })
+                                    .on_change(move |_: &bool| {
+                                        c.send(UiCommand::WizardToggleSubfolder(node_id.clone()));
+                                    })
+                                    .child(
+                                        view()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .min_w(px(0.0))
+                                            .child(
+                                                text(label_text)
+                                                    .min_w(px(0.0))
+                                                    .truncate()
+                                                    .text_color(p.fg),
+                                            )
+                                            .child(
+                                                if item.is_some_and(|item| {
+                                                    !draft.declined_archives.contains(&item.name)
+                                                }) {
+                                                    icon(IconKind::Archive, 14.0, p.primary)
+                                                        .into_element()
+                                                } else {
+                                                    view().into_element()
+                                                },
+                                            )
+                                            .child(if !node.included {
+                                                text(if draft.changing_subfolders {
+                                                    "· excluded"
+                                                } else {
+                                                    "· cloud only"
+                                                })
+                                                .text_size(px(S_CAPTION))
+                                                .text_color(p.muted)
+                                                .into_element()
+                                            } else {
+                                                view().into_element()
+                                            }),
+                                    ),
                             ),
-                    ),
+                        )
+                        .child(
+                            table_cell().w(px(80.0)).items_end().child(
+                                text(node.size_label.clone())
+                                    .text_size(px(S_COMPACT))
+                                    .text_color(p.fg)
+                                    .tabular_nums(),
+                            ),
+                        ),
                 )
-                .child(
-                    table_cell().w(px(80.0)).items_end().child(
-                        text(node.size_label.clone())
-                            .text_size(px(S_COMPACT))
-                            .text_color(p.fg)
-                            .tabular_nums(),
-                    ),
-                ),
+                .child(if let Some(item) = item {
+                    archive_choice(
+                        ctrl.clone(),
+                        item,
+                        !draft.declined_archives.contains(&item.name),
+                    )
+                    .into_element()
+                } else {
+                    view().into_element()
+                }),
         );
     }
 
-    let tree_card = card().flex_1().p(px(6.0)).child(
+    let mut tree_card = card().flex_1().min_w(px(0.0)).p(px(6.0)).child(
         table()
             .accessibility_label(format!("Subfolders of {}", draft.selected_folder))
             .w_full()
@@ -1291,6 +1556,59 @@ fn render_step_subfolders(
             )
             .child(body),
     );
+
+    let eligible_archives = draft
+        .archive_suggestions
+        .iter()
+        .filter(|item| draft.archive_folder_included(&item.name))
+        .count();
+    if eligible_archives > 0 {
+        let (count, saved) = draft
+            .selected_archives()
+            .fold((0, 0u64), |(count, seconds), item| {
+                (
+                    count + 1,
+                    seconds.saturating_add(item.estimated_seconds_saved),
+                )
+            });
+        let wording = if count == 1 {
+            "folder will"
+        } else {
+            "folders will"
+        };
+        let summary = if count == 0 {
+            "No folders selected for archiving".to_owned()
+        } else {
+            format!(
+                "{count} {wording} be uploaded as archives · saves {}",
+                archive_time_saved(saved)
+            )
+        };
+        let c_all = ctrl.clone();
+        let c_none = ctrl.clone();
+        tree_card = tree_card.child(
+            view()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .p(px(6.0))
+                .child(text(summary).text_size(px(S_SMALL)).text_color(p.muted))
+                .child(
+                    link_button("Tick all", S_SMALL, move || {
+                        c_all.send(UiCommand::WizardSetAllArchives(true))
+                    })
+                    .disabled(count == eligible_archives)
+                    .test_id("wizard-archive-tick-all"),
+                )
+                .child(
+                    link_button("Untick all", S_SMALL, move || {
+                        c_none.send(UiCommand::WizardSetAllArchives(false))
+                    })
+                    .disabled(count == 0)
+                    .test_id("wizard-archive-untick-all"),
+                ),
+        );
+    }
 
     let included_gb = draft.included_gb();
     let total_opt = draft.total_gb_opt();
@@ -1389,6 +1707,19 @@ fn render_step_subfolders(
         side_card = side_card.child(list);
     }
 
+    let submit = move || {
+        let input = pattern_input.get_untracked();
+        match parse_wizard_patterns(&input) {
+            Ok(patterns) if !patterns.is_empty() => {
+                pattern_error.set(None);
+                c_add_pat.send(UiCommand::WizardAddPattern(input));
+                pattern_input.set(String::new());
+            }
+            Ok(_) => pattern_error.set(None),
+            Err(error) => pattern_error.set(Some(error)),
+        }
+    };
+    let submit_on_return = submit.clone();
     side_card = side_card
         .child(
             view()
@@ -1403,7 +1734,12 @@ fn render_step_subfolders(
                 .child(
                     input()
                         .test_id("wizard-pattern-input")
+                        .multiline(true)
+                        .submit_behavior(SubmitBehavior::Submit)
+                        .auto_correct(false)
+                        .max_h(px(78.0))
                         .flex_1()
+                        .min_w(px(0.0))
                         .min_h(px(28.0))
                         .px(px(8.0))
                         .py(px(4.0))
@@ -1417,25 +1753,26 @@ fn render_step_subfolders(
                         .text_color(p.fg)
                         .placeholder("e.g. *.lrdata/")
                         .value(move || pattern_input.get())
-                        .on_change(move |val: &str| pattern_input.set(val.to_owned())),
+                        .on_change(move |val: &str| {
+                            pattern_error.set(None);
+                            pattern_input.set(val.to_owned());
+                        })
+                        .on_submit(move |_: &str| submit_on_return()),
                 )
                 .child(
-                    app_button(
-                        "Add",
-                        BtnKind::Default,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || {
-                            let pat = pattern_input.get_untracked();
-                            c_add_pat.send(UiCommand::WizardAddPattern(pat));
-                            pattern_input.set(String::new());
-                        },
-                    )
-                    .test_id("wizard-add-pattern-btn"),
+                    app_button("Add", BtnKind::Default, true, false, None, None, submit)
+                        .flex_none()
+                        .test_id("wizard-add-pattern-btn"),
                 ),
         );
+
+    if let Some(error) = pattern_error.get() {
+        side_card = side_card.child(
+            text(error)
+                .text_color(p.err)
+                .test_id("wizard-pattern-error"),
+        );
+    }
 
     let remove_pattern = |pattern: &str| {
         let c_remove = ctrl.clone();
@@ -1462,63 +1799,20 @@ fn render_step_subfolders(
                     .items_center()
                     .justify_between()
                     .gap(px(6.0))
-                    .child(mono_text(pattern.clone(), S_SMALL, p.fg).min_w(px(0.0)))
+                    .test_id(&format!("pattern-row-{pattern}"))
+                    .child(
+                        mono_text(pattern.clone(), S_SMALL, p.fg)
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate(),
+                    )
                     .child(remove_pattern(pattern)),
             );
         }
     }
 
     if !draft.suggested_folders.is_empty() {
-        let c_remove_all = ctrl.clone();
-        side_card = side_card
-            .child(section_label("Suggested: build and cache folders"))
-            .child(
-                link_button("Remove all suggested", S_SMALL, move || {
-                    c_remove_all.send(UiCommand::WizardRemoveAllSuggested)
-                })
-                .test_id("wizard-remove-all-suggested"),
-            );
-        for suggestion in SUGGESTED_EXCLUSIONS {
-            let Some(counts) = draft.suggested_folders.get(suggestion.pattern) else {
-                continue;
-            };
-            let name = suggestion.pattern.trim_end_matches("**");
-            let folders = format_count(counts.folder_count as u64);
-            let folder_label = if counts.folder_count == 1 {
-                "folder"
-            } else {
-                "folders"
-            };
-            let files = format_count(counts.file_count as u64);
-            let file_label = if counts.file_count == 1 {
-                "file"
-            } else {
-                "files"
-            };
-            let size = counts
-                .total_bytes
-                .map_or_else(|| "size unknown".to_owned(), format_bytes);
-            let stats = format!("{folders} {folder_label}, {files} {file_label}, {size}");
-            side_card = side_card.child(
-                view()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(mono_text(name, S_SMALL, p.fg))
-                            .child(remove_pattern(suggestion.pattern)),
-                    )
-                    .child(text(stats).text_size(px(S_SMALL)).text_color(p.fg))
-                    .child(
-                        text(suggestion.reason)
-                            .text_size(px(S_TINY))
-                            .text_color(p.muted),
-                    ),
-            );
-        }
+        side_card = side_card.child(render_suggestions(ctrl.clone(), draft));
     }
 
     let name_check = if draft.found_name_issues.is_empty() {
@@ -1548,7 +1842,9 @@ fn render_step_subfolders(
         )
     };
 
-    let found_card = if draft.changing_subfolders {
+    let found_card = if draft.transition_check.is_some() {
+        view()
+    } else if draft.changing_subfolders {
         card()
             .flex_1()
             .child(card_title("Before updating the selection"))
@@ -1592,7 +1888,7 @@ fn render_step_subfolders(
             "Duplicate names or case/Unicode clashes stop the run for review.",
         ));
 
-    let mut content = view().flex_col().w_full().gap(px(14.0)).child(
+    let content = view().flex_col().w_full().gap(px(14.0)).child(
         view()
             .flex_row()
             .items_start()
@@ -1601,69 +1897,6 @@ fn render_step_subfolders(
             .child(tree_card)
             .child(side_card),
     );
-    if !draft.archive_suggestions.is_empty() {
-        let mut suggestions = card().child(card_title("Upload as one archive"));
-        for item in &draft.archive_suggestions {
-            let sender = ctrl.clone();
-            let folder = item.name.clone();
-            let checked = !draft.declined_archives.contains(&folder);
-            let last_changed = chrono::DateTime::from_timestamp(item.last_changed_unix_secs, 0)
-                .map(|date| date.format("%b %-d, %Y").to_string())
-                .unwrap_or_else(|| "Unknown".to_owned());
-            let saved_minutes = item.estimated_seconds_saved.div_ceil(300) * 5;
-            let saved = if saved_minutes < 60 {
-                format!("{saved_minutes} min")
-            } else {
-                format!("{} hr {} min", saved_minutes / 60, saved_minutes % 60)
-            };
-            suggestions = suggestions.child(
-                checkbox()
-                    .test_id(&format!("wizard-archive-{}", item.name))
-                    .checked(checked)
-                    .flex_row()
-                    .items_start()
-                    .gap(px(10.0))
-                    .cursor_pointer()
-                    .focus_visible(focus_ring)
-                    .indicator_style(move |s| {
-                        s.w(px(16.0))
-                            .h(px(16.0))
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(if checked { p.primary } else { p.border })
-                            .bg(if checked { p.primary } else { p.bg })
-                            .items_center()
-                            .justify_center()
-                    })
-                    .indicator(if checked {
-                        icon(IconKind::Check, 11.0, p.primary_fg).into_element()
-                    } else {
-                        view().into_element()
-                    })
-                    .on_change(move |_: &bool| {
-                        sender.send(UiCommand::WizardToggleArchive(folder.clone()));
-                    })
-                    .child(
-                        view()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(text(item.name.clone()).font_weight(W_TITLE))
-                            .child(
-                                text(archive_file_summary(item.file_count, item.bytes))
-                                    .text_color(p.fg),
-                            )
-                            .child(
-                                text(format!(
-                                    "Last change {last_changed} · Time saved about {saved}"
-                                ))
-                                .text_size(px(S_SMALL))
-                                .text_color(p.muted),
-                            ),
-                    ),
-            );
-        }
-        content = content.child(suggestions);
-    }
     content.child(
         view()
             .flex_row()
@@ -1673,6 +1906,51 @@ fn render_step_subfolders(
             .child(found_card)
             .child(supported_card),
     )
+}
+
+fn archive_choice(
+    ctrl: AppController,
+    item: &sync_core::archive::ArchiveSuggestion,
+    checked: bool,
+) -> nsh_base::CheckboxElement {
+    let p = Palette::current();
+    let folder = item.name.clone();
+    let last_change = chrono::DateTime::from_timestamp(item.last_changed_unix_secs, 0)
+        .map(|date| date.format("%b %-d, %Y").to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let details = format!(
+        "{} · Last change {last_change} · saves {}",
+        archive_file_summary(item.file_count, item.bytes),
+        archive_time_saved(item.estimated_seconds_saved)
+    );
+    suggestion_checkbox(checked, false)
+        .test_id(&format!("wizard-archive-{}", item.name))
+        .accessibility_label(format!("Upload {} as one archive", item.name))
+        .on_change(move |_: &bool| ctrl.send(UiCommand::WizardToggleArchive(folder.clone())))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    text("Upload as one archive")
+                        .text_size(px(S_SMALL))
+                        .text_color(p.fg),
+                )
+                .child(text(details).text_size(px(S_TINY)).text_color(p.muted)),
+        )
+}
+
+fn archive_time_saved(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    if minutes == 0 {
+        "under 1 min".to_owned()
+    } else if minutes < 60 {
+        format!("about {minutes} min")
+    } else {
+        format!("about {} hr {} min", minutes / 60, minutes % 60)
+    }
 }
 
 fn archive_file_summary(files: u64, bytes: u64) -> String {
@@ -2012,8 +2290,16 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                 .join(", "),
         );
     }
-    if !draft.custom_patterns.is_empty() {
-        not_synced_parts.push(draft.custom_patterns.join(", "));
+    for pattern in &draft.custom_patterns {
+        if let Some(counts) = draft.suggested_folders.get(pattern.as_str()) {
+            not_synced_parts.push(format!(
+                "{} · {}",
+                pattern.trim_end_matches("**"),
+                suggestion_stats(counts)
+            ));
+        } else {
+            not_synced_parts.push(pattern.clone());
+        }
     }
     not_synced_parts.push("macOS metadata and temporary files".to_owned());
     let not_synced_text = not_synced_parts.join(" · ");
@@ -2606,10 +2892,12 @@ fn render_wizard_footer(
     skip_account: bool,
     account_ready: bool,
     folder_ready: bool,
+    demo: bool,
 ) -> View {
     let p = Palette::current();
     let c_cancel = ctrl.clone();
     let c_save = ctrl.clone();
+    let check = draft.transition_check.as_ref();
     let mut row = view()
         .flex_row()
         .items_center()
@@ -2629,32 +2917,90 @@ fn render_wizard_footer(
         ))
         .child(
             app_button(
-                "Save draft",
+                if check.is_some_and(|check| check.saving_draft) {
+                    "Saving draft…"
+                } else {
+                    "Save draft"
+                },
                 BtnKind::Default,
                 false,
-                false,
+                check.is_some_and(|check| check.saving_draft),
                 None,
                 None,
                 move || {
                     c_save.send(UiCommand::WizardSaveDraft);
-                    c_save.navigate(ScreenRoute::Overview);
+                    if demo {
+                        c_save.navigate(ScreenRoute::Overview);
+                    }
                 },
             )
             .test_id("wizard-save-draft-btn"),
         )
         .child(view().flex_1());
 
+    if draft.step >= WizardStep::Location && !draft.local_path.is_empty() && check.is_none() {
+        let c = ctrl.clone();
+        row = row.child(
+            link_button("Check again", S_SMALL, move || {
+                c.send(UiCommand::WizardCheckAgain)
+            })
+            .test_id("wizard-check-again"),
+        );
+    }
+
+    if demo {
+        let c = ctrl.clone();
+        let (label, command, id) = if check.is_some() {
+            (
+                "Finish check",
+                UiCommand::DemoFinishWizardCheck,
+                "wizard-demo-finish-check",
+            )
+        } else {
+            (
+                "Preview checking",
+                UiCommand::DemoPreviewWizardCheck,
+                "wizard-demo-preview-check",
+            )
+        };
+        row = row.child(
+            app_button(label, BtnKind::Ghost, true, false, None, None, move || {
+                c.send(command.clone())
+            })
+            .test_id(id),
+        );
+    }
+
     if let Some(prev) = draft.step.prev(skip_account) {
         let c_back = ctrl.clone();
-        row = row.child(app_button(
-            "Back",
-            BtnKind::Default,
-            false,
-            false,
-            None,
-            None,
-            move || c_back.send(UiCommand::WizardSetStep(prev)),
-        ));
+        row = row.child(
+            app_button(
+                "Back",
+                BtnKind::Default,
+                false,
+                false,
+                None,
+                None,
+                move || c_back.send(UiCommand::WizardSetStep(prev)),
+            )
+            .disabled(check.is_some_and(|check| !check.waiting))
+            .test_id("wizard-back-btn"),
+        );
+    }
+
+    if check.is_some() {
+        return row.child(
+            app_button(
+                "Checking…",
+                BtnKind::Primary,
+                false,
+                true,
+                None,
+                None,
+                || {},
+            )
+            .test_id("wizard-continue-btn"),
+        );
     }
 
     if draft.step == WizardStep::Review {
