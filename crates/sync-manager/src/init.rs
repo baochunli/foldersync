@@ -590,7 +590,10 @@ fn rclone_glob_match(pattern: &str, text: &str) -> bool {
         return true; // The literal prefix was checked above.
     }
     if first == last && pattern.as_bytes()[first] == b'*' {
-        return text.len() >= first + pattern.len() - last - 1 && !text.contains('/');
+        let suffix_len = pattern.len() - last - 1;
+        return text
+            .get(first..text.len() - suffix_len)
+            .is_some_and(|matched| !matched.contains('/'));
     }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -1505,6 +1508,52 @@ mod tests {
 #[cfg(test)]
 mod wizard_inventory_tests {
     use super::*;
+
+    #[test]
+    fn slash_single_star_exclusions_match_only_one_component() {
+        assert!(matches_exclusion_pattern("sub/note.tmp", "/sub/*.tmp"));
+        assert!(matches_exclusion_pattern("sub/.tmp", "/sub/*.tmp"));
+        assert!(!matches_exclusion_pattern(
+            "other/sub/note.tmp",
+            "/sub/*.tmp"
+        ));
+        assert!(!matches_exclusion_pattern(
+            "sub/deeper/note.tmp",
+            "/sub/*.tmp"
+        ));
+        assert!(matches_exclusion_pattern("sub/note.tmp", "sub/*.tmp"));
+        assert!(matches_exclusion_pattern("other/sub/note.tmp", "sub/*.tmp"));
+        assert!(!matches_exclusion_pattern(
+            "other/sub/deeper/note.tmp",
+            "sub/*.tmp"
+        ));
+        assert!(matches_exclusion_pattern(
+            "sub/build-cache/output.o",
+            "sub/build*/**"
+        ));
+        assert!(!matches_exclusion_pattern(
+            "sub/other/build-cache/output.o",
+            "sub/build*/**"
+        ));
+        assert!(rclone_glob_match("日本/*/é", "日本/文件/é"));
+        assert!(!rclone_glob_match("é*é", "é"));
+    }
+
+    #[test]
+    fn archive_slash_single_star_exclusions_match_only_one_component() {
+        let exclusions = BTreeSet::from(["/Reports/raw_*.csv".to_owned(), "dir/*/file".to_owned()]);
+        assert!(archive_excluded("Reports/raw_2024.csv", &exclusions));
+        assert!(!archive_excluded(
+            "nested/Reports/raw_2024.csv",
+            &exclusions
+        ));
+        assert!(!archive_excluded(
+            "Reports/raw_backup/2024.csv",
+            &exclusions
+        ));
+        assert!(archive_excluded("nested/dir/one/file", &exclusions));
+        assert!(!archive_excluded("nested/dir/one/two/file", &exclusions));
+    }
 
     #[test]
     fn refilters_a_large_cached_listing() {

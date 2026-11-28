@@ -1948,6 +1948,8 @@ fn archive_time_saved(seconds: u64) -> String {
         "under 1 min".to_owned()
     } else if minutes < 60 {
         format!("about {minutes} min")
+    } else if minutes.is_multiple_of(60) {
+        format!("about {} hr", minutes / 60)
     } else {
         format!("about {} hr {} min", minutes / 60, minutes % 60)
     }
@@ -3129,4 +3131,17 @@ fn bullet(line: &str) -> View {
                 .text_size(px(S_SMALL))
                 .text_color(p.fg),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::archive_time_saved;
+
+    #[test]
+    fn archive_time_saved_omits_zero_minutes() {
+        assert_eq!(archive_time_saved(59), "under 1 min");
+        assert_eq!(archive_time_saved(3_600), "about 1 hr");
+        assert_eq!(archive_time_saved(7_200), "about 2 hr");
+        assert_eq!(archive_time_saved(3_660), "about 1 hr 1 min");
+    }
 }

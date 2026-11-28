@@ -383,13 +383,22 @@ test("Pattern input splits pasted lists, handles Return, and keeps Remove visibl
   const add = "id:wizard-add-pattern-btn";
   const build = "id:wizard-suggestion-build/**";
   await app.press(build);
-  await app.paste(input, { text: "*.bak\n*.tmp, *.log *.bak build/**" });
+  await app.paste(input, { text: "*.bak\n*.tmp, *.log *.bak build/" });
   await app.press(add);
   for (const pattern of ["*.bak", "*.tmp", "*.log"]) {
     expect(app.shows(`id:remove-pattern-${pattern}`)).toBe(true);
   }
-  expect(app.shows("id:remove-pattern-build/**")).toBe(false);
+  expect(app.shows("id:remove-pattern-build/")).toBe(false);
   expect(app.texts()).not.toContain("Will upload");
+
+  for (const alias of ["build", "build/**"]) {
+    await app.press(build);
+    expect(app.texts()).toContain("Will upload");
+    await app.type(input, alias);
+    await app.press(add);
+    expect(app.shows(`id:remove-pattern-${alias}`)).toBe(false);
+    expect(app.texts()).not.toContain("Will upload");
+  }
 
   await app.type(input, "broken[");
   await app.press(add);

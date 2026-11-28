@@ -121,7 +121,8 @@ them to Git.
    If both folders contain files, use a new empty destination and keep both
    existing copies while you decide which files to sync.
 
-   In **Choose what to include**, check **Suggested: build and cache folders**.
+   In **Choose what to include**, check
+   **Left out of Google Drive: build and cache folders**.
    Matching build and cache folders, such as `build/` or `.venv/`, are checked
    by default and left out of Google Drive. Clear a checkbox to upload that
    folder type, or use the heading checkbox to change all suggestions.

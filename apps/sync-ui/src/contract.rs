@@ -1688,8 +1688,12 @@ impl WizardDraft {
         };
         let mut changed = false;
         for pattern in patterns {
-            changed |= if self.suggested_folders.contains_key(pattern) {
-                self.set_suggestion(pattern, true)
+            let folder = pattern.strip_suffix('/').unwrap_or(pattern);
+            let suggestion = self.suggested_folders.keys().copied().find(|suggestion| {
+                *suggestion == pattern || suggestion.strip_suffix("/**") == Some(folder)
+            });
+            changed |= if let Some(suggestion) = suggestion {
+                self.set_suggestion(suggestion, true)
             } else {
                 self.add_custom_pattern(pattern)
             };
