@@ -130,6 +130,24 @@ Initialization uses the same validated base profile, except:
   `--resync-mode path2` (remote has data, local is empty) is emitted instead.
 - Ordinary runs never carry `--resync` or `--resync-mode`.
 
+### Interrupted first-sync qualification
+
+Resume is blocked on rclone 1.76.0. A local-to-local fixture started with
+matching markers and a destination that was a subset of the source. After
+rclone began staging a missing file, an independent writer created that file
+at the destination. Rclone replaced the new file, exited successfully, and
+left both recovery directories empty. This occurred with both preferred
+directions and with the initialization profile augmented by `--immutable`
+and `--no-update-modtime`.
+
+A subset check cannot reserve destination names. On the local backend,
+rclone checks for an existing destination before staging the copy and
+publishes the staged file with a rename that can replace a newly created
+file. Safe resume requires a destination write that fails atomically if
+another writer has claimed the name.
+[Resync copy passes](https://github.com/rclone/rclone/blob/v1.76.0/cmd/bisync/resync.go#L104-L119) ·
+[Local file publication](https://github.com/rclone/rclone/blob/v1.76.0/backend/local/local.go#L1114-L1148)
+
 ### Comparison policy and known `--compare size,modtime` limitation (§10)
 
 The initial profile uses `--compare size,modtime` and retains normal
