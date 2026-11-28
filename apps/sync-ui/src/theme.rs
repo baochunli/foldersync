@@ -579,6 +579,11 @@ pub fn progress_bar(
     let indeterminate = value_percent.is_none();
     let val = value_percent.unwrap_or(0.0);
     let reduced = reduce_motion();
+    let a11y_label = a11y_label.into();
+    let a11y_label = match value_percent {
+        Some(percent) => format!("{a11y_label}, {percent:.0} percent").into(),
+        None => a11y_label,
+    };
 
     let radius = height_pt / 2.0;
 
@@ -586,7 +591,7 @@ pub fn progress_bar(
         .w_full()
         .value(val)
         .indeterminate(indeterminate)
-        .accessibility_label(a11y_label.into())
+        .accessibility_label(a11y_label)
         .track_style(move |s| {
             s.w_full()
                 .h(px(height_pt))

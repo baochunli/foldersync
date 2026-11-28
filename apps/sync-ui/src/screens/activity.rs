@@ -647,14 +647,12 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         ),
                 )
         }
-        RunPhase::TransferringKnown {
-            transferred_label,
-            total_label,
-            percent,
+        RunPhase::Transferring {
+            progress,
             elapsed_secs,
         } => {
             let base_secs = *elapsed_secs;
-            let pct = *percent;
+            let percent = progress.percent();
             let elapsed_sig = ctrl.elapsed_offset;
             card()
                 .border_color(p.run_bd)
@@ -667,69 +665,20 @@ fn render_active_run_card(ctrl: AppController, run: &ActiveRunSnapshot) -> View 
                         .child(card_title(run.mapping_name.clone()))
                         .child(text(format!("· {}", run.volume_name)).text_color(p.muted)),
                 )
-                .child(emphasized_line(
-                    "Transferring",
-                    format!(" · {transferred_label} of {total_label}"),
-                ))
+                .child(emphasized_line("Transferring", String::new()))
                 .child(progress_bar(
-                    Some(f32::from(pct)),
+                    percent.map(f32::from),
                     6.0,
                     format!("Transferring {}", run.mapping_name),
                 ))
+                .child(text(progress.line()).text_color(p.fg).tabular_nums())
                 .child(
                     text(move || {
                         let elapsed = format_duration(base_secs.saturating_add(elapsed_sig.get()));
-                        format!("{pct}% · elapsed {elapsed} · total known")
-                    })
-                    .text_size(px(S_SMALL))
-                    .text_color(p.muted)
-                    .tabular_nums(),
-                )
-                .child(
-                    view().flex_row().mt(px(CARD_ACTION_MARGIN)).child(
-                        app_button(
-                            "Stop",
-                            BtnKind::Default,
-                            false,
-                            false,
-                            Some(IconKind::Stop),
-                            None,
-                            move || c_stop.send(UiCommand::StopRun(id_stop.clone())),
-                        )
-                        .test_id("activity-stop-btn"),
-                    ),
-                )
-        }
-        RunPhase::TransferringUnknown {
-            transferred_label,
-            elapsed_secs,
-        } => {
-            let base_secs = *elapsed_secs;
-            let elapsed_sig = ctrl.elapsed_offset;
-            card()
-                .border_color(p.run_bd)
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(status_pill(IconKind::Sync, "Running", Tone::Run))
-                        .child(card_title(run.mapping_name.clone()))
-                        .child(text(format!("· {}", run.volume_name)).text_color(p.muted)),
-                )
-                .child(emphasized_line(
-                    "Transferring",
-                    format!(" · {transferred_label} so far"),
-                ))
-                .child(progress_bar(
-                    None,
-                    6.0,
-                    format!("{transferred_label} so far, total not known yet"),
-                ))
-                .child(
-                    text(move || {
-                        let elapsed = format_duration(base_secs.saturating_add(elapsed_sig.get()));
-                        format!("Total not known yet · elapsed {elapsed}")
+                        match percent {
+                            Some(percent) => format!("{percent}% · elapsed {elapsed}"),
+                            None => format!("Elapsed {elapsed}"),
+                        }
                     })
                     .text_size(px(S_SMALL))
                     .text_color(p.muted)

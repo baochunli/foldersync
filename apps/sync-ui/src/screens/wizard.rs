@@ -6,11 +6,13 @@ use nsh_base::{
     table_header, table_row,
 };
 use nsh_core::{file_dialog::OpenDialog, prelude::*};
-use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, VolumeKind};
+use sync_core::{
+    DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, VolumeKind, policy::SUGGESTED_EXCLUSIONS,
+};
 
 use crate::contract::{
     AccountStatus, FolderSize, IconKind, ReviewScenario, ScreenRoute, Tone, UiCommand, UiSnapshot,
-    WizardDraft, WizardStep, format_bytes, format_duration,
+    WizardDraft, WizardStep, format_bytes, format_count, format_duration,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -1368,33 +1370,78 @@ fn render_step_subfolders(
                 ),
         );
 
-    for pattern in &draft.custom_patterns {
+    let remove_pattern = |pattern: &str| {
         let c_remove = ctrl.clone();
-        let removed = pattern.clone();
-        side_card = side_card.child(
-            view()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(6.0))
-                .child(mono_text(pattern.clone(), S_SMALL, p.fg).min_w(px(0.0)))
-                .child(
-                    app_button(
-                        "Remove",
-                        BtnKind::Ghost,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || {
-                            c_remove.send(UiCommand::WizardRemovePattern(removed.clone()));
-                        },
+        let removed = pattern.to_owned();
+        app_button(
+            "Remove",
+            BtnKind::Ghost,
+            true,
+            false,
+            None,
+            None,
+            move || c_remove.send(UiCommand::WizardRemovePattern(removed.clone())),
+        )
+        .flex_none()
+        .accessibility_label(format!("Remove {pattern}"))
+        .test_id(&format!("remove-pattern-{pattern}"))
+    };
+
+    for pattern in &draft.custom_patterns {
+        if !draft.suggested_folders.contains_key(pattern.as_str()) {
+            side_card = side_card.child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(mono_text(pattern.clone(), S_SMALL, p.fg).min_w(px(0.0)))
+                    .child(remove_pattern(pattern)),
+            );
+        }
+    }
+
+    if !draft.suggested_folders.is_empty() {
+        let c_remove_all = ctrl.clone();
+        side_card = side_card
+            .child(section_label("Suggested: build and cache folders"))
+            .child(
+                link_button("Remove all suggested", S_SMALL, move || {
+                    c_remove_all.send(UiCommand::WizardRemoveAllSuggested)
+                })
+                .test_id("wizard-remove-all-suggested"),
+            );
+        for suggestion in SUGGESTED_EXCLUSIONS {
+            let Some(counts) = draft.suggested_folders.get(suggestion.pattern) else {
+                continue;
+            };
+            let name = suggestion.pattern.trim_end_matches("**");
+            let folders = format_count(counts.folder_count as u64);
+            let files = format_count(counts.file_count as u64);
+            let size = counts
+                .total_bytes
+                .map_or_else(|| "size unknown".to_owned(), format_bytes);
+            let stats = format!("{folders} folders, {files} files, {size}");
+            side_card = side_card.child(
+                view()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(mono_text(name, S_SMALL, p.fg))
+                            .child(remove_pattern(suggestion.pattern)),
                     )
-                    .flex_none()
-                    .accessibility_label(format!("Remove {pattern}"))
-                    .test_id(&format!("remove-pattern-{pattern}")),
-                ),
-        );
+                    .child(text(stats).text_size(px(S_SMALL)).text_color(p.fg))
+                    .child(
+                        text(suggestion.reason)
+                            .text_size(px(S_TINY))
+                            .text_color(p.muted),
+                    ),
+            );
+        }
     }
 
     let name_check = if draft.found_name_issues.is_empty() {
@@ -2021,18 +2068,16 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             "Setting up",
             format!("Checking access markers · elapsed {elapsed}"),
         ),
-        ReviewScenario::CloudToLocal | ReviewScenario::BothPopulated => (
-            "Downloading",
-            if draft.total_gb_opt().is_some() {
-                format!(
-                    "Downloading · about {:.1} GB · elapsed {elapsed}",
-                    draft.included_gb()
-                )
-            } else {
-                format!("Downloading · elapsed {elapsed}")
-            },
-        ),
+        ReviewScenario::CloudToLocal | ReviewScenario::BothPopulated => {
+            ("Downloading", format!("Downloading · elapsed {elapsed}"))
+        }
     };
+
+    let progress = snap
+        .active_run
+        .as_ref()
+        .filter(|run| draft.first_sync_mapping_id.as_ref() == Some(&run.mapping_id))
+        .and_then(|run| run.transfer_progress());
 
     let preflight_done = snap.is_demo_mode || draft.first_sync_preflight_done;
     let markers_ready = snap.is_demo_mode || draft.first_sync_markers_ready;
@@ -2102,6 +2147,22 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         } else {
             text(in_flight_line)
         };
+        let mut transfer = view()
+            .flex_1()
+            .max_w(px(460.0))
+            .flex_col()
+            .gap(px(6.0))
+            .child(active_line.tabular_nums())
+            .child(progress_bar(
+                progress
+                    .and_then(|progress| progress.percent())
+                    .map(f32::from),
+                6.0,
+                format!("{verb} {}", draft.selected_folder),
+            ));
+        if let Some(progress) = progress {
+            transfer = transfer.child(text(progress.line()).text_color(p.fg).tabular_nums());
+        }
         progress_card = progress_card
             .child(
                 view()
@@ -2110,23 +2171,7 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                     .gap(px(10.0))
                     .py(px(4.0))
                     .child(icon(IconKind::Sync, 16.0, p.run))
-                    .child(
-                        view()
-                            .flex_1()
-                            .max_w(px(460.0))
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(active_line.tabular_nums())
-                            .child(progress_bar(
-                                if snap.is_demo_mode {
-                                    Some(f32::from(draft.first_sync_percent))
-                                } else {
-                                    None
-                                },
-                                6.0,
-                                format!("{verb} {}", draft.selected_folder),
-                            )),
-                    ),
+                    .child(transfer),
             )
             .child(check_row(IconKind::Dash, p.muted, "Check the result"))
             .child(check_row(IconKind::Dash, p.muted, finish_mode_pending));

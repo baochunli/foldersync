@@ -5,7 +5,7 @@
 //! or `sync-manager`. All sample data is neutral and matches `ui-spec.md` §2 and §6.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use sync_core::{
@@ -14,14 +14,16 @@ use sync_core::{
     WallTime, apply_event, apply_user_action, available_actions,
 };
 
+use sync_manager::init::SuggestedFolderInventory;
+
 use crate::contract::{
     AccountSnapshot, AccountStatus, ActiveRunSnapshot, ActivityEvent, AttentionItem, AttentionKind,
     AttentionPriority, CloudFolderCandidate, DemoActivityPhase, DemoPreset, FinderExtensionStatus,
     FolderSize, IconKind, InspectedRunSnapshot, LocationCheck, MappingSnapshot,
     PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem,
     ReviewScenario, RunPhase, RunRecordSnapshot, SYNC_ALL_NOW_LABEL, ScheduledCheck, ScreenRoute,
-    StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts,
-    VolumeSnapshot, WizardDraft, WizardStep, is_low_space,
+    StatusModifier, SubfolderNode, Tone, TransferProgress, UiCommand, UiSnapshot,
+    UnreviewedConflicts, VolumeSnapshot, WizardDraft, WizardStep, is_low_space,
 };
 use crate::system_actions::{RecordingSystemActions, SystemActions};
 
@@ -982,6 +984,13 @@ impl DemoSource {
                 if snap.wizard.remove_custom_pattern(&pattern) {
                     snap.wizard.no_other_sync_confirmed = false;
                     snap.wizard.filter_review = None;
+                    recompute_wizard_checks(&mut snap);
+                }
+            }
+            UiCommand::WizardRemoveAllSuggested => {
+                if snap.wizard.remove_all_suggested() {
+                    snap.wizard.no_other_sync_confirmed = false;
+                    recompute_wizard_checks(&mut snap);
                 }
             }
             UiCommand::WizardSetLocalRecoveryPath(path) => {
@@ -1060,24 +1069,54 @@ impl DemoSource {
                     snap.wizard.first_sync_completed = false;
                     snap.wizard.first_sync_error = None;
                     snap.wizard.step = WizardStep::FirstSync;
-                    snap.wizard.first_sync_percent =
-                        if snap.wizard.review_scenario == ReviewScenario::BothEmpty {
-                            90
-                        } else {
-                            33
-                        };
-                    snap.wizard.first_sync_elapsed_secs = 21 * 60 + 40;
-                    if snap.active_run.is_none() {
-                        snap.active_run = Some(ActiveRunSnapshot {
-                            run_id: RunId::new(format!("run-init-{id}")),
-                            mapping_id: id,
-                            mapping_name: name.clone(),
-                            volume_name: vol_name,
-                            started_label: "14:46".to_owned(),
-                            trigger_label: "First sync".to_owned(),
-                            phase: RunPhase::Scanning { elapsed_secs: 1 },
-                        });
+                    let elapsed_secs = 189 * 60 + 58;
+                    snap.wizard.first_sync_elapsed_secs = elapsed_secs;
+                    let (bytes, files) = match snap.wizard.review_scenario {
+                        ReviewScenario::CloudToLocal => {
+                            (snap.wizard.cloud_total_bytes, snap.wizard.cloud_file_count)
+                        }
+                        _ => (snap.wizard.local_total_bytes, snap.wizard.local_file_count),
+                    };
+                    let phase = if let Some((bytes, files)) = bytes
+                        .zip(files)
+                        .filter(|&(bytes, files)| bytes > 0 || files > 0)
+                    {
+                        RunPhase::Transferring {
+                            elapsed_secs,
+                            progress: TransferProgress {
+                                bytes_transferred: bytes * 178 / 1000,
+                                files_transferred: (files * 78 / 1000) as u64,
+                                expected_bytes: Some(bytes),
+                                expected_files: Some(files as u64),
+                                eta_seconds: Some(38 * 3600),
+                                ..Default::default()
+                            },
+                        }
+                    } else {
+                        RunPhase::Scanning { elapsed_secs }
+                    };
+                    if let Some(previous) = snap.active_run.take()
+                        && previous.mapping_id != id
+                        && let Some(mapping) = snap
+                            .mappings
+                            .iter_mut()
+                            .find(|m| m.id == previous.mapping_id)
+                    {
+                        mapping.state.execution = Execution::Queued;
+                        mapping.available_actions = available_actions(&mapping.state);
+                        snap.queue_order
+                            .retain(|queued| queued != &previous.mapping_id);
+                        snap.queue_order.insert(0, previous.mapping_id);
                     }
+                    snap.active_run = Some(ActiveRunSnapshot {
+                        run_id: RunId::new(format!("run-init-{id}")),
+                        mapping_id: id,
+                        mapping_name: name.clone(),
+                        volume_name: vol_name,
+                        started_label: "14:46".to_owned(),
+                        trigger_label: "First sync".to_owned(),
+                        phase,
+                    });
                     recount_account_mappings(&mut snap);
                     self.push_event(
                         &mut snap,
@@ -1153,7 +1192,6 @@ impl DemoSource {
                     {
                         c.on_this_mac = Some(format!("On {vol_name}"));
                     }
-                    snap.wizard.first_sync_percent = 100;
                     snap.wizard.first_sync_completed = true;
                     snap.wizard.first_sync_error = None;
                     recount_account_mappings(&mut snap);
@@ -1214,16 +1252,26 @@ impl DemoSource {
                             };
                         }
                         DemoActivityPhase::TransferringKnown => {
-                            run.phase = RunPhase::TransferringKnown {
-                                transferred_label: "1.2 GB".to_owned(),
-                                total_label: "3.4 GB".to_owned(),
-                                percent: 35,
+                            run.phase = RunPhase::Transferring {
+                                progress: TransferProgress {
+                                    bytes_transferred: 1_200_000_000,
+                                    expected_bytes: Some(3_400_000_000),
+                                    files_transferred: 112,
+                                    expected_files: Some(410),
+                                    eta_seconds: Some(450),
+                                    ..Default::default()
+                                },
                                 elapsed_secs: 2 * 60 + 40,
                             };
                         }
                         DemoActivityPhase::TransferringUnknown => {
-                            run.phase = RunPhase::TransferringUnknown {
-                                transferred_label: "820 MB".to_owned(),
+                            run.phase = RunPhase::Transferring {
+                                progress: TransferProgress {
+                                    bytes_transferred: 820_000_000,
+                                    files_transferred: 68,
+                                    bytes_per_second: Some(3_500_000),
+                                    ..Default::default()
+                                },
                                 elapsed_secs: 6 * 60 + 5,
                             };
                         }
@@ -1300,8 +1348,7 @@ impl DemoSource {
                 if let Some(run) = &mut snap.active_run {
                     match &mut run.phase {
                         RunPhase::Scanning { elapsed_secs }
-                        | RunPhase::TransferringKnown { elapsed_secs, .. }
-                        | RunPhase::TransferringUnknown { elapsed_secs, .. }
+                        | RunPhase::Transferring { elapsed_secs, .. }
                         | RunPhase::Stopping { elapsed_secs } => {
                             *elapsed_secs = elapsed_secs.saturating_add(1);
                         }
@@ -1520,6 +1567,9 @@ fn load_mapping_into_wizard(snap: &mut UiSnapshot, m: &MappingSnapshot, step: Wi
             .and_then(|c| c.size.bytes())
             .map(|bytes| bytes as f64 / 1_000_000_000.0),
     );
+    snap.wizard.suggest_exclusions = false;
+    snap.wizard.suggested_folders.clear();
+    snap.wizard.dismissed_suggestions.clear();
     snap.wizard.custom_patterns = m.custom_exclusions.clone();
     snap.wizard.marker_reused = candidate.as_ref().is_some_and(|c| c.used_by_other_computer);
     snap.wizard.no_other_sync_confirmed = false;
@@ -1595,7 +1645,7 @@ fn upsert_wizard_mapping(snap: &mut UiSnapshot, state: MappingState) -> MappingI
         .max(1);
     let inc_subs = total_subs.saturating_sub(excluded_subs.len());
 
-    let new_record = make_mapping(
+    let mut new_record = make_mapping(
         id.as_str(),
         &draft.selected_folder,
         draft.selected_account.as_str(),
@@ -1630,6 +1680,7 @@ fn upsert_wizard_mapping(snap: &mut UiSnapshot, state: MappingState) -> MappingI
         false,
     );
 
+    new_record.custom_exclusions = draft.custom_patterns;
     if let Some(existing) = snap.mappings.iter_mut().find(|m| m.id == id) {
         *existing = new_record;
     } else {
@@ -1831,6 +1882,63 @@ fn sync_wizard_volume_from_path(snap: &mut UiSnapshot) {
 }
 
 fn recompute_wizard_checks(snap: &mut UiSnapshot) {
+    let wizard = &mut snap.wizard;
+    if wizard.suggest_exclusions {
+        let mut observed = BTreeMap::new();
+        let measure_projects = wizard.selected_folder == "Projects"
+            && matches!(
+                wizard.review_scenario,
+                ReviewScenario::CloudToLocal | ReviewScenario::BothPopulated
+            );
+        if measure_projects {
+            // Synthetic nested folders in the Projects fixture (for example a/build/x.o).
+            for (pattern, folder_count, file_count, bytes) in [
+                ("build/**", 28, 608, 2_300_000_000),
+                ("Pods/**", 4, 70, 600_000_000),
+                (".venv/**", 2, 42, 100_000_000),
+            ] {
+                observed.insert(
+                    pattern,
+                    SuggestedFolderInventory {
+                        folder_count,
+                        file_count,
+                        total_bytes: Some(bytes),
+                    },
+                );
+            }
+        }
+        wizard.update_suggestions(observed);
+        if measure_projects {
+            let skipped_bytes = wizard
+                .suggested_folders
+                .values()
+                .filter_map(|counts| counts.total_bytes)
+                .sum::<u64>();
+            let skipped_files = wizard
+                .suggested_folders
+                .values()
+                .map(|counts| counts.file_count)
+                .sum::<usize>();
+            let bytes = 18_600_000_000 - skipped_bytes;
+            if let Some(root) = wizard
+                .subfolders
+                .iter_mut()
+                .find(|folder| folder.depth == 0)
+            {
+                root.size_gb = bytes as f64 / 1_000_000_000.0;
+                root.size_label = format!("{:.1} GB", root.size_gb);
+            }
+            let excluded_gb = wizard.total_gb() - wizard.included_gb();
+            let excluded_files = if wizard.excluded_names().iter().any(|name| name == "Renders") {
+                420
+            } else {
+                0
+            };
+            wizard.cloud_total_bytes =
+                Some(bytes.saturating_sub((excluded_gb * 1_000_000_000.0).round() as u64));
+            wizard.cloud_file_count = Some(2_410 - skipped_files - excluded_files);
+        }
+    }
     let included_gb = snap.wizard.included_gb();
     let editing = snap.wizard.editing_mapping_id.as_ref();
     let other_mappings: Vec<MappingSnapshot> = snap
@@ -2117,6 +2225,9 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         volume_total_gb: 2000,
         subfolders: demo_subfolders_for_folder("Projects", Some(18.6)),
         custom_patterns: Vec::new(),
+        suggest_exclusions: true,
+        dismissed_suggestions: BTreeSet::new(),
+        suggested_folders: BTreeMap::new(),
         show_default_exclusions: false,
         local_recovery_path: "/Volumes/WorkSSD/FolderSyncRecovery/Projects".to_owned(),
         cloud_recovery_path: "household:Recovery/projects/studio-mac".to_owned(),
@@ -2136,7 +2247,6 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         first_sync_preflight_done: true,
         first_sync_markers_ready: true,
         first_sync_stopping: false,
-        first_sync_percent: 33,
         first_sync_elapsed_secs: 21 * 60 + 40,
         first_sync_completed: false,
         first_sync_error: None,

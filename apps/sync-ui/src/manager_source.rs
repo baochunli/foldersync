@@ -27,6 +27,7 @@ use rclone_adapter::{
     InitPreference, ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle,
     SpawnOptions,
 };
+use sync_core::policy::SUGGESTED_EXCLUSIONS;
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccountId, CloudCollection, DEFAULT_EXCLUSIONS, Execution, Intent,
     LastRunSummary, MappingId, MappingState, Readiness, RunId, VolumeIdentity, VolumeKind,
@@ -50,8 +51,8 @@ use crate::{
         FinderExtensionStatus, FolderSize, IconKind, InspectedRunSnapshot, LocationCheck,
         MappingSnapshot, PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData,
         RecoveryCopyItem, ReviewScenario, RunPhase, RunRecordSnapshot, ScheduledCheck, ScreenRoute,
-        StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts,
-        VolumeSnapshot, WizardDraft, WizardStep, format_bytes, is_low_space,
+        StatusModifier, SubfolderNode, Tone, TransferProgress, UiCommand, UiSnapshot,
+        UnreviewedConflicts, VolumeSnapshot, WizardDraft, WizardStep, format_bytes, is_low_space,
     },
     system_actions::{
         LaunchAtLoginOutcome, SystemActionOutcome, SystemActionRequest, SystemActions,
@@ -432,8 +433,122 @@ struct LiveRunProgress {
     mapping_id: MappingId,
     run_id: RunId,
     started_at: Instant,
-    bytes_transferred: u64,
-    total_bytes: Option<u64>,
+    samples: VecDeque<(Instant, u64, u64)>,
+    transfer: TransferProgress,
+}
+
+impl LiveRunProgress {
+    fn new(mapping_id: MappingId, run_id: RunId, started_at: Instant) -> Self {
+        Self {
+            mapping_id,
+            run_id,
+            started_at,
+            samples: VecDeque::from([(started_at, 0, 0)]),
+            transfer: TransferProgress::default(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        now: Instant,
+        bytes: u64,
+        files: u64,
+        expected_bytes: Option<u64>,
+        expected_files: Option<u64>,
+    ) {
+        const RATE_WINDOW: Duration = Duration::from_secs(120);
+        let progress = &mut self.transfer;
+        progress.bytes_transferred = progress.bytes_transferred.max(bytes);
+        progress.files_transferred = progress.files_transferred.max(files);
+        progress.expected_bytes = expected_bytes;
+        progress.expected_files = expected_files;
+        self.samples
+            .push_back((now, progress.bytes_transferred, progress.files_transferred));
+        while self
+            .samples
+            .get(1)
+            .is_some_and(|(time, _, _)| now.duration_since(*time) >= RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        let (baseline, previous_bytes, previous_files) = self.samples[0];
+        let sample_secs = now.duration_since(baseline).as_secs_f64();
+        if sample_secs == 0.0 {
+            return;
+        }
+        let bytes_per_second = (progress.bytes_transferred - previous_bytes) as f64 / sample_secs;
+        let files_per_second = (progress.files_transferred - previous_files) as f64 / sample_secs;
+        progress.bytes_per_second = Some(bytes_per_second.round() as u64);
+        progress.eta_seconds = None;
+        if now.duration_since(self.started_at) >= RATE_WINDOW {
+            let byte_eta = expected_bytes.and_then(|total| {
+                remaining_seconds(
+                    total.saturating_sub(progress.bytes_transferred),
+                    bytes_per_second,
+                )
+            });
+            let file_eta = expected_files.and_then(|total| {
+                remaining_seconds(
+                    total.saturating_sub(progress.files_transferred),
+                    files_per_second,
+                )
+            });
+            progress.eta_seconds = byte_eta
+                .zip(file_eta)
+                .map(|(bytes, files)| bytes.max(files));
+        }
+    }
+}
+
+fn remaining_seconds(remaining: u64, units_per_second: f64) -> Option<u64> {
+    if remaining == 0 {
+        Some(0)
+    } else if units_per_second > 0.0 {
+        Some((remaining as f64 / units_per_second).ceil() as u64)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_transfer_waits_two_minutes_then_uses_the_slower_trailing_rate() {
+    let start = Instant::now();
+    let mut run = LiveRunProgress::new(MappingId::new("test"), RunId::new("test-run"), start);
+    run.record(
+        start + Duration::from_secs(60),
+        600,
+        30,
+        Some(3_600),
+        Some(600),
+    );
+    assert_eq!(run.transfer.eta_seconds, None);
+    run.record(
+        start + Duration::from_secs(120),
+        1_200,
+        60,
+        Some(3_600),
+        Some(600),
+    );
+    assert_eq!(run.transfer.eta_seconds, Some(1_080));
+    run.record(
+        start + Duration::from_secs(240),
+        2_400,
+        180,
+        Some(3_600),
+        Some(600),
+    );
+    assert_eq!(run.transfer.eta_seconds, Some(420));
+    run.record(
+        start + Duration::from_secs(360),
+        1_800,
+        100,
+        Some(3_600),
+        Some(600),
+    );
+    assert_eq!(run.transfer.bytes_transferred, 2_400);
+    assert_eq!(run.transfer.files_transferred, 180);
+    assert_eq!(run.transfer.eta_seconds, None);
 }
 
 enum AccountOperation {
@@ -892,7 +1007,6 @@ fn manager_worker_main(
                     if state.wizard.first_sync_preflight_done {
                         state.wizard.first_sync_completed = true;
                         state.wizard.first_sync_stopping = false;
-                        state.wizard.first_sync_percent = 100;
                     }
                     if let Some(started) = state.first_sync_started_at {
                         state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
@@ -969,13 +1083,18 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
         } => {
             state.raw_log.clear();
             state.recent_runs_dirty = true;
-            state.live_progress = Some(LiveRunProgress {
-                mapping_id: mapping_id.clone(),
-                run_id: run_id.clone(),
-                started_at: Instant::now(),
-                bytes_transferred: 0,
-                total_bytes: None,
-            });
+            let now = Instant::now();
+            if !state
+                .live_progress
+                .as_ref()
+                .is_some_and(|p| p.run_id == run_id)
+            {
+                state.live_progress = Some(LiveRunProgress::new(
+                    mapping_id.clone(),
+                    run_id.clone(),
+                    now,
+                ));
+            }
             if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id) {
                 state.wizard.first_sync_preflight_done = true;
                 state.wizard.first_sync_markers_ready = true;
@@ -995,25 +1114,27 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
             mapping_id,
             run_id,
             bytes_transferred,
-            total_bytes,
+            files_transferred,
+            expected_bytes,
+            expected_files,
             ..
         } => {
-            match state.live_progress.as_mut() {
-                Some(p) if p.mapping_id == mapping_id && p.run_id == run_id => {
-                    p.bytes_transferred = p.bytes_transferred.max(bytes_transferred);
-                    if total_bytes.is_some() {
-                        p.total_bytes = total_bytes;
-                    }
-                }
-                _ => {
-                    state.live_progress = Some(LiveRunProgress {
-                        mapping_id: mapping_id.clone(),
-                        run_id,
-                        started_at: Instant::now(),
-                        bytes_transferred,
-                        total_bytes,
-                    });
-                }
+            let now = Instant::now();
+            if !state
+                .live_progress
+                .as_ref()
+                .is_some_and(|p| p.run_id == run_id)
+            {
+                state.live_progress = Some(LiveRunProgress::new(mapping_id.clone(), run_id, now));
+            }
+            if let Some(progress) = state.live_progress.as_mut() {
+                progress.record(
+                    now,
+                    bytes_transferred,
+                    files_transferred,
+                    expected_bytes,
+                    expected_files,
+                );
             }
             if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
                 && let Some(started) = state.first_sync_started_at
@@ -1041,7 +1162,7 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
             if state
                 .live_progress
                 .as_ref()
-                .is_some_and(|p| p.mapping_id == mapping_id)
+                .is_some_and(|p| p.run_id == run_id)
             {
                 state.live_progress = None;
             }
@@ -1052,7 +1173,6 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                 if outcome == "success" {
                     state.wizard.first_sync_completed = true;
                     state.wizard.first_sync_stopping = false;
-                    state.wizard.first_sync_percent = 100;
                 } else if state.wizard.first_sync_stopping {
                     show_stopped_first_sync(&mut state.wizard);
                 } else {
@@ -1808,6 +1928,12 @@ fn handle_ui_command(
             }
             (None, None)
         }
+        UiCommand::WizardRemoveAllSuggested => {
+            if state.wizard.remove_all_suggested() {
+                wizard_exclusions_changed(state);
+            }
+            (None, None)
+        }
         UiCommand::WizardSetLocalRecoveryPath(path) => {
             state.wizard.local_recovery_path = path.trim().to_owned();
             invalidate_wizard_confirmation(&mut state.wizard);
@@ -2191,7 +2317,6 @@ fn begin_first_sync(state: &mut WorkerState, mapping_id: MappingId) {
     state.wizard.first_sync_stopping = false;
     state.wizard.first_sync_completed = false;
     state.wizard.first_sync_error = None;
-    state.wizard.first_sync_percent = 0;
     state.wizard.first_sync_elapsed_secs = 0;
     state.first_sync_started_at = Some(Instant::now());
     state.wizard.step = WizardStep::FirstSync;
@@ -2252,6 +2377,7 @@ fn wizard_review_fingerprint(wizard: &WizardDraft) -> String {
 #[test]
 fn wizard_review_fingerprint_changes_with_drive_ancestry() {
     let mut wizard = default_real_wizard();
+    wizard.suggest_exclusions = false;
     wizard.drive_collection = Some(CloudCollection {
         folder_id: "research-id".to_owned(),
         display_path: "Data/Research".to_owned(),
@@ -3028,10 +3154,21 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
     let mut local_inv_res = None;
     let mut remote_inv_res = None;
     let mut layout_err = None;
+    let mut preview_exclusions = state.wizard.extra_exclusions();
+    if state.wizard.suggest_exclusions {
+        // Apply candidates to the preview without saving absent patterns on the mapping.
+        preview_exclusions.extend(
+            SUGGESTED_EXCLUSIONS
+                .iter()
+                .filter(|entry| !state.wizard.dismissed_suggestions.contains(entry.pattern))
+                .map(|entry| entry.pattern.to_owned()),
+        );
+    }
 
     if let Some(mgr) = &state.mgr
-        && let Ok(cmd) = build_add_mapping_from_wizard(state)
+        && let Ok(mut cmd) = build_add_mapping_from_wizard(state)
     {
+        cmd.extra_exclusions = preview_exclusions;
         let editing_id = state.wizard.editing_mapping_id.as_ref();
         match mgr.preflight_mapping_preview(&cmd, editing_id) {
             Ok(preview) => {
@@ -3059,11 +3196,7 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
             ancestor_ids: vec!["local-root".to_owned()],
         };
         let mut exclusions = sync_core::default_exclusion_patterns();
-        for pat in &state.wizard.custom_patterns {
-            if !pat.trim().is_empty() {
-                exclusions.insert(pat.trim().to_owned());
-            }
-        }
+        exclusions.extend(preview_exclusions);
         local_inv_res = Some(
             inspect_local_endpoint_detailed(&local_path, &collection, &exclusions)
                 .map_err(|e| e.cause()),
@@ -3181,6 +3314,26 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
         .or(local_ok)
     {
         set_subfolder_inventory(&mut state.wizard, src_inv);
+    }
+
+    if state.wizard.suggest_exclusions {
+        let mut observed = BTreeMap::new();
+        for inventory in [local_ok, remote_ok].into_iter().flatten() {
+            for (&pattern, counts) in &inventory.suggested_folders {
+                observed
+                    .entry(pattern)
+                    .and_modify(|total: &mut sync_manager::init::SuggestedFolderInventory| {
+                        total.folder_count += counts.folder_count;
+                        total.file_count += counts.file_count;
+                        total.total_bytes = total
+                            .total_bytes
+                            .zip(counts.total_bytes)
+                            .map(|(left, right)| left.saturating_add(right));
+                    })
+                    .or_insert_with(|| counts.clone());
+            }
+        }
+        state.wizard.update_suggestions(observed);
     }
 
     state.wizard.cloud_file_count = remote_ok.map(|i| i.file_count);
@@ -3454,23 +3607,11 @@ fn project_ui_snapshot(
             let phase = if m.execution == Execution::Stopping {
                 RunPhase::Stopping { elapsed_secs }
             } else if let Some(p) = live
-                && p.bytes_transferred > 0
+                && (p.transfer.bytes_transferred > 0 || p.transfer.files_transferred > 0)
             {
-                if let Some(total) = p.total_bytes
-                    && total > 0
-                {
-                    let pct = ((p.bytes_transferred.saturating_mul(100)) / total).min(100) as u8;
-                    RunPhase::TransferringKnown {
-                        transferred_label: format_bytes(p.bytes_transferred),
-                        total_label: format_bytes(total),
-                        percent: pct,
-                        elapsed_secs,
-                    }
-                } else {
-                    RunPhase::TransferringUnknown {
-                        transferred_label: format_bytes(p.bytes_transferred),
-                        elapsed_secs,
-                    }
+                RunPhase::Transferring {
+                    progress: p.transfer.clone(),
+                    elapsed_secs,
                 }
             } else {
                 RunPhase::Scanning { elapsed_secs }
@@ -3985,6 +4126,9 @@ fn default_real_wizard() -> WizardDraft {
         location_checks: Vec::new(),
         subfolders: Vec::new(),
         custom_patterns: Vec::new(),
+        suggest_exclusions: true,
+        dismissed_suggestions: BTreeSet::new(),
+        suggested_folders: BTreeMap::new(),
         show_default_exclusions: false,
         local_recovery_path: String::new(),
         cloud_recovery_path: String::new(),
@@ -4007,7 +4151,6 @@ fn default_real_wizard() -> WizardDraft {
         first_sync_preflight_done: false,
         first_sync_markers_ready: false,
         first_sync_stopping: false,
-        first_sync_percent: 0,
         first_sync_elapsed_secs: 0,
         first_sync_completed: false,
         first_sync_error: None,

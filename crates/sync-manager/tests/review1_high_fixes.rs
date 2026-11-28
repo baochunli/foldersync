@@ -10,7 +10,7 @@ use sync_core::{ACCESS_MARKER_FILENAME, Execution, Intent, MappingId, Readiness,
 use sync_manager::{
     AddMappingCommand, FakeBisyncLauncher, FakeLaunchScript, FakeProcessInspector,
     FinderStatusSnapshot, InitializeCommand, LiveProcessInfo, ManagerConfig, ManagerError,
-    ProcessProbeResult, SqliteStateStore, SyncManager,
+    ManagerEvent, ProcessProbeResult, SqliteStateStore, SyncManager,
 };
 use tempfile::TempDir;
 
@@ -56,6 +56,64 @@ impl Fx {
             &self.remote_recovery,
         )
         .unwrap()
+    }
+}
+
+#[test]
+fn first_sync_progress_uses_filtered_source_inventory_in_both_directions() {
+    for upload in [true, false] {
+        let fx = Fx::new();
+        let source = if upload {
+            &fx.local_dir
+        } else {
+            &fx.remote_dir
+        };
+        fs::create_dir_all(source.join("nested/build")).unwrap();
+        fs::write(source.join("nested/build/ignored.bin"), [0; 123]).unwrap();
+        fs::write(source.join("build"), [0; 6]).unwrap();
+        fs::write(source.join("included.bin"), [0; 10]).unwrap();
+
+        let launcher = Arc::new(FakeBisyncLauncher::new());
+        launcher.push_script(FakeLaunchScript {
+            lines: vec![OutputLine {
+                stream: StreamKind::Stderr,
+                text: r#"{"level":"info","msg":"stats","stats":{"bytes":8,"totalBytes":9000,"transfers":1,"totalTransfers":901,"eta":1}}"#.to_owned(),
+                truncated: false,
+            }],
+            ..Default::default()
+        });
+        let mut cfg = ManagerConfig::with_state_dir(&fx.state_dir);
+        cfg.launcher = launcher;
+        let mgr = SyncManager::open(cfg).unwrap();
+        mgr.register_local_fixture_account("local-1", "Local Fixture")
+            .unwrap();
+        let mut mapping = fx.cmd();
+        mapping
+            .extra_exclusions
+            .insert(if upload { "build/**" } else { "build/" }.to_owned());
+        mgr.add_mapping(mapping).unwrap();
+        let events = mgr.subscribe_events(64);
+        let command = InitializeCommand {
+            mapping_id: MappingId::new("research"),
+            expected_direction: None,
+        };
+        if upload {
+            mgr.initialize(command).unwrap();
+        } else {
+            mgr.start_initialize(command).unwrap();
+        }
+        mgr.wait_until_idle(Duration::from_secs(5)).unwrap();
+        let progress = events
+            .try_iter()
+            .find(|event| matches!(event, ManagerEvent::RunProgress { .. }))
+            .expect("expected progress from the engine stats");
+        let json = serde_json::to_value(progress).unwrap();
+        let fields = json.get("RunProgress").unwrap_or(&json);
+        assert_eq!(fields["expected_bytes"], 16);
+        assert_eq!(fields["expected_files"], 2);
+        assert_eq!(fields["bytes_transferred"], 8);
+        assert_eq!(fields["files_transferred"], 1);
+        mgr.shutdown().unwrap();
     }
 }
 

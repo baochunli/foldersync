@@ -11,7 +11,7 @@ use std::{
 };
 
 use nsh_app_sync_ui::{
-    contract::{ReviewScenario, RunPhase, ScreenRoute, UiCommand, UiSnapshot, WizardStep},
+    contract::{ReviewScenario, ScreenRoute, UiCommand, UiSnapshot, WizardStep},
     manager_source::{ManagerSource, ManagerSourceConfig, UiControlEvent},
     system_actions::{
         LaunchAtLoginOutcome, RecordedSystemAction, RecordingSystemActions, SystemActionOutcome,
@@ -142,6 +142,73 @@ fn drive_wizard_init(
     ));
     mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
     mgr.dispatch(UiCommand::WizardStartFirstSync);
+}
+
+#[test]
+fn new_mapping_applies_only_observed_suggestions_before_review_and_first_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    for (relative, len) in [
+        ("a/build/x.o", 100),
+        ("a/build/nested/build/another.o", 25),
+        ("b/Pods/dependency.a", 40),
+        ("c/.venv/pyvenv.cfg", 20),
+        ("notes/build", 3),
+        ("keep.txt", 10),
+    ] {
+        let path = remote_folder.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, vec![0; len]).unwrap();
+    }
+    let launcher = Arc::new(FakeBisyncLauncher::new());
+    launcher.push_script(FakeLaunchScript {
+        lines: vec![OutputLine {
+            stream: StreamKind::Stderr,
+            text: r#"{"level":"info","msg":"stats","stats":{"bytes":3,"totalBytes":4000,"transfers":1,"totalTransfers":600}}"#.to_owned(),
+            truncated: false,
+        }],
+        wait_for_stop: true,
+        exit_status_on_stop: Some(ExitStatusInfo { code: Some(130), signal: None }),
+        ..Default::default()
+    });
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        launcher,
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    drive_wizard_init(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.active_run
+            .as_ref()
+            .and_then(|run| run.transfer_progress())
+            .is_some()
+    });
+    let progress = snap
+        .active_run
+        .as_ref()
+        .unwrap()
+        .transfer_progress()
+        .unwrap();
+    assert_eq!(progress.percent(), Some(23));
+    assert_eq!(progress.expected_files, Some(2));
+    assert_eq!(progress.expected_bytes, Some(13));
+    assert_eq!(snap.wizard.cloud_file_count, Some(2));
+    assert_eq!(snap.wizard.cloud_total_bytes, Some(13));
+    assert_eq!(
+        snap.mappings[0].custom_exclusions,
+        [".venv/**", "Pods/**", "build/**"]
+    );
+    mgr.dispatch(UiCommand::WizardStopFirstSync);
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.active_run.is_none());
+    mgr.shutdown();
 }
 
 #[test]
@@ -727,7 +794,7 @@ fn channel_system_actions_live_transfer_progress_and_recovery_identity_checks() 
     let launcher = Arc::new(FakeBisyncLauncher::new());
     // Init succeeds
     launcher.push_script(FakeLaunchScript::default());
-    // Run 2 emits live rclone JSON stats while waiting for stop -> Activity must show TransferringKnown (HIGH #14)!
+    // Run 2 emits live stats with misleading queue totals while waiting for stop.
     launcher.push_script(FakeLaunchScript {
         lines: vec![OutputLine {
             stream: StreamKind::Stderr,
@@ -793,15 +860,25 @@ fn channel_system_actions_live_transfer_progress_and_recovery_identity_checks() 
     assert!(ready.wizard.first_sync_markers_ready);
     let mid = ready.mappings[0].id.clone();
 
-    // Start Run 2 -> observe live RunPhase::TransferringKnown (50%) on Activity (HIGH #14)!
+    // Start Run 2 and observe transferred counts without a fabricated total.
     mgr.dispatch(UiCommand::SyncNow(mid.clone()));
     let transferring = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
-        matches!(
-            s.active_run.as_ref().map(|r| &r.phase),
-            Some(RunPhase::TransferringKnown { percent: 50, .. })
-        )
+        s.active_run
+            .as_ref()
+            .and_then(|run| run.transfer_progress())
+            .is_some()
     });
-    assert!(transferring.active_run.is_some());
+    let progress = transferring
+        .active_run
+        .as_ref()
+        .unwrap()
+        .transfer_progress()
+        .unwrap();
+    assert_eq!(progress.expected_files, None);
+    assert_eq!(progress.percent(), None);
+    assert_eq!(progress.bytes_transferred, 512);
+    assert_eq!(progress.files_transferred, 1);
+    assert!(progress.line().starts_with("512 B · 1 file so far"));
 
     // Stop Run 2 -> Interrupted -> RecoveryRequired -> InspectRecovery verifies real identities (HIGH #9)!
     mgr.dispatch(UiCommand::StopRun(mid.clone()));

@@ -17,6 +17,10 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
    Connect an external disk before selecting a folder on it. After choosing a
    local folder, wait for the disk and free-space checks before continuing.
 3. Under **Choose what to include**, clear the subfolders you want to skip.
+   **Suggested: build and cache folders** lists matching folders that
+   FolderSync found and pre-excluded, with their folder count, file count,
+   and size. Choose **Remove** or **Remove all suggested** to include
+   those files. The size estimate updates as you make changes.
    Use **Pattern (optional)** and **Add** for a custom exclusion. Use
    **Remove** beside a pattern to take it out of the selection.
    Choose a local location for **Recovery copies**. Leave room for both synced
@@ -24,7 +28,9 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
 4. Review the direction of the first sync. Use an empty destination for an
    upload or download. If both folders contain files, ask the owner to compare
    and preserve both sets before proceeding. Choose **Start first sync** once
-   the setup checks pass.
+   the setup checks pass. The first-sync screen shows elapsed time and
+   transferred bytes and files. When FolderSync knows the expected totals,
+   it shows a progress bar and can estimate time left after two minutes.
 
 ## Everyday use
 

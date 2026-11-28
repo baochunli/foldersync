@@ -123,10 +123,53 @@ pub struct DetailedEndpointInventory {
     pub marker_conflict: Option<String>,
     pub marker_conflict_path: Option<PathBuf>,
     pub subfolders: Vec<SubfolderInventory>,
+    /// Contents of matching build and cache folders observed during this scan.
+    pub suggested_folders: BTreeMap<&'static str, SuggestedFolderInventory>,
     pub symlinks: Vec<String>,
     pub special_files: Vec<String>,
     pub name_findings: Vec<String>,
     pub first_name_finding_next_step: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedFolderInventory {
+    pub folder_count: usize,
+    pub file_count: usize,
+    pub total_bytes: Option<u64>,
+}
+
+fn record_suggested_folder(
+    inventory: &mut BTreeMap<&'static str, SuggestedFolderInventory>,
+    path: &str,
+    is_dir: bool,
+    size: Option<u64>,
+) {
+    let (parents, name) = path.rsplit_once('/').unwrap_or(("", path));
+    for suggestion in sync_core::policy::SUGGESTED_EXCLUSIONS {
+        let pattern = suggestion.pattern;
+        let directory = pattern.trim_end_matches("/**");
+        let matching_directory = is_dir && name == directory;
+        let matching_file = !is_dir && parents.split('/').any(|parent| parent == directory);
+        if !matching_directory && !matching_file {
+            continue;
+        }
+        let count = inventory
+            .entry(pattern)
+            .or_insert(SuggestedFolderInventory {
+                folder_count: 0,
+                file_count: 0,
+                total_bytes: Some(0),
+            });
+        if matching_directory {
+            count.folder_count += 1;
+        } else {
+            count.file_count += 1;
+            count.total_bytes = count
+                .total_bytes
+                .zip(size)
+                .map(|(total, size)| total.saturating_add(size));
+        }
+    }
 }
 
 /// Inspects a local directory tree without following symlinks and returns a
@@ -166,6 +209,7 @@ pub fn inspect_local_endpoint_detailed(
     let mut total_bytes = 0u64;
     let mut top_subfolders: std::collections::BTreeMap<String, SubfolderInventory> =
         std::collections::BTreeMap::new();
+    let mut suggested_folders = BTreeMap::new();
 
     walk_detailed(
         root,
@@ -182,6 +226,7 @@ pub fn inspect_local_endpoint_detailed(
         &mut file_count,
         &mut total_bytes,
         &mut top_subfolders,
+        &mut suggested_folders,
     )?;
 
     let findings = validate_names(&all_relative_paths);
@@ -204,6 +249,7 @@ pub fn inspect_local_endpoint_detailed(
         marker_conflict,
         marker_conflict_path,
         subfolders: top_subfolders.into_values().collect(),
+        suggested_folders,
         symlinks,
         special_files,
         name_findings,
@@ -227,6 +273,7 @@ fn walk_detailed(
     file_count: &mut usize,
     total_bytes: &mut u64,
     top_subfolders: &mut std::collections::BTreeMap<String, SubfolderInventory>,
+    suggested_folders: &mut BTreeMap<&'static str, SuggestedFolderInventory>,
 ) -> Result<(), ManagerError> {
     let entries = fs::read_dir(current).map_err(|err| ManagerError::Io {
         cause: format!("Failed to read directory `{}`: {err}.", current.display()),
@@ -300,6 +347,7 @@ fn walk_detailed(
         // Count ALL ordinary entries for side classification & filename validation so
         // preview and actual preflight always agree (§9, HIGH #2).
         all_relative_paths.push(rel.clone());
+        record_suggested_folder(suggested_folders, &rel, ft.is_dir(), Some(meta.len()));
 
         let excluded = is_excluded(&rel, exclusions);
         if !excluded && ft.is_file() {
@@ -339,6 +387,7 @@ fn walk_detailed(
                 file_count,
                 total_bytes,
                 top_subfolders,
+                suggested_folders,
             )?;
         }
     }
@@ -353,6 +402,8 @@ pub struct EndpointInventory {
     pub classification: SideClassification,
     pub item_count: usize,
     pub has_valid_marker: bool,
+    pub file_count: usize,
+    pub total_bytes: u64,
 }
 
 /// Rclone-compatible exclusion matcher for onboarding symlink checks (§18).
@@ -376,17 +427,17 @@ pub fn matches_exclusion_pattern(rel_path: &str, pattern: &str) -> bool {
         return false;
     }
 
-    if let Some(prefix) = body.strip_suffix("/**") {
-        let prefix = prefix.trim_end_matches('/');
-        if anchored {
-            return rclone_glob_match(prefix, rel)
-                || rclone_glob_match(&format!("{prefix}/**"), rel);
+    if let Some(directory) = body.strip_suffix("/**").or_else(|| body.strip_suffix('/')) {
+        if !anchored && !directory.contains(['/', '*']) {
+            return rel
+                .rsplit_once('/')
+                .is_some_and(|(parents, _)| parents.split('/').any(|name| name == directory));
         }
-        if rclone_glob_match(prefix, rel) || rclone_glob_match(&format!("{prefix}/**"), rel) {
-            return true;
-        }
-        return rclone_glob_match(&format!("**/{prefix}"), rel)
-            || rclone_glob_match(&format!("**/{prefix}/**"), rel);
+        return rel.match_indices('/').any(|(end, _)| {
+            let prefix = &rel[..end];
+            rclone_glob_match(directory, prefix)
+                || (!anchored && rclone_glob_match(&format!("**/{directory}"), prefix))
+        });
     }
 
     if anchored {
@@ -497,6 +548,8 @@ pub fn inspect_local_endpoint(
         classification: inv.classification,
         item_count: inv.all_items_count,
         has_valid_marker: inv.has_valid_marker,
+        file_count: inv.file_count,
+        total_bytes: inv.total_bytes,
     })
 }
 
@@ -858,6 +911,7 @@ pub(crate) fn inspect_drive_endpoint(
         .collect();
     let findings = validate_names(&paths);
     let mut subfolders = BTreeMap::<String, SubfolderInventory>::new();
+    let mut suggested_folders = BTreeMap::new();
     let mut file_count = 0;
     let mut total_bytes = 0_u64;
     for entry in entries
@@ -881,6 +935,7 @@ pub(crate) fn inspect_drive_endpoint(
         .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
     {
         let size = u64::try_from(entry.size);
+        record_suggested_folder(&mut suggested_folders, &entry.path, entry.is_dir, size.ok());
         if !entry.is_dir && !is_excluded(&entry.path, exclusions) {
             let size = size.map_err(|_| ManagerError::PreflightRejected {
                 cause: format!("The Drive file `{}` did not report a size.", entry.path),
@@ -920,6 +975,7 @@ pub(crate) fn inspect_drive_endpoint(
             marker_conflict: None,
             marker_conflict_path: None,
             subfolders: subfolders.into_values().collect(),
+            suggested_folders,
             symlinks: Vec::new(),
             special_files: Vec::new(),
             first_name_finding_next_step: findings.first().map(|finding| finding.next_step.clone()),

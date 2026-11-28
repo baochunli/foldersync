@@ -992,6 +992,7 @@ enum QueuedJobKind {
     Prepared {
         generation_id: GenerationId,
         mode: RunMode,
+        expected: Option<RunInventory>,
     },
     InitializePreflight {
         expected_direction: Option<InitPreference>,
@@ -1549,12 +1550,16 @@ impl SyncManager {
                     classification: l.classification,
                     item_count: l.all_items_count,
                     has_valid_marker: l.has_valid_marker,
+                    file_count: l.file_count,
+                    total_bytes: l.total_bytes,
                 };
                 let r_inv = crate::init::EndpointInventory {
                     root: r.root.clone(),
                     classification: r.classification,
                     item_count: r.all_items_count,
                     has_valid_marker: r.has_valid_marker,
+                    file_count: r.file_count,
+                    total_bytes: r.total_bytes,
                 };
                 decide_init_direction(&cmd.id, &l_inv, &r_inv, None).map_err(|e| e.cause())
             }
@@ -3245,6 +3250,7 @@ impl SyncManager {
             kind: QueuedJobKind::Prepared {
                 generation_id: gen_id,
                 mode: RunMode::Initialize(direction),
+                expected: Some(preflight.expected),
             },
         });
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
@@ -3397,6 +3403,7 @@ impl SyncManager {
             kind: QueuedJobKind::Prepared {
                 generation_id: gen_id,
                 mode: RunMode::Normal,
+                expected: None,
             },
         });
         let snapshot = publish_updated_snapshot(&self.inner, &mut guard)?;
@@ -3476,6 +3483,7 @@ impl SyncManager {
                 kind: QueuedJobKind::Prepared {
                     generation_id: gen_id,
                     mode: RunMode::Normal,
+                    expected: None,
                 },
             });
             queued_ids.push(mapping.id);
@@ -3685,6 +3693,7 @@ impl SyncManager {
                 kind: QueuedJobKind::Prepared {
                     generation_id: gen_id,
                     mode: RunMode::Normal,
+                    expected: None,
                 },
             });
             self.inner.worker_cv.notify_all();
@@ -4748,6 +4757,7 @@ fn schedule_tick(
             kind: QueuedJobKind::Prepared {
                 generation_id: generation,
                 mode: RunMode::Normal,
+                expected: None,
             },
         });
         queued = true;
@@ -5818,8 +5828,32 @@ fn validate_mapping_collections(
     validate_cloud_collections(&account_collections).map_err(ManagerError::ValidationList)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RunInventory {
+    files: u64,
+    bytes: u64,
+}
+
+impl RunInventory {
+    fn from_source(
+        direction: InitPreference,
+        local: &EndpointInventory,
+        remote: &EndpointInventory,
+    ) -> Self {
+        let source = match direction {
+            InitPreference::Path1 => local,
+            InitPreference::Path2 => remote,
+        };
+        Self {
+            files: source.file_count as u64,
+            bytes: source.total_bytes,
+        }
+    }
+}
+
 struct InitPreflightOutput {
     direction: InitPreference,
+    expected: RunInventory,
     gen_record: GenerationRecord,
 }
 
@@ -5905,7 +5939,7 @@ fn run_init_preflight_unlocked(
         &mapping.remote_endpoint_kind,
         &mapping.remote_endpoint_value,
     )?;
-    let (direction, engine_meta) = match &remote_ep {
+    let (direction, engine_meta, expected) = match &remote_ep {
         RemoteEndpoint::LocalDir(remote_root) => {
             let local_inv =
                 inspect_local_endpoint(&canonical_local, &mapping.collection, &effective_filters)?;
@@ -5954,7 +5988,11 @@ fn run_init_preflight_unlocked(
                 &remote_inv,
                 &mapping.collection,
             )?;
-            (dir, engine_meta)
+            (
+                dir,
+                engine_meta,
+                RunInventory::from_source(dir, &local_inv, &remote_inv),
+            )
         }
         RemoteEndpoint::DriveRemote { .. } => {
             let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
@@ -5981,6 +6019,8 @@ fn run_init_preflight_unlocked(
                 classification: remote.classification,
                 item_count: remote.all_items_count,
                 has_valid_marker: remote.has_valid_marker,
+                file_count: remote.file_count,
+                total_bytes: remote.total_bytes,
             };
             let direction =
                 decide_init_direction(&mapping.id, &local_inv, &remote_inv, expected_direction)?;
@@ -6012,7 +6052,11 @@ fn run_init_preflight_unlocked(
                 &recovery,
                 is_cancelled,
             )?;
-            (direction, engine_meta)
+            (
+                direction,
+                engine_meta,
+                RunInventory::from_source(direction, &local_inv, &remote_inv),
+            )
         }
         RemoteEndpoint::OtherRemote { .. } => {
             return Err(ManagerError::PreflightRejected {
@@ -6096,6 +6140,7 @@ fn run_init_preflight_unlocked(
 
     Ok(Some(InitPreflightOutput {
         direction,
+        expected,
         gen_record,
     }))
 }
@@ -6237,6 +6282,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                     QueuedJobKind::Prepared {
                         generation_id,
                         mode,
+                        expected,
                     } => {
                         match claim_and_prepare_locked(
                             &inner,
@@ -6244,6 +6290,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                             &job.mapping_id,
                             generation_id,
                             *mode,
+                            *expected,
                         ) {
                             Ok(Some(prepared)) => {
                                 guard.worker_busy = true;
@@ -6385,6 +6432,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                                         &mapping_id,
                                         &gen_id,
                                         mode,
+                                        Some(out.expected),
                                     ) {
                                         Ok(opt) => opt,
                                         Err(err) => {
@@ -6507,6 +6555,7 @@ struct PreparedRun {
     plan: LaunchPlan,
     mode_label: String,
     is_init: bool,
+    expected: Option<RunInventory>,
     log_file: fs::File,
 }
 
@@ -6518,6 +6567,7 @@ fn claim_and_prepare_locked(
     mapping_id: &MappingId,
     generation_id: &GenerationId,
     mode: RunMode,
+    expected: Option<RunInventory>,
 ) -> Result<Option<PreparedRun>, ManagerError> {
     if guard.shutdown || guard.storage_blocked_mappings.contains(mapping_id) {
         return Ok(None);
@@ -6704,6 +6754,7 @@ fn claim_and_prepare_locked(
         plan,
         mode_label,
         is_init,
+        expected,
         log_file,
     }))
 }
@@ -7090,6 +7141,7 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
     let fwd_mapping = prepared.run.mapping_id.clone();
     let fwd_run = prepared.run.id.clone();
     let mut log_file = prepared.log_file;
+    let expected = prepared.expected;
     // Stream valid NDJSON lines to disk live during the run (HIGH #8) and emit
     // live transfer progress events from parsed rclone JSON stats (HIGH #14).
     let forwarder = thread::spawn(move || {
@@ -7108,12 +7160,12 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
             if let LogEvent::Structured(ev) = parse_log_line(&line.text)
                 && let Some(stats) = ev.stats
             {
-                let first_bytes = max_bytes == 0 && stats.bytes > 0;
+                let first_transfer = (max_bytes == 0 && stats.bytes > 0)
+                    || (max_transfers == 0 && stats.transfers > 0);
                 max_bytes = max_bytes.max(stats.bytes);
                 max_transfers = max_transfers.max(stats.transfers);
                 max_checks = max_checks.max(stats.checks);
-                let total_bytes = (stats.total_bytes > 0).then_some(stats.total_bytes);
-                if first_bytes || last_progress_emit.elapsed() >= Duration::from_millis(250) {
+                if first_transfer || last_progress_emit.elapsed() >= Duration::from_millis(250) {
                     last_progress_emit = Instant::now();
                     forwarder_inner
                         .event_bus
@@ -7121,7 +7173,8 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
                             mapping_id: fwd_mapping.clone(),
                             run_id: fwd_run.clone(),
                             bytes_transferred: max_bytes,
-                            total_bytes,
+                            expected_bytes: expected.map(|total| total.bytes),
+                            expected_files: expected.map(|total| total.files),
                             files_transferred: max_transfers,
                             files_checked: max_checks,
                             timestamp: ts.clone(),

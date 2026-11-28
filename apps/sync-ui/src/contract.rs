@@ -4,13 +4,15 @@
 //! identifiers and user intent — never secrets, raw shell strings, or rclone
 //! command lines.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use sync_core::policy::SUGGESTED_EXCLUSIONS;
 use sync_core::{
     AccountId, AvailableAction, CloudCollection, DEFAULT_EXCLUSIONS, Execution, Intent,
     LastRunSummary, MappingId, MappingState, Readiness, RunId, VolumeIdentity, VolumeKind,
     available_actions, status_text,
 };
+use sync_manager::init::SuggestedFolderInventory;
 
 pub(crate) const SYNC_ALL_NOW_LABEL: &str = "Sync all now";
 
@@ -103,16 +105,8 @@ pub enum RunPhase {
         /// Elapsed seconds since the run started.
         elapsed_secs: u64,
     },
-    /// Transferring with a known byte total: determinate bar + percentage.
-    TransferringKnown {
-        transferred_label: String,
-        total_label: String,
-        percent: u8,
-        elapsed_secs: u64,
-    },
-    /// Transferring with an unknown total: indeterminate bar + "Total not known yet".
-    TransferringUnknown {
-        transferred_label: String,
+    Transferring {
+        progress: TransferProgress,
         elapsed_secs: u64,
     },
     /// Graceful stop in flight (~90 seconds).
@@ -129,6 +123,126 @@ pub struct ActiveRunSnapshot {
     pub started_label: String,
     pub trigger_label: String,
     pub phase: RunPhase,
+}
+
+impl ActiveRunSnapshot {
+    pub fn transfer_progress(&self) -> Option<&TransferProgress> {
+        match &self.phase {
+            RunPhase::Transferring { progress, .. } => Some(progress),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub bytes_transferred: u64,
+    pub files_transferred: u64,
+    pub expected_bytes: Option<u64>,
+    pub expected_files: Option<u64>,
+    pub bytes_per_second: Option<u64>,
+    pub eta_seconds: Option<u64>,
+}
+
+impl TransferProgress {
+    pub fn percent(&self) -> Option<u8> {
+        self.expected_bytes.filter(|total| *total > 0).map(|total| {
+            (u128::from(self.bytes_transferred) * 100 / u128::from(total)).min(99) as u8
+        })
+    }
+
+    pub fn line(&self) -> String {
+        let bytes = format_bytes(self.bytes_transferred);
+        let files = format_count(self.files_transferred);
+        match self.expected_bytes.zip(self.expected_files) {
+            Some((total_bytes, total_files)) if total_bytes > 0 || total_files > 0 => {
+                let total_bytes = format_bytes(total_bytes).replace(".0 ", " ");
+                let unit = if total_files == 1 { "file" } else { "files" };
+                let total_files = format_count(total_files);
+                let mut line =
+                    format!("{bytes} of {total_bytes} · {files} of {total_files} {unit}");
+                if let Some(eta) = self.eta_seconds.filter(|eta| *eta > 0) {
+                    line.push_str(&format!(" · about {} left", format_eta(eta)));
+                }
+                line
+            }
+            _ => {
+                let unit = if self.files_transferred == 1 {
+                    "file"
+                } else {
+                    "files"
+                };
+                let mut line = format!("{bytes} · {files} {unit} so far");
+                if let Some(rate) = self.bytes_per_second {
+                    line.push_str(&format!(" · {}/s", format_bytes(rate)));
+                }
+                line
+            }
+        }
+    }
+}
+
+pub(crate) fn format_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(char::from(digit));
+    }
+    grouped
+}
+
+fn format_eta(seconds: u64) -> String {
+    if seconds < 10 * 60 {
+        let minutes = (seconds.saturating_add(30) / 60).max(1);
+        return format!("{minutes} min");
+    }
+    let minutes = (seconds.saturating_add(150) / 300) * 5;
+    if minutes < 60 {
+        return format!("{minutes} min");
+    }
+    let hours = seconds.saturating_add(1_800) / 3_600;
+    if hours < 24 {
+        return format!("{hours} h");
+    }
+    let days = hours / 24;
+    let day_unit = if days == 1 { "day" } else { "days" };
+    let hours = hours % 24;
+    if hours == 0 {
+        format!("{days} {day_unit}")
+    } else {
+        format!("{days} {day_unit} {hours} h")
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn transfer_progress_formats_counts_rates_and_eta() {
+    let mut progress = TransferProgress {
+        bytes_transferred: 41_000_000_000,
+        files_transferred: 31_121,
+        bytes_per_second: Some(3_500_000),
+        ..Default::default()
+    };
+    assert_eq!(progress.percent(), None);
+    assert_eq!(progress.line(), "41.0 GB · 31,121 files so far · 3.5 MB/s");
+    progress.expected_bytes = Some(230_000_000_000);
+    progress.expected_files = Some(400_641);
+    progress.eta_seconds = Some(38 * 3_600 + 311);
+    assert_eq!(progress.percent(), Some(17));
+    assert_eq!(
+        progress.line(),
+        "41.0 GB of 230 GB · 31,121 of 400,641 files · about 1 day 14 h left"
+    );
+    progress.bytes_transferred = u64::MAX;
+    assert_eq!(progress.percent(), Some(99));
+    progress.expected_bytes = Some(0);
+    assert_eq!(progress.percent(), None);
+    assert_eq!(format_eta(300), "5 min");
+    assert_eq!(format_eta(3 * 3_600 + 381), "3 h");
+    assert_eq!(format_eta(48 * 3_600), "2 days");
 }
 
 /// Reason a mapping is held or has a special modifier on top of its state machine state.
@@ -535,14 +649,7 @@ impl MappingSnapshot {
                             format_duration(*elapsed_secs)
                         )
                     }
-                    RunPhase::TransferringKnown {
-                        transferred_label,
-                        total_label,
-                        ..
-                    } => format!("Transferring · {transferred_label} of {total_label}"),
-                    RunPhase::TransferringUnknown {
-                        transferred_label, ..
-                    } => format!("Transferring · {transferred_label} so far"),
+                    RunPhase::Transferring { progress, .. } => progress.line(),
                     RunPhase::Stopping { elapsed_secs } => {
                         format!("Stopping · {}", format_mm_ss(*elapsed_secs))
                     }
@@ -1261,6 +1368,9 @@ pub struct WizardDraft {
     pub location_checks: Vec<LocationCheck>,
     pub subfolders: Vec<SubfolderNode>,
     pub custom_patterns: Vec<String>,
+    pub(crate) suggest_exclusions: bool,
+    pub(crate) dismissed_suggestions: BTreeSet<&'static str>,
+    pub(crate) suggested_folders: BTreeMap<&'static str, SuggestedFolderInventory>,
     pub show_default_exclusions: bool,
     pub local_recovery_path: String,
     pub cloud_recovery_path: String,
@@ -1290,7 +1400,6 @@ pub struct WizardDraft {
     pub first_sync_markers_ready: bool,
     /// True while waiting for Stop on the active first sync run to finish (HIGH #4).
     pub first_sync_stopping: bool,
-    pub first_sync_percent: u8,
     pub first_sync_elapsed_secs: u64,
     pub first_sync_completed: bool,
     pub first_sync_error: Option<String>,
@@ -1332,7 +1441,47 @@ impl WizardDraft {
     pub(crate) fn remove_custom_pattern(&mut self, pattern: &str) -> bool {
         let count = self.custom_patterns.len();
         self.custom_patterns.retain(|existing| existing != pattern);
+        if self.custom_patterns.len() != count
+            && self.suggest_exclusions
+            && let Some(entry) = SUGGESTED_EXCLUSIONS
+                .iter()
+                .find(|entry| entry.pattern == pattern)
+        {
+            self.dismissed_suggestions.insert(entry.pattern);
+            self.suggested_folders.remove(pattern);
+        }
         self.custom_patterns.len() != count
+    }
+
+    pub(crate) fn update_suggestions(
+        &mut self,
+        observed: BTreeMap<&'static str, SuggestedFolderInventory>,
+    ) {
+        if !self.suggest_exclusions {
+            return;
+        }
+        self.custom_patterns
+            .retain(|pattern| !self.suggested_folders.contains_key(pattern.as_str()));
+        self.suggested_folders = observed
+            .into_iter()
+            .filter(|(pattern, stats)| {
+                stats.folder_count > 0
+                    && !self.dismissed_suggestions.contains(pattern)
+                    && self.add_custom_pattern(pattern)
+            })
+            .collect();
+    }
+
+    pub(crate) fn remove_all_suggested(&mut self) -> bool {
+        if self.suggested_folders.is_empty() {
+            return false;
+        }
+        self.custom_patterns
+            .retain(|pattern| !self.suggested_folders.contains_key(pattern.as_str()));
+        self.dismissed_suggestions
+            .extend(self.suggested_folders.keys().copied());
+        self.suggested_folders.clear();
+        true
     }
 
     pub fn extra_exclusions(&self) -> BTreeSet<String> {
@@ -1649,6 +1798,7 @@ pub enum UiCommand {
     WizardToggleDefaultExclusions,
     WizardAddPattern(String),
     WizardRemovePattern(String),
+    WizardRemoveAllSuggested,
     WizardSetLocalRecoveryPath(String),
     WizardSetReviewScenario(ReviewScenario),
     WizardSetNoOtherSyncConfirmed(bool),

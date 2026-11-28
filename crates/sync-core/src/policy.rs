@@ -327,6 +327,58 @@ pub const DEFAULT_EXCLUSIONS: &[DefaultExclusion] = &[
     },
 ];
 
+/// Optional directory exclusions offered when setting up a new mapping.
+pub const SUGGESTED_EXCLUSIONS: &[DefaultExclusion] = &[
+    DefaultExclusion {
+        pattern: "node_modules/**",
+        reason: "Installed JavaScript dependencies can be restored by the package manager.",
+    },
+    DefaultExclusion {
+        pattern: ".gradle/**",
+        reason: "Gradle regenerates these caches when it builds the project.",
+    },
+    DefaultExclusion {
+        pattern: "build/**",
+        reason: "Build tools often regenerate the outputs in these folders.",
+    },
+    DefaultExclusion {
+        pattern: "DerivedData/**",
+        reason: "Xcode regenerates these build and indexing files.",
+    },
+    DefaultExclusion {
+        pattern: "xcuserdata/**",
+        reason: "Xcode keeps per-user workspace settings in these folders.",
+    },
+    DefaultExclusion {
+        pattern: "Pods/**",
+        reason: "CocoaPods can reinstall these dependencies.",
+    },
+    DefaultExclusion {
+        pattern: "__pycache__/**",
+        reason: "Python regenerates these compiled bytecode files.",
+    },
+    DefaultExclusion {
+        pattern: ".venv/**",
+        reason: "Python virtual environments can be recreated from dependencies.",
+    },
+    DefaultExclusion {
+        pattern: ".pytest_cache/**",
+        reason: "pytest regenerates these test caches.",
+    },
+    DefaultExclusion {
+        pattern: ".mypy_cache/**",
+        reason: "mypy regenerates these type-checking caches.",
+    },
+    DefaultExclusion {
+        pattern: ".tox/**",
+        reason: "tox recreates these test environments.",
+    },
+    DefaultExclusion {
+        pattern: ".next/**",
+        reason: "Next.js regenerates these build outputs and caches.",
+    },
+];
+
 /// Returns the default exclusion patterns as an ordered set.
 pub fn default_exclusion_patterns() -> BTreeSet<String> {
     DEFAULT_EXCLUSIONS

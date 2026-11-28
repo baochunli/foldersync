@@ -226,6 +226,57 @@ test("Custom exclusions can be removed individually from a new mapping", async (
   expect(app.shows("id:remove-pattern-.DS_Store")).toBe(false);
 });
 
+test("Suggested exclusions show measured folders and can be removed individually or together", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+
+  await app.press("id:subfolder-renders");
+  expect(app.texts().join("\n")).toContain("Suggested: build and cache folders");
+  expect(app.texts().join("\n")).toContain("28 folders, 608 files, 2.3 GB");
+  expect(app.texts()).toContain("15.6 GB");
+  expect(app.shows("id:remove-pattern-Pods/**")).toBe(true);
+  expect(app.shows("id:remove-pattern-.venv/**")).toBe(true);
+  expect(app.shows("id:remove-pattern-.gradle/**")).toBe(false);
+
+  await app.press("id:remove-pattern-build/**");
+  expect(app.shows("id:remove-pattern-build/**")).toBe(false);
+  expect(app.shows("id:remove-pattern-Pods/**")).toBe(true);
+  expect(app.texts()).toContain("17.9 GB");
+  await app.type("id:wizard-pattern-input", "*.bak");
+  await app.press("id:wizard-add-pattern-btn");
+  await app.press("id:wizard-remove-all-suggested");
+  expect(app.shows("id:remove-pattern-Pods/**")).toBe(false);
+  expect(app.shows("id:remove-pattern-.venv/**")).toBe(false);
+  expect(app.texts()).toContain("18.6 GB");
+  expect(app.shows("id:remove-pattern-*.bak")).toBe(true);
+  expect(app.texts().join("\n")).not.toContain("Suggested: build and cache folders");
+});
+
+test("First-sync demo shows a long transfer with shared progress", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  await app.press("id:subfolder-renders");
+  await app.press("id:wizard-step-6");
+  expect(app.texts().join("\n")).toContain("15.6 GB");
+  await app.press("id:wizard-no-other-sync-checkbox");
+  await app.press("id:wizard-start-first-sync-btn");
+
+  const line = "2.8 GB of 15.6 GB · 131 of 1,690 files · about 1 day 14 h left";
+  expect(app.texts().join("\n")).toContain(line);
+  expect(app.texts().join("\n")).toContain("elapsed 189m 58s");
+  await app.press("id:nav-activity");
+  expect(app.texts().join("\n")).toContain(line);
+  expect(app.texts().join("\n")).toContain("17% · elapsed");
+  await app.press("id:nav-overview");
+  expect(app.texts().join("\n")).toContain(line);
+  await app.press("id:open-detail-projects");
+  expect(app.texts().join("\n")).toContain(line);
+});
+
 test("Removing an existing custom exclusion requires filter review and confirmation", async () => {
   const app = await open(".", DESKTOP);
   await app.press("id:open-detail-family");
@@ -316,7 +367,7 @@ test("Activity Stop targets the displayed mapping, ⌘R targets only selected Ma
   await app.press("id:nav-activity");
   await app.press("id:activity-phase-known");
   expect(app.texts()).toContain("Research");
-  expect(app.texts().join("\n")).toContain("Transferring · 1.2 GB of 3.4 GB");
+  expect(app.texts().join("\n")).toContain("1.2 GB of 3.4 GB · 112 of 410 files");
 
   // Stopping from Activity stops Research (the displayed mapping), transitioning to Stopping + Force stop…
   await app.press("id:activity-stop-btn");

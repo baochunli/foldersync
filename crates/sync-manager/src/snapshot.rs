@@ -149,7 +149,10 @@ pub enum ManagerEvent {
         mapping_id: MappingId,
         run_id: RunId,
         bytes_transferred: u64,
-        total_bytes: Option<u64>,
+        #[serde(default)]
+        expected_bytes: Option<u64>,
+        #[serde(default)]
+        expected_files: Option<u64>,
         files_transferred: u64,
         files_checked: u64,
         timestamp: String,

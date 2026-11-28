@@ -120,6 +120,12 @@ them to Git.
 
    If both folders contain files, use a new empty destination and keep both
    existing copies while you decide which files to sync.
+
+   In **Choose what to include**, check **Suggested: build and cache folders**.
+   FolderSync pre-excludes matching directories it finds at any depth, such
+   as `build/` or `.venv/`. Choose **Remove** to include a listed folder type
+   or **Remove all suggested** to include them all. **Review** shows the
+   count and size after exclusions.
 5. In **Recovery copies**, review both paths. The default local path is
    `FolderSyncRecovery/<local-folder-name>` in the mapped folder's parent.
    You can choose a different local recovery folder outside every synced
@@ -127,7 +133,10 @@ them to Git.
    parent.
 6. In **Review**, check the direction shown and confirm that no other sync
    app manages the local folder. Choose **Start first sync** when the
-   checks pass. FolderSync starts checking the mapping automatically after it
+   checks pass. The first-sync screen shows elapsed time and transferred
+   bytes and files. When the expected total is known, the bar shows progress.
+   Time remaining appears once there is enough transfer history.
+   FolderSync starts checking the mapping automatically after it
    verifies the first sync. The default deletion limit stops a run that
    would delete more than 10% of tracked files. Check both folders and your
    backup if a run stops.

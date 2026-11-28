@@ -10,6 +10,7 @@ use rclone_adapter::{InitPreference, pinned_binary_path};
 use sha2::{Digest, Sha256};
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccessMarker, Execution, MappingId, Readiness, RunOutcome,
+    policy::SUGGESTED_EXCLUSIONS,
 };
 use sync_manager::{
     AddMappingCommand, CommandOutcome, InitializeCommand, ManagerConfig, ManagerError, SyncManager,
@@ -114,6 +115,67 @@ fn tree_hashes(root: &Path) -> BTreeMap<String, String> {
 }
 
 #[test]
+fn suggested_directory_rules_exclude_root_and_nested_directories_only() {
+    if !require_pinned_rclone("suggested_directory_rules_exclude_root_and_nested_directories_only")
+    {
+        return;
+    }
+    let fx = RealFixture::new();
+    let mgr = fx.open_manager();
+    mgr.register_local_fixture_account("local-1", "Local Fixture")
+        .unwrap();
+    let mut command = fx.add_mapping_cmd();
+    for suggestion in SUGGESTED_EXCLUSIONS {
+        let name = suggestion.pattern.strip_suffix("/**").unwrap();
+        command
+            .extra_exclusions
+            .insert(suggestion.pattern.to_owned());
+        for dir in [name.to_owned(), format!("a/b/{name}")] {
+            write_rel(&fx.local_dir, &format!("{dir}/x.o"), b"excluded");
+        }
+        write_rel(&fx.local_dir, &format!("keep/{name}"), b"ordinary file");
+        write_rel(
+            &fx.local_dir,
+            &format!("{name}-notes/x"),
+            b"ordinary directory",
+        );
+    }
+    write_rel(&fx.local_dir, "buildings/x", b"ordinary directory");
+    mgr.add_mapping(command).unwrap();
+    let id = MappingId::new("research");
+    mgr.initialize(InitializeCommand {
+        mapping_id: id,
+        expected_direction: None,
+    })
+    .unwrap();
+    let snapshot = mgr.wait_until_idle(Duration::from_secs(30)).unwrap();
+    let generation = mgr
+        .get_generation(snapshot.mappings[0].active_generation_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    let rendered = fs::read_to_string(generation.filters_file_path).unwrap();
+    for suggestion in SUGGESTED_EXCLUSIONS {
+        let name = suggestion.pattern.strip_suffix("/**").unwrap();
+        assert!(rendered.lines().any(|line| line == format!("- {name}/**")));
+        assert!(!fx.remote_dir.join(name).exists());
+        assert!(!fx.remote_dir.join(format!("a/b/{name}")).exists());
+        assert_eq!(
+            fs::read(fx.remote_dir.join(format!("keep/{name}"))).unwrap(),
+            b"ordinary file"
+        );
+        assert_eq!(
+            fs::read(fx.remote_dir.join(format!("{name}-notes/x"))).unwrap(),
+            b"ordinary directory"
+        );
+    }
+    assert_eq!(
+        fs::read(fx.remote_dir.join("buildings/x")).unwrap(),
+        b"ordinary directory"
+    );
+    mgr.shutdown().unwrap();
+}
+
+#[test]
 fn upload_initialization_propagates_files_and_persists_generation_and_run_artifacts() {
     if !require_pinned_rclone(
         "upload_initialization_propagates_files_and_persists_generation_and_run_artifacts",
@@ -149,6 +211,16 @@ fn upload_initialization_propagates_files_and_persists_generation_and_run_artifa
     assert_eq!(snap.mappings[0].execution, Execution::Idle);
     assert!(snap.mappings[0].scheduling_enabled);
     assert!(snap.mappings[0].active_generation_fingerprint.is_some());
+
+    let generation = mgr
+        .get_generation(snap.mappings[0].active_generation_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    // Baseline bytes from before wizard suggestions were introduced.
+    assert_eq!(
+        fs::read(generation.filters_file_path).unwrap(),
+        b"# Frozen FolderSync generation filters\n- .DS_Store\n- .Spotlight-V100/**\n- .TemporaryItems/**\n- .Trashes/**\n- ._*\n- .fseventsd/**\n- .~lock.*#\n- Thumbs.db\n- ~$*\n"
+    );
 
     // Verify files propagated with exact hashes and recognizable RCLONE_TEST marker created on both sides.
     assert_eq!(tree_hashes(&fx.local_dir), tree_hashes(&fx.remote_dir));
