@@ -3814,7 +3814,7 @@ fn build_real_attention_items(
 ) -> Vec<AttentionItem> {
     let mut items = Vec::new();
     for m in mappings {
-        if matches!(m.modifier, StatusModifier::StoppedFirstSync(_))
+        if matches!(&m.modifier, StatusModifier::StoppedFirstSync(stopped) if stopped.cause.is_none())
             && m.state.readiness() == Readiness::RecoveryRequired
         {
             continue;
@@ -3851,7 +3851,13 @@ fn build_real_attention_items(
                     icon: IconKind::Octagon,
                     is_error_accent: true,
                     title: format!("{} · recovery required", m.display_name),
-                    cause: "An earlier run was interrupted or hit a safety stop.".to_owned(),
+                    cause: match &m.modifier {
+                        StatusModifier::StoppedFirstSync(stopped) => stopped.cause.clone(),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        "An earlier run was interrupted or hit a safety stop.".to_owned()
+                    }),
                     what_did:
                         "Kept the sync state and recovery copies intact and held this mapping."
                             .to_owned(),

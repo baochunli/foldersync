@@ -15,7 +15,12 @@ use sync_core::{
     validate_names,
 };
 
-use crate::{accounts::LockedDrive, error::ManagerError, manager::drive_error};
+use crate::{
+    accounts::{AccountError, LockedDrive},
+    error::ManagerError,
+    manager::drive_error,
+    platform::reject_symlinks_under_root,
+};
 
 /// Classification of one endpoint during §9 initialization preflight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -787,7 +792,7 @@ fn read_drive_marker(
     collection: &CloudCollection,
     entries: &[LsJsonEntry],
     runner: &dyn ProcessRunner,
-) -> Result<Option<Vec<u8>>, ManagerError> {
+) -> Result<Option<Vec<u8>>, AccountError> {
     let marker_path = format!("{}/{ACCESS_MARKER_FILENAME}", collection.display_path);
     let mut matching = entries
         .iter()
@@ -803,15 +808,15 @@ fn read_drive_marker(
         return Err(drive_marker_error(
             &marker_path,
             "The Drive access marker is ambiguous or is not an ordinary marker file.",
-        ));
+        )
+        .into());
     }
 
     let scratch = marker_scratch(drive)?;
     let destination = scratch.path().join(ACCESS_MARKER_FILENAME);
     drive
         .request
-        .fetch_marker(&marker_path, &destination, runner)
-        .map_err(|err| drive_error(err.into()))?;
+        .fetch_marker(&marker_path, &destination, runner)?;
     let bytes = read_marker_bytes(&destination).map_err(|_| {
         drive_marker_error(&marker_path, "The Drive access marker could not be read.")
     })?;
@@ -824,7 +829,8 @@ fn read_drive_marker(
         return Err(drive_marker_error(
             &marker_path,
             "The Drive access marker is unrecognized or identifies another collection.",
-        ));
+        )
+        .into());
     }
     Ok(Some(bytes))
 }
@@ -856,7 +862,8 @@ pub(crate) fn inspect_drive_endpoint(
         .request
         .list_entries(&collection.display_path, true, &drive.runner)
         .map_err(|err| drive_error(err.into()))?;
-    let marker = read_drive_marker(drive, collection, &entries, &drive.runner)?;
+    let marker =
+        read_drive_marker(drive, collection, &entries, &drive.runner).map_err(drive_error)?;
     let paths: Vec<_> = entries
         .iter()
         .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
@@ -939,23 +946,23 @@ pub(crate) fn verify_drive_marker(
     drive: &LockedDrive<'_>,
     collection: &CloudCollection,
 ) -> Result<Vec<u8>, ManagerError> {
-    verify_drive_marker_with_runner(drive, collection, &drive.runner)
+    verify_drive_marker_with_runner(drive, collection, &drive.runner).map_err(drive_error)
 }
 
 pub(crate) fn verify_drive_marker_with_runner(
     drive: &LockedDrive<'_>,
     collection: &CloudCollection,
     runner: &dyn ProcessRunner,
-) -> Result<Vec<u8>, ManagerError> {
+) -> Result<Vec<u8>, AccountError> {
     let entries = drive
         .request
-        .list_entries(&collection.display_path, false, runner)
-        .map_err(|err| drive_error(err.into()))?;
+        .list_entries(&collection.display_path, false, runner)?;
     read_drive_marker(drive, collection, &entries, runner)?.ok_or_else(|| {
         drive_marker_error(
             &collection.display_path,
             "The expected Drive access marker is missing.",
         )
+        .into()
     })
 }
 
@@ -1051,7 +1058,8 @@ pub(crate) fn verify_first_sync_subset(
     let source = index_resume_entries(source)?;
     let destination = index_resume_entries(destination)?;
     let unique_paths: BTreeSet<_> = source.keys().chain(destination.keys()).copied().collect();
-    if let Some(finding) = validate_names(&unique_paths.into_iter().collect::<Vec<_>>()).first() {
+    if let Some(finding) = validate_names(&unique_paths.iter().copied().collect::<Vec<_>>()).first()
+    {
         return Err(ManagerError::PreflightRejected {
             cause: format!(
                 "{} Paths: {}.",
@@ -1066,6 +1074,31 @@ pub(crate) fn verify_first_sync_subset(
             ),
             next_step: finding.next_step.clone(),
         });
+    }
+
+    // Bisync can use a path from either inventory on either endpoint. In
+    // particular, lsjson can omit a symlink that occupies an ancestor of a
+    // missing file, and checking only the leaf would follow that symlink.
+    for root in [
+        (!drive || !destination_is_local).then_some(source_root),
+        destination_is_local.then_some(destination_root),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for path in &unique_paths {
+            reject_symlinks_under_root("first-sync path", root, &root.join(path)).map_err(
+                |err| ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Cannot safely use the first-sync path `{path}`. {}",
+                        err.cause()
+                    ),
+                    next_step:
+                        "Review the files and folders at both sync locations before resuming."
+                            .into(),
+                },
+            )?;
+        }
     }
 
     let is_data_file = |entry: &&LsJsonEntry| !entry.is_dir && entry.path != ACCESS_MARKER_FILENAME;
@@ -1229,4 +1262,35 @@ fn rclone_partial_path(entry: &LsJsonEntry, drive_source: bool) -> Option<String
         }
     }
     Some(format!("{}{suffix}", &entry.path[..end]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_rejects_a_symlinked_destination_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(source.join("sub/note.txt"), b"source bytes").unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("sub")).unwrap();
+        let entries = rclone_adapter::parse_lsjson_entries(
+            r#"[
+            {"Path":"sub","Name":"sub","IsDir":true},
+            {"Path":"sub/note.txt","Name":"note.txt","Size":12,"ModTime":"2026-01-01T00:00:00Z"}
+        ]"#,
+        )
+        .unwrap();
+
+        let error = verify_first_sync_subset(&entries, &[], &source, &destination, true, false)
+            .err()
+            .expect("a missing leaf behind a symlink must never pass subset preflight");
+        assert!(error.cause().contains("symbolic link"), "{error}");
+        assert!(!outside.join("note.txt").exists());
+    }
 }

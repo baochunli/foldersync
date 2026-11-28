@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -28,6 +28,7 @@ struct FixtureRunner {
     fake: FakeProcessRunner,
     root: PathBuf,
     mkdir_calls: AtomicUsize,
+    fake_first_bisync: AtomicBool,
 }
 
 impl ProcessRunner for FixtureRunner {
@@ -39,6 +40,7 @@ impl ProcessRunner for FixtureRunner {
         }
         let directory_listing = args.iter().any(|arg| arg == "--dirs-only");
         if directory_listing
+            || command == "bisync" && self.fake_first_bisync.swap(false, Ordering::Relaxed)
             || command == "config"
             || command == "size" && args.iter().any(|arg| arg == "household:Data/Slow")
         {
@@ -69,6 +71,7 @@ impl Fixture {
             fake: FakeProcessRunner::new(),
             root: root.clone(),
             mkdir_calls: AtomicUsize::new(0),
+            fake_first_bisync: AtomicBool::new(false),
         });
         let state = root.join("state");
         let account_dir = state.join("accounts/drive");
@@ -414,6 +417,83 @@ fn initialize_research(fx: &Fixture, expected_direction: rclone_adapter::InitPre
     ] {
         assert!(argv.contains(expected), "missing {expected}");
     }
+}
+
+#[test]
+fn first_resume_drive_check_preserves_endpoint_and_authentication_failures() {
+    let Some(fx) = Fixture::new(true) else { return };
+    let mapping = fx.mapping("local", "research-id", "Data/Research");
+    fs::write(fx.root().join("local/note"), b"from local").unwrap();
+    fx.listing(&RESEARCH);
+    fx.manager.add_mapping(mapping).unwrap();
+    for _ in 0..3 {
+        fx.listing(&RESEARCH);
+    }
+    fx.runner.fake_first_bisync.store(true, Ordering::Relaxed);
+    fx.runner.fake.push_run(FakeRunScript {
+        wait_for_stop: true,
+        exit_status_on_stop: Some(rclone_adapter::ExitStatusInfo {
+            code: None,
+            signal: Some(libc::SIGINT),
+        }),
+        ..Default::default()
+    });
+    let events = fx.manager.subscribe_events(64);
+    let id = MappingId::new("local");
+    fx.manager
+        .initialize(InitializeCommand {
+            mapping_id: id.clone(),
+            expected_direction: Some(rclone_adapter::InitPreference::Path1),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !matches!(
+        events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap(),
+        ManagerEvent::RunStarted { .. }
+    ) {}
+    fx.manager.stop_run(id.clone()).unwrap();
+    let stopped = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(
+        stopped.mappings[0].readiness,
+        Readiness::NeedsInitialization
+    );
+
+    fx.listing(&[("Research", "replacement-id")]);
+    fx.manager.resume_first_sync(id.clone()).unwrap();
+    let endpoint = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+
+    fx.runner.fake.push_run(FakeRunScript {
+        lines: vec![OutputLine {
+            stream: StreamKind::Stderr,
+            text: "oauth2: invalid_grant".into(),
+            truncated: false,
+        }],
+        exit_status: rclone_adapter::ExitStatusInfo {
+            code: Some(1),
+            signal: None,
+        },
+        ..Default::default()
+    });
+    fx.manager.resume_first_sync(id.clone()).unwrap();
+    let authentication = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let runs = fx.manager.list_runs(&id).unwrap();
+    assert!(runs[..2].iter().all(|run| run.child_pid.is_none()));
+    assert_eq!(endpoint.mappings[0].readiness, Readiness::EndpointChanged);
+    assert_eq!(
+        authentication.mappings[0].readiness,
+        Readiness::AuthenticationRequired
+    );
 }
 
 #[test]

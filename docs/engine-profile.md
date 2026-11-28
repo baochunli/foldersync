@@ -137,7 +137,10 @@ backup paths. Both before request preparation and immediately before
 launch, FolderSync requires the destination's included files to match a
 subset of the source by path, size, and modification time. Local-to-local
 checks compare exact times. With Drive, the allowed difference is strictly
-less than 1 ms, matching rclone's Drive timestamp precision. Scheduling
+less than 1 ms, matching rclone's Drive timestamp precision. FolderSync
+checks paths from both inventories for symlink ancestors on local endpoints.
+Drive Resume uses `--fast-list`, and Drive Stop uses the saved transfer
+evidence so completion does not wait for another inventory. Scheduling
 becomes eligible only after normal bisync verification succeeds.
 
 First sync and resume share a concurrent-writer window. The local backend

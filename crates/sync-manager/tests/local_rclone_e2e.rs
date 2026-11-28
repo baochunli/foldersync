@@ -392,7 +392,7 @@ impl BisyncLauncher for DestinationChangedDuringPrepare {
 }
 
 #[test]
-fn pre_spawn_recheck_refuses_a_new_destination_file_and_changed_filters_require_review() {
+fn resume_pre_spawn_recheck_refuses_a_new_destination_file_and_changed_filters_require_review() {
     if !require_pinned_rclone("resume second subset check and filter identity") {
         return;
     }
@@ -419,6 +419,12 @@ fn pre_spawn_recheck_refuses_a_new_destination_file_and_changed_filters_require_
     store.update_mapping_runtime(&mapping).unwrap();
     drop(store);
     let manager = fx.open_manager();
+    let snapshot = manager.snapshot();
+    assert!(snapshot.mappings[0].stopped_first_sync.is_none());
+    assert_eq!(
+        snapshot.mappings[0].readiness,
+        Readiness::NeedsInitialization
+    );
     let error = manager.resume_first_sync(id.clone()).unwrap_err();
     assert!(error.cause().contains("exclusions have changed"), "{error}");
     assert_eq!(

@@ -365,7 +365,12 @@ impl LsJsonRequest {
         // Drive supplies MD5 as object metadata. It is needed to recognize the
         // pinned engine's scratch filenames on the local destination.
         if remote && self.is_drive {
-            args.extend(["--hash".into(), "--hash-type".into(), "MD5".into()]);
+            args.extend([
+                "--fast-list".into(),
+                "--hash".into(),
+                "--hash-type".into(),
+                "MD5".into(),
+            ]);
         }
         let output = self.run_with_limits(
             self.with_config_args(args),
