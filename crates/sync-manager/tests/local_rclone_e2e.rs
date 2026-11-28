@@ -2,19 +2,44 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use rclone_adapter::{InitPreference, pinned_binary_path};
+use rclone_adapter::{
+    InitPreference, ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle,
+    SpawnOptions, pinned_binary_path,
+};
 use sha2::{Digest, Sha256};
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccessMarker, Execution, MappingId, Readiness, RunOutcome,
+    policy::SUGGESTED_EXCLUSIONS,
 };
 use sync_manager::{
-    AddMappingCommand, CommandOutcome, InitializeCommand, ManagerConfig, ManagerError, SyncManager,
+    AddMappingCommand, BisyncLauncher, CommandOutcome, FakeProcessInspector, InitializeCommand,
+    LaunchPlan, LiveProcessInfo, ManagerConfig, ManagerError, ManagerEvent, ProcessProbeResult,
+    RealBisyncLauncher, RunRecord, SqliteStateStore, SyncManager,
 };
 use tempfile::TempDir;
+
+struct SlowFirstSync;
+
+impl ProcessRunner for SlowFirstSync {
+    fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
+        let mut spec = spec.clone();
+        if spec.args.first().is_some_and(|arg| arg == "bisync") {
+            spec.args.extend([
+                "--disable=Copy".into(),
+                "--transfers=1".into(),
+                "--bwlimit=512Ki".into(),
+                "--stats=200ms".into(),
+            ]);
+        }
+        RealProcessRunner.spawn(&spec, options)
+    }
+}
 
 struct RealFixture {
     temp: TempDir,
@@ -113,6 +138,514 @@ fn tree_hashes(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
+fn stop_real_first_sync(
+    fx: &RealFixture,
+    direction: InitPreference,
+    keep_partial_fixture: bool,
+) -> RunRecord {
+    let (source, destination) = match direction {
+        InitPreference::Path1 => (&fx.local_dir, &fx.remote_dir),
+        InitPreference::Path2 => (&fx.remote_dir, &fx.local_dir),
+    };
+    for i in 0..8 {
+        write_rel(source, &format!("file-{i}"), &vec![i; 512 * 1024]);
+    }
+    write_rel(source, "omit/protected.txt", b"source exclusion");
+    let mut config = ManagerConfig::with_state_dir(&fx.state_dir);
+    config.launcher = Arc::new(RealBisyncLauncher::with_process_runner(
+        None,
+        Arc::new(SlowFirstSync),
+    ));
+    let manager = SyncManager::open(config).unwrap();
+    manager
+        .register_local_fixture_account("local-1", "Local fixture")
+        .unwrap();
+    let mut mapping = fx.add_mapping_cmd();
+    mapping.extra_exclusions.insert("/omit/".into());
+    manager.add_mapping(mapping).unwrap();
+    let id = MappingId::new("research");
+    manager
+        .initialize(InitializeCommand {
+            mapping_id: id.clone(),
+            expected_direction: Some(direction),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let partial_fixture = loop {
+        let names: Vec<_> = fs::read_dir(destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        if names.iter().any(|name| {
+            name.to_str()
+                .is_some_and(|name| name.len() == 6 && name.starts_with("file-"))
+        }) {
+            if !keep_partial_fixture {
+                break None;
+            }
+            if let Some((name, bytes)) = names
+                .iter()
+                .filter_map(|name| {
+                    let name = name.to_str()?;
+                    if !name.ends_with(".partial") {
+                        return None;
+                    }
+                    let bytes = fs::read(destination.join(name)).ok()?;
+                    (!bytes.is_empty() && bytes.len() < 256 * 1024)
+                        .then(|| (name.to_owned(), bytes))
+                })
+                .next()
+            {
+                break Some((name, bytes));
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no completed file or requested staging partial observed"
+        );
+        thread::sleep(Duration::from_millis(15));
+    };
+    manager.stop_run(id.clone()).unwrap();
+    manager.wait_until_idle(Duration::from_secs(90)).unwrap();
+    let run = manager.list_runs(&id).unwrap().remove(0);
+    assert_eq!(run.outcome_kind.as_deref(), Some("first_sync_stopped"));
+    manager.shutdown().unwrap();
+    if let Some((name, bytes)) = partial_fixture {
+        let final_name = name.split('.').next().unwrap();
+        assert!(
+            !destination.join(final_name).exists(),
+            "the staged file completed before Stop"
+        );
+        // A graceful engine Stop removes its scratch file. Restore the observed
+        // staging bytes to exercise the residue an abrupt exit would leave.
+        write_rel(destination, &name, &bytes);
+    }
+    run
+}
+
+fn file_manifest(root: &Path) -> BTreeMap<String, (String, SystemTime)> {
+    tree_hashes(root)
+        .into_iter()
+        .map(|(path, hash)| {
+            let mtime = fs::metadata(root.join(&path)).unwrap().modified().unwrap();
+            (path, (hash, mtime))
+        })
+        .collect()
+}
+
+fn assert_resume_refused(manager: &SyncManager, id: &MappingId, path: &str) {
+    let stale = manager.list_runs(id).unwrap().len();
+    manager.resume_first_sync(id.clone()).unwrap();
+    let snapshot = manager.wait_until_idle(Duration::from_secs(90)).unwrap();
+    let runs = manager.list_runs(id).unwrap();
+    assert_eq!(runs.len(), stale + 1);
+    assert_eq!(
+        runs[0].child_pid, None,
+        "unsafe subset launched: {:?}",
+        runs[0]
+    );
+    assert!(
+        runs[0]
+            .outcome_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(path)),
+        "{:?}",
+        runs[0]
+    );
+    assert!(!snapshot.mappings[0].scheduling_enabled);
+}
+
+fn verify_stopped_and_resume(direction: InitPreference) {
+    let fx = RealFixture::new();
+    let first = stop_real_first_sync(&fx, direction, false);
+    let (source, destination) = match direction {
+        InitPreference::Path1 => (&fx.local_dir, &fx.remote_dir),
+        InitPreference::Path2 => (&fx.remote_dir, &fx.local_dir),
+    };
+    let original = file_manifest(source);
+    let completed_before_resume = tree_hashes(destination);
+    let copied = completed_before_resume.len();
+    assert!((1..8).contains(&copied), "{completed_before_resume:?}");
+
+    let manager = fx.open_manager();
+    let snapshot = manager.snapshot();
+    assert_eq!(
+        snapshot.mappings[0].status_text,
+        format!("First sync stopped · {copied} of 8 files copied")
+    );
+    assert!(!snapshot.mappings[0].scheduling_enabled);
+    assert_eq!(snapshot.mappings[0].counters.open_recovery_cases, 0);
+    let id = MappingId::new("research");
+
+    // A suffix alone doesn't make a destination-only file an engine partial.
+    write_rel(destination, "extra.partial", b"keep this");
+    assert_resume_refused(&manager, &id, "extra.partial");
+    assert_eq!(
+        fs::read(destination.join("extra.partial")).unwrap(),
+        b"keep this"
+    );
+    fs::remove_file(destination.join("extra.partial")).unwrap();
+
+    let sample = completed_before_resume.keys().next().unwrap();
+    let path = destination.join(sample);
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, b"unexpected replacement").unwrap();
+    assert_resume_refused(&manager, &id, sample);
+    assert_eq!(fs::read(&path).unwrap(), b"unexpected replacement");
+    fs::write(&path, &bytes).unwrap();
+    let mtime = original[sample].1;
+    fs::File::open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(mtime + Duration::from_secs(2)))
+        .unwrap();
+    assert_resume_refused(&manager, &id, sample);
+    fs::File::open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+
+    write_rel(destination, "omit/protected.txt", b"destination exclusion");
+    let events = manager.subscribe_events(1024);
+    manager.resume_first_sync(id.clone()).unwrap();
+    let snapshot = manager.wait_until_idle(Duration::from_secs(90)).unwrap();
+    assert_eq!(
+        snapshot.mappings[0].readiness,
+        Readiness::Ready,
+        "{:?}",
+        snapshot.mappings[0]
+    );
+    assert!(snapshot.mappings[0].scheduling_enabled);
+    assert_eq!(
+        snapshot.mappings[0].active_generation_id.as_ref(),
+        Some(&first.generation_id)
+    );
+    assert_eq!(file_manifest(source), original);
+    let expected: BTreeMap<_, _> = original
+        .iter()
+        .filter(|(path, _)| !path.starts_with("omit/"))
+        .map(|(path, value)| (path.clone(), value.clone()))
+        .chain([(
+            "omit/protected.txt".to_owned(),
+            (
+                sha256_bytes(b"destination exclusion"),
+                fs::metadata(destination.join("omit/protected.txt"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            ),
+        )])
+        .collect();
+    assert_eq!(file_manifest(destination), expected);
+    assert!(tree_hashes(&fx.local_recovery).is_empty());
+    assert!(tree_hashes(&fx.remote_recovery).is_empty());
+    let last = manager.list_runs(&id).unwrap().remove(0);
+    assert_eq!(last.mode, first.mode);
+    assert_eq!(last.backup_dir1, first.backup_dir1);
+    assert_eq!(last.backup_dir2, first.backup_dir2);
+    assert_eq!(last.workdir_path, first.workdir_path);
+    assert_eq!(last.files_already_present, copied as u64);
+    assert_eq!(last.first_sync_total_files, Some(8));
+    assert!(
+        events
+            .try_iter()
+            .any(|event| matches!(event, ManagerEvent::RunProgress {
+        files_already_present, first_sync_total_files: Some(8), ..
+    } if files_already_present == copied as u64))
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn stopped_first_sync_is_neutral_and_resumes_upload_after_restart() {
+    if require_pinned_rclone("resume interrupted upload") {
+        verify_stopped_and_resume(InitPreference::Path1);
+    }
+}
+
+#[test]
+fn stopped_first_sync_is_neutral_and_resumes_download_after_restart() {
+    if require_pinned_rclone("resume interrupted download") {
+        verify_stopped_and_resume(InitPreference::Path2);
+    }
+}
+
+struct DestinationChangedDuringPrepare {
+    destination: PathBuf,
+    launcher: RealBisyncLauncher,
+}
+
+impl BisyncLauncher for DestinationChangedDuringPrepare {
+    fn engine_metadata(&self) -> Result<sync_manager::launcher::EngineMetadata, ManagerError> {
+        self.launcher.engine_metadata()
+    }
+
+    fn prepare(
+        &self,
+        plan: &LaunchPlan,
+    ) -> Result<sync_manager::launcher::PreparedLaunch, ManagerError> {
+        write_rel(
+            &self.destination,
+            "added-before-launch",
+            b"destination author data",
+        );
+        self.launcher.prepare(plan)
+    }
+}
+
+#[test]
+fn resume_pre_spawn_recheck_refuses_a_new_destination_file_and_changed_filters_require_review() {
+    if !require_pinned_rclone("resume second subset check and filter identity") {
+        return;
+    }
+    let fx = RealFixture::new();
+    let first = stop_real_first_sync(&fx, InitPreference::Path1, false);
+    let id = MappingId::new("research");
+    let mut config = ManagerConfig::with_state_dir(&fx.state_dir);
+    config.launcher = Arc::new(DestinationChangedDuringPrepare {
+        destination: fx.remote_dir.clone(),
+        launcher: RealBisyncLauncher::default(),
+    });
+    let manager = SyncManager::open(config).unwrap();
+    assert_resume_refused(&manager, &id, "added-before-launch");
+    assert_eq!(
+        fs::read(fx.remote_dir.join("added-before-launch")).unwrap(),
+        b"destination author data"
+    );
+    assert!(!fx.local_dir.join("added-before-launch").exists());
+    manager.shutdown().unwrap();
+
+    let store = SqliteStateStore::open(&fx.state_dir.join("state.sqlite")).unwrap();
+    let mut mapping = store.get_mapping(&id).unwrap().unwrap();
+    mapping.exclusions.push("*.changed".into());
+    store.update_mapping_runtime(&mapping).unwrap();
+    drop(store);
+    let manager = fx.open_manager();
+    let snapshot = manager.snapshot();
+    assert!(snapshot.mappings[0].stopped_first_sync.is_none());
+    assert_eq!(
+        snapshot.mappings[0].readiness,
+        Readiness::NeedsInitialization
+    );
+    let error = manager.resume_first_sync(id.clone()).unwrap_err();
+    assert!(error.cause().contains("exclusions have changed"), "{error}");
+    assert_eq!(
+        manager.list_runs(&id).unwrap()[0].generation_id,
+        first.generation_id
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn orphaned_first_sync_resumes_only_after_hold_resolution_and_archives_stale_lock() {
+    if !require_pinned_rclone("resume a reconciled first sync") {
+        return;
+    }
+    let fx = RealFixture::new();
+    let first = stop_real_first_sync(&fx, InitPreference::Path1, true);
+    let id = MappingId::new("research");
+    let (partial, partial_hash) = tree_hashes(&fx.remote_dir)
+        .into_iter()
+        .find(|(name, _)| name.ends_with(".partial"))
+        .unwrap();
+    let pid = first.child_pid.unwrap();
+    let lock = fs::read_dir(&first.workdir_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "lck"))
+        .unwrap_or_else(|| {
+            let session = first.workdir_path.join("fixture");
+            let lock = session.with_extension("lck");
+            fs::write(
+                &lock,
+                serde_json::json!({ "PID": pid.to_string(), "Session": session }).to_string(),
+            )
+            .unwrap();
+            lock
+        });
+    let db = rusqlite::Connection::open(fx.state_dir.join("state.sqlite")).unwrap();
+    db.execute(
+        "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?1",
+        [first.id.as_str()],
+    )
+    .unwrap();
+    drop(db);
+
+    let inspector = Arc::new(FakeProcessInspector::new());
+    inspector.set_process(
+        pid,
+        ProcessProbeResult::Live(LiveProcessInfo {
+            pid,
+            start_time: first.child_start_time,
+            executable: first.child_executable.clone(),
+        }),
+    );
+    let mut config = ManagerConfig::with_state_dir(&fx.state_dir);
+    config.process_inspector = inspector.clone();
+    let manager = SyncManager::open(config).unwrap();
+    assert!(manager.resume_first_sync(id.clone()).is_err());
+    assert!(lock.is_file());
+    inspector.set_process(pid, ProcessProbeResult::NotFound);
+    assert!(manager.resume_first_sync(id.clone()).is_err());
+    manager.complete_recovery(id.clone(), false).unwrap();
+    manager.resume_first_sync(id.clone()).unwrap();
+    let snapshot = manager.wait_until_idle(Duration::from_secs(90)).unwrap();
+    assert_eq!(
+        snapshot.mappings[0].readiness,
+        Readiness::Ready,
+        "{:?}",
+        snapshot.mappings[0]
+    );
+    assert_eq!(snapshot.mappings[0].counters.open_recovery_cases, 0);
+    let resumed = manager.list_runs(&id).unwrap().remove(0);
+    assert!(resumed.run_dir.join("interrupted-bisync.lck").is_file());
+    assert!(!lock.exists());
+    assert!(!fx.remote_dir.join(&partial).exists());
+    assert!(!fx.local_dir.join(&partial).exists());
+    let archived = Path::new(&resumed.backup_dir2)
+        .join(format!("partials-{}", resumed.id))
+        .join(partial);
+    assert_eq!(sha256_bytes(&fs::read(archived).unwrap()), partial_hash);
+    manager.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "Documents the pinned rclone concurrent-writer window on disposable local fixtures"]
+fn rclone_can_replace_a_file_created_during_first_sync_publish() {
+    let Some(binary) = pinned_binary_path() else {
+        return;
+    };
+    rclone_adapter::qualify_pinned_binary().unwrap().unwrap();
+    let fx = RealFixture::new();
+    let workdir = fx.temp.path().join("work");
+    let config = fx.temp.path().join("rclone.conf");
+    fs::create_dir(&workdir).unwrap();
+    fs::write(&config, b"").unwrap();
+    write_rel(&fx.local_dir, "pending.bin", &vec![b'S'; 4 * 1024 * 1024]);
+    let mut child = Command::new(binary)
+        .arg("bisync")
+        .arg(&fx.local_dir)
+        .arg(&fx.remote_dir)
+        .arg("--config")
+        .arg(config)
+        .arg("--workdir")
+        .arg(&workdir)
+        .arg("--backup-dir1")
+        .arg(&fx.local_recovery)
+        .arg("--backup-dir2")
+        .arg(&fx.remote_recovery)
+        .args([
+            "--resync-mode",
+            "path1",
+            "--disable=Copy",
+            "--transfers=1",
+            "--bwlimit=2Mi",
+            "--immutable",
+            "--no-update-modtime",
+            "--check-sync=true",
+        ])
+        .env_clear()
+        .env("HOME", fx.temp.path())
+        .env("FOLDERSYNC_STATE_DIR", &fx.state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut observed_partial = false;
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        if fs::read_dir(&fx.remote_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".partial")
+        }) {
+            observed_partial = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let live = fx.remote_dir.join("pending.bin");
+    let injected = if observed_partial {
+        use std::io::Write;
+        fs::File::create_new(&live).and_then(|mut file| file.write_all(b"independent data"))
+    } else {
+        child.kill().ok();
+        Err(std::io::Error::other("no engine partial observed"))
+    };
+    let status = child.wait().unwrap();
+    injected.unwrap();
+    assert!(status.success());
+    assert_eq!(
+        fs::read(&live).unwrap(),
+        fs::read(fx.local_dir.join("pending.bin")).unwrap()
+    );
+    assert!(tree_hashes(&fx.local_recovery).is_empty());
+    assert!(tree_hashes(&fx.remote_recovery).is_empty());
+}
+
+#[test]
+fn suggested_directory_rules_exclude_root_and_nested_directories_only() {
+    if !require_pinned_rclone("suggested_directory_rules_exclude_root_and_nested_directories_only")
+    {
+        return;
+    }
+    let fx = RealFixture::new();
+    let mgr = fx.open_manager();
+    mgr.register_local_fixture_account("local-1", "Local Fixture")
+        .unwrap();
+    let mut command = fx.add_mapping_cmd();
+    for suggestion in SUGGESTED_EXCLUSIONS {
+        let name = suggestion.pattern.strip_suffix("/**").unwrap();
+        command
+            .extra_exclusions
+            .insert(suggestion.pattern.to_owned());
+        for dir in [name.to_owned(), format!("a/b/{name}")] {
+            write_rel(&fx.local_dir, &format!("{dir}/x.o"), b"excluded");
+        }
+        write_rel(&fx.local_dir, &format!("keep/{name}"), b"ordinary file");
+        write_rel(
+            &fx.local_dir,
+            &format!("{name}-notes/x"),
+            b"ordinary directory",
+        );
+    }
+    write_rel(&fx.local_dir, "buildings/x", b"ordinary directory");
+    mgr.add_mapping(command).unwrap();
+    let id = MappingId::new("research");
+    mgr.initialize(InitializeCommand {
+        mapping_id: id,
+        expected_direction: None,
+    })
+    .unwrap();
+    let snapshot = mgr.wait_until_idle(Duration::from_secs(30)).unwrap();
+    let generation = mgr
+        .get_generation(snapshot.mappings[0].active_generation_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    let rendered = fs::read_to_string(generation.filters_file_path).unwrap();
+    for suggestion in SUGGESTED_EXCLUSIONS {
+        let name = suggestion.pattern.strip_suffix("/**").unwrap();
+        assert!(rendered.lines().any(|line| line == format!("- {name}/**")));
+        assert!(!fx.remote_dir.join(name).exists());
+        assert!(!fx.remote_dir.join(format!("a/b/{name}")).exists());
+        assert_eq!(
+            fs::read(fx.remote_dir.join(format!("keep/{name}"))).unwrap(),
+            b"ordinary file"
+        );
+        assert_eq!(
+            fs::read(fx.remote_dir.join(format!("{name}-notes/x"))).unwrap(),
+            b"ordinary directory"
+        );
+    }
+    assert_eq!(
+        fs::read(fx.remote_dir.join("buildings/x")).unwrap(),
+        b"ordinary directory"
+    );
+    mgr.shutdown().unwrap();
+}
+
 #[test]
 fn upload_initialization_propagates_files_and_persists_generation_and_run_artifacts() {
     if !require_pinned_rclone(
@@ -149,6 +682,16 @@ fn upload_initialization_propagates_files_and_persists_generation_and_run_artifa
     assert_eq!(snap.mappings[0].execution, Execution::Idle);
     assert!(snap.mappings[0].scheduling_enabled);
     assert!(snap.mappings[0].active_generation_fingerprint.is_some());
+
+    let generation = mgr
+        .get_generation(snap.mappings[0].active_generation_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    // Baseline bytes from before wizard suggestions were introduced.
+    assert_eq!(
+        fs::read(generation.filters_file_path).unwrap(),
+        b"# Frozen FolderSync generation filters\n- .DS_Store\n- .Spotlight-V100/**\n- .TemporaryItems/**\n- .Trashes/**\n- ._*\n- .fseventsd/**\n- .~lock.*#\n- Thumbs.db\n- ~$*\n"
+    );
 
     // Verify files propagated with exact hashes and recognizable RCLONE_TEST marker created on both sides.
     assert_eq!(tree_hashes(&fx.local_dir), tree_hashes(&fx.remote_dir));
@@ -658,4 +1201,232 @@ fn interrupted_run_transitions_to_recovery_required_surviving_restart() {
         return;
     }
     panic!("both batches completed before StopRun could interrupt a transfer");
+}
+
+#[test]
+fn narrowing_populated_mapping_catches_up_and_keeps_excluded_local_fixture_files() {
+    if !require_pinned_rclone("narrowing_populated_mapping") {
+        return;
+    }
+    let fx = RealFixture::new();
+    write_rel(&fx.local_dir, "proj/build/x.o", b"original object");
+    write_rel(&fx.local_dir, "proj/node_modules/m.js", b"original module");
+    write_rel(&fx.local_dir, "proj/src/a.txt", b"original source");
+    let mgr = fx.open_manager();
+    mgr.register_local_fixture_account("local-1", "Local fixture")
+        .unwrap();
+    let mut cmd = fx.add_mapping_cmd();
+    cmd.extra_exclusions.insert("archive/**".to_owned());
+    mgr.add_mapping(cmd).unwrap();
+    let id = MappingId::new("research");
+    mgr.initialize(InitializeCommand {
+        mapping_id: id.clone(),
+        expected_direction: None,
+    })
+    .unwrap();
+    let before = mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let old_id = before.mappings[0].active_generation_id.as_ref().unwrap();
+    let old_generation = mgr.get_generation(old_id).unwrap().unwrap();
+    let old_filters = fs::read(&old_generation.filters_file_path).unwrap();
+
+    let mixed = mgr
+        .propose_filter_change(&id, ["build/**".to_owned()].into())
+        .unwrap();
+    assert!(
+        mgr.apply_filter_change(mixed)
+            .unwrap_err()
+            .cause()
+            .contains("already contain data")
+    );
+    let preview = mgr
+        .propose_filter_change(
+            &id,
+            ["archive/**", "build/**", "node_modules/**"]
+                .map(str::to_owned)
+                .into(),
+        )
+        .unwrap();
+    write_rel(&fx.local_dir, "proj/src/a.txt", b"pending source edit");
+    mgr.apply_filter_change(preview).unwrap();
+    let after = mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let mapping = &after.mappings[0];
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_ne!(mapping.active_generation_id.as_ref(), Some(old_id));
+    assert!(mapping.scheduling_enabled);
+    assert_eq!(tree_hashes(&fx.local_dir), tree_hashes(&fx.remote_dir));
+    assert_eq!(
+        fs::read(fx.remote_dir.join("proj/src/a.txt")).unwrap(),
+        b"pending source edit"
+    );
+    assert_eq!(
+        fs::read(&old_generation.filters_file_path).unwrap(),
+        old_filters
+    );
+    assert!(
+        tree_hashes(&fx.remote_recovery)
+            .keys()
+            .all(|path| path.ends_with("/proj/src/a.txt"))
+    );
+
+    write_rel(&fx.local_dir, "proj/build/x.o", b"local-only build change");
+    write_rel(&fx.local_dir, "proj/src/a.txt", b"included source change");
+    mgr.run_now(id.clone()).unwrap();
+    mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        fs::read(fx.remote_dir.join("proj/build/x.o")).unwrap(),
+        b"original object"
+    );
+    assert_eq!(
+        fs::read(fx.remote_dir.join("proj/src/a.txt")).unwrap(),
+        b"included source change"
+    );
+    fs::remove_file(fx.remote_dir.join("proj/build/x.o")).unwrap();
+    mgr.run_now(id).unwrap();
+    mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        fs::read(fx.local_dir.join("proj/build/x.o")).unwrap(),
+        b"local-only build change"
+    );
+    mgr.shutdown().unwrap();
+}
+
+fn fake_narrowing_fixture() -> (
+    RealFixture,
+    SyncManager,
+    std::sync::Arc<sync_manager::FakeBisyncLauncher>,
+) {
+    let fixture = RealFixture::new();
+    write_rel(&fixture.local_dir, "proj/build/x.o", b"built");
+    write_rel(&fixture.local_dir, "proj/src/a.txt", b"source");
+    let launcher = std::sync::Arc::new(sync_manager::FakeBisyncLauncher::new());
+    let mut config = ManagerConfig::with_state_dir(&fixture.state_dir);
+    config.launcher = launcher.clone();
+    let manager = SyncManager::open(config).unwrap();
+    manager
+        .register_local_fixture_account("local-1", "Local fixture")
+        .unwrap();
+    manager.add_mapping(fixture.add_mapping_cmd()).unwrap();
+    launcher.push_script(Default::default());
+    manager
+        .initialize(InitializeCommand {
+            mapping_id: MappingId::new("research"),
+            expected_direction: None,
+        })
+        .unwrap();
+    manager.wait_until_idle(Duration::from_secs(15)).unwrap();
+    write_rel(&fixture.remote_dir, "proj/build/x.o", b"built");
+    write_rel(&fixture.remote_dir, "proj/src/a.txt", b"source");
+    (fixture, manager, launcher)
+}
+
+#[test]
+fn catch_up_retryable_failure_keeps_the_active_generation_and_scheduling() {
+    use rclone_adapter::{ExitStatusInfo, OutputLine, StreamKind};
+    use sync_manager::FakeLaunchScript;
+
+    let (_fixture, manager, launcher) = fake_narrowing_fixture();
+    let id = MappingId::new("research");
+    let original = manager.snapshot();
+    launcher.push_script(FakeLaunchScript {
+        exit_status: ExitStatusInfo {
+            code: Some(5),
+            signal: None,
+        },
+        lines: vec![OutputLine {
+            stream: StreamKind::Stderr,
+            text: "temporary network error".to_owned(),
+            truncated: false,
+        }],
+        ..Default::default()
+    });
+    manager
+        .apply_filter_change(
+            manager
+                .propose_filter_change(&id, ["build/**".to_owned()].into())
+                .unwrap(),
+        )
+        .unwrap();
+    let snapshot = manager.wait_until_idle(Duration::from_secs(15)).unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(
+        mapping.active_generation_id,
+        original.mappings[0].active_generation_id
+    );
+    assert_eq!(mapping.exclusions, original.mappings[0].exclusions);
+    assert_eq!(
+        mapping.scheduling_enabled,
+        original.mappings[0].scheduling_enabled
+    );
+    assert_eq!(mapping.last_run_outcome, Some(RunOutcome::RetryableFailure));
+    assert!(
+        mapping
+            .last_run_summary
+            .as_deref()
+            .unwrap()
+            .contains("Catch-up sync stopped")
+    );
+    assert_eq!(launcher.launched_plans().len(), 2);
+}
+
+#[test]
+fn stop_during_catch_up_or_rebaseline_keeps_the_old_generation() {
+    use std::sync::{Arc, mpsc};
+    use sync_manager::{FakeLaunchScript, FilterMigrationPhase};
+
+    if !require_pinned_rclone("stop_during_catch_up_or_rebaseline") {
+        return;
+    }
+    for phase in [
+        FilterMigrationPhase::CatchUp,
+        FilterMigrationPhase::Rebaseline,
+    ] {
+        let (fixture, manager, launcher) = fake_narrowing_fixture();
+        let id = MappingId::new("research");
+        let original = manager.snapshot();
+        let generation = manager
+            .get_generation(original.mappings[0].active_generation_id.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        let filters = fs::read(&generation.filters_file_path).unwrap();
+        if phase == FilterMigrationPhase::Rebaseline {
+            launcher.push_script(Default::default());
+        }
+        let (entered, receiver) = mpsc::channel();
+        launcher.push_script(FakeLaunchScript {
+            wait_for_stop: true,
+            on_wait: Some(Arc::new(move || {
+                entered.send(()).unwrap();
+            })),
+            ..Default::default()
+        });
+        let preview = manager
+            .propose_filter_change(&id, ["build/**".to_owned()].into())
+            .unwrap();
+        manager.apply_filter_change(preview).unwrap();
+        receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            manager.snapshot().mappings[0].filter_migration_phase,
+            Some(phase)
+        );
+        manager.stop_run(id).unwrap();
+        let after = manager.wait_until_idle(Duration::from_secs(30)).unwrap();
+        let mapping = &after.mappings[0];
+        assert_eq!(
+            mapping.active_generation_id,
+            original.mappings[0].active_generation_id
+        );
+        assert_eq!(mapping.exclusions, original.mappings[0].exclusions);
+        assert_eq!(
+            mapping.scheduling_enabled,
+            original.mappings[0].scheduling_enabled
+        );
+        assert_eq!(mapping.last_run_outcome, Some(RunOutcome::Interrupted));
+        assert_eq!(fs::read(&generation.filters_file_path).unwrap(), filters);
+        assert_eq!(
+            tree_hashes(&fixture.local_dir),
+            tree_hashes(&fixture.remote_dir)
+        );
+        assert_eq!(launcher.stop_calls(), 1);
+    }
 }

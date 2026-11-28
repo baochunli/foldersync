@@ -9,13 +9,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rclone_adapter::{InitPreference, LsJsonEntry};
+use chrono::{DateTime, Utc};
+use rclone_adapter::{InitPreference, LsJsonEntry, ProcessRunner};
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, VolumeIdentity,
+    archive::{ArchiveSuggestion, archive_suggestion},
     validate_names,
 };
 
-use crate::{accounts::LockedDrive, error::ManagerError, manager::drive_error};
+use crate::{
+    accounts::{AccountError, LockedDrive},
+    archive_transaction::ARCHIVE_PARTIAL_SUFFIX,
+    error::ManagerError,
+    manager::drive_error,
+    platform::reject_symlinks_under_root,
+};
 
 /// Classification of one endpoint during §9 initialization preflight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,10 +131,54 @@ pub struct DetailedEndpointInventory {
     pub marker_conflict: Option<String>,
     pub marker_conflict_path: Option<PathBuf>,
     pub subfolders: Vec<SubfolderInventory>,
+    /// Contents of matching build and cache folders observed during this scan.
+    pub suggested_folders: BTreeMap<&'static str, SuggestedFolderInventory>,
+    pub archive_suggestions: Vec<ArchiveSuggestion>,
     pub symlinks: Vec<String>,
     pub special_files: Vec<String>,
     pub name_findings: Vec<String>,
     pub first_name_finding_next_step: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedFolderInventory {
+    pub folder_count: usize,
+    pub file_count: usize,
+    pub total_bytes: Option<u64>,
+}
+
+fn record_suggested_folder(
+    inventory: &mut BTreeMap<&'static str, SuggestedFolderInventory>,
+    path: &str,
+    is_dir: bool,
+    size: Option<u64>,
+) {
+    let (parents, name) = path.rsplit_once('/').unwrap_or(("", path));
+    for suggestion in sync_core::policy::SUGGESTED_EXCLUSIONS {
+        let pattern = suggestion.pattern;
+        let directory = pattern.trim_end_matches("/**");
+        let matching_directory = is_dir && name == directory;
+        let matching_file = !is_dir && parents.split('/').any(|parent| parent == directory);
+        if !matching_directory && !matching_file {
+            continue;
+        }
+        let count = inventory
+            .entry(pattern)
+            .or_insert(SuggestedFolderInventory {
+                folder_count: 0,
+                file_count: 0,
+                total_bytes: Some(0),
+            });
+        if matching_directory {
+            count.folder_count += 1;
+        } else {
+            count.file_count += 1;
+            count.total_bytes = count
+                .total_bytes
+                .zip(size)
+                .map(|(total, size)| total.saturating_add(size));
+        }
+    }
 }
 
 /// Inspects a local directory tree without following symlinks and returns a
@@ -164,8 +216,10 @@ pub fn inspect_local_endpoint_detailed(
     let mut marker_conflict_path = None;
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
+    let mut archive_totals = BTreeMap::new();
     let mut top_subfolders: std::collections::BTreeMap<String, SubfolderInventory> =
         std::collections::BTreeMap::new();
+    let mut suggested_folders = BTreeMap::new();
 
     walk_detailed(
         root,
@@ -182,6 +236,8 @@ pub fn inspect_local_endpoint_detailed(
         &mut file_count,
         &mut total_bytes,
         &mut top_subfolders,
+        &mut suggested_folders,
+        &mut archive_totals,
     )?;
 
     let findings = validate_names(&all_relative_paths);
@@ -194,6 +250,13 @@ pub fn inspect_local_endpoint_detailed(
         SideClassification::HasData
     };
 
+    let archive_suggestions = archive_totals
+        .into_iter()
+        .filter_map(|(name, (count, bytes, latest))| {
+            archive_suggestion(name, count, bytes, latest, Utc::now().timestamp())
+        })
+        .collect();
+
     Ok(DetailedEndpointInventory {
         root: root.to_path_buf(),
         classification,
@@ -204,6 +267,8 @@ pub fn inspect_local_endpoint_detailed(
         marker_conflict,
         marker_conflict_path,
         subfolders: top_subfolders.into_values().collect(),
+        suggested_folders,
+        archive_suggestions,
         symlinks,
         special_files,
         name_findings,
@@ -227,6 +292,8 @@ fn walk_detailed(
     file_count: &mut usize,
     total_bytes: &mut u64,
     top_subfolders: &mut std::collections::BTreeMap<String, SubfolderInventory>,
+    suggested_folders: &mut BTreeMap<&'static str, SuggestedFolderInventory>,
+    archive_totals: &mut BTreeMap<String, (u64, u64, i64)>,
 ) -> Result<(), ManagerError> {
     let entries = fs::read_dir(current).map_err(|err| ManagerError::Io {
         cause: format!("Failed to read directory `{}`: {err}.", current.display()),
@@ -300,11 +367,31 @@ fn walk_detailed(
         // Count ALL ordinary entries for side classification & filename validation so
         // preview and actual preflight always agree (§9, HIGH #2).
         all_relative_paths.push(rel.clone());
+        record_suggested_folder(suggested_folders, &rel, ft.is_dir(), Some(meta.len()));
 
         let excluded = is_excluded(&rel, exclusions);
         if !excluded && ft.is_file() {
             *file_count += 1;
             *total_bytes = total_bytes.saturating_add(meta.len());
+        }
+
+        if let Some(top) = top_subdir
+            && ft.is_file()
+            && !archive_excluded(&rel, exclusions)
+        {
+            // Treat an unreadable mtime as recent so a folder with missing evidence is
+            // never suggested as finished.
+            let timestamp = meta
+                .modified()
+                .map(|time| DateTime::<Utc>::from(time).timestamp())
+                .unwrap_or(i64::MAX);
+            let (count, bytes, latest) =
+                archive_totals
+                    .entry(top.to_owned())
+                    .or_insert((0, 0, i64::MIN));
+            *count += 1;
+            *bytes = bytes.saturating_add(meta.len());
+            *latest = (*latest).max(timestamp);
         }
 
         if let Some(top) = top_subdir
@@ -339,6 +426,8 @@ fn walk_detailed(
                 file_count,
                 total_bytes,
                 top_subfolders,
+                suggested_folders,
+                archive_totals,
             )?;
         }
     }
@@ -353,6 +442,8 @@ pub struct EndpointInventory {
     pub classification: SideClassification,
     pub item_count: usize,
     pub has_valid_marker: bool,
+    pub file_count: usize,
+    pub total_bytes: u64,
 }
 
 /// Rclone-compatible exclusion matcher for onboarding symlink checks (§18).
@@ -376,17 +467,17 @@ pub fn matches_exclusion_pattern(rel_path: &str, pattern: &str) -> bool {
         return false;
     }
 
-    if let Some(prefix) = body.strip_suffix("/**") {
-        let prefix = prefix.trim_end_matches('/');
-        if anchored {
-            return rclone_glob_match(prefix, rel)
-                || rclone_glob_match(&format!("{prefix}/**"), rel);
+    if let Some(directory) = body.strip_suffix("/**").or_else(|| body.strip_suffix('/')) {
+        if !anchored && !directory.contains(['/', '*']) {
+            return rel
+                .rsplit_once('/')
+                .is_some_and(|(parents, _)| parents.split('/').any(|name| name == directory));
         }
-        if rclone_glob_match(prefix, rel) || rclone_glob_match(&format!("{prefix}/**"), rel) {
-            return true;
-        }
-        return rclone_glob_match(&format!("**/{prefix}"), rel)
-            || rclone_glob_match(&format!("**/{prefix}/**"), rel);
+        return rel.match_indices('/').any(|(end, _)| {
+            let prefix = &rel[..end];
+            rclone_glob_match(directory, prefix)
+                || (!anchored && rclone_glob_match(&format!("**/{directory}"), prefix))
+        });
     }
 
     if anchored {
@@ -404,6 +495,9 @@ pub fn matches_exclusion_pattern(rel_path: &str, pattern: &str) -> bool {
 
 /// Glob matcher where `*` matches any char except `/` and `**` matches across `/`.
 fn rclone_glob_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains(['*', '?']) {
+        return pattern == text;
+    }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let mut memo = vec![vec![None; t.len() + 1]; p.len() + 1];
@@ -424,10 +518,55 @@ fn glob_dp(p: &[char], t: &[char], pi: usize, ti: usize, memo: &mut [Vec<Option<
         glob_dp(p, t, pi + 1, ti, memo)
             || (ti < t.len() && t[ti] != '/' && glob_dp(p, t, pi, ti + 1, memo))
     } else {
-        ti < t.len() && p[pi] == t[ti] && glob_dp(p, t, pi + 1, ti + 1, memo)
+        ti < t.len()
+            && (p[pi] == t[ti] || (p[pi] == '?' && t[ti] != '/'))
+            && glob_dp(p, t, pi + 1, ti + 1, memo)
     };
     memo[pi][ti] = Some(res);
     res
+}
+
+// Directory exclusions use a trailing slash or a recursive glob. Ordinary file
+// patterns match at the end of a path or a slash-delimited suffix.
+pub(crate) fn archive_excluded(path: &str, exclusions: &BTreeSet<String>) -> bool {
+    if path.ends_with(ARCHIVE_PARTIAL_SUFFIX) {
+        return true;
+    }
+    let matches = |pattern: &str, path: &str| match pattern.strip_prefix('/') {
+        Some(pattern) => rclone_glob_match(pattern, path),
+        None => {
+            rclone_glob_match(pattern, path)
+                || path
+                    .match_indices('/')
+                    .any(|(i, _)| rclone_glob_match(pattern, &path[i + 1..]))
+        }
+    };
+    // Preserve repository internals inside included project folders.
+    let git_root = path
+        .split('/')
+        .scan(0, |offset, segment| {
+            let start = *offset;
+            *offset += segment.len() + 1;
+            Some((start, segment))
+        })
+        .find_map(|(start, segment)| (segment == ".git").then_some(start));
+    exclusions.iter().any(|pattern| {
+        let directory_pattern = pattern.ends_with('/') || pattern.contains("**");
+        let normalized;
+        let pattern = if pattern.ends_with('/') {
+            normalized = format!("{pattern}**");
+            &normalized
+        } else {
+            pattern
+        };
+        if git_root.is_none() && matches(pattern, path) {
+            return true;
+        }
+        directory_pattern
+            && path.match_indices('/').any(|(i, _)| {
+                git_root.is_none_or(|git_root| i < git_root) && matches(pattern, &path[..=i])
+            })
+    })
 }
 
 fn is_excluded(rel_path: &str, exclusions: &BTreeSet<String>) -> bool {
@@ -497,6 +636,8 @@ pub fn inspect_local_endpoint(
         classification: inv.classification,
         item_count: inv.all_items_count,
         has_valid_marker: inv.has_valid_marker,
+        file_count: inv.file_count,
+        total_bytes: inv.total_bytes,
     })
 }
 
@@ -766,13 +907,16 @@ fn drive_marker_error(path: &str, cause: &str) -> ManagerError {
     }
 }
 
-fn read_marker_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_marker_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?
-        .take(MAX_DRIVE_MARKER_BYTES + 1)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular access marker"));
+    }
+    file.take(MAX_DRIVE_MARKER_BYTES + 1)
         .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
@@ -781,7 +925,8 @@ fn read_drive_marker(
     drive: &LockedDrive<'_>,
     collection: &CloudCollection,
     entries: &[LsJsonEntry],
-) -> Result<Option<Vec<u8>>, ManagerError> {
+    runner: &dyn ProcessRunner,
+) -> Result<Option<Vec<u8>>, AccountError> {
     let marker_path = format!("{}/{ACCESS_MARKER_FILENAME}", collection.display_path);
     let mut matching = entries
         .iter()
@@ -797,15 +942,15 @@ fn read_drive_marker(
         return Err(drive_marker_error(
             &marker_path,
             "The Drive access marker is ambiguous or is not an ordinary marker file.",
-        ));
+        )
+        .into());
     }
 
     let scratch = marker_scratch(drive)?;
     let destination = scratch.path().join(ACCESS_MARKER_FILENAME);
     drive
         .request
-        .fetch_marker(&marker_path, &destination, &drive.runner)
-        .map_err(|err| drive_error(err.into()))?;
+        .fetch_marker(&marker_path, &destination, runner)?;
     let bytes = read_marker_bytes(&destination).map_err(|_| {
         drive_marker_error(&marker_path, "The Drive access marker could not be read.")
     })?;
@@ -818,7 +963,8 @@ fn read_drive_marker(
         return Err(drive_marker_error(
             &marker_path,
             "The Drive access marker is unrecognized or identifies another collection.",
-        ));
+        )
+        .into());
     }
     Ok(Some(bytes))
 }
@@ -850,7 +996,8 @@ pub(crate) fn inspect_drive_endpoint(
         .request
         .list_entries(&collection.display_path, true, &drive.runner)
         .map_err(|err| drive_error(err.into()))?;
-    let marker = read_drive_marker(drive, collection, &entries)?;
+    let marker =
+        read_drive_marker(drive, collection, &entries, &drive.runner).map_err(drive_error)?;
     let paths: Vec<_> = entries
         .iter()
         .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
@@ -858,6 +1005,7 @@ pub(crate) fn inspect_drive_endpoint(
         .collect();
     let findings = validate_names(&paths);
     let mut subfolders = BTreeMap::<String, SubfolderInventory>::new();
+    let mut suggested_folders = BTreeMap::new();
     let mut file_count = 0;
     let mut total_bytes = 0_u64;
     for entry in entries
@@ -881,6 +1029,7 @@ pub(crate) fn inspect_drive_endpoint(
         .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
     {
         let size = u64::try_from(entry.size);
+        record_suggested_folder(&mut suggested_folders, &entry.path, entry.is_dir, size.ok());
         if !entry.is_dir && !is_excluded(&entry.path, exclusions) {
             let size = size.map_err(|_| ManagerError::PreflightRejected {
                 cause: format!("The Drive file `{}` did not report a size.", entry.path),
@@ -920,6 +1069,8 @@ pub(crate) fn inspect_drive_endpoint(
             marker_conflict: None,
             marker_conflict_path: None,
             subfolders: subfolders.into_values().collect(),
+            suggested_folders,
+            archive_suggestions: Vec::new(),
             symlinks: Vec::new(),
             special_files: Vec::new(),
             first_name_finding_next_step: findings.first().map(|finding| finding.next_step.clone()),
@@ -933,15 +1084,23 @@ pub(crate) fn verify_drive_marker(
     drive: &LockedDrive<'_>,
     collection: &CloudCollection,
 ) -> Result<Vec<u8>, ManagerError> {
+    verify_drive_marker_with_runner(drive, collection, &drive.runner).map_err(drive_error)
+}
+
+pub(crate) fn verify_drive_marker_with_runner(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+    runner: &dyn ProcessRunner,
+) -> Result<Vec<u8>, AccountError> {
     let entries = drive
         .request
-        .list_entries(&collection.display_path, false, &drive.runner)
-        .map_err(|err| drive_error(err.into()))?;
-    read_drive_marker(drive, collection, &entries)?.ok_or_else(|| {
+        .list_entries(&collection.display_path, false, runner)?;
+    read_drive_marker(drive, collection, &entries, runner)?.ok_or_else(|| {
         drive_marker_error(
             &collection.display_path,
             "The expected Drive access marker is missing.",
         )
+        .into()
     })
 }
 
@@ -1017,4 +1176,273 @@ pub fn render_filters_file(exclusions: &BTreeSet<String>) -> String {
         }
     }
     out
+}
+
+/// Comparison evidence for reusing a recorded first-sync generation.
+pub(crate) struct ResumeInventory {
+    pub total_files: u64,
+    pub total_bytes: Option<u64>,
+    pub files_already_present: u64,
+    pub bytes_already_present: u64,
+    pub partials: Vec<(String, u64)>,
+}
+
+pub(crate) fn verify_first_sync_subset(
+    source: &[LsJsonEntry],
+    destination: &[LsJsonEntry],
+    source_root: &Path,
+    destination_root: &Path,
+    destination_is_local: bool,
+    drive: bool,
+) -> Result<ResumeInventory, ManagerError> {
+    let source = index_resume_entries(source)?;
+    let destination = index_resume_entries(destination)?;
+    let unique_paths: BTreeSet<_> = source.keys().chain(destination.keys()).copied().collect();
+    if let Some(finding) = validate_names(&unique_paths.iter().copied().collect::<Vec<_>>()).first()
+    {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "{} Paths: {}.",
+                finding.cause,
+                finding
+                    .paths
+                    .iter()
+                    .take(5)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            next_step: finding.next_step.clone(),
+        });
+    }
+
+    // Bisync can use a path from either inventory on either endpoint. In
+    // particular, lsjson can omit a symlink that occupies an ancestor of a
+    // missing file, and checking only the leaf would follow that symlink.
+    for root in [
+        (!drive || !destination_is_local).then_some(source_root),
+        destination_is_local.then_some(destination_root),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for path in &unique_paths {
+            reject_symlinks_under_root("first-sync path", root, &root.join(path)).map_err(
+                |err| ManagerError::PreflightRejected {
+                    cause: format!(
+                        "Cannot safely use the first-sync path `{path}`. {}",
+                        err.cause()
+                    ),
+                    next_step:
+                        "Review the files and folders at both sync locations before resuming."
+                            .into(),
+                },
+            )?;
+        }
+    }
+
+    let is_data_file = |entry: &&LsJsonEntry| !entry.is_dir && entry.path != ACCESS_MARKER_FILENAME;
+    let mut inventory = ResumeInventory {
+        total_files: source.values().copied().filter(is_data_file).count() as u64,
+        total_bytes: source.values().copied().filter(is_data_file).try_fold(
+            0u64,
+            |total, entry| {
+                u64::try_from(entry.size)
+                    .ok()
+                    .map(|bytes| total.saturating_add(bytes))
+            },
+        ),
+        files_already_present: 0,
+        bytes_already_present: 0,
+        partials: Vec::new(),
+    };
+    // An unmatched local file is only an engine partial when its exact name
+    // matches the pinned engine's fingerprint of an included, still-missing
+    // source file. A user file merely ending in .partial is ordinary data.
+    let mut expected_partials = BTreeMap::new();
+    if destination_is_local
+        && destination.values().any(|entry| {
+            !entry.is_dir
+                && entry.path.ends_with(".partial")
+                && !source.contains_key(entry.path.as_str())
+        })
+    {
+        for entry in source.values().copied().filter(is_data_file) {
+            if !destination.contains_key(entry.path.as_str())
+                && let Some(partial) = rclone_partial_path(entry, drive)
+            {
+                // A CRC collision is ambiguous even if both source sizes match.
+                expected_partials
+                    .entry(partial)
+                    .and_modify(|size| *size = None)
+                    .or_insert(Some(entry.size));
+            }
+        }
+    }
+
+    let mut offending = Vec::new();
+    for (&path, &entry) in &destination {
+        if path == ACCESS_MARKER_FILENAME || (entry.is_dir && !source.contains_key(path)) {
+            continue;
+        }
+        match source.get(path) {
+            Some(source_entry) if entry.is_dir && source_entry.is_dir => {}
+            Some(source_entry) if files_match(source_entry, entry, drive) => {
+                inventory.files_already_present += 1;
+                inventory.bytes_already_present = inventory
+                    .bytes_already_present
+                    .saturating_add(entry.size as u64);
+            }
+            None if expected_partials
+                .get(path)
+                .and_then(|size| *size)
+                .is_some_and(|size| entry.size >= 0 && entry.size <= size) =>
+            {
+                inventory
+                    .partials
+                    .push((path.to_owned(), entry.size as u64));
+            }
+            _ if offending.len() < 5 => offending.push(path),
+            _ => {}
+        }
+    }
+    // A filtered-out case alias, symlink, or special file can still occupy a
+    // new destination pathname on a local filesystem. An absent listing entry
+    // alone is insufficient proof that its live pathname is free.
+    if destination_is_local {
+        for entry in source.values().copied().filter(is_data_file) {
+            if offending.len() == 5 {
+                break;
+            }
+            if !destination.contains_key(entry.path.as_str())
+                && !matches!(fs::symlink_metadata(destination_root.join(&entry.path)), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+            {
+                offending.push(entry.path.as_str());
+            }
+        }
+    }
+    if !offending.is_empty() {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Both the local folder and the cloud collection already contain data. Automatic initialization will not merge two populated trees. Review these paths: {}.",
+                offending.join(", ")
+            ),
+            next_step: format!(
+                "Preserve the files in both folders, then review `{}` and `{}` before trying again.",
+                source_root.display(),
+                destination_root.display()
+            ),
+        });
+    }
+    Ok(inventory)
+}
+
+fn index_resume_entries(
+    entries: &[LsJsonEntry],
+) -> Result<BTreeMap<&str, &LsJsonEntry>, ManagerError> {
+    let mut index = BTreeMap::new();
+    for entry in entries {
+        let path = entry.path.as_str();
+        if path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || Path::new(path)
+                .file_name()
+                .is_none_or(|name| name != entry.name.as_str())
+            || (!entry.is_dir && entry.size < 0)
+            || index.insert(path, entry).is_some()
+        {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!("Could not safely identify the first-sync path `{path}`."),
+                next_step: "Review unsupported or duplicate files and folders before resuming."
+                    .into(),
+            });
+        }
+    }
+    Ok(index)
+}
+
+fn files_match(source: &LsJsonEntry, destination: &LsJsonEntry, drive: bool) -> bool {
+    if source.is_dir || destination.is_dir || source.size < 0 || source.size != destination.size {
+        return false;
+    }
+    let Ok(source_time) = chrono::DateTime::parse_from_rfc3339(&source.mod_time) else {
+        return false;
+    };
+    let Ok(destination_time) = chrono::DateTime::parse_from_rfc3339(&destination.mod_time) else {
+        return false;
+    };
+    if drive {
+        // Drive stores timestamps at millisecond precision. Match rclone's
+        // strict comparison window so the recorded file is also skipped.
+        (source_time - destination_time).abs() < chrono::TimeDelta::milliseconds(1)
+    } else {
+        source_time == destination_time
+    }
+}
+
+/// rclone v1.76.0 uses CRC32(path + fast source fingerprint), then truncates
+/// long basenames before appending the partial suffix.
+fn rclone_partial_path(entry: &LsJsonEntry, drive_source: bool) -> Option<String> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&entry.mod_time)
+        .ok()?
+        .to_utc();
+    let seconds = timestamp.format("%Y-%m-%d %H:%M:%S");
+    let nanos = format!("{:09}", timestamp.timestamp_subsec_nanos());
+    let fractional = nanos.trim_end_matches('0');
+    let mut fingerprint = format!("{}{},{seconds}", entry.path, entry.size);
+    if !fractional.is_empty() {
+        fingerprint.push('.');
+        fingerprint.push_str(fractional);
+    }
+    fingerprint.push_str(" +0000 UTC");
+    if drive_source {
+        let md5 = entry
+            .hashes
+            .iter()
+            .find(|(name, value)| name.eq_ignore_ascii_case("md5") && !value.is_empty())?
+            .1;
+        fingerprint.push(',');
+        fingerprint.push_str(md5);
+    }
+    let suffix = format!(".{:08x}.partial", crc32fast::hash(fingerprint.as_bytes()));
+    let mut end = entry.path.len();
+    if entry.name.len() > 100 {
+        end -= suffix.len();
+        while !entry.path.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    Some(format!("{}{suffix}", &entry.path[..end]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_rejects_a_symlinked_destination_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(source.join("sub/note.txt"), b"source bytes").unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("sub")).unwrap();
+        let entries = rclone_adapter::parse_lsjson_entries(
+            r#"[
+            {"Path":"sub","Name":"sub","IsDir":true},
+            {"Path":"sub/note.txt","Name":"note.txt","Size":12,"ModTime":"2026-01-01T00:00:00Z"}
+        ]"#,
+        )
+        .unwrap();
+
+        let error = verify_first_sync_subset(&entries, &[], &source, &destination, true, false)
+            .err()
+            .expect("a missing leaf behind a symlink must never pass subset preflight");
+        assert!(error.cause().contains("symbolic link"), "{error}");
+        assert!(!outside.join("note.txt").exists());
+    }
 }

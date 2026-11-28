@@ -6,11 +6,13 @@ use nsh_base::{
     table_header, table_row,
 };
 use nsh_core::{file_dialog::OpenDialog, prelude::*};
-use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, VolumeKind};
+use sync_core::{DEFAULT_EXCLUSIONS, DEFAULT_MAX_DELETE_PERCENT, SUGGESTED_EXCLUSIONS, VolumeKind};
+use sync_manager::{ArchiveState, FilterMigrationPhase};
 
 use crate::contract::{
-    AccountStatus, FolderSize, IconKind, ReviewScenario, ScreenRoute, Tone, UiCommand, UiSnapshot,
-    WizardDraft, WizardStep, format_bytes, format_duration,
+    AccountStatus, FilterMigrationProgress, FolderSize, IconKind, ReviewScenario, ScreenRoute,
+    Tone, UiCommand, UiSnapshot, WizardDraft, WizardStep, archive_percent, archive_progress_label,
+    format_bytes, format_count, format_duration,
 };
 use crate::screens::AppController;
 use crate::theme::{
@@ -169,24 +171,54 @@ fn render_filter_change(
         ))
         .child(view().flex_1());
     if let Some(review) = draft.filter_review.as_ref().filter(|_| reviewing) {
+        let narrowing = review.narrowing;
         let mut body = card().child(card_title("Changes for this mapping"));
-        for (label, patterns) in [
-            ("New exclusions", &review.added),
-            ("Removed exclusions", &review.removed),
-        ] {
-            body = body.child(kv_row(
-                label,
-                text(if patterns.is_empty() {
-                    "None".to_owned()
-                } else {
-                    patterns.join(", ")
-                })
-                .text_color(p.fg)
-                .into_element(),
-            ));
+        if let Some(estimates) = &review.cloud_move_counts {
+            body = body.child(section_label("New exclusions"));
+            for estimate in estimates {
+                let count = estimate.file_count;
+                let unit = if count == 1 { "file" } else { "files" };
+                body = body.child(kv_row(
+                    estimate.pattern.clone(),
+                    text(format!(
+                        "{count} {unit} · {}",
+                        format_bytes(estimate.total_bytes)
+                    ))
+                    .text_color(p.fg)
+                    .into_element(),
+                ));
+            }
+        } else {
+            for (label, patterns) in [
+                ("New exclusions", &review.added),
+                ("Removed exclusions", &review.removed),
+            ] {
+                body = body.child(kv_row(
+                    label,
+                    text(if patterns.is_empty() {
+                        "None".to_owned()
+                    } else {
+                        patterns.join(", ")
+                    })
+                    .text_color(p.fg)
+                    .into_element(),
+                ));
+            }
         }
-        body = body.child(text("Previous sync setup is kept. Local copies of newly excluded files stay in place. Applying these changes starts a new first sync.").text_color(p.fg));
-        let mut checks = card().child(card_title("Before first sync"));
+        body = body
+            .child(text("Previous sync setup is kept for recovery.").text_color(p.fg))
+            .child(text(if review.cloud_move_counts.is_some() {
+                "FolderSync stops syncing these folders. Their copies in Google Drive move to the Recovery folder. The copies on this Mac stay. When another Mac syncs these removals, its copies move to its own recovery folder."
+            } else if narrowing {
+                "FolderSync stops syncing the newly excluded files. Both copies stay in place."
+            } else {
+                "Applying these changes starts a new first sync."
+            }).text_color(p.fg));
+        let mut checks = card().child(card_title(if narrowing {
+            "Before updating the selection"
+        } else {
+            "Before first sync"
+        }));
         for check in &review.checks {
             checks = checks.child(check_row(
                 if check.ok {
@@ -229,8 +261,12 @@ fn render_filter_change(
                         view().into_element()
                     })
                     .child(
-                        text("I’ve reviewed the changes and want to start a new first sync.")
-                            .text_color(p.fg),
+                        text(if narrowing {
+                            "I’ve reviewed the changes and want to update this selection."
+                        } else {
+                            "I’ve reviewed the changes and want to start a new first sync."
+                        })
+                        .text_color(p.fg),
                     ),
             );
         }
@@ -246,7 +282,11 @@ fn render_filter_change(
             ))
             .child(
                 app_button(
-                    "Apply and start first sync",
+                    if narrowing {
+                        "Apply changes"
+                    } else {
+                        "Apply and start first sync"
+                    },
                     BtnKind::Primary,
                     false,
                     !can_apply || !draft.no_other_sync_confirmed,
@@ -258,6 +298,27 @@ fn render_filter_change(
             );
         content = content.child(body).child(checks);
     } else {
+        let c_suggest = ctrl.clone();
+        let suggestions_added = SUGGESTED_EXCLUSIONS.iter().all(|suggestion| {
+            draft
+                .custom_patterns
+                .iter()
+                .any(|added| added == suggestion.pattern)
+        });
+        content = content.child(
+            view().items_start().child(
+                app_button(
+                    "Add suggested build and cache exclusions",
+                    BtnKind::Default,
+                    false,
+                    suggestions_added,
+                    None,
+                    suggestions_added.then_some("All suggested exclusions are selected"),
+                    move || c_suggest.send(UiCommand::AddSuggestedExclusions),
+                )
+                .test_id("add-suggested-exclusions"),
+            ),
+        );
         content = content.child(render_step_subfolders(ctrl, draft, pattern_input));
         footer = footer.child(
             app_button(
@@ -1183,10 +1244,14 @@ fn render_step_subfolders(
                                     .gap(px(6.0))
                                     .child(text(label_text).text_color(p.fg))
                                     .child(if !node.included {
-                                        text("· cloud only")
-                                            .text_size(px(S_CAPTION))
-                                            .text_color(p.muted)
-                                            .into_element()
+                                        text(if draft.changing_subfolders {
+                                            "· excluded"
+                                        } else {
+                                            "· cloud only"
+                                        })
+                                        .text_size(px(S_CAPTION))
+                                        .text_color(p.muted)
+                                        .into_element()
                                     } else {
                                         view().into_element()
                                     }),
@@ -1278,7 +1343,11 @@ fn render_step_subfolders(
     let mut side_card = card()
         .w(px(276.0))
         .flex_none()
-        .child(card_title("Will be on this Mac"))
+        .child(card_title(if draft.changing_subfolders {
+            "Selected to sync"
+        } else {
+            "Will be on this Mac"
+        }))
         .child(size_headline)
         .child(text(fit).text_size(px(S_SMALL)).text_color(p.muted))
         .child(view().pt(px(4.0)).child(section_label("Always excluded")))
@@ -1368,33 +1437,88 @@ fn render_step_subfolders(
                 ),
         );
 
-    for pattern in &draft.custom_patterns {
+    let remove_pattern = |pattern: &str| {
         let c_remove = ctrl.clone();
-        let removed = pattern.clone();
-        side_card = side_card.child(
-            view()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(6.0))
-                .child(mono_text(pattern.clone(), S_SMALL, p.fg).min_w(px(0.0)))
-                .child(
-                    app_button(
-                        "Remove",
-                        BtnKind::Ghost,
-                        true,
-                        false,
-                        None,
-                        None,
-                        move || {
-                            c_remove.send(UiCommand::WizardRemovePattern(removed.clone()));
-                        },
+        let removed = pattern.to_owned();
+        app_button(
+            "Remove",
+            BtnKind::Ghost,
+            true,
+            false,
+            None,
+            None,
+            move || c_remove.send(UiCommand::WizardRemovePattern(removed.clone())),
+        )
+        .flex_none()
+        .accessibility_label(format!("Remove {pattern}"))
+        .test_id(&format!("remove-pattern-{pattern}"))
+    };
+
+    for pattern in &draft.custom_patterns {
+        if !draft.suggested_folders.contains_key(pattern.as_str()) {
+            side_card = side_card.child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(mono_text(pattern.clone(), S_SMALL, p.fg).min_w(px(0.0)))
+                    .child(remove_pattern(pattern)),
+            );
+        }
+    }
+
+    if !draft.suggested_folders.is_empty() {
+        let c_remove_all = ctrl.clone();
+        side_card = side_card
+            .child(section_label("Suggested: build and cache folders"))
+            .child(
+                link_button("Remove all suggested", S_SMALL, move || {
+                    c_remove_all.send(UiCommand::WizardRemoveAllSuggested)
+                })
+                .test_id("wizard-remove-all-suggested"),
+            );
+        for suggestion in SUGGESTED_EXCLUSIONS {
+            let Some(counts) = draft.suggested_folders.get(suggestion.pattern) else {
+                continue;
+            };
+            let name = suggestion.pattern.trim_end_matches("**");
+            let folders = format_count(counts.folder_count as u64);
+            let folder_label = if counts.folder_count == 1 {
+                "folder"
+            } else {
+                "folders"
+            };
+            let files = format_count(counts.file_count as u64);
+            let file_label = if counts.file_count == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            let size = counts
+                .total_bytes
+                .map_or_else(|| "size unknown".to_owned(), format_bytes);
+            let stats = format!("{folders} {folder_label}, {files} {file_label}, {size}");
+            side_card = side_card.child(
+                view()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(mono_text(name, S_SMALL, p.fg))
+                            .child(remove_pattern(suggestion.pattern)),
                     )
-                    .flex_none()
-                    .accessibility_label(format!("Remove {pattern}"))
-                    .test_id(&format!("remove-pattern-{pattern}")),
-                ),
-        );
+                    .child(text(stats).text_size(px(S_SMALL)).text_color(p.fg))
+                    .child(
+                        text(suggestion.reason)
+                            .text_size(px(S_TINY))
+                            .text_color(p.muted),
+                    ),
+            );
+        }
     }
 
     let name_check = if draft.found_name_issues.is_empty() {
@@ -1427,7 +1551,7 @@ fn render_step_subfolders(
     let found_card = if draft.changing_subfolders {
         card()
             .flex_1()
-            .child(card_title("Before first sync"))
+            .child(card_title("Before updating the selection"))
             .child(
                 text("Review changes to check both folders and the recovery locations.")
                     .text_color(p.muted),
@@ -1468,28 +1592,99 @@ fn render_step_subfolders(
             "Duplicate names or case/Unicode clashes stop the run for review.",
         ));
 
-    view()
-        .flex_col()
-        .w_full()
-        .gap(px(14.0))
-        .child(
-            view()
-                .flex_row()
-                .items_start()
-                .gap(px(16.0))
-                .w_full()
-                .child(tree_card)
-                .child(side_card),
-        )
-        .child(
-            view()
-                .flex_row()
-                .items_stretch()
-                .gap(px(14.0))
-                .w_full()
-                .child(found_card)
-                .child(supported_card),
-        )
+    let mut content = view().flex_col().w_full().gap(px(14.0)).child(
+        view()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .w_full()
+            .child(tree_card)
+            .child(side_card),
+    );
+    if !draft.archive_suggestions.is_empty() {
+        let mut suggestions = card().child(card_title("Upload as one archive"));
+        for item in &draft.archive_suggestions {
+            let sender = ctrl.clone();
+            let folder = item.name.clone();
+            let checked = !draft.declined_archives.contains(&folder);
+            let last_changed = chrono::DateTime::from_timestamp(item.last_changed_unix_secs, 0)
+                .map(|date| date.format("%b %-d, %Y").to_string())
+                .unwrap_or_else(|| "Unknown".to_owned());
+            let saved_minutes = item.estimated_seconds_saved.div_ceil(300) * 5;
+            let saved = if saved_minutes < 60 {
+                format!("{saved_minutes} min")
+            } else {
+                format!("{} hr {} min", saved_minutes / 60, saved_minutes % 60)
+            };
+            suggestions = suggestions.child(
+                checkbox()
+                    .test_id(&format!("wizard-archive-{}", item.name))
+                    .checked(checked)
+                    .flex_row()
+                    .items_start()
+                    .gap(px(10.0))
+                    .cursor_pointer()
+                    .focus_visible(focus_ring)
+                    .indicator_style(move |s| {
+                        s.w(px(16.0))
+                            .h(px(16.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(if checked { p.primary } else { p.border })
+                            .bg(if checked { p.primary } else { p.bg })
+                            .items_center()
+                            .justify_center()
+                    })
+                    .indicator(if checked {
+                        icon(IconKind::Check, 11.0, p.primary_fg).into_element()
+                    } else {
+                        view().into_element()
+                    })
+                    .on_change(move |_: &bool| {
+                        sender.send(UiCommand::WizardToggleArchive(folder.clone()));
+                    })
+                    .child(
+                        view()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(text(item.name.clone()).font_weight(W_TITLE))
+                            .child(
+                                text(archive_file_summary(item.file_count, item.bytes))
+                                    .text_color(p.fg),
+                            )
+                            .child(
+                                text(format!(
+                                    "Last change {last_changed} · Time saved about {saved}"
+                                ))
+                                .text_size(px(S_SMALL))
+                                .text_color(p.muted),
+                            ),
+                    ),
+            );
+        }
+        content = content.child(suggestions);
+    }
+    content.child(
+        view()
+            .flex_row()
+            .items_stretch()
+            .gap(px(14.0))
+            .w_full()
+            .child(found_card)
+            .child(supported_card),
+    )
+}
+
+fn archive_file_summary(files: u64, bytes: u64) -> String {
+    let plain = files.to_string();
+    let mut count = String::new();
+    for (index, digit) in plain.chars().enumerate() {
+        if index > 0 && (plain.len() - index).is_multiple_of(3) {
+            count.push(',');
+        }
+        count.push(digit);
+    }
+    format!("{count} files · {}", format_bytes(bytes))
 }
 
 fn render_step_recovery(ctrl: AppController, draft: &WizardDraft) -> View {
@@ -1935,7 +2130,38 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
     if is_demo {
         root = root.child(scenario_bar);
     }
-    root = root.child(sides).child(direction_card).child(details);
+    root = root.child(sides).child(direction_card);
+    if draft.selected_archives().next().is_some() {
+        let mut archives = card().child(card_title("Upload as archives"));
+        let (files, bytes) = draft.selected_archives().fold((0_u64, 0_u64), |acc, item| {
+            (
+                acc.0.saturating_add(item.file_count),
+                acc.1.saturating_add(item.bytes),
+            )
+        });
+        for item in draft.selected_archives() {
+            archives = archives.child(text(format!("{}.zip", item.name)).text_color(p.fg));
+        }
+        archives = archives.child(text(archive_file_summary(files, bytes)).text_color(p.fg));
+        if let Some(holding) = &draft.archive_holding_folder {
+            archives = archives.child(text(format!(
+                "Each folder is replaced by one .zip in this folder and in Google Drive, so every Mac gets the same .zip. The original folder is moved to {}; delete it there when you no longer need it.",
+                holding.display()
+            )).text_color(p.muted));
+        }
+        for error in &draft.archive_errors {
+            archives = archives.child(check_row(IconKind::Octagon, p.err, error));
+        }
+        if draft.archive_holding_folder.is_none() && draft.archive_errors.is_empty() {
+            archives = archives.child(check_row(
+                IconKind::Octagon,
+                p.err,
+                "Could not check where the original folders will be kept.",
+            ));
+        }
+        root = root.child(archives);
+    }
+    root = root.child(details);
     if draft.download_exceeds_free_space() {
         root = root.child(
             accented_card(p.err_bd)
@@ -1989,9 +2215,7 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         ),
                 )
                 .child(
-                    text("If you can, ask others not to change ")
-                    .child(mono_text(format!("Data/{}", draft.selected_folder), S_CAPTION, p.muted))
-                    .child(text(" until the first sync finishes."))
+                    text("Keep the destination folder unchanged until the first sync finishes. Ask others with access to wait before editing it.")
                     .pl(px(26.0))
                     .text_size(px(S_SMALL))
                     .text_color(p.muted),
@@ -2004,12 +2228,59 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
 
 fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
     let draft = &snap.wizard;
+    let migration = draft.filter_migration_progress.as_ref();
     let p = Palette::current();
     let c_stop = ctrl.clone();
     let c_done = ctrl.clone();
     let c_open_detail = ctrl.clone();
     let c_demo_finish = ctrl.clone();
+    if let Some(mapping) = draft
+        .first_sync_mapping_id
+        .as_ref()
+        .and_then(|id| snap.mapping(id))
+        && let crate::contract::StatusModifier::StoppedFirstSync(stopped) = &mapping.modifier
+    {
+        let mut status = card().child(card_title(stopped.status_text()));
+        if let Some(cause) = draft.first_sync_error.as_ref().or(stopped.cause.as_ref()) {
+            status = status.child(text(cause.clone()).text_color(p.muted));
+        }
+        return view()
+            .flex_col()
+            .gap(px(14.0))
+            .child(page_title(format!("First sync · {}", mapping.display_name)))
+            .child(status.child(super::stopped_first_sync_actions(
+                &ctrl,
+                &mapping.id,
+                &mapping.display_name,
+            )))
+            .child(link_button("Back to Overview", S_SMALL, move || {
+                c_done.navigate(ScreenRoute::Overview)
+            }));
+    }
     let elapsed = format_duration(draft.first_sync_elapsed_secs);
+    let archives = || {
+        snap.archives
+            .iter()
+            .filter(|entry| draft.first_sync_mapping_id.as_ref() == Some(&entry.mapping_id))
+    };
+    let archive_progress = archives()
+        .find_map(|entry| match entry.state {
+            ArchiveState::Creating { bytes, total } => Some((
+                archive_progress_label(&entry.folder, bytes, total),
+                archive_percent(bytes, total),
+            )),
+            _ => None,
+        })
+        .or_else(|| {
+            archives()
+                .find(|entry| entry.state == ArchiveState::Pending)
+                .map(|entry| {
+                    (
+                        format!("Preparing to create archive {}", entry.folder),
+                        None,
+                    )
+                })
+        });
 
     // #4: Direction-accurate verb and progress text.
     let (verb, in_flight_line) = match draft.review_scenario {
@@ -2021,18 +2292,16 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             "Setting up",
             format!("Checking access markers · elapsed {elapsed}"),
         ),
-        ReviewScenario::CloudToLocal | ReviewScenario::BothPopulated => (
-            "Downloading",
-            if draft.total_gb_opt().is_some() {
-                format!(
-                    "Downloading · about {:.1} GB · elapsed {elapsed}",
-                    draft.included_gb()
-                )
-            } else {
-                format!("Downloading · elapsed {elapsed}")
-            },
-        ),
+        ReviewScenario::CloudToLocal | ReviewScenario::BothPopulated => {
+            ("Downloading", format!("Downloading · elapsed {elapsed}"))
+        }
     };
+
+    let progress = snap
+        .active_run
+        .as_ref()
+        .filter(|run| draft.first_sync_mapping_id.as_ref() == Some(&run.mapping_id))
+        .and_then(|run| run.transfer_progress());
 
     let preflight_done = snap.is_demo_mode || draft.first_sync_preflight_done;
     let markers_ready = snap.is_demo_mode || draft.first_sync_markers_ready;
@@ -2063,36 +2332,46 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         check_row(IconKind::Dash, p.muted, "Verifying marker files")
     };
 
-    let mut progress_card = card().child(preflight_row).child(marker_row);
-
     let completed_mapping = draft
         .first_sync_mapping_id
         .as_ref()
         .and_then(|id| snap.mapping(id));
-    let finish_mode_done =
-        if completed_mapping.is_some_and(|m| m.state.intent == sync_core::Intent::Paused) {
-            "Automatic sync stays paused for this mapping"
-        } else if snap.scheduling_paused {
-            "Automatic sync is ready when scheduling resumes"
-        } else {
-            "Automatic sync is now on"
-        };
+    let finish_mode_done = if completed_mapping.is_some_and(|m| !m.scheduling_enabled) {
+        "Automatic sync stays off for this mapping"
+    } else if completed_mapping.is_some_and(|m| m.state.intent == sync_core::Intent::Paused) {
+        "Automatic sync stays paused for this mapping"
+    } else if snap.scheduling_paused {
+        "Automatic sync is ready when scheduling resumes"
+    } else {
+        "Automatic sync is now on"
+    };
     let finish_mode_pending = "Enable automatic sync after verification";
+    let mut progress_card = if let Some(migration) = migration {
+        render_filter_migration_rows(migration, draft)
+    } else {
+        card().child(preflight_row).child(marker_row)
+    };
 
     if let Some(err) = &draft.first_sync_error {
         progress_card = progress_card.child(check_row(IconKind::Octagon, p.err, err));
     } else if draft.first_sync_completed {
-        progress_card = progress_card
-            .child(check_row(
-                IconKind::Check,
-                p.ok,
-                &format!("{verb} finished"),
-            ))
-            .child(check_row(IconKind::Check, p.ok, "Checked the result"))
-            .child(check_row(IconKind::Check, p.ok, finish_mode_done));
-    } else {
-        let active_line = if draft.first_sync_stopping {
+        if migration.is_none() {
+            progress_card = progress_card
+                .child(check_row(
+                    IconKind::Check,
+                    p.ok,
+                    &format!("{verb} finished"),
+                ))
+                .child(check_row(IconKind::Check, p.ok, "Checked the result"));
+        }
+        progress_card = progress_card.child(check_row(IconKind::Check, p.ok, finish_mode_done));
+    } else if migration.is_none() {
+        let active_line = if draft.first_sync_stopping && archive_progress.is_some() {
+            text(format!("Stopping archive creation… · elapsed {elapsed}"))
+        } else if draft.first_sync_stopping {
             emphasized_line("Stopping", format!(" first sync… · elapsed {elapsed}"))
+        } else if let Some((label, _)) = &archive_progress {
+            text(format!("{label} · elapsed {elapsed}"))
         } else if !preflight_done {
             text(format!(
                 "Checking folders before syncing… · elapsed {elapsed}"
@@ -2102,6 +2381,28 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         } else {
             text(in_flight_line)
         };
+        let (percent, label) = if let Some((label, percent)) = archive_progress.as_ref() {
+            (*percent, label.clone())
+        } else {
+            (
+                progress
+                    .and_then(|progress| progress.percent())
+                    .map(f32::from),
+                format!("{verb} {}", draft.selected_folder),
+            )
+        };
+        let mut transfer = view()
+            .flex_1()
+            .max_w(px(460.0))
+            .flex_col()
+            .gap(px(6.0))
+            .child(active_line.tabular_nums())
+            .child(progress_bar(percent, 6.0, label));
+        if archive_progress.is_none()
+            && let Some(progress) = progress
+        {
+            transfer = transfer.child(text(progress.line()).text_color(p.fg).tabular_nums());
+        }
         progress_card = progress_card
             .child(
                 view()
@@ -2110,23 +2411,7 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                     .gap(px(10.0))
                     .py(px(4.0))
                     .child(icon(IconKind::Sync, 16.0, p.run))
-                    .child(
-                        view()
-                            .flex_1()
-                            .max_w(px(460.0))
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(active_line.tabular_nums())
-                            .child(progress_bar(
-                                if snap.is_demo_mode {
-                                    Some(f32::from(draft.first_sync_percent))
-                                } else {
-                                    None
-                                },
-                                6.0,
-                                format!("{verb} {}", draft.selected_folder),
-                            )),
-                    ),
+                    .child(transfer),
             )
             .child(check_row(IconKind::Dash, p.muted, "Check the result"))
             .child(check_row(IconKind::Dash, p.muted, finish_mode_pending));
@@ -2153,8 +2438,14 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             .first_sync_mapping_id
             .clone()
             .filter(|_| draft.changing_subfolders);
+        let held = changed_mapping
+            .as_ref()
+            .and_then(|id| snap.mapping(id))
+            .is_some_and(|mapping| mapping.filter_migration_held);
         footer_btns = footer_btns.child(app_button(
-            if changed_mapping.is_some() {
+            if held {
+                "Review recovery"
+            } else if changed_mapping.is_some() {
                 "Open mapping"
             } else {
                 "Back to Review"
@@ -2166,7 +2457,11 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             None,
             move || {
                 if let Some(id) = &changed_mapping {
-                    c_back_review.navigate(ScreenRoute::MappingDetail(id.clone()));
+                    if held {
+                        c_back_review.open_recovery(id.clone());
+                    } else {
+                        c_back_review.navigate(ScreenRoute::MappingDetail(id.clone()));
+                    }
                 } else {
                     c_back_review.send(UiCommand::WizardSetStep(WizardStep::Review));
                 }
@@ -2189,10 +2484,27 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             )
             .test_id("wizard-open-completed-mapping-btn"),
         );
+    } else if snap.is_demo_mode && archive_progress.is_some() {
+        footer_btns = footer_btns.child(
+            app_button(
+                "Finish archive (demo)",
+                BtnKind::Primary,
+                true,
+                false,
+                None,
+                None,
+                move || c_demo_finish.send(UiCommand::WizardCompleteDemoArchive),
+            )
+            .test_id("wizard-demo-complete-archive-btn"),
+        );
     } else if snap.is_demo_mode {
         footer_btns = footer_btns.child(
             app_button(
-                "Finish first sync (demo)",
+                if migration.is_some() {
+                    "Finish update (demo)"
+                } else {
+                    "Finish first sync (demo)"
+                },
                 BtnKind::Primary,
                 true,
                 false,
@@ -2206,18 +2518,26 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
 
     progress_card = progress_card.child(footer_btns);
 
+    let (title, close_line) = match migration {
+        Some(progress) if progress.restoring => (
+            "Put moved files back",
+            "You can close this window. The restore continues while FolderSync runs.",
+        ),
+        Some(_) => (
+            "Update subfolder selection",
+            "You can close this window. The update continues while FolderSync runs.",
+        ),
+        None => (
+            "First sync",
+            "You can close this window. The first sync continues while FolderSync runs.",
+        ),
+    };
     let mut header_row = view().flex_row().items_end().justify_between().child(
         view()
             .flex_col()
             .gap(px(3.0))
-            .child(page_title(format!(
-                "First sync · {}",
-                draft.selected_folder
-            )))
-            .child(
-                text("You can close this window. The first sync continues while FolderSync runs.")
-                    .text_color(p.muted),
-            ),
+            .child(page_title(format!("{title} · {}", draft.selected_folder)))
+            .child(text(close_line).text_color(p.muted)),
     );
 
     if !draft.first_sync_completed && draft.first_sync_error.is_none() {
@@ -2229,7 +2549,11 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
                 false,
                 stopping,
                 Some(IconKind::Stop),
-                stopping.then_some("Waiting for the active first sync to stop"),
+                stopping.then_some(if migration.is_some() {
+                    "Waiting for the subfolder update to stop"
+                } else {
+                    "Waiting for the active first sync to stop"
+                }),
                 move || c_stop.send(UiCommand::WizardStopFirstSync),
             )
             .test_id("wizard-stop-first-sync-btn"),
@@ -2242,6 +2566,38 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
         .gap(px(14.0))
         .child(header_row)
         .child(progress_card)
+}
+
+fn render_filter_migration_rows(progress: &FilterMigrationProgress, draft: &WizardDraft) -> View {
+    use FilterMigrationPhase::*;
+
+    let p = Palette::current();
+    let mut steps = Vec::new();
+    if progress.restoring {
+        steps.push((Restoring, "Restore moved files to Google Drive"));
+    } else {
+        steps.push((CatchUp, "Catch up with the current selection"));
+        steps.push((Checking, "Compare the folders with the new selection"));
+        if progress.moves_drive_files {
+            steps.push((MovingToRecovery, "Move excluded cloud files to Recovery"));
+        }
+        steps.push((Rebaseline, "Set up the new selection"));
+    }
+    steps.push((Verifying, "Check the result"));
+
+    let active = steps.iter().position(|(phase, _)| *phase == progress.phase);
+    let mut rows = card();
+    for (index, (_, label)) in steps.into_iter().enumerate() {
+        let row = if draft.first_sync_completed || active.is_some_and(|step| index < step) {
+            check_row(IconKind::Check, p.ok, label)
+        } else if active == Some(index) && draft.first_sync_error.is_none() {
+            check_row(IconKind::Sync, p.run, label)
+        } else {
+            check_row(IconKind::Dash, p.muted, label)
+        };
+        rows = rows.child(row);
+    }
+    rows
 }
 
 fn render_wizard_footer(
@@ -2312,6 +2668,8 @@ fn render_wizard_footer(
                 Some("Fix the failing recovery location checks first")
             } else if draft.download_exceeds_free_space() {
                 Some("Leave out more subfolders or choose another volume")
+            } else if !draft.archives_reviewed() {
+                Some("Resolve the archive checks first")
             } else if !draft.no_other_sync_confirmed {
                 Some("Confirm the checkbox first")
             } else {
@@ -2319,7 +2677,11 @@ fn render_wizard_footer(
             };
             row = row.child(
                 app_button(
-                    "Start first sync",
+                    if draft.selected_archives().next().is_some() {
+                        "Create archives and start first sync"
+                    } else {
+                        "Start first sync"
+                    },
                     BtnKind::Primary,
                     false,
                     !can_start,

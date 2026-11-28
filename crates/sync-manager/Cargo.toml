@@ -11,6 +11,7 @@ keychain-test-helper = []
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+crc32fast = "1"
 directories = "6"
 libc = "0.2"
 notify = "8.2"
@@ -22,6 +23,7 @@ sync-core = { path = "../sync-core" }
 tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 sha2 = "0.10"

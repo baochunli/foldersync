@@ -120,6 +120,12 @@ them to Git.
 
    If both folders contain files, use a new empty destination and keep both
    existing copies while you decide which files to sync.
+
+   In **Choose what to include**, check **Suggested: build and cache folders**.
+   FolderSync pre-excludes matching directories it finds at any depth, such
+   as `build/` or `.venv/`. Choose **Remove** to include a listed folder type
+   or **Remove all suggested** to include them all. **Review** shows the
+   count and size after exclusions.
 5. In **Recovery copies**, review both paths. The default local path is
    `FolderSyncRecovery/<local-folder-name>` in the mapped folder's parent.
    You can choose a different local recovery folder outside every synced
@@ -127,10 +133,14 @@ them to Git.
    parent.
 6. In **Review**, check the direction shown and confirm that no other sync
    app manages the local folder. Choose **Start first sync** when the
-   checks pass. FolderSync starts checking the mapping automatically after it
-   verifies the first sync. The default deletion limit stops a run that
-   would delete more than 10% of tracked files. Check both folders and your
-   backup if a run stops.
+   checks pass. Keep the destination folder unchanged until the first sync
+   finishes. If it stops, choose **Resume first sync** on the mapping to check
+   and continue from the files already copied. The first-sync screen shows
+   elapsed time, transferred bytes and files, and progress across the whole
+   first sync, including files already present. FolderSync starts checking the
+   mapping automatically after it verifies the first sync. The default
+   deletion limit stops a run that would delete more than 10% of tracked
+   files. Check both folders and your backup if a run stops.
 7. In macOS **System Settings → General → Login Items & Extensions**, scroll
    to **Extensions** and turn on FolderSync's Finder extension. Recent macOS
    versions list it under **File Providers** as **FolderSync**, not under

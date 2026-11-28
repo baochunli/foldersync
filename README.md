@@ -95,6 +95,9 @@ and its [OFL-1.1 license](apps/sync-ui/assets/fonts/OFL.txt).
 Overview paths use a single line with a middle ellipsis when space is tight.
 The full path remains available in the accessibility label and mapping detail.
 Automatic scheduling starts after FolderSync verifies a mapping’s first sync.
+If it stops partway through, **Resume first sync** checks the files already
+copied and continues with the original folder selection. Keep the destination
+folder unchanged while the first sync is running.
 Choose its polling interval in the mapping’s **Schedule** section. Pause
 scheduling in the sidebar or menu bar. **Sync now** requests an on-demand run
 while scheduling is paused.
@@ -103,9 +106,10 @@ estimated next check or retry when one is scheduled. Local changes can prompt
 an earlier check.
 
 Overview and Mapping Detail show reported disk capacity and filesystem.
-Use **Change subfolders…** to review a replacement selection and its first-sync
-checks. Applying the change keeps the previous sync setup and leaves newly
-excluded local files in place.
+Use **Change subfolders…** to review a replacement selection. On an established
+mapping with files on both sides, you can add exclusions, including suggested
+build and cache folders. After catch-up, FolderSync moves matching Drive files
+to Recovery and keeps the copies on this Mac in place.
 
 Accounts supports browser sign-in, import from an explicitly chosen exported
 configuration, reconnect, and checking access to the shared parent folder.
@@ -119,6 +123,12 @@ create a new folder with an unused name. Select a folder to calculate its size
 and file count before choosing subfolder exclusions. FolderSync compares that
 estimate with free space on known volumes and checks the chosen destination
 again during setup. Review the first sync before starting it.
+
+The wizard can suggest ZIPs for finished subfolders with at least 2,000
+included files and no included file changed in the past 12 months. Review
+which originals will move into the same disk’s **FolderSync Archived
+Originals** folder. Other Macs receive the same verified ZIPs through
+ordinary two-way sync. [Using FolderSync](docs/household-guide.md)
 
 ## Development
 

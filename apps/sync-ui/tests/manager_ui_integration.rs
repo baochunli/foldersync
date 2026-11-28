@@ -7,11 +7,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use nsh_app_sync_ui::{
-    contract::{ReviewScenario, RunPhase, ScreenRoute, UiCommand, UiSnapshot, WizardStep},
+    contract::{ReviewScenario, ScreenRoute, UiCommand, UiSnapshot, WizardStep},
     manager_source::{ManagerSource, ManagerSourceConfig, UiControlEvent},
     system_actions::{
         LaunchAtLoginOutcome, RecordedSystemAction, RecordingSystemActions, SystemActionOutcome,
@@ -116,7 +116,7 @@ fn setup_dirs(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, Path
     )
 }
 
-fn drive_wizard_init(
+fn configure_fixture_wizard(
     mgr: &ManagerSource,
     remote_parent: &Path,
     remote_folder: &Path,
@@ -140,8 +140,261 @@ fn drive_wizard_init(
     mgr.dispatch(UiCommand::WizardSetLocalRecoveryPath(
         local_recovery.to_string_lossy().into_owned(),
     ));
+}
+
+fn drive_wizard_init(
+    mgr: &ManagerSource,
+    remote_parent: &Path,
+    remote_folder: &Path,
+    local_folder: &Path,
+    local_recovery: &Path,
+) {
+    configure_fixture_wizard(
+        mgr,
+        remote_parent,
+        remote_folder,
+        local_folder,
+        local_recovery,
+    );
     mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
     mgr.dispatch(UiCommand::WizardStartFirstSync);
+}
+
+#[test]
+fn suggested_exclusions_stay_removed_when_reopening_a_saved_mapping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    for (folder, payload) in [("build", b"output"), ("Pods", b"vendor")] {
+        let dir = remote_folder.join("nested").join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file"), payload).unwrap();
+    }
+    let launcher = Arc::new(FakeBisyncLauncher::new());
+    launcher.push_script(FakeLaunchScript::default());
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        launcher,
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    configure_fixture_wizard(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let new = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.wizard.recovery_valid());
+    assert_eq!(
+        new.wizard.extra_exclusions(),
+        ["Pods/**".to_owned(), "build/**".to_owned()].into()
+    );
+
+    mgr.dispatch(UiCommand::WizardRemovePattern("build/**".to_owned()));
+    mgr.dispatch(UiCommand::WizardAddPattern("*.bak".to_owned()));
+    mgr.dispatch(UiCommand::WizardSaveDraft);
+    let saved = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.mappings.len() == 1);
+    let saved_mapping = &saved.mappings[0];
+    assert_eq!(saved_mapping.custom_exclusions, ["*.bak", "Pods/**"]);
+    let id = saved_mapping.id.clone();
+
+    for (command, step) in [
+        (UiCommand::ResumeDraft(id.clone()), WizardStep::Location),
+        (UiCommand::FinishSetup(id.clone()), WizardStep::Review),
+    ] {
+        mgr.dispatch(command);
+        let reopened = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.wizard.step == step);
+        assert_eq!(
+            reopened.wizard.custom_patterns, saved_mapping.custom_exclusions,
+            "{step:?}"
+        );
+        assert_eq!(reopened.wizard.cloud_file_count, Some(1), "{step:?}");
+        assert_eq!(reopened.wizard.cloud_total_bytes, Some(6), "{step:?}");
+    }
+
+    mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    mgr.dispatch(UiCommand::WizardStartFirstSync);
+    let ready = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.mapping(&id)
+            .is_some_and(|mapping| mapping.state.readiness() == Readiness::Ready)
+    });
+    assert_eq!(
+        ready.mapping(&id).unwrap().custom_exclusions,
+        saved_mapping.custom_exclusions
+    );
+    mgr.dispatch(UiCommand::ChangeSubfolders(id));
+    let changing = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.changing_subfolders
+    });
+    assert_eq!(
+        changing.wizard.custom_patterns,
+        saved_mapping.custom_exclusions
+    );
+    mgr.shutdown();
+}
+
+#[test]
+fn suggested_exclusions_reset_dismissals_when_choosing_another_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    let other_folder = remote_parent.join("Other");
+    for folder in [&remote_folder, &other_folder] {
+        let build = folder.join("source/build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("cache"), b"generated").unwrap();
+    }
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        Arc::new(FakeBisyncLauncher::new()),
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    configure_fixture_wizard(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let new = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.wizard.recovery_valid());
+    assert_eq!(new.wizard.custom_patterns, ["build/**"]);
+    mgr.dispatch(UiCommand::WizardRemovePattern("build/**".to_owned()));
+    mgr.dispatch(UiCommand::WizardAddPattern("*.bak".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetRemotePath(
+        remote_folder.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Folder));
+    let same = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.step == WizardStep::Folder
+    });
+    assert_eq!(same.wizard.custom_patterns, ["*.bak"]);
+    assert_eq!(same.wizard.cloud_total_bytes, Some(9));
+
+    mgr.dispatch(UiCommand::WizardSelectFolder("Other".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Location));
+    let other = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.selected_folder == "Other" && s.wizard.step == WizardStep::Location
+    });
+    assert_eq!(other.wizard.custom_patterns, ["*.bak", "build/**"]);
+    assert_eq!(other.wizard.cloud_total_bytes, Some(0));
+    mgr.shutdown();
+}
+
+#[test]
+fn new_mapping_applies_only_observed_suggestions_before_review_and_first_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    for (relative, len) in [
+        ("a/build/x.o", 100),
+        ("a/build/nested/build/another.o", 25),
+        ("b/Pods/dependency.a", 40),
+        ("c/.venv/pyvenv.cfg", 20),
+        ("notes/build", 3),
+        ("keep.txt", 10),
+    ] {
+        let path = remote_folder.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, vec![0; len]).unwrap();
+    }
+    let launcher = Arc::new(FakeBisyncLauncher::new());
+    launcher.push_script(FakeLaunchScript {
+        lines: vec![OutputLine {
+            stream: StreamKind::Stderr,
+            text: r#"{"level":"info","msg":"stats","stats":{"bytes":3,"totalBytes":4000,"transfers":1,"totalTransfers":600}}"#.to_owned(),
+            truncated: false,
+        }],
+        wait_for_stop: true,
+        exit_status_on_stop: Some(ExitStatusInfo { code: Some(130), signal: None }),
+        ..Default::default()
+    });
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        launcher,
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    drive_wizard_init(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.active_run
+            .as_ref()
+            .and_then(|run| run.transfer_progress())
+            .is_some()
+    });
+    let progress = snap
+        .active_run
+        .as_ref()
+        .unwrap()
+        .transfer_progress()
+        .unwrap();
+    assert_eq!(progress.percent(), Some(23));
+    assert_eq!(progress.expected_files, Some(2));
+    assert_eq!(progress.expected_bytes, Some(13));
+    assert_eq!(snap.wizard.cloud_file_count, Some(2));
+    assert_eq!(snap.wizard.cloud_total_bytes, Some(13));
+    assert_eq!(
+        snap.mappings[0].custom_exclusions,
+        [".venv/**", "Pods/**", "build/**"]
+    );
+    mgr.dispatch(UiCommand::WizardStopFirstSync);
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.active_run.is_none());
+    mgr.shutdown();
+}
+
+#[test]
+fn automatic_build_exclusion_updates_archive_eligibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    let finished = local_folder.join("Finished");
+    fs::create_dir_all(finished.join("project/build")).unwrap();
+    let old = fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_000));
+    for name in (0..1999)
+        .map(|i| format!("{i}.txt"))
+        .chain(["project/build/old.o".to_owned()])
+    {
+        let path = finished.join(name);
+        fs::write(&path, b"old").unwrap();
+        fs::File::open(path).unwrap().set_times(old).unwrap();
+    }
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        Arc::new(FakeBisyncLauncher::new()),
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    configure_fixture_wizard(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.local_file_count.is_some()
+    });
+    assert_eq!(snap.wizard.custom_patterns, ["build/**"]);
+    assert_eq!(snap.wizard.local_file_count, Some(1_999));
+    assert!(snap.wizard.archive_suggestions.is_empty());
+
+    mgr.dispatch(UiCommand::WizardRemovePattern("build/**".to_owned()));
+    let snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.custom_patterns.is_empty()
+    });
+    let [suggestion] = snap.wizard.archive_suggestions.as_slice() else {
+        panic!("expected one archive suggestion");
+    };
+    assert_eq!(suggestion.name, "Finished");
+    assert_eq!(suggestion.file_count, 2_000);
+    mgr.shutdown();
 }
 
 #[test]
@@ -727,7 +980,7 @@ fn channel_system_actions_live_transfer_progress_and_recovery_identity_checks() 
     let launcher = Arc::new(FakeBisyncLauncher::new());
     // Init succeeds
     launcher.push_script(FakeLaunchScript::default());
-    // Run 2 emits live rclone JSON stats while waiting for stop -> Activity must show TransferringKnown (HIGH #14)!
+    // Run 2 emits live stats with misleading queue totals while waiting for stop.
     launcher.push_script(FakeLaunchScript {
         lines: vec![OutputLine {
             stream: StreamKind::Stderr,
@@ -793,15 +1046,25 @@ fn channel_system_actions_live_transfer_progress_and_recovery_identity_checks() 
     assert!(ready.wizard.first_sync_markers_ready);
     let mid = ready.mappings[0].id.clone();
 
-    // Start Run 2 -> observe live RunPhase::TransferringKnown (50%) on Activity (HIGH #14)!
+    // Start Run 2 and observe transferred counts without a fabricated total.
     mgr.dispatch(UiCommand::SyncNow(mid.clone()));
     let transferring = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
-        matches!(
-            s.active_run.as_ref().map(|r| &r.phase),
-            Some(RunPhase::TransferringKnown { percent: 50, .. })
-        )
+        s.active_run
+            .as_ref()
+            .and_then(|run| run.transfer_progress())
+            .is_some()
     });
-    assert!(transferring.active_run.is_some());
+    let progress = transferring
+        .active_run
+        .as_ref()
+        .unwrap()
+        .transfer_progress()
+        .unwrap();
+    assert_eq!(progress.expected_files, None);
+    assert_eq!(progress.percent(), None);
+    assert_eq!(progress.bytes_transferred, 512);
+    assert_eq!(progress.files_transferred, 1);
+    assert!(progress.line().starts_with("512 B · 1 file so far"));
 
     // Stop Run 2 -> Interrupted -> RecoveryRequired -> InspectRecovery verifies real identities (HIGH #9)!
     mgr.dispatch(UiCommand::StopRun(mid.clone()));

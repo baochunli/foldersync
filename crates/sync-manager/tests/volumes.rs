@@ -145,6 +145,7 @@ struct FakeVolumeProbe {
     original: PathBuf,
     renamed: PathBuf,
     stall: Mutex<Option<StalledProbe>>,
+    stall_watcher: Mutex<Option<StalledProbe>>,
     recovery: PathBuf,
     recovery_low: AtomicBool,
 }
@@ -179,6 +180,15 @@ impl FakeVolumeProbe {
 
 impl VolumeProbe for FakeVolumeProbe {
     fn probe(&self, path: &Path) -> io::Result<MountedVolume> {
+        if path.starts_with(&self.original)
+            && std::thread::current().name() == Some("foldersync-volumes")
+        {
+            let stall = self.stall_watcher.lock().unwrap().take();
+            if let Some((entered, release)) = stall {
+                entered.send(()).unwrap();
+                let _ = release.recv_timeout(Duration::from_secs(120));
+            }
+        }
         let mount = *self.mount.lock().unwrap();
         if path == self.recovery && self.recovery_low.load(Ordering::Relaxed) {
             return Ok(self.volume(Mount::LowSpace));
@@ -217,11 +227,21 @@ fn open_with_fixture_disk_config(
     fixture: &Fixture,
     config: ManagerConfig,
 ) -> (SyncManager, Arc<FakeVolumeProbe>) {
+    let (manager, probe, command) = prepare_fixture_disk(fixture, config);
+    fixture.initialize(&manager, command);
+    (manager, probe)
+}
+
+fn prepare_fixture_disk(
+    fixture: &Fixture,
+    config: ManagerConfig,
+) -> (SyncManager, Arc<FakeVolumeProbe>, AddMappingCommand) {
     let probe = Arc::new(FakeVolumeProbe {
         mount: Mutex::new(Mount::Connected),
         original: fixture.path("WorkSSD"),
         renamed: fixture.path("RenamedSSD"),
         stall: Mutex::new(None),
+        stall_watcher: Mutex::new(None),
         recovery: fixture.path("recovery"),
         recovery_low: AtomicBool::new(false),
     });
@@ -243,8 +263,7 @@ fn open_with_fixture_disk_config(
         relative_dir: PathBuf::from("notes"),
     };
     let manager = SyncManager::open_with_volume_probe(config, probe.clone()).unwrap();
-    fixture.initialize(&manager, command);
-    (manager, probe)
+    (manager, probe, command)
 }
 
 fn wait_for_snapshot(
@@ -403,6 +422,61 @@ fn watcher_stops_active_child_once_and_preserves_recovery_even_on_exit_zero() {
     let snapshot = wait_for_snapshot(&manager, |s| s.mappings[0].volume_space.is_some());
     assert_eq!(snapshot.mappings[0].readiness, Readiness::RecoveryRequired);
     assert!(manager.run_now("notes").is_err());
+}
+
+#[test]
+fn verified_resume_clears_a_first_sync_volume_loss_before_the_next_poll() {
+    if rclone_adapter::pinned_binary_path().is_none() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let (manager, probe, command) = prepare_fixture_disk(&fixture, fixture.config());
+    manager
+        .register_local_fixture_account("local", "Local fixture")
+        .unwrap();
+    manager.add_mapping(command).unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    fixture.launcher.push_script(FakeLaunchScript {
+        wait_for_stop: true,
+        on_wait: Some(Arc::new(move || started_tx.send(()).unwrap())),
+        ..Default::default()
+    });
+    manager
+        .initialize(InitializeCommand {
+            mapping_id: MappingId::new("notes"),
+            expected_direction: None,
+        })
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    probe.set(Mount::Missing);
+    let stopped = manager.wait_until_idle(Duration::from_secs(12)).unwrap();
+    assert!(!stopped.mappings[0].scheduling_enabled);
+    assert!(
+        stopped.mappings[0]
+            .stopped_first_sync
+            .as_ref()
+            .and_then(|stopped| stopped.cause.as_deref())
+            .is_some_and(|cause| cause.contains("disk disconnected"))
+    );
+
+    // Keep the watcher from clearing the gate. The resume worker can see the
+    // reconnected disk and must publish Ready as part of its own commit.
+    let (watcher_tx, watcher_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *probe.stall_watcher.lock().unwrap() = Some((watcher_tx, release_rx));
+    watcher_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+    probe.set(Mount::Connected);
+    fixture.launcher.push_script(FakeLaunchScript::default());
+    manager.resume_first_sync("notes").unwrap();
+    let finished = manager.wait_until_idle(Duration::from_secs(90));
+    drop(release_tx);
+    let finished = finished.unwrap();
+    let mapping = &finished.mappings[0];
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert!(mapping.scheduling_enabled);
+    assert!(mapping.active_generation_id.is_some());
+    assert_eq!(fixture.launcher.launched_plans().len(), 2);
 }
 
 #[test]
@@ -608,7 +682,9 @@ fn space_only_updates_notify_ui_without_rewriting_finder_status() {
 fn filter_migration_rechecks_inventory_and_holds_when_both_sides_have_data() {
     let fixture = Fixture::new();
     let manager = SyncManager::open(fixture.config()).unwrap();
-    fixture.initialize(&manager, fixture.command());
+    let mut command = fixture.command();
+    command.extra_exclusions.insert("legacy/**".to_owned());
+    fixture.initialize(&manager, command);
     let id = MappingId::new("notes");
     let old = manager.snapshot().mappings[0]
         .active_generation_id

@@ -1,6 +1,9 @@
 //! Durable SQLite state store with forward-only `schema_migrations` and the §6 entities.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use chrono::{SecondsFormat, Utc};
 use rclone_adapter::ProcessStartTime;
@@ -18,7 +21,7 @@ use crate::{
 };
 
 /// Current highest SQLite schema migration version supported by this build.
-pub const LATEST_SCHEMA_VERSION: i64 = 3;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 struct Migration {
     version: i64,
@@ -177,6 +180,19 @@ WHERE EXISTS (
 );
 "#,
     },
+    Migration {
+        version: 4,
+        name: "confirmed_first_sync_archives",
+        sql: "ALTER TABLE mappings ADD COLUMN archive_folders_json TEXT NOT NULL DEFAULT '[]';",
+    },
+    Migration {
+        version: 5,
+        name: "first_sync_progress",
+        sql: r#"
+ALTER TABLE runs ADD COLUMN first_sync_total_files INTEGER;
+ALTER TABLE runs ADD COLUMN files_already_present INTEGER NOT NULL DEFAULT 0;
+"#,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +231,8 @@ pub struct MappingRecord {
     pub state: MappingState,
     pub active_generation_id: Option<GenerationId>,
     pub exclusions: Vec<String>,
+    #[serde(default)]
+    pub archive_folders: BTreeSet<String>,
     pub max_delete_percent: u8,
     pub last_run_id: Option<RunId>,
     pub last_run_outcome: Option<RunOutcome>,
@@ -269,6 +287,10 @@ pub struct RunRecord {
     pub last_verified_phase: String,
     pub files_checked: u64,
     pub files_transferred: u64,
+    #[serde(default)]
+    pub first_sync_total_files: Option<u64>,
+    #[serde(default)]
+    pub files_already_present: u64,
     pub bytes_transferred: u64,
     pub conflict_count: u64,
 }
@@ -717,6 +739,8 @@ impl SqliteStateStore {
             .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
         let exclusions_json = serde_json::to_string(&m.exclusions)
             .map_err(|e| storage_err("Failed to serialize exclusions", e))?;
+        let archive_folders_json = serde_json::to_string(&m.archive_folders)
+            .map_err(|e| storage_err("Failed to serialize confirmed archives", e))?;
         let last_outcome_json = m
             .last_run_outcome
             .map(|o| serde_json::to_string(&o))
@@ -736,10 +760,10 @@ impl SqliteStateStore {
                     active_generation_id, exclusions_json, max_delete_percent,
                     last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
                     unreviewed_conflict_run_id,
-                    created_at, updated_at
+                    created_at, updated_at, archive_folders_json
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
                 )",
                 params![
                     m.id.as_str(),
@@ -772,6 +796,7 @@ impl SqliteStateStore {
                     m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                     m.created_at,
                     m.updated_at,
+                    archive_folders_json,
                 ],
             )
             .map_err(|e| storage_err("Failed to insert mapping record", e))?;
@@ -785,6 +810,8 @@ impl SqliteStateStore {
             .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
         let exclusions_json = serde_json::to_string(&m.exclusions)
             .map_err(|e| storage_err("Failed to serialize exclusions", e))?;
+        let archive_folders_json = serde_json::to_string(&m.archive_folders)
+            .map_err(|e| storage_err("Failed to serialize confirmed archives", e))?;
         self.conn
             .execute(
                 "UPDATE mappings SET
@@ -807,7 +834,8 @@ impl SqliteStateStore {
                     execution = ?18,
                     exclusions_json = ?19,
                     max_delete_percent = ?20,
-                    updated_at = ?21
+                    updated_at = ?21,
+                    archive_folders_json = ?22
                  WHERE id = ?1",
                 params![
                     m.id.as_str(),
@@ -831,6 +859,7 @@ impl SqliteStateStore {
                     exclusions_json,
                     i64::from(m.max_delete_percent),
                     m.updated_at,
+                    archive_folders_json,
                 ],
             )
             .map_err(|e| storage_err("Failed to update draft mapping record", e))?;
@@ -872,7 +901,8 @@ impl SqliteStateStore {
                     child_pid, child_start_time_kind, child_start_time_value, child_executable,
                     engine_version, engine_sha256, engine_platform,
                     exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                    last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                    last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
              FROM runs WHERE generation_id = ?1 AND finished_at IS NOT NULL
                AND (child_pid IS NOT NULL OR last_verified_phase IN
                     ('pre_spawn_endpoint_check_failed', 'aborted_pre_spawn'))
@@ -1013,6 +1043,10 @@ impl SqliteStateStore {
             .as_deref()
             .and_then(|s| serde_json::from_str::<RunOutcome>(s).ok());
 
+        let archives_json: String = row.get(30)?;
+        let archive_folders = serde_json::from_str(&archives_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(30, rusqlite::types::Type::Text, Box::new(e))
+        })?;
         Ok(MappingRecord {
             id: MappingId::new(row.get::<_, String>(0)?),
             device_id: DeviceId::new(row.get::<_, String>(1)?),
@@ -1039,6 +1073,7 @@ impl SqliteStateStore {
             state,
             active_generation_id: row.get::<_, Option<String>>(20)?.map(GenerationId::new),
             exclusions,
+            archive_folders,
             max_delete_percent: row.get::<_, i64>(22)? as u8,
             last_run_id: row.get::<_, Option<String>>(23)?.map(RunId::new),
             last_run_outcome,
@@ -1066,7 +1101,7 @@ impl SqliteStateStore {
                         active_generation_id, exclusions_json, max_delete_percent,
                         last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
                         unreviewed_conflict_run_id,
-                        created_at, updated_at
+                        created_at, updated_at, archive_folders_json
                  FROM mappings WHERE id = ?1",
                 params![mapping_id.as_str()],
                 Self::map_mapping_row,
@@ -1089,7 +1124,7 @@ impl SqliteStateStore {
                         active_generation_id, exclusions_json, max_delete_percent,
                         last_run_id, last_run_outcome, last_run_completed_at, last_run_summary_text,
                         unreviewed_conflict_run_id,
-                        created_at, updated_at
+                        created_at, updated_at, archive_folders_json
                  FROM mappings ORDER BY created_at ASC, id ASC",
             )
             .map_err(|e| storage_err("Failed to prepare list_mappings", e))?;
@@ -1186,11 +1221,12 @@ impl SqliteStateStore {
                     child_pid, child_start_time_kind, child_start_time_value, child_executable,
                     engine_version, engine_sha256, engine_platform,
                     exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                    last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                    last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                    ?25, ?26, ?27, ?28, ?29
+                    ?25, ?26, ?27, ?28, ?29, ?30, ?31
                 )",
                 params![
                     run.id.as_str(),
@@ -1224,6 +1260,8 @@ impl SqliteStateStore {
                     run.files_transferred as i64,
                     run.bytes_transferred as i64,
                     run.conflict_count as i64,
+                    run.first_sync_total_files.map(|n| n as i64),
+                    run.files_already_present as i64,
                 ],
             )
             .map_err(|e| storage_err("Failed to persist run-start row", e))?;
@@ -1262,6 +1300,14 @@ impl SqliteStateStore {
                 ],
             )
             .map_err(|e| storage_err("Failed to record child identity on run row", e))?;
+        Ok(())
+    }
+
+    pub(crate) fn update_first_sync_progress(&self, run: &RunRecord) -> Result<(), ManagerError> {
+        self.conn.execute(
+            "UPDATE runs SET first_sync_total_files = ?2, files_already_present = ?3 WHERE id = ?1",
+            params![run.id.as_str(), run.first_sync_total_files.map(|n| n as i64), run.files_already_present as i64],
+        ).map_err(|err| storage_err("Failed to record first-sync progress", err))?;
         Ok(())
     }
 
@@ -1339,6 +1385,8 @@ impl SqliteStateStore {
             files_transferred: row.get::<_, i64>(26)? as u64,
             bytes_transferred: row.get::<_, i64>(27)? as u64,
             conflict_count: row.get::<_, i64>(28)? as u64,
+            first_sync_total_files: row.get::<_, Option<i64>>(29)?.map(|n| n as u64),
+            files_already_present: row.get::<_, i64>(30)? as u64,
         })
     }
 
@@ -1350,7 +1398,8 @@ impl SqliteStateStore {
                         child_pid, child_start_time_kind, child_start_time_value, child_executable,
                         engine_version, engine_sha256, engine_platform,
                         exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
                  FROM runs WHERE id = ?1",
                 params![run_id.as_str()],
                 Self::map_run_row,
@@ -1368,7 +1417,8 @@ impl SqliteStateStore {
                         child_pid, child_start_time_kind, child_start_time_value, child_executable,
                         engine_version, engine_sha256, engine_platform,
                         exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
                  FROM runs WHERE status IN ('starting', 'running') ORDER BY started_at ASC",
             )
             .map_err(|e| storage_err("Failed to query unfinished runs", e))?;
@@ -1388,7 +1438,8 @@ impl SqliteStateStore {
                         child_pid, child_start_time_kind, child_start_time_value, child_executable,
                         engine_version, engine_sha256, engine_platform,
                         exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
                  FROM runs WHERE status NOT IN ('starting', 'running') ORDER BY started_at DESC",
             )
             .map_err(|e| storage_err("Failed to query terminal runs", e))?;
@@ -1411,7 +1462,8 @@ impl SqliteStateStore {
                         child_pid, child_start_time_kind, child_start_time_value, child_executable,
                         engine_version, engine_sha256, engine_platform,
                         exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
                  FROM runs WHERE mapping_id = ?1 ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|e| storage_err("Failed to query runs for mapping", e))?;
@@ -1436,7 +1488,8 @@ impl SqliteStateStore {
                         child_pid, child_start_time_kind, child_start_time_value, child_executable,
                         engine_version, engine_sha256, engine_platform,
                         exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
                  FROM runs WHERE mapping_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2",
             )
             .map_err(|e| storage_err("Failed to query recent runs for mapping", e))?;
@@ -1462,7 +1515,8 @@ impl SqliteStateStore {
                         child_pid, child_start_time_kind, child_start_time_value, child_executable,
                         engine_version, engine_sha256, engine_platform,
                         exit_code, exit_signal, outcome_kind, outcome_detail, conflict_paths_json,
-                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count
+                        last_verified_phase, files_checked, files_transferred, bytes_transferred, conflict_count,
+                        first_sync_total_files, files_already_present
                  FROM runs WHERE mapping_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
                 params![mapping_id.as_str()],
                 Self::map_run_row,
@@ -1596,7 +1650,9 @@ impl SqliteStateStore {
                 files_checked = ?10,
                 files_transferred = ?11,
                 bytes_transferred = ?12,
-                conflict_count = ?13
+                conflict_count = ?13,
+                first_sync_total_files = ?14,
+                files_already_present = ?15
              WHERE id = ?1",
             params![
                 run.id.as_str(),
@@ -1612,6 +1668,8 @@ impl SqliteStateStore {
                 run.files_transferred as i64,
                 run.bytes_transferred as i64,
                 run.conflict_count as i64,
+                run.first_sync_total_files.map(|n| n as i64),
+                run.files_already_present as i64,
             ],
         )
         .map_err(|e| storage_err("Failed to update finished run row in transaction", e))?;
@@ -1656,6 +1714,27 @@ impl SqliteStateStore {
                 ],
             )
             .map_err(|e| storage_err("Failed to update mapping state in transaction", e))?;
+        }
+
+        if mapping.is_some_and(|m| m.active_generation_id.as_ref() == Some(&run.generation_id))
+            && run.mode.starts_with("init_path")
+            && run.outcome_kind.as_deref() == Some("success")
+        {
+            tx.execute(
+                "UPDATE recovery_cases
+                 SET status = 'resolved', resolved_at = ?3,
+                     resolution_note = 'First sync completed and verified.'
+                 WHERE mapping_id = ?1 AND status = 'open' AND run_id IN
+                    (SELECT id FROM runs WHERE mapping_id = ?1 AND generation_id = ?2)",
+                params![
+                    run.mapping_id.as_str(),
+                    run.generation_id.as_str(),
+                    run.finished_at
+                ],
+            )
+            .map_err(|err| {
+                storage_err("Failed to resolve verified first-sync recovery cases", err)
+            })?;
         }
 
         if let Some(case) = recovery_case {
@@ -1796,6 +1875,8 @@ impl SqliteStateStore {
         resolved_at: &str,
         resolution_note: &str,
     ) -> Result<(), ManagerError> {
+        let exclusions_json = serde_json::to_string(&m.exclusions)
+            .map_err(|e| storage_err("Failed to serialize exclusions", e))?;
         let state_json = serde_json::to_string(&m.state)
             .map_err(|e| storage_err("Failed to serialize MappingState", e))?;
         let last_outcome_json = m
@@ -1829,7 +1910,8 @@ impl SqliteStateStore {
                 last_run_completed_at = ?10,
                 last_run_summary_text = ?11,
                 unreviewed_conflict_run_id = ?12,
-                updated_at = ?13
+                updated_at = ?13,
+                exclusions_json = ?14
              WHERE id = ?1",
             params![
                 m.id.as_str(),
@@ -1845,6 +1927,7 @@ impl SqliteStateStore {
                 m.last_run_summary_text,
                 m.unreviewed_conflict_run_id.as_ref().map(|r| r.as_str()),
                 m.updated_at,
+                exclusions_json,
             ],
         )
         .map_err(|e| storage_err("Failed to update mapping state after recovery", e))?;
@@ -1935,6 +2018,7 @@ mod tests {
             state: MappingState::new(Readiness::Ready, Execution::Running, Intent::Enabled),
             active_generation_id: None,
             exclusions: vec![],
+            archive_folders: BTreeSet::new(),
             max_delete_percent: 10,
             last_run_id: None,
             last_run_outcome: None,
@@ -2000,6 +2084,8 @@ mod tests {
             last_verified_phase: "spawned".to_string(),
             files_checked: 0,
             files_transferred: 0,
+            first_sync_total_files: None,
+            files_already_present: 0,
             bytes_transferred: 0,
             conflict_count: 0,
         };

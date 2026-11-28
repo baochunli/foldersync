@@ -544,11 +544,24 @@ fn mapping_row(
     }
 
     if m.state.execution == Execution::Running {
-        col_status = col_status.child(view().max_w(px(220.0)).pt(px(2.0)).child(progress_bar(
-            None,
-            4.0,
-            format!("Scanning {}", m.display_name),
-        )));
+        let progress = snap
+            .active_run
+            .as_ref()
+            .filter(|run| run.mapping_id == m.id)
+            .and_then(|run| run.transfer_progress());
+        col_status = col_status.child(
+            view().max_w(px(220.0)).pt(px(2.0)).child(progress_bar(
+                progress
+                    .and_then(|progress| progress.percent())
+                    .map(f32::from),
+                4.0,
+                if progress.is_some() {
+                    format!("Transferring {}", m.display_name)
+                } else {
+                    format!("Scanning {}", m.display_name)
+                },
+            )),
+        );
     }
 
     // Column 3: last completed timestamp
@@ -585,7 +598,16 @@ fn mapping_row(
         .justify_end()
         .gap(px(6.0));
 
-    if pres.is_draft {
+    if matches!(
+        m.modifier,
+        crate::contract::StatusModifier::StoppedFirstSync(_)
+    ) {
+        col_actions = col_actions.child(super::stopped_first_sync_actions(
+            &ctrl,
+            &m.id,
+            &m.display_name,
+        ));
+    } else if pres.is_draft {
         let ctrl_cont = ctrl.clone();
         let ctrl_disc = ctrl.clone();
         let id_cont = m.id.clone();

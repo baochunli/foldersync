@@ -10,7 +10,7 @@ Local-to-local fixtures verify orchestration, state persistence, multi-client re
 
 Verified locally on macOS `arm64` (`osx-arm64`) inside fresh temporary directories with throwaway empty `--config` files, cleared environments, external truth sets, SHA-256 verification, and second-cycle checks:
 
-- Pinned binary SHA-256 + isolated `version` probe qualification, plus launch-boundary re-hashing refusing a binary replaced after qualification.
+- Pinned binary SHA-256 + isolated `version` probe qualification, plus a launch-boundary digest check that refuses a binary replaced after qualification.
 - Parent environment isolation (`RCLONE_FORCE=true` and `RCLONE_RESYNC=true` cannot bypass `--max-delete` or trigger resync).
 - Initialization with `--resync-mode path1` and `--resync-mode path2`.
 - Bidirectional add, edit, and delete propagation with `--backup-dir1` and `--backup-dir2` verified by SHA-256.

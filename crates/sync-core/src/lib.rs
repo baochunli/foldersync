@@ -7,6 +7,7 @@
 
 #![deny(missing_docs)]
 
+pub mod archive;
 pub mod generation;
 pub mod model;
 pub mod policy;
@@ -25,8 +26,8 @@ pub use policy::{
     ACCESS_MARKER_FILENAME, ACCESS_MARKER_HEADER, AccessMarker, AccessMarkerError, ComparePolicy,
     ConflictLoserNaming, ConflictPolicy, ConflictResolution, DEFAULT_EXCLUSIONS,
     DEFAULT_MAX_DELETE_PERCENT, DefaultExclusion, MaxDeletePercent, RecoveryPolicy,
-    SUPPORTED_FILE_POLICY_TABLE, SupportDisposition, SupportedFilePolicyEntry, SupportedItemKind,
-    SupportedTypesPolicy, default_exclusion_patterns,
+    SUGGESTED_EXCLUSIONS, SUPPORTED_FILE_POLICY_TABLE, SupportDisposition,
+    SupportedFilePolicyEntry, SupportedItemKind, SupportedTypesPolicy, default_exclusion_patterns,
 };
 pub use state::{
     AvailableAction, Execution, Intent, LastRunSummary, MappingState, ObservedEvent,

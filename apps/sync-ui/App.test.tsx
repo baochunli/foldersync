@@ -4,6 +4,27 @@ import { expect, open, test } from "nsh/test";
 
 const DESKTOP = { width: 1120, height: 760, platform: "macos" as const };
 
+test("Stopped first sync shows copied files and can resume", async () => {
+  const app = await open(".", DESKTOP);
+  expect(app.texts().join("\n")).toContain("First sync stopped · 3 of 8 files copied");
+  expect(app.shows("id:remove-stopped-first-sync-notes-stopped")).toBe(true);
+
+  await app.press("id:open-detail-research");
+  await app.press("id:detail-step-state-btn");
+  await app.press("id:detail-step-state-btn");
+  await app.press("id:nav-overview");
+
+  await app.press("id:resume-first-sync-notes-stopped");
+  expect(app.texts()).toContain("First sync · Recipes");
+  expect(app.texts().join("\n")).not.toContain("First sync stopped · 3 of 8 files copied");
+  expect(app.texts().join("\n")).toContain("3 of 8 files copied");
+  await app.press("id:wizard-stop-first-sync-btn");
+  expect(app.texts().join("\n")).toContain("First sync stopped · 3 of 8 files copied");
+  await app.press("id:resume-first-sync-notes-stopped");
+  await app.press("id:wizard-demo-complete-first-sync-btn");
+  expect(app.texts()).toContain("Checked the result");
+});
+
 async function startDemoSignIn(app: Awaited<ReturnType<typeof open>>) {
   await app.press("id:accounts-connect-btn");
   await app.type("id:accounts-account-id", "work-2");
@@ -127,6 +148,7 @@ test("Add-mapping review blocks both-populated with no Start first sync button",
   await pickDemoFolder(app);
   await app.press("id:wizard-step-6");
   expect(app.texts()).toContain("Review “Projects”");
+  expect(app.texts().join("\n")).toContain("Keep the destination folder unchanged until the first sync finishes.");
   expect(app.shows("id:wizard-start-first-sync-btn")).toBe(true);
   expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
 
@@ -140,6 +162,58 @@ test("Add-mapping review blocks both-populated with no Start first sync button",
   expect(joined).toContain("Both sides already contain files");
   expect(joined).toContain("Choose another folder…");
   expect(app.shows("id:wizard-start-first-sync-btn")).toBe(false);
+});
+
+test("Archive suggestions are selected individually and listed on Review", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-6");
+  await app.press("id:review-variant-upload");
+  await app.press("id:wizard-step-4");
+
+  expect(app.shows("id:wizard-archive-Field-Data")).toBe(true);
+  expect(app.shows("id:wizard-archive-Reports")).toBe(true);
+  const choices = app.texts().join("\n");
+  expect(choices).toContain("Upload as one archive");
+  expect(choices).toContain("4,000 files · 9.8 GB");
+  expect(choices).toContain("Time saved");
+  expect(choices).toContain("Last change");
+
+  await app.press("id:wizard-archive-Reports");
+  await app.press("id:wizard-step-6");
+  const review = app.texts().join("\n");
+  expect(review).toContain("Upload as archives");
+  expect(review).toContain("Field-Data.zip");
+  expect(review).not.toContain("Reports.zip");
+  expect(review).toContain("4,000 files · 9.8 GB");
+  expect(review).toContain("Each folder is replaced by one .zip in this folder and in Google Drive, so every Mac gets the same .zip.");
+  expect(review).toContain("The original folder is moved to /Volumes/WorkSSD/FolderSync Archived Originals/Projects; delete it there when you no longer need it.");
+  expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
+});
+
+test("Demo creates archives before first sync and lists the originals afterward", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-6");
+  await app.press("id:review-variant-upload");
+  await app.press("id:wizard-step-4");
+  expect(app.shows("id:remove-pattern-build/**")).toBe(true);
+  await app.press("id:wizard-archive-Reports");
+  await app.press("id:wizard-step-6");
+  await app.press("id:wizard-no-other-sync-checkbox");
+  await app.press("id:wizard-start-first-sync-btn");
+  expect(app.texts().join("\n")).toContain("Creating archive Field-Data · 2.5 of 9.8 GB");
+  expect(app.texts().join("\n")).not.toContain("Uploading to the cloud");
+  await app.press("id:wizard-demo-complete-archive-btn");
+  expect(app.texts().join("\n")).toContain("Uploading to the cloud");
+  expect(app.texts().join("\n")).toContain("225 of 2,893 files");
+  await app.press("id:wizard-demo-complete-first-sync-btn");
+  await app.press("id:wizard-open-completed-mapping-btn");
+  expect(app.texts().join("\n")).toContain("Archived originals");
+  expect(app.texts().join("\n")).toContain("Field-Data · 12.1 GB");
+  expect(app.shows("id:reveal-archive-original-Field-Data")).toBe(true);
 });
 
 test("Interactive Pause/Resume, Scheduling hold banner, and window close keep-alive work", async () => {
@@ -190,7 +264,7 @@ test("Mapping schedule, volume, and subfolder change review; Activity raw log to
   await app.press("id:filter-change-consent");
   expect(app.enabled("id:filter-change-confirm")).toBe(true);
   await app.press("id:filter-change-confirm");
-  expect(app.texts().join("\n")).toContain("First sync");
+  expect(app.texts()).toContain("Update subfolder selection · Family");
   expect(detailText).toContain("Sync now");
 
   // Activity screen: indeterminate scanning + elapsed time, raw log closed by default
@@ -202,6 +276,30 @@ test("Mapping schedule, volume, and subfolder change review; Activity raw log to
 
   await app.press("id:activity-raw-log-toggle");
   expect(app.shows("id:activity-raw-log-body")).toBe(true);
+});
+
+test("Suggested exclusions can be reviewed before updating an established mapping", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:open-detail-family");
+  await app.press("id:change-subfolders-btn");
+  await app.type("id:wizard-pattern-input", "build/**");
+  await app.press("id:wizard-add-pattern-btn");
+  await app.press("id:add-suggested-exclusions");
+  expect(app.texts().filter((label) => label === "build/**").length).toBe(1);
+  expect(app.enabled("id:add-suggested-exclusions")).toBe(false);
+  await app.press("id:filter-change-preview");
+  expect(app.texts()).toContain("New exclusions");
+  expect(app.texts()).toContain("0 files · 0 B");
+  expect(app.texts().join("\n")).toContain("copies in Google Drive move to the Recovery folder");
+  expect(app.enabled("id:filter-change-confirm")).toBe(false);
+  await app.press("id:filter-change-consent");
+  expect(app.enabled("id:filter-change-confirm")).toBe(true);
+  await app.press("id:filter-change-confirm");
+  expect(app.texts()).toContain("Update subfolder selection · Family");
+  expect(app.texts()).toContain("Catch up with the current selection");
+  expect(app.texts()).toContain("Move excluded cloud files to Recovery");
+  expect(app.texts()).toContain("Set up the new selection");
+  expect(app.shows("id:wizard-stop-first-sync-btn")).toBe(true);
 });
 
 test("Custom exclusions can be removed individually from a new mapping", async () => {
@@ -224,6 +322,78 @@ test("Custom exclusions can be removed individually from a new mapping", async (
   await app.press("id:wizard-default-exclusions-toggle");
   expect(app.texts()).toContain(".DS_Store");
   expect(app.shows("id:remove-pattern-.DS_Store")).toBe(false);
+});
+
+test("Suggested exclusions show measured folders and can be removed individually or together", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+
+  await app.press("id:subfolder-renders");
+  expect(app.texts().join("\n")).toContain("Suggested: build and cache folders");
+  expect(app.texts().join("\n")).toContain("28 folders, 608 files, 2.3 GB");
+  expect(app.texts()).toContain("1 folder, 1 file, 100.0 MB");
+  expect(app.texts()).toContain("15.6 GB");
+  expect(app.shows("id:remove-pattern-Pods/**")).toBe(true);
+  expect(app.shows("id:remove-pattern-.venv/**")).toBe(true);
+  expect(app.shows("id:remove-pattern-.gradle/**")).toBe(false);
+
+  await app.press("id:remove-pattern-build/**");
+  expect(app.shows("id:remove-pattern-build/**")).toBe(false);
+  expect(app.shows("id:remove-pattern-Pods/**")).toBe(true);
+  expect(app.texts()).toContain("17.9 GB");
+  await app.type("id:wizard-pattern-input", "*.bak");
+  await app.press("id:wizard-add-pattern-btn");
+  await app.press("id:wizard-remove-all-suggested");
+  expect(app.shows("id:remove-pattern-Pods/**")).toBe(false);
+  expect(app.shows("id:remove-pattern-.venv/**")).toBe(false);
+  expect(app.texts()).toContain("18.6 GB");
+  expect(app.shows("id:remove-pattern-*.bak")).toBe(true);
+  expect(app.texts().join("\n")).not.toContain("Suggested: build and cache folders");
+});
+
+test("Suggested exclusions reset when the selected folder changes", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  await app.press("id:remove-pattern-build/**");
+  await app.press("id:wizard-step-2");
+  await app.press("id:wizard-folder-Projects");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  expect(app.shows("id:remove-pattern-build/**")).toBe(false);
+
+  await app.press("id:wizard-step-2");
+  await app.press("id:wizard-folder-Shared-Media");
+  await app.press("id:wizard-folder-Projects");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  expect(app.shows("id:remove-pattern-build/**")).toBe(true);
+});
+
+test("First-sync demo shows a long transfer with shared progress", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  await app.press("id:subfolder-renders");
+  await app.press("id:wizard-step-6");
+  expect(app.texts().join("\n")).toContain("15.6 GB");
+  await app.press("id:wizard-no-other-sync-checkbox");
+  await app.press("id:wizard-start-first-sync-btn");
+
+  const line = "2.8 GB of 15.6 GB · 131 of 1,690 files · about 1 day 14 h left";
+  expect(app.texts().join("\n")).toContain(line);
+  expect(app.texts().join("\n")).toContain("elapsed 189m 58s");
+  await app.press("id:nav-activity");
+  expect(app.texts().join("\n")).toContain(line);
+  expect(app.texts().join("\n")).toContain("17% · elapsed");
+  await app.press("id:nav-overview");
+  expect(app.texts().join("\n")).toContain(line);
+  await app.press("id:open-detail-projects");
+  expect(app.texts().join("\n")).toContain(line);
 });
 
 test("Removing an existing custom exclusion requires filter review and confirmation", async () => {
@@ -316,7 +486,7 @@ test("Activity Stop targets the displayed mapping, ⌘R targets only selected Ma
   await app.press("id:nav-activity");
   await app.press("id:activity-phase-known");
   expect(app.texts()).toContain("Research");
-  expect(app.texts().join("\n")).toContain("Transferring · 1.2 GB of 3.4 GB");
+  expect(app.texts().join("\n")).toContain("1.2 GB of 3.4 GB · 112 of 410 files");
 
   // Stopping from Activity stops Research (the displayed mapping), transitioning to Stopping + Force stop…
   await app.press("id:activity-stop-btn");

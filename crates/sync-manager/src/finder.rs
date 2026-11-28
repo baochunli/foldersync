@@ -150,6 +150,17 @@ pub fn derive_finder_state_with_pause(
         return FinderMappingState::Syncing;
     }
 
+    if matches!(
+        mapping.readiness,
+        Readiness::NeedsInitialization | Readiness::RecoveryRequired
+    ) && mapping
+        .stopped_first_sync
+        .as_ref()
+        .is_some_and(|stopped| stopped.cause.is_none())
+    {
+        return FinderMappingState::Paused;
+    }
+
     match mapping.readiness {
         Readiness::VolumeUnavailable => return FinderMappingState::DiskMissing,
         Readiness::RecoveryRequired
@@ -637,6 +648,8 @@ mod tests {
             execution,
             intent,
             scheduling_enabled: false,
+            filter_migration_held: false,
+            filter_migration_phase: None,
             schedule_interval_secs: 300,
             next_poll_at: None,
             retry_at: None,
@@ -646,6 +659,7 @@ mod tests {
             last_run_outcome,
             last_run_completed_at: None,
             last_run_summary: None,
+            stopped_first_sync: None,
             unreviewed_conflict_run_id,
             unreviewed_conflict_paths: Vec::new(),
             exclusions: Vec::new(),

@@ -4186,6 +4186,7 @@ name = "sync-core"
 version = "0.1.0"
 dependencies = [
  "caseless",
+ "chrono",
  "proptest",
  "serde",
  "serde_json",
@@ -4199,6 +4200,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "core-foundation-sys",
+ "crc32fast",
  "directories",
  "libc",
  "notify",
@@ -4211,6 +4213,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
+ "zip",
 ]
 
 [[package]]

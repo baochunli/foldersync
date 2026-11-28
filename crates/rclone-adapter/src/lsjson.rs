@@ -16,14 +16,19 @@ use thiserror::Error;
 
 use crate::{
     config::stderr_indicates_auth_failure,
+    log_parser::{LogEvent, LogLevel, parse_log_line},
     process::{
-        ProcessError, ProcessRunner, ProcessSpec, RunOutput, SpawnOptions, minimal_isolated_env,
+        OutputLimits, ProcessError, ProcessRunner, ProcessSpec, RunOutput, SpawnOptions,
+        StreamKind, minimal_isolated_env,
     },
     qualification::{
         EngineIdentity, QualificationError, QualificationManifest,
         verify_binary_identity_with_manifest, verify_executable_metadata,
     },
-    request::{PasswordCommand, RequestError, validate_remote_name_str, validate_remote_path_str},
+    request::{
+        BisyncRequest, PasswordCommand, RequestError, remote_paths_overlap, validate_local_path,
+        validate_remote_name_str, validate_remote_path_str,
+    },
 };
 
 /// Single item emitted by `rclone lsjson` (Google Drive and local backends).
@@ -46,6 +51,8 @@ pub struct LsJsonEntry {
     pub orig_id: Option<String>,
     #[serde(default)]
     pub is_bucket: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hashes: BTreeMap<String, String>,
 }
 
 /// Resolved single component along a cloud collection path.
@@ -145,6 +152,8 @@ pub enum LsJsonError {
     },
     #[error("failed to parse the rclone response: {reason}")]
     ParseJson { reason: String },
+    #[error("rclone could not verify the complete result: {reason}")]
+    VerificationIncomplete { reason: String },
     #[error("rclone remote command failed (code={code:?}, signal={signal:?}): {detail}")]
     CommandFailed {
         code: Option<i32>,
@@ -214,19 +223,13 @@ impl LsJsonRequest {
         Ok(format!("{}:{subpath}", self.remote_name).into())
     }
 
-    fn with_config_args(&self, mut args: Vec<OsString>) -> Vec<OsString> {
-        args.push("--config".into());
-        args.push(self.config_path.as_os_str().into());
-        if let Some(pw) = &self.password_command {
-            args.push("--password-command".into());
-            args.push(pw.to_rclone_space_sep_list().into());
-        }
-        args.push("--ask-password=false".into());
-        if self.is_drive {
-            args.push("--drive-skip-gdocs".into());
-            args.push("--drive-skip-shortcuts".into());
-        }
-        args
+    fn with_config_args(&self, args: Vec<OsString>) -> Vec<OsString> {
+        with_config_args(
+            args,
+            &self.config_path,
+            self.password_command.as_ref(),
+            self.is_drive,
+        )
     }
 
     /// Builds the `rclone lsjson --dirs-only` argv for `subpath` (`""` for remote root).
@@ -246,29 +249,14 @@ impl LsJsonRequest {
         manifest: &QualificationManifest,
         runner: &dyn ProcessRunner,
     ) -> Result<RunOutput, LsJsonError> {
-        verify_binary_identity_with_manifest(&self.engine, manifest)?;
-        verify_executable_metadata(&self.engine)?;
-        // The real runner verifies the executable digest at the spawn boundary.
-        let spec = ProcessSpec {
-            program: self.engine.path().to_path_buf(),
+        run_qualified(
+            &self.engine,
+            &self.config_path,
             args,
-            current_dir: None,
-            env: minimal_isolated_env(self.config_path.parent()),
-            expected_binary_sha256: Some(self.engine.sha256().to_string()),
-        };
-        let output = runner.spawn(&spec, SpawnOptions::default())?.wait()?;
-        if !output.exit_status.is_success() {
-            let detail = output.output.stderr_text().trim().to_owned();
-            if stderr_indicates_auth_failure(&detail) {
-                return Err(LsJsonError::AuthenticationRequired { reason: detail });
-            }
-            return Err(LsJsonError::CommandFailed {
-                code: output.exit_status.code,
-                signal: output.exit_status.signal,
-                detail,
-            });
-        }
-        Ok(output)
+            manifest,
+            runner,
+            None,
+        )
     }
 
     fn run_command(
@@ -298,6 +286,197 @@ impl LsJsonRequest {
         }
         let output = self.run_command(args, runner)?;
         parse_lsjson_entries(&complete_stdout(&output)?)
+    }
+
+    /// Lists immediate sibling names for a collision check, including Drive
+    /// shortcuts and native documents hidden by the ordinary sync policy.
+    pub fn list_sibling_names(
+        &self,
+        subpath: &str,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<String>, LsJsonError> {
+        let mut args = self.with_config_args(vec![
+            "lsjson".into(),
+            self.target(subpath)?,
+            "--max-depth".into(),
+            "1".into(),
+        ]);
+        if self.is_drive {
+            args.extend([
+                "--drive-skip-gdocs=false".into(),
+                "--drive-show-all-gdocs".into(),
+                "--drive-skip-shortcuts=false".into(),
+                "--drive-skip-dangling-shortcuts=false".into(),
+            ]);
+        }
+        let output = self.run(args, &QualificationManifest::embedded()?, runner)?;
+        Ok(parse_lsjson_entries(&complete_stdout(&output)?)?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect())
+    }
+
+    /// Lists a complete inventory of regular objects under the endpoint, using
+    /// rclone's filter evaluation and MD5 metadata for later move verification.
+    pub fn list_files(
+        &self,
+        subpath: &str,
+        filters_file: Option<&Path>,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        self.list_recursive_inventory(subpath, filters_file, runner, true)
+    }
+
+    /// Lists files with hashes and directory objects in the same recursive walk.
+    pub fn list_inventory(
+        &self,
+        subpath: &str,
+        filters_file: Option<&Path>,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        self.list_recursive_inventory(subpath, filters_file, runner, false)
+    }
+
+    fn list_recursive_inventory(
+        &self,
+        subpath: &str,
+        filters_file: Option<&Path>,
+        runner: &dyn ProcessRunner,
+        files_only: bool,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        let mut args = vec![
+            "lsjson".into(),
+            self.target(subpath)?,
+            "--recursive".into(),
+            "--hash-type=md5".into(),
+            "--log-level=ERROR".into(),
+        ];
+        if files_only {
+            args.push("--files-only".into());
+        }
+        if let Some(filters) = filters_file {
+            validate_local_path("filters_file", filters)?;
+            args.extend(["--filter-from".into(), filters.as_os_str().into()]);
+        }
+        let output = self.run_command(args, runner)?;
+        let detail = output.output.stderr_text();
+        if !detail.trim().is_empty() {
+            return Err(LsJsonError::VerificationIncomplete { reason: detail });
+        }
+        let stdout = complete_stdout(&output)?;
+        if stdout.trim().is_empty() {
+            return Err(LsJsonError::VerificationIncomplete {
+                reason: "rclone returned no inventory".into(),
+            });
+        }
+        parse_lsjson_entries(&stdout)
+    }
+
+    /// Moves only the literal paths in the caller's verified list. The caller
+    /// must verify the resulting source and destination inventories.
+    pub fn move_files(
+        &self,
+        source: &str,
+        destination: &str,
+        files_from_raw: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<(), LsJsonError> {
+        validate_remote_path_str(source)?;
+        validate_remote_path_str(destination)?;
+        validate_local_path("files_from_raw", files_from_raw)?;
+        if remote_paths_overlap(source, destination) {
+            return Err(RequestError::OverlappingPaths {
+                left_field: "move_source",
+                left: source.to_owned(),
+                right_field: "move_destination",
+                right: destination.to_owned(),
+            }
+            .into());
+        }
+        self.run_command(
+            vec![
+                "move".into(),
+                self.target(source)?,
+                self.target(destination)?,
+                "--files-from-raw".into(),
+                files_from_raw.as_os_str().into(),
+                "--ignore-existing".into(),
+                // A server-side move does not consult the copy limit. If the
+                // backend cannot move, rclone's copy/delete fallback fails
+                // before copying or deleting the source.
+                "--max-transfer=0".into(),
+                "--cutoff-mode=hard".into(),
+                "--retries=1".into(),
+            ],
+            runner,
+        )?;
+        Ok(())
+    }
+
+    /// Uses the same rclone filter parser as bisync's frozen filters file.
+    pub fn list_filtered_remote(
+        &self,
+        subpath: &str,
+        filters_file: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        self.list_filtered(self.target(subpath)?, filters_file, true, runner)
+    }
+
+    pub fn list_filtered_local(
+        &self,
+        root: &Path,
+        filters_file: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        if !root.is_absolute() {
+            return Err(RequestError::RelativePath {
+                field: "inventory_root",
+                path: root.into(),
+            }
+            .into());
+        }
+        self.list_filtered(root.into(), filters_file, false, runner)
+    }
+
+    fn list_filtered(
+        &self,
+        target: OsString,
+        filters_file: &Path,
+        remote: bool,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        let mut args = vec![
+            "lsjson".into(),
+            target,
+            "--recursive".into(),
+            "--filter-from".into(),
+            filters_file.into(),
+            "--no-mimetype".into(),
+        ];
+        // Drive supplies MD5 as object metadata. It is needed to recognize the
+        // pinned engine's scratch filenames on the local destination.
+        if remote && self.is_drive {
+            args.extend([
+                "--fast-list".into(),
+                "--hash".into(),
+                "--hash-type".into(),
+                "MD5".into(),
+            ]);
+        }
+        let output = run_qualified(
+            &self.engine,
+            &self.config_path,
+            self.with_config_args(args),
+            &QualificationManifest::embedded()?,
+            runner,
+            Some(OutputLimits {
+                max_lines: 1_000_002,
+                max_total_bytes: 256 * 1024 * 1024,
+                ..Default::default()
+            }),
+        )?;
+        parse_filtered_inventory(output)
     }
 
     /// Counts supported objects without retrieving file contents.
@@ -388,6 +567,213 @@ impl LsJsonRequest {
         )?;
         Ok(())
     }
+}
+
+/// Checks the two validated bisync endpoints with a proposed filter file.
+/// A size match without a common checksum cannot qualify the new baseline.
+pub fn check_filtered(
+    request: &BisyncRequest,
+    filters_file: &Path,
+    runner: &dyn ProcessRunner,
+) -> Result<(), LsJsonError> {
+    validate_local_path("filters_file", filters_file)?;
+    let args = with_config_args(
+        vec![
+            "check".into(),
+            request.path1().as_os_str().into(),
+            request.path2().to_os_string(),
+            "--filter-from".into(),
+            filters_file.as_os_str().into(),
+            "--use-json-log".into(),
+            "--log-level=NOTICE".into(),
+            "--retries=1".into(),
+        ],
+        request.config_path(),
+        request.password_command(),
+        request.path2().is_drive_remote(),
+    );
+    let output = run_qualified(
+        request.engine(),
+        request.config_path(),
+        args,
+        &QualificationManifest::embedded()?,
+        runner,
+        None,
+    )?;
+    let captured = output.output;
+    if captured.dropped_lines != 0 || captured.truncated_lines != 0 {
+        return Err(LsJsonError::VerificationIncomplete {
+            reason: "rclone output exceeded the capture limit".into(),
+        });
+    }
+    for line in captured.lines {
+        if line.stream == StreamKind::Stderr
+            && let LogEvent::Structured(event) = parse_log_line(&line.text)
+            && (matches!(event.level, LogLevel::Error | LogLevel::Critical)
+                || event.plain_msg.ends_with(" hashes could not be checked"))
+        {
+            return Err(LsJsonError::VerificationIncomplete {
+                reason: event.plain_msg,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Renders a single filtered listing that includes exactly newly excluded
+/// file paths. Evaluating both sets in one listing avoids interpreting
+/// concurrent changes between independent listings as exclusion matches.
+pub fn render_move_filter<'a>(
+    previous: impl IntoIterator<Item = &'a str>,
+    added: impl IntoIterator<Item = &'a str>,
+) -> Result<String, RequestError> {
+    let previous = previous.into_iter().map(|pattern| (false, pattern));
+    let added = added.into_iter().map(|pattern| (true, pattern));
+    let mut filters = String::new();
+    for (include, pattern) in previous.chain(added) {
+        if pattern.chars().any(char::is_control) {
+            return Err(RequestError::InvalidCharacters {
+                field: "exclusion",
+                reason: "must be a single line without control characters",
+            });
+        }
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        filters.push_str(if include { "+ " } else { "- " });
+        filters.push_str(pattern);
+        // rclone internally expands a directory exclusion to its contents.
+        // An equivalent include needs the expansion written explicitly.
+        if include && pattern.ends_with('/') {
+            filters.push_str("**");
+        }
+        filters.push('\n');
+    }
+    // Descend through directories of any name so a nested added pattern can
+    // match even when none of its parent paths is included as a file.
+    filters.push_str("+ **/\n- **\n");
+    Ok(filters)
+}
+
+fn with_config_args(
+    mut args: Vec<OsString>,
+    config_path: &Path,
+    password_command: Option<&PasswordCommand>,
+    is_drive: bool,
+) -> Vec<OsString> {
+    args.extend(["--config".into(), config_path.as_os_str().into()]);
+    if let Some(pw) = password_command {
+        args.extend([
+            "--password-command".into(),
+            pw.to_rclone_space_sep_list().into(),
+        ]);
+    }
+    args.push("--ask-password=false".into());
+    if is_drive {
+        args.extend(["--drive-skip-gdocs".into(), "--drive-skip-shortcuts".into()]);
+    }
+    args
+}
+
+fn run_qualified(
+    engine: &EngineIdentity,
+    config_path: &Path,
+    args: Vec<OsString>,
+    manifest: &QualificationManifest,
+    runner: &dyn ProcessRunner,
+    limits: Option<OutputLimits>,
+) -> Result<RunOutput, LsJsonError> {
+    verify_binary_identity_with_manifest(engine, manifest)?;
+    verify_executable_metadata(engine)?;
+    // The real runner verifies the executable digest at the spawn boundary.
+    // Recursive inventory holds one JSON record per file. Keep it bounded
+    // independently of diagnostic output so ordinary build trees fit while
+    // incomplete inventories still fail closed.
+    let limits = limits.unwrap_or_else(|| {
+        if args.first().is_some_and(|arg| arg == "lsjson")
+            && args.iter().any(|arg| arg == "--recursive")
+        {
+            OutputLimits {
+                max_total_bytes: 64 * 1024 * 1024,
+                max_lines: 250_000,
+                ..OutputLimits::default()
+            }
+        } else {
+            OutputLimits::default()
+        }
+    });
+    let options = SpawnOptions {
+        limits,
+        ..SpawnOptions::default()
+    };
+    let spec = ProcessSpec {
+        program: engine.path().to_path_buf(),
+        args,
+        current_dir: None,
+        env: minimal_isolated_env(config_path.parent()),
+        expected_binary_sha256: Some(engine.sha256().to_string()),
+    };
+    let output = runner.spawn(&spec, options)?.wait()?;
+    if !output.exit_status.is_success() {
+        let detail = output.output.stderr_text().trim().to_owned();
+        if stderr_indicates_auth_failure(&detail) {
+            return Err(LsJsonError::AuthenticationRequired { reason: detail });
+        }
+        return Err(LsJsonError::CommandFailed {
+            code: output.exit_status.code,
+            signal: output.exit_status.signal,
+            detail,
+        });
+    }
+    Ok(output)
+}
+
+fn parse_filtered_inventory(output: RunOutput) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+    let incomplete = || LsJsonError::ParseJson {
+        reason: "rclone did not return a complete file inventory".into(),
+    };
+    if output.output.dropped_lines != 0 || output.output.truncated_lines != 0 {
+        return Err(incomplete());
+    }
+    // Pinned lsjson writes a JSON array with one object per line. Consume the
+    // captured lines directly so a large scan does not need another text buffer.
+    let mut lines = output
+        .output
+        .lines
+        .into_iter()
+        .filter(|line| line.stream == StreamKind::Stdout)
+        .map(|line| line.text);
+    let first = lines.next().ok_or_else(incomplete)?;
+    if first.trim() != "[" {
+        return parse_lsjson_entries(&first).and_then(|entries| {
+            if !first.trim().starts_with('[') || lines.next().is_some() {
+                Err(incomplete())
+            } else {
+                Ok(entries)
+            }
+        });
+    }
+    let mut entries = Vec::new();
+    let mut previous_had_comma = true;
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        if line == "]" && (entries.is_empty() || !previous_had_comma) && lines.next().is_none() {
+            return Ok(entries);
+        }
+        if !previous_had_comma {
+            return Err(incomplete());
+        }
+        previous_had_comma = line.ends_with(',');
+        let entry =
+            serde_json::from_str(line.strip_suffix(',').unwrap_or(line)).map_err(|err| {
+                LsJsonError::ParseJson {
+                    reason: err.to_string(),
+                }
+            })?;
+        entries.push(entry);
+    }
+    Err(incomplete())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

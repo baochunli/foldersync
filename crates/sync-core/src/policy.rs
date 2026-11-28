@@ -12,6 +12,12 @@ use crate::validation::{ValidationError, ValidationErrorKind};
 /// Default percentage deletion guard (`10%` of tracked files).
 pub const DEFAULT_MAX_DELETE_PERCENT: u8 = 10;
 
+/// Minimum number of included files in a suggested subfolder archive.
+pub const ARCHIVE_MIN_FILES: u64 = 2_000;
+
+/// Minimum age in calendar months of the newest included file in an archive suggestion.
+pub const ARCHIVE_MIN_AGE_MONTHS: u32 = 12;
+
 /// Filename used as the common rclone bisync access marker on both endpoints.
 pub const ACCESS_MARKER_FILENAME: &str = "RCLONE_TEST";
 
@@ -324,6 +330,58 @@ pub const DEFAULT_EXCLUSIONS: &[DefaultExclusion] = &[
     DefaultExclusion {
         pattern: ".~lock.*#",
         reason: "Temporary LibreOffice document lock files.",
+    },
+];
+
+/// Optional directory exclusions offered during setup and filter changes.
+pub const SUGGESTED_EXCLUSIONS: &[DefaultExclusion] = &[
+    DefaultExclusion {
+        pattern: "node_modules/**",
+        reason: "Installed JavaScript dependencies can be restored by the package manager.",
+    },
+    DefaultExclusion {
+        pattern: ".gradle/**",
+        reason: "Gradle regenerates these caches when it builds the project.",
+    },
+    DefaultExclusion {
+        pattern: "build/**",
+        reason: "Build tools often regenerate the outputs in these folders.",
+    },
+    DefaultExclusion {
+        pattern: "DerivedData/**",
+        reason: "Xcode regenerates these build and indexing files.",
+    },
+    DefaultExclusion {
+        pattern: "xcuserdata/**",
+        reason: "Xcode keeps per-user workspace settings in these folders.",
+    },
+    DefaultExclusion {
+        pattern: "Pods/**",
+        reason: "CocoaPods can reinstall these dependencies.",
+    },
+    DefaultExclusion {
+        pattern: "__pycache__/**",
+        reason: "Python regenerates these compiled bytecode files.",
+    },
+    DefaultExclusion {
+        pattern: ".venv/**",
+        reason: "Python virtual environments can be recreated from dependencies.",
+    },
+    DefaultExclusion {
+        pattern: ".pytest_cache/**",
+        reason: "pytest regenerates these test caches.",
+    },
+    DefaultExclusion {
+        pattern: ".mypy_cache/**",
+        reason: "mypy regenerates these type-checking caches.",
+    },
+    DefaultExclusion {
+        pattern: ".tox/**",
+        reason: "tox recreates these test environments.",
+    },
+    DefaultExclusion {
+        pattern: ".next/**",
+        reason: "Next.js regenerates these build outputs and caches.",
     },
 ];
 

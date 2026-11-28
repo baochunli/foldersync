@@ -28,30 +28,32 @@ use rclone_adapter::{
     SpawnOptions,
 };
 use sync_core::{
-    ACCESS_MARKER_FILENAME, AccountId, CloudCollection, DEFAULT_EXCLUSIONS, Execution, Intent,
-    LastRunSummary, MappingId, MappingState, Readiness, RunId, VolumeIdentity, VolumeKind,
-    WallTime, available_actions,
+    ACCESS_MARKER_FILENAME, AccountId, CloudCollection, DEFAULT_EXCLUSIONS, Execution,
+    GenerationId, Intent, LastRunSummary, MappingId, MappingState, Readiness, RunId, RunOutcome,
+    SUGGESTED_EXCLUSIONS, VolumeIdentity, VolumeKind, WallTime, available_actions,
 };
 use sync_manager::{
     AccountError, AccountRecord, AccountService, AccountServiceConfig, AddDriveAccountRequest,
-    AddMappingCommand, BisyncLauncher, CollectionCandidate, ControlledShutdownOutcome,
-    DarwinFinderNotifier, DriveAuthorization, FilterChangePreview, FinderActionDispatch,
-    FinderNotifier, FolderSizeSnapshot, FolderSizeStatus, ImportAccountRequest, InitializeCommand,
-    ManagerConfig, ManagerError, ManagerEvent, MappingStatusSnapshot, NoopFinderNotifier,
-    OperationCanceller, OperationHandle, RecoveryCopySide, RunRecord, SecretString,
-    SideClassification, SkippedCollection, StatusSnapshot, SyncManager, ValidatedFinderAction,
-    detect_volume_identity, inspect_local_endpoint_detailed,
+    AddMappingCommand, ArchiveState, BisyncLauncher, CollectionCandidate,
+    ControlledShutdownOutcome, DarwinFinderNotifier, DriveAuthorization, FilterChangePreview,
+    FilterMigrationPhase, FinderActionDispatch, FinderNotifier, FolderSizeSnapshot,
+    FolderSizeStatus, ImportAccountRequest, InitializeCommand, ManagerConfig, ManagerError,
+    ManagerEvent, MappingStatusSnapshot, NoopFinderNotifier, OperationCanceller, OperationHandle,
+    RecoveryCopySide, RunRecord, SecretString, SideClassification, SkippedCollection,
+    StatusSnapshot, SyncManager, ValidatedFinderAction, detect_volume_identity,
+    inspect_local_endpoint_detailed,
 };
 
 use crate::{
     contract::{
         AccountSnapshot, AccountStatus, ActiveRunSnapshot, ActivityEvent, AttentionItem,
-        AttentionKind, AttentionPriority, CloudFolderCandidate, DemoPreset, FilterReview,
-        FinderExtensionStatus, FolderSize, IconKind, InspectedRunSnapshot, LocationCheck,
-        MappingSnapshot, PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData,
-        RecoveryCopyItem, ReviewScenario, RunPhase, RunRecordSnapshot, ScheduledCheck, ScreenRoute,
-        StatusModifier, SubfolderNode, Tone, UiCommand, UiSnapshot, UnreviewedConflicts,
-        VolumeSnapshot, WizardDraft, WizardStep, format_bytes, is_low_space,
+        AttentionKind, AttentionPriority, CloudFolderCandidate, DemoPreset,
+        FilterMigrationProgress, FilterReview, FinderExtensionStatus, FolderSize, IconKind,
+        InspectedRunSnapshot, LocationCheck, MappingSnapshot, PreferencesSnapshot,
+        RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem, ReviewScenario, RunPhase,
+        RunRecordSnapshot, ScheduledCheck, ScreenRoute, StatusModifier, SubfolderNode, Tone,
+        TransferProgress, UiCommand, UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardDraft,
+        WizardStep, format_bytes, is_low_space,
     },
     system_actions::{
         LaunchAtLoginOutcome, SystemActionOutcome, SystemActionRequest, SystemActions,
@@ -432,8 +434,164 @@ struct LiveRunProgress {
     mapping_id: MappingId,
     run_id: RunId,
     started_at: Instant,
-    bytes_transferred: u64,
-    total_bytes: Option<u64>,
+    samples: VecDeque<(Instant, u64, u64)>,
+    transfer: TransferProgress,
+}
+
+impl LiveRunProgress {
+    fn new(mapping_id: MappingId, run_id: RunId, started_at: Instant) -> Self {
+        Self {
+            mapping_id,
+            run_id,
+            started_at,
+            samples: VecDeque::from([(started_at, 0, 0)]),
+            transfer: TransferProgress::default(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        now: Instant,
+        bytes: u64,
+        files: u64,
+        expected_bytes: Option<u64>,
+        expected_files: Option<u64>,
+        (bytes_already_present, files_already_present): (u64, u64),
+    ) {
+        const RATE_WINDOW: Duration = Duration::from_secs(120);
+        if self.samples.len() == 1 {
+            // Start the rate at the verified offset so already-copied files
+            // contribute to completion without inflating this attempt's rate.
+            self.samples[0] = (
+                self.started_at,
+                bytes_already_present,
+                files_already_present,
+            );
+        }
+        let bytes = bytes
+            .saturating_add(bytes_already_present)
+            .min(expected_bytes.unwrap_or(u64::MAX));
+        let files = files
+            .saturating_add(files_already_present)
+            .min(expected_files.unwrap_or(u64::MAX));
+        let progress = &mut self.transfer;
+        progress.bytes_transferred = progress.bytes_transferred.max(bytes);
+        progress.files_transferred = progress.files_transferred.max(files);
+        progress.expected_bytes = expected_bytes;
+        progress.expected_files = expected_files;
+        self.samples
+            .push_back((now, progress.bytes_transferred, progress.files_transferred));
+        while self
+            .samples
+            .get(1)
+            .is_some_and(|(time, _, _)| now.duration_since(*time) >= RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        let (baseline, previous_bytes, previous_files) = self.samples[0];
+        let sample_secs = now.duration_since(baseline).as_secs_f64();
+        if sample_secs == 0.0 {
+            return;
+        }
+        let bytes_per_second =
+            progress.bytes_transferred.saturating_sub(previous_bytes) as f64 / sample_secs;
+        let files_per_second =
+            progress.files_transferred.saturating_sub(previous_files) as f64 / sample_secs;
+        progress.bytes_per_second = Some(bytes_per_second.round() as u64);
+        progress.eta_seconds = None;
+        if now.duration_since(self.started_at) >= RATE_WINDOW {
+            let byte_eta = expected_bytes.and_then(|total| {
+                remaining_seconds(
+                    total.saturating_sub(progress.bytes_transferred),
+                    bytes_per_second,
+                )
+            });
+            let file_eta = expected_files.and_then(|total| {
+                remaining_seconds(
+                    total.saturating_sub(progress.files_transferred),
+                    files_per_second,
+                )
+            });
+            progress.eta_seconds = byte_eta
+                .zip(file_eta)
+                .map(|(bytes, files)| bytes.max(files));
+        }
+    }
+}
+
+fn remaining_seconds(remaining: u64, units_per_second: f64) -> Option<u64> {
+    if remaining == 0 {
+        Some(0)
+    } else if units_per_second > 0.0 {
+        Some((remaining as f64 / units_per_second).ceil() as u64)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_transfer_waits_two_minutes_then_uses_the_slower_trailing_rate() {
+    let start = Instant::now();
+    let mut run = LiveRunProgress::new(MappingId::new("test"), RunId::new("test-run"), start);
+    run.record(
+        start + Duration::from_secs(60),
+        600,
+        30,
+        Some(3_600),
+        Some(600),
+        (0, 0),
+    );
+    assert_eq!(run.transfer.eta_seconds, None);
+    run.record(
+        start + Duration::from_secs(120),
+        1_200,
+        60,
+        Some(3_600),
+        Some(600),
+        (0, 0),
+    );
+    assert_eq!(run.transfer.eta_seconds, Some(1_080));
+    run.record(
+        start + Duration::from_secs(240),
+        2_400,
+        180,
+        Some(3_600),
+        Some(600),
+        (0, 0),
+    );
+    assert_eq!(run.transfer.eta_seconds, Some(420));
+    run.record(
+        start + Duration::from_secs(360),
+        1_800,
+        100,
+        Some(3_600),
+        Some(600),
+        (0, 0),
+    );
+    assert_eq!(run.transfer.bytes_transferred, 2_400);
+    assert_eq!(run.transfer.files_transferred, 180);
+    assert_eq!(run.transfer.eta_seconds, None);
+}
+
+#[cfg(test)]
+#[test]
+fn live_transfer_counts_already_present_files_without_boosting_the_rate() {
+    let start = Instant::now();
+    let mut run = LiveRunProgress::new(MappingId::new("test"), RunId::new("resume"), start);
+    run.record(start, 0, 0, Some(800), Some(8), (300, 3));
+    assert_eq!(run.transfer.line(), "300 B of 800 B · 3 of 8 files");
+    run.record(
+        start + Duration::from_secs(120),
+        100,
+        1,
+        Some(800),
+        Some(8),
+        (300, 3),
+    );
+    assert_eq!(run.transfer.files_transferred, 4);
+    assert_eq!(run.transfer.bytes_per_second, Some(1));
+    assert_eq!(run.transfer.eta_seconds, Some(480));
 }
 
 enum AccountOperation {
@@ -467,6 +625,7 @@ struct WorkerState {
     live_progress: Option<LiveRunProgress>,
     first_sync_started_at: Option<Instant>,
     filter_preview: Option<FilterChangePreview>,
+    filter_migration_watch: Option<FilterMigrationWatch>,
     wizard: WizardDraft,
     cloud_catalog: Vec<CloudFolderCandidate>,
     skipped_cloud_folders: Vec<SkippedCollection>,
@@ -483,6 +642,11 @@ struct WorkerState {
     status_notice: Option<String>,
     action_error: Option<String>,
     device_id: String,
+}
+
+struct FilterMigrationWatch {
+    previous_generation: GenerationId,
+    accepted_sequence: u64,
 }
 
 fn manager_worker_main(
@@ -533,6 +697,7 @@ fn manager_worker_main(
         live_progress: None,
         first_sync_started_at: None,
         filter_preview: None,
+        filter_migration_watch: None,
         wizard: default_real_wizard(),
         cloud_catalog: Vec::new(),
         skipped_cloud_folders: Vec::new(),
@@ -888,20 +1053,39 @@ fn manager_worker_main(
             if let Some(ref mid) = state.wizard.first_sync_mapping_id
                 && let Some(m) = snap.mappings.iter().find(|m| &m.id == mid)
             {
-                if m.readiness == Readiness::Ready && m.execution == Execution::Idle {
+                if !state.wizard.first_sync_completed
+                    && let Some(started) = state.first_sync_started_at
+                {
+                    state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
+                }
+                if state.wizard.filter_migration_progress.is_some() {
+                    update_filter_migration(&mut state, m, snap.sequence);
+                } else if m.readiness == Readiness::Ready && m.execution == Execution::Idle {
                     if state.wizard.first_sync_preflight_done {
                         state.wizard.first_sync_completed = true;
                         state.wizard.first_sync_stopping = false;
-                        state.wizard.first_sync_percent = 100;
                     }
-                    if let Some(started) = state.first_sync_started_at {
-                        state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
-                    }
+                } else if m.stopped_first_sync.is_some() {
+                    state.wizard.first_sync_stopping = false;
                 } else if state.wizard.first_sync_stopping
                     && m.execution == Execution::Idle
                     && m.readiness == Readiness::NeedsInitialization
                 {
-                    show_stopped_first_sync(&mut state.wizard);
+                    show_stopped_first_sync(&mut state);
+                } else if state.wizard.step == WizardStep::FirstSync
+                    && m.execution == Execution::Idle
+                    && let Some(cause) = snap.archives.iter().find_map(|archive| {
+                        if &archive.mapping_id == mid
+                            && let ArchiveState::Failed { cause } = &archive.state
+                        {
+                            Some(cause.clone())
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    state.wizard.first_sync_stopping = false;
+                    state.wizard.first_sync_error = Some(cause);
                 }
             }
             explicit_snap = Some(snap);
@@ -969,17 +1153,23 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
         } => {
             state.raw_log.clear();
             state.recent_runs_dirty = true;
-            state.live_progress = Some(LiveRunProgress {
-                mapping_id: mapping_id.clone(),
-                run_id: run_id.clone(),
-                started_at: Instant::now(),
-                bytes_transferred: 0,
-                total_bytes: None,
-            });
-            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id) {
+            let now = Instant::now();
+            if !state
+                .live_progress
+                .as_ref()
+                .is_some_and(|p| p.run_id == run_id)
+            {
+                state.live_progress = Some(LiveRunProgress::new(
+                    mapping_id.clone(),
+                    run_id.clone(),
+                    now,
+                ));
+            }
+            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
+                && state.wizard.filter_migration_progress.is_none()
+            {
                 state.wizard.first_sync_preflight_done = true;
                 state.wizard.first_sync_markers_ready = true;
-                state.first_sync_started_at = Some(Instant::now());
             }
             push_ui_event(
                 state,
@@ -995,25 +1185,31 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
             mapping_id,
             run_id,
             bytes_transferred,
-            total_bytes,
+            files_transferred,
+            expected_bytes,
+            expected_files,
+            bytes_already_present,
+            files_already_present,
+            first_sync_total_files,
             ..
         } => {
-            match state.live_progress.as_mut() {
-                Some(p) if p.mapping_id == mapping_id && p.run_id == run_id => {
-                    p.bytes_transferred = p.bytes_transferred.max(bytes_transferred);
-                    if total_bytes.is_some() {
-                        p.total_bytes = total_bytes;
-                    }
-                }
-                _ => {
-                    state.live_progress = Some(LiveRunProgress {
-                        mapping_id: mapping_id.clone(),
-                        run_id,
-                        started_at: Instant::now(),
-                        bytes_transferred,
-                        total_bytes,
-                    });
-                }
+            let now = Instant::now();
+            if !state
+                .live_progress
+                .as_ref()
+                .is_some_and(|p| p.run_id == run_id)
+            {
+                state.live_progress = Some(LiveRunProgress::new(mapping_id.clone(), run_id, now));
+            }
+            if let Some(progress) = state.live_progress.as_mut() {
+                progress.record(
+                    now,
+                    bytes_transferred,
+                    files_transferred,
+                    expected_bytes,
+                    first_sync_total_files.or(expected_files),
+                    (bytes_already_present, files_already_present),
+                );
             }
             if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
                 && let Some(started) = state.first_sync_started_at
@@ -1041,21 +1237,25 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
             if state
                 .live_progress
                 .as_ref()
-                .is_some_and(|p| p.mapping_id == mapping_id)
+                .is_some_and(|p| p.run_id == run_id)
             {
                 state.live_progress = None;
             }
-            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id) {
+            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
+                && state.wizard.filter_migration_progress.is_none()
+            {
                 if let Some(started) = state.first_sync_started_at {
                     state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
                 }
                 if outcome == "success" {
                     state.wizard.first_sync_completed = true;
                     state.wizard.first_sync_stopping = false;
-                    state.wizard.first_sync_percent = 100;
-                } else if state.wizard.first_sync_stopping {
-                    show_stopped_first_sync(&mut state.wizard);
-                } else {
+                } else if matches!(
+                    outcome.as_str(),
+                    "first_sync_stopped" | "canceled_before_spawn"
+                ) {
+                    state.wizard.first_sync_stopping = false;
+                } else if outcome != "preflight_failed" {
                     // Surface terminal engine failures in the wizard (HIGH #4).
                     state.wizard.first_sync_stopping = false;
                     state.wizard.first_sync_error = Some(format!(
@@ -1078,6 +1278,7 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
         } => {
             state.recent_runs_dirty = true;
             if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
+                && state.wizard.filter_migration_progress.is_none()
                 && !state.wizard.first_sync_stopping
                 && state.wizard.first_sync_error.is_none()
             {
@@ -1105,7 +1306,7 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                 state.wizard.first_sync_stopping = false;
             }
             state.action_error = Some(full);
-            push_ui_event(state, format!("First sync check failed: {cause}"), None);
+            push_ui_event(state, format!("Sync could not continue. {cause}"), None);
             true
         }
         ManagerEvent::ShutdownTimedOut { mapping_id, .. } => {
@@ -1232,7 +1433,46 @@ fn handle_ui_command(
             }
             (None, None)
         }
+        UiCommand::ResumeFirstSync(id) => {
+            let Some(mgr) = &state.mgr else {
+                return (None, None);
+            };
+            match mgr.resume_first_sync(id.clone()) {
+                Ok(acceptance) => {
+                    if let Some(mapping) = acceptance.snapshot.mappings.iter().find(|m| m.id == id)
+                    {
+                        let direction = mapping
+                            .last_run_id
+                            .as_ref()
+                            .and_then(|rid| mgr.get_run(rid).ok().flatten())
+                            .map(|run| run.mode);
+                        state.wizard = default_real_wizard();
+                        state.wizard.editing_mapping_id = Some(id.clone());
+                        state.wizard.selected_account = mapping.account_id.clone();
+                        state.wizard.selected_folder = mapping.display_name.clone();
+                        state.wizard.volume_name = mapping.volume_name.clone();
+                        state.wizard.review_scenario = match direction.as_deref() {
+                            Some("init_path2") => ReviewScenario::CloudToLocal,
+                            _ => ReviewScenario::LocalToCloud,
+                        };
+                        begin_first_sync(state, id);
+                    }
+                    return (Some(ScreenRoute::AddMapping), None);
+                }
+                Err(err) => {
+                    state.action_error = Some(format!("{} {}", err.cause(), err.next_step()))
+                }
+            }
+            (None, None)
+        }
         UiCommand::StopRun(id) => {
+            if state.wizard.step == WizardStep::FirstSync
+                && state.wizard.first_sync_mapping_id.as_ref() == Some(&id)
+                && !state.wizard.first_sync_completed
+                && state.wizard.first_sync_error.is_none()
+            {
+                return handle_ui_command(state, UiCommand::WizardStopFirstSync);
+            }
             if let Some(mgr) = &state.mgr {
                 record_mgr_result(state, mgr.stop_run(id));
             }
@@ -1326,6 +1566,57 @@ fn handle_ui_command(
             }
             (None, None)
         }
+        UiCommand::ResolveFilterMigration {
+            mapping_id,
+            restore,
+        } => {
+            if let Some(mgr) = &state.mgr {
+                let snapshot = mgr.snapshot();
+                let Some(mapping) = snapshot.mappings.iter().find(|m| m.id == mapping_id) else {
+                    state.action_error = Some("The held mapping could not be found.".to_owned());
+                    return (None, None);
+                };
+                let Some(previous_generation) = mapping.active_generation_id.clone() else {
+                    state.action_error = Some("The previous sync setup is unavailable.".to_owned());
+                    return (None, None);
+                };
+                let result = if restore {
+                    mgr.restore_filter_change(mapping_id.clone())
+                } else {
+                    mgr.finish_filter_change(mapping_id.clone())
+                };
+                match result {
+                    Ok(accepted) => {
+                        state.recovery_checklist = None;
+                        state.wizard = default_real_wizard();
+                        state.wizard.changing_subfolders = true;
+                        state.wizard.selected_folder = mapping.display_name.clone();
+                        begin_filter_migration(
+                            state,
+                            mapping_id,
+                            FilterMigrationWatch {
+                                previous_generation,
+                                accepted_sequence: accepted.snapshot.sequence,
+                            },
+                            FilterMigrationProgress {
+                                phase: if restore {
+                                    FilterMigrationPhase::Restoring
+                                } else {
+                                    FilterMigrationPhase::Checking
+                                },
+                                moves_drive_files: true,
+                                restoring: restore,
+                            },
+                        );
+                        return (Some(ScreenRoute::AddMapping), None);
+                    }
+                    Err(err) => {
+                        state.action_error = Some(format!("{} {}", err.cause(), err.next_step()));
+                    }
+                }
+            }
+            (None, None)
+        }
         UiCommand::RemoveMapping(id) | UiCommand::DiscardDraft(id) => {
             if let Some(mgr) = &state.mgr {
                 match mgr.remove_mapping(id) {
@@ -1403,6 +1694,9 @@ fn handle_ui_command(
                 && let Some(preview) = state.filter_preview.take()
             {
                 let id = preview.mapping_id().clone();
+                let previous_generation = preview.previous_generation_id().clone();
+                let narrowing = preview.is_narrowing();
+                let moves_drive_files = preview.cloud_move_counts().is_some();
                 let preflight = preview.preflight();
                 let local = preflight.local_inventory.as_ref().ok();
                 let remote = preflight.remote_inventory.as_ref().ok();
@@ -1416,6 +1710,19 @@ fn handle_ui_command(
                     _ => ReviewScenario::BothEmpty,
                 };
                 match mgr.apply_filter_change(preview) {
+                    Ok(accepted) if narrowing => begin_filter_migration(
+                        state,
+                        id,
+                        FilterMigrationWatch {
+                            previous_generation,
+                            accepted_sequence: accepted.snapshot.sequence,
+                        },
+                        FilterMigrationProgress {
+                            phase: FilterMigrationPhase::CatchUp,
+                            moves_drive_files,
+                            restoring: false,
+                        },
+                    ),
                     Ok(_) => begin_first_sync(state, id),
                     Err(err) => {
                         invalidate_wizard_confirmation(&mut state.wizard);
@@ -1423,6 +1730,15 @@ fn handle_ui_command(
                         state.action_error = Some(format!("{} {}", err.cause(), err.next_step()));
                     }
                 }
+            }
+            (None, None)
+        }
+        UiCommand::AddSuggestedExclusions => {
+            if state.wizard.changing_subfolders
+                && state.wizard.step == WizardStep::Subfolders
+                && state.wizard.add_suggested_exclusions()
+            {
+                wizard_exclusions_changed(state);
             }
             (None, None)
         }
@@ -1650,10 +1966,12 @@ fn handle_ui_command(
             if state.wizard.selected_account != acct {
                 cancel_folder_size(state);
                 clear_cloud_catalog(state);
+                state.wizard.reset_suggestions();
                 state.wizard.selected_folder.clear();
                 state.wizard.remote_folder_path = None;
                 state.wizard.drive_collection = None;
                 state.wizard.subfolders.clear();
+                state.wizard.reset_archive_choices();
             }
             state.wizard.selected_account = acct;
             if state
@@ -1740,8 +2058,16 @@ fn handle_ui_command(
                     return (None, None);
                 }
             }
+            if state.wizard.remote_folder_path.as_deref().map(Path::new)
+                != Some(candidate.as_path())
+            {
+                state.wizard.reset_suggestions();
+            }
             if let Some(name) = candidate.file_name().and_then(|n| n.to_str()) {
                 state.wizard.selected_folder = name.to_owned();
+            }
+            if state.wizard.remote_folder_path.as_deref() != Some(trimmed) {
+                state.wizard.reset_archive_choices();
             }
             state.wizard.remote_folder_path = Some(trimmed.to_owned());
             invalidate_wizard_confirmation(&mut state.wizard);
@@ -1750,6 +2076,9 @@ fn handle_ui_command(
         }
         UiCommand::WizardSetLocalPath(path) => {
             let p = PathBuf::from(path.trim());
+            if state.wizard.local_path != path.trim() {
+                state.wizard.reset_archive_choices();
+            }
             state.wizard.local_path = path.trim().to_owned();
             state.wizard.location_check_pending = !state.wizard.local_path.is_empty();
             state.wizard.location_checks.clear();
@@ -1792,6 +2121,10 @@ fn handle_ui_command(
             wizard_exclusions_changed(state);
             (None, None)
         }
+        UiCommand::WizardToggleArchive(folder) => {
+            state.wizard.toggle_archive(folder);
+            (None, None)
+        }
         UiCommand::WizardToggleDefaultExclusions => {
             state.wizard.show_default_exclusions = !state.wizard.show_default_exclusions;
             (None, None)
@@ -1804,6 +2137,12 @@ fn handle_ui_command(
         }
         UiCommand::WizardRemovePattern(pattern) => {
             if state.wizard.remove_custom_pattern(&pattern) {
+                wizard_exclusions_changed(state);
+            }
+            (None, None)
+        }
+        UiCommand::WizardRemoveAllSuggested => {
+            if state.wizard.remove_all_suggested() {
                 wizard_exclusions_changed(state);
             }
             (None, None)
@@ -1839,6 +2178,14 @@ fn handle_ui_command(
             }
             let prior_fp = state.wizard.reviewed_fingerprint.clone();
             recompute_real_wizard_inventory(state);
+            if state.wizard.step != WizardStep::Review
+                && state.wizard.selected_archives().next().is_some()
+            {
+                invalidate_wizard_confirmation(&mut state.wizard);
+                state.action_error =
+                    Some("Confirm your archive choices on Review first.".to_owned());
+                return (None, None);
+            }
             let current_fp = wizard_review_fingerprint(&state.wizard);
             if prior_fp.as_deref() != Some(current_fp.as_str()) {
                 // Inventory or direction changed since confirmation -> invalidate confirmation (HIGH #1).
@@ -1884,7 +2231,9 @@ fn handle_ui_command(
 
             if let Some(mgr) = &state.mgr {
                 // ALWAYS persist all reviewed edits & exclusions before starting initialization (HIGH #1).
-                if let Err(err) = mgr.add_mapping(add_cmd) {
+                if let Err(err) =
+                    mgr.add_mapping_with_archives(add_cmd, state.wizard.selected_archive_names())
+                {
                     state.action_error = Some(format!("{} {}", err.cause(), err.next_step()));
                     return (None, None);
                 }
@@ -1906,14 +2255,13 @@ fn handle_ui_command(
             {
                 match mgr.stop_run(mid.clone()) {
                     Ok(acceptance) => {
-                        let already_idle = acceptance
-                            .snapshot
-                            .mappings
-                            .iter()
-                            .find(|m| m.id == mid)
-                            .is_some_and(|m| m.execution == Execution::Idle);
-                        if already_idle {
-                            show_stopped_first_sync(&mut state.wizard);
+                        let mapping = acceptance.snapshot.mappings.iter().find(|m| m.id == mid);
+                        if let Some(mapping) = mapping.filter(|m| m.execution == Execution::Idle) {
+                            if mapping.stopped_first_sync.is_some() {
+                                state.wizard.first_sync_stopping = false;
+                            } else {
+                                show_stopped_first_sync(state);
+                            }
                         } else {
                             // Wait for the stop result before jumping back to Review (HIGH #4).
                             state.wizard.first_sync_stopping = true;
@@ -1926,7 +2274,9 @@ fn handle_ui_command(
             }
             (None, None)
         }
-        UiCommand::WizardCompleteDemoFirstSync => (None, None),
+        UiCommand::WizardCompleteDemoFirstSync | UiCommand::WizardCompleteDemoArchive => {
+            (None, None)
+        }
         UiCommand::RevealPath(path) => {
             let req =
                 dispatch_system_action(state, SystemActionRequest::RevealPath(PathBuf::from(path)));
@@ -2148,42 +2498,55 @@ fn project_filter_review(preview: &FilterChangePreview, free_bytes: Option<u64>)
             }),
         }
     }
-    checks.push(LocationCheck {
-        ok: preflight.direction.is_ok(),
-        message: match &preflight.direction {
-            Ok(InitPreference::Path2) => "First sync downloads from the cloud.".to_owned(),
-            Ok(InitPreference::Path1)
-                if preflight
-                    .local_inventory
-                    .as_ref()
-                    .is_ok_and(|i| i.file_count > 0) =>
-            {
-                "First sync uploads to the cloud.".to_owned()
-            }
-            Ok(InitPreference::Path1) => "First sync sets up access markers.".to_owned(),
-            Err(reason) => reason.clone(),
-        },
-    });
-    if matches!(preflight.direction, Ok(InitPreference::Path2))
-        && let (Some(free), Ok(cloud)) = (free_bytes, &preflight.remote_inventory)
-    {
+    if preview.is_narrowing() {
         checks.push(LocationCheck {
-            ok: cloud.total_bytes <= free,
-            message: format!(
-                "{} to download · {} free on the target volume.",
-                format_bytes(cloud.total_bytes),
-                format_bytes(free)
-            ),
+            ok: true,
+            message:
+                "FolderSync will catch up and check the new selection before moving any files."
+                    .to_owned(),
         });
+    } else {
+        checks.push(LocationCheck {
+            ok: preflight.direction.is_ok(),
+            message: match &preflight.direction {
+                Ok(InitPreference::Path2) => "First sync downloads from the cloud.".to_owned(),
+                Ok(InitPreference::Path1)
+                    if preflight
+                        .local_inventory
+                        .as_ref()
+                        .is_ok_and(|i| i.file_count > 0) =>
+                {
+                    "First sync uploads to the cloud.".to_owned()
+                }
+                Ok(InitPreference::Path1) => "First sync sets up access markers.".to_owned(),
+                Err(reason) => reason.clone(),
+            },
+        });
+        if matches!(preflight.direction, Ok(InitPreference::Path2))
+            && let (Some(free), Ok(cloud)) = (free_bytes, &preflight.remote_inventory)
+        {
+            checks.push(LocationCheck {
+                ok: cloud.total_bytes <= free,
+                message: format!(
+                    "{} to download · {} free on the target volume.",
+                    format_bytes(cloud.total_bytes),
+                    format_bytes(free)
+                ),
+            });
+        }
     }
     FilterReview {
         added: preview.added_exclusions().to_vec(),
         removed: preview.removed_exclusions().to_vec(),
         checks,
+        narrowing: preview.is_narrowing(),
+        cloud_move_counts: preview.cloud_move_counts().map(<[_]>::to_vec),
     }
 }
 
 fn begin_first_sync(state: &mut WorkerState, mapping_id: MappingId) {
+    state.filter_migration_watch = None;
+    state.wizard.filter_migration_progress = None;
     state.wizard.editing_mapping_id = Some(mapping_id.clone());
     state.wizard.first_sync_mapping_id = Some(mapping_id);
     state.wizard.first_sync_preflight_done = false;
@@ -2191,19 +2554,87 @@ fn begin_first_sync(state: &mut WorkerState, mapping_id: MappingId) {
     state.wizard.first_sync_stopping = false;
     state.wizard.first_sync_completed = false;
     state.wizard.first_sync_error = None;
-    state.wizard.first_sync_percent = 0;
     state.wizard.first_sync_elapsed_secs = 0;
     state.first_sync_started_at = Some(Instant::now());
     state.wizard.step = WizardStep::FirstSync;
 }
 
-fn show_stopped_first_sync(wizard: &mut WizardDraft) {
+fn begin_filter_migration(
+    state: &mut WorkerState,
+    mapping_id: MappingId,
+    watch: FilterMigrationWatch,
+    progress: FilterMigrationProgress,
+) {
+    begin_first_sync(state, mapping_id);
+    state.filter_migration_watch = Some(watch);
+    state.wizard.filter_migration_progress = Some(progress);
+}
+
+fn update_filter_migration(
+    state: &mut WorkerState,
+    mapping: &MappingStatusSnapshot,
+    sequence: u64,
+) {
+    let Some(watch) = &state.filter_migration_watch else {
+        return;
+    };
+    if sequence < watch.accepted_sequence {
+        return;
+    }
+    let wizard = &mut state.wizard;
+    let Some(progress) = &mut wizard.filter_migration_progress else {
+        return;
+    };
+    if let Some(phase) = mapping.filter_migration_phase {
+        progress.phase = phase;
+        return;
+    }
+    let completed = if progress.restoring {
+        !mapping.filter_migration_held
+    } else {
+        mapping
+            .active_generation_id
+            .as_ref()
+            .is_some_and(|generation| generation != &watch.previous_generation)
+    };
+    if completed && mapping.readiness == Readiness::Ready {
+        wizard.first_sync_completed = true;
+        wizard.first_sync_stopping = false;
+        state.filter_migration_watch = None;
+    } else if matches!(mapping.execution, Execution::Idle | Execution::Interrupted) {
+        if wizard.first_sync_stopping {
+            show_stopped_first_sync(state);
+        } else if wizard.first_sync_error.is_none() {
+            wizard.first_sync_error = Some(
+                mapping
+                    .last_run_summary
+                    .clone()
+                    .filter(|_| mapping.last_run_outcome != Some(RunOutcome::Success))
+                    .unwrap_or_else(|| {
+                        "FolderSync could not finish updating the selection. Review the run log."
+                            .to_owned()
+                    }),
+            );
+        }
+        state.filter_migration_watch = None;
+    }
+}
+
+fn show_stopped_first_sync(state: &mut WorkerState) {
+    let wizard = &mut state.wizard;
     wizard.first_sync_stopping = false;
-    if wizard.changing_subfolders {
+    invalidate_wizard_confirmation(wizard);
+    if wizard.filter_migration_progress.is_some() {
+        wizard.first_sync_error =
+            Some("Subfolder update stopped. Open the mapping to review its setup.".to_owned());
+    } else if wizard.changing_subfolders {
         wizard.first_sync_error =
             Some("First sync stopped. Open the mapping to review its setup.".to_owned());
     } else {
-        wizard.step = WizardStep::Review;
+        state.wizard.step = WizardStep::Review;
+        if state.wizard.selected_archives().next().is_some() {
+            recompute_real_wizard_inventory(state);
+        }
     }
 }
 
@@ -2230,7 +2661,7 @@ fn wizard_review_fingerprint(wizard: &WizardDraft) -> String {
         .map(|n| n.name.as_str())
         .collect();
     format!(
-        "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
         wizard.selected_account,
         wizard.selected_folder,
         wizard.remote_folder_path.as_deref().unwrap_or(""),
@@ -2245,6 +2676,8 @@ fn wizard_review_fingerprint(wizard: &WizardDraft) -> String {
         wizard.cloud_file_count,
         wizard.local_total_bytes,
         wizard.cloud_total_bytes,
+        wizard.selected_archives().collect::<Vec<_>>(),
+        wizard.archive_holding_folder,
     )
 }
 
@@ -2448,6 +2881,7 @@ fn load_mapping_into_wizard(
     // Reset wizard cleanly before populating from `rec` so prior draft exclusions
     // never leak into a resumed draft or Finish Setup session (HIGH #1).
     let mut wizard = default_real_wizard();
+    wizard.suggest_exclusions = false;
     wizard.editing_mapping_id = Some(rec.id.clone());
     wizard.selected_account = rec.account_id.clone();
     wizard.selected_folder = rec.collection.display_name().to_owned();
@@ -2526,6 +2960,7 @@ fn load_mapping_into_wizard(
             set_subfolder_inventory(&mut state.wizard, &inventory);
         }
     } else {
+        state.wizard.step = requested_step;
         recompute_real_wizard_inventory(state);
         state.wizard.step = if state.wizard.can_visit_step(requested_step) {
             requested_step
@@ -2778,13 +3213,16 @@ fn project_drive_candidate(
 }
 
 fn select_cloud_folder(state: &mut WorkerState, candidate: CloudFolderCandidate) {
-    let same_folder = state.wizard.selected_folder == candidate.name;
+    let same_folder = state.wizard.selected_folder == candidate.name
+        && state.wizard.drive_collection == candidate.collection;
     if same_folder && candidate.size == FolderSize::Calculating {
         return;
     }
     cancel_folder_size(state);
     if !same_folder {
+        state.wizard.reset_suggestions();
         state.wizard.subfolders.clear();
+        state.wizard.reset_archive_choices();
     }
     state.wizard.selected_folder = candidate.name;
     state.wizard.drive_collection = candidate.collection;
@@ -2983,6 +3421,25 @@ fn set_subfolder_inventory(
 }
 
 fn recompute_real_wizard_inventory(state: &mut WorkerState) {
+    let prior_archives = state.wizard.selected_archive_names();
+    recompute_real_wizard_inventory_with_archives(state, &prior_archives);
+    let selected = state.wizard.selected_archive_names();
+    if state.wizard.step == WizardStep::Review && !selected.is_empty() && selected != prior_archives
+    {
+        recompute_real_wizard_inventory_with_archives(state, &selected);
+        if state.wizard.selected_archive_names() != selected {
+            state.wizard.archive_errors.push(
+                "Folder contents changed during the archive check. Review the selection again."
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn recompute_real_wizard_inventory_with_archives(
+    state: &mut WorkerState,
+    archive_names: &BTreeSet<String>,
+) {
     let mut loc_checks = Vec::new();
     let mut rec_checks = Vec::new();
     let trimmed_local = state.wizard.local_path.trim().to_owned();
@@ -2997,6 +3454,8 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
         return;
     }
     state.wizard.location_check_pending = false;
+    state.wizard.archive_errors.clear();
+    state.wizard.archive_holding_folder = None;
 
     let volume_space = if trimmed_local.is_empty() {
         None
@@ -3028,12 +3487,23 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
     let mut local_inv_res = None;
     let mut remote_inv_res = None;
     let mut layout_err = None;
+    let mut preview_exclusions = state.wizard.extra_exclusions();
+    if state.wizard.suggest_exclusions {
+        // Apply candidates to the preview without saving absent patterns on the mapping.
+        preview_exclusions.extend(
+            SUGGESTED_EXCLUSIONS
+                .iter()
+                .filter(|entry| !state.wizard.dismissed_suggestions.contains(entry.pattern))
+                .map(|entry| entry.pattern.to_owned()),
+        );
+    }
 
     if let Some(mgr) = &state.mgr
-        && let Ok(cmd) = build_add_mapping_from_wizard(state)
+        && let Ok(mut cmd) = build_add_mapping_from_wizard(state)
     {
+        cmd.extra_exclusions = preview_exclusions;
         let editing_id = state.wizard.editing_mapping_id.as_ref();
-        match mgr.preflight_mapping_preview(&cmd, editing_id) {
+        match mgr.preflight_mapping_preview_with_archives(&cmd, editing_id, archive_names) {
             Ok(preview) => {
                 if let Ok(det) = preview.detected_volume {
                     state.wizard.volume_name = det.display_name;
@@ -3041,6 +3511,8 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
                     state.wizard.volume_fs = det.filesystem;
                 }
                 layout_err = preview.layout_error;
+                state.wizard.archive_errors = preview.archive_errors;
+                state.wizard.archive_holding_folder = preview.archive_holding_folder;
                 local_inv_res = Some(preview.local_inventory);
                 remote_inv_res = Some(preview.remote_inventory);
             }
@@ -3059,11 +3531,7 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
             ancestor_ids: vec!["local-root".to_owned()],
         };
         let mut exclusions = sync_core::default_exclusion_patterns();
-        for pat in &state.wizard.custom_patterns {
-            if !pat.trim().is_empty() {
-                exclusions.insert(pat.trim().to_owned());
-            }
-        }
+        exclusions.extend(preview_exclusions);
         local_inv_res = Some(
             inspect_local_endpoint_detailed(&local_path, &collection, &exclusions)
                 .map_err(|e| e.cause()),
@@ -3181,6 +3649,33 @@ fn recompute_real_wizard_inventory(state: &mut WorkerState) {
         .or(local_ok)
     {
         set_subfolder_inventory(&mut state.wizard, src_inv);
+    }
+    state.wizard.archive_suggestions = if state.wizard.changing_subfolders {
+        Vec::new()
+    } else {
+        local_ok
+            .map(|inventory| inventory.archive_suggestions.clone())
+            .unwrap_or_default()
+    };
+
+    if state.wizard.suggest_exclusions {
+        let mut observed = BTreeMap::new();
+        for inventory in [local_ok, remote_ok].into_iter().flatten() {
+            for (&pattern, counts) in &inventory.suggested_folders {
+                observed
+                    .entry(pattern)
+                    .and_modify(|total: &mut sync_manager::init::SuggestedFolderInventory| {
+                        total.folder_count += counts.folder_count;
+                        total.file_count += counts.file_count;
+                        total.total_bytes = total
+                            .total_bytes
+                            .zip(counts.total_bytes)
+                            .map(|(left, right)| left.saturating_add(right));
+                    })
+                    .or_insert_with(|| counts.clone());
+            }
+        }
+        state.wizard.update_suggestions(observed);
     }
 
     state.wizard.cloud_file_count = remote_ok.map(|i| i.file_count);
@@ -3423,6 +3918,8 @@ fn project_ui_snapshot(
                 .map_or(StatusModifier::None, |entry| StatusModifier::QueuedBehind {
                     active_name: entry.display_name.clone(),
                 })
+        } else if let Some(stopped) = &m.stopped_first_sync {
+            StatusModifier::StoppedFirstSync(stopped.clone())
         } else if m.readiness == Readiness::RecoveryRequired {
             StatusModifier::RecoveryCause {
                 kind: RecoveryCauseKind::Interrupted,
@@ -3451,26 +3948,34 @@ fn project_ui_snapshot(
                 .as_ref()
                 .filter(|p| p.mapping_id == m.id);
             let elapsed_secs = live.map(|p| p.started_at.elapsed().as_secs()).unwrap_or(0);
-            let phase = if m.execution == Execution::Stopping {
+            let phase = if let Some(phase) = mgr_snap.archives.iter().find_map(|archive| {
+                if archive.mapping_id == m.id
+                    && let ArchiveState::Creating { bytes, total } = archive.state
+                {
+                    Some(if m.execution == Execution::Stopping {
+                        RunPhase::StoppingArchive
+                    } else {
+                        RunPhase::CreatingArchive {
+                            folder: archive.folder.clone(),
+                            bytes,
+                            total,
+                        }
+                    })
+                } else {
+                    None
+                }
+            }) {
+                phase
+            } else if m.execution == Execution::Stopping {
                 RunPhase::Stopping { elapsed_secs }
             } else if let Some(p) = live
-                && p.bytes_transferred > 0
+                && (p.transfer.bytes_transferred > 0
+                    || p.transfer.files_transferred > 0
+                    || p.transfer.expected_files.is_some_and(|total| total > 0))
             {
-                if let Some(total) = p.total_bytes
-                    && total > 0
-                {
-                    let pct = ((p.bytes_transferred.saturating_mul(100)) / total).min(100) as u8;
-                    RunPhase::TransferringKnown {
-                        transferred_label: format_bytes(p.bytes_transferred),
-                        total_label: format_bytes(total),
-                        percent: pct,
-                        elapsed_secs,
-                    }
-                } else {
-                    RunPhase::TransferringUnknown {
-                        transferred_label: format_bytes(p.bytes_transferred),
-                        elapsed_secs,
-                    }
+                RunPhase::Transferring {
+                    progress: p.transfer.clone(),
+                    elapsed_secs,
                 }
             } else {
                 RunPhase::Scanning { elapsed_secs }
@@ -3536,6 +4041,7 @@ fn project_ui_snapshot(
             unreviewed_conflicts,
             available_actions: available_actions(&mapping_state),
             scheduling_enabled: m.scheduling_enabled,
+            filter_migration_held: m.filter_migration_held,
             volume_issue: (m.readiness == Readiness::VolumeUnavailable)
                 .then(|| m.status_text.trim_end_matches(" (paused)").to_owned()),
             schedule_minutes: (m.schedule_interval_secs / 60).max(1) as u32,
@@ -3582,6 +4088,7 @@ fn project_ui_snapshot(
         volumes,
         mappings,
         active_run,
+        archives: mgr_snap.archives,
         queue_order: mgr_snap.queue_order,
         active_job_mapping_id: mgr_snap.active_job_mapping_id,
         attention_items,
@@ -3712,6 +4219,11 @@ fn project_run_record(r: RunRecord) -> RunRecordSnapshot {
             Tone::Attn,
             IconKind::Bang,
         ),
+        Some("first_sync_stopped") => (
+            "First sync stopped".to_owned(),
+            Tone::Neutral,
+            IconKind::Stop,
+        ),
         Some("interrupted" | "force_stopped" | "canceled_before_spawn") => {
             ("Interrupted".to_owned(), Tone::Err, IconKind::Octagon)
         }
@@ -3756,6 +4268,11 @@ fn build_real_attention_items(
 ) -> Vec<AttentionItem> {
     let mut items = Vec::new();
     for m in mappings {
+        if matches!(&m.modifier, StatusModifier::StoppedFirstSync(stopped) if stopped.cause.is_none())
+            && m.state.readiness() == Readiness::RecoveryRequired
+        {
+            continue;
+        }
         match m.state.readiness() {
             Readiness::AuthenticationRequired => {
                 items.push(AttentionItem {
@@ -3788,7 +4305,13 @@ fn build_real_attention_items(
                     icon: IconKind::Octagon,
                     is_error_accent: true,
                     title: format!("{} · recovery required", m.display_name),
-                    cause: "An earlier run was interrupted or hit a safety stop.".to_owned(),
+                    cause: match &m.modifier {
+                        StatusModifier::StoppedFirstSync(stopped) => stopped.cause.clone(),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| {
+                        "An earlier run was interrupted or hit a safety stop.".to_owned()
+                    }),
                     what_did:
                         "Kept the sync state and recovery copies intact and held this mapping."
                             .to_owned(),
@@ -3968,6 +4491,7 @@ fn default_real_wizard() -> WizardDraft {
     WizardDraft {
         changing_subfolders: false,
         filter_review: None,
+        filter_migration_progress: None,
         volume_free_bytes: None,
         step: WizardStep::Account,
         editing_mapping_id: None,
@@ -3984,7 +4508,14 @@ fn default_real_wizard() -> WizardDraft {
         volume_total_gb: 1,
         location_checks: Vec::new(),
         subfolders: Vec::new(),
+        archive_suggestions: Vec::new(),
+        declined_archives: BTreeSet::new(),
+        archive_holding_folder: None,
+        archive_errors: Vec::new(),
         custom_patterns: Vec::new(),
+        suggest_exclusions: true,
+        dismissed_suggestions: BTreeSet::new(),
+        suggested_folders: BTreeMap::new(),
         show_default_exclusions: false,
         local_recovery_path: String::new(),
         cloud_recovery_path: String::new(),
@@ -4007,7 +4538,6 @@ fn default_real_wizard() -> WizardDraft {
         first_sync_preflight_done: false,
         first_sync_markers_ready: false,
         first_sync_stopping: false,
-        first_sync_percent: 0,
         first_sync_elapsed_secs: 0,
         first_sync_completed: false,
         first_sync_error: None,
@@ -4039,6 +4569,7 @@ fn empty_loading_snapshot() -> UiSnapshot {
         volumes: Vec::new(),
         mappings: Vec::new(),
         active_run: None,
+        archives: Vec::new(),
         queue_order: Vec::new(),
         active_job_mapping_id: None,
         attention_items: Vec::new(),

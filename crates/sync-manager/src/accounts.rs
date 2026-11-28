@@ -764,7 +764,7 @@ impl AccountService {
         self.clock.now_rfc3339()
     }
 
-    fn qualify_engine(&self) -> Result<EngineIdentity, AccountError> {
+    pub(crate) fn qualify_engine(&self) -> Result<EngineIdentity, AccountError> {
         let mut qualified = self.qualified_engine.lock().unwrap();
         if let Some(engine) = qualified.as_ref() {
             return Ok(engine.clone());

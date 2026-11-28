@@ -244,6 +244,8 @@ fn reused_pid_with_different_start_time_is_not_trusted_on_restart() {
             last_verified_phase: "spawned".to_string(),
             files_checked: 0,
             files_transferred: 0,
+            first_sync_total_files: None,
+            files_already_present: 0,
             bytes_transferred: 0,
             conflict_count: 0,
         };
@@ -375,6 +377,8 @@ fn live_matching_orphan_is_detected_and_blocks_second_job() {
             last_verified_phase: "spawned".to_string(),
             files_checked: 0,
             files_transferred: 0,
+            first_sync_total_files: None,
+            files_already_present: 0,
             bytes_transferred: 0,
             conflict_count: 0,
         };

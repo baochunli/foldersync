@@ -17,6 +17,10 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
    Connect an external disk before selecting a folder on it. After choosing a
    local folder, wait for the disk and free-space checks before continuing.
 3. Under **Choose what to include**, clear the subfolders you want to skip.
+   **Suggested: build and cache folders** lists matching folders that
+   FolderSync found and pre-excluded, with their folder count, file count,
+   and size. Choose **Remove** or **Remove all suggested** to include
+   those files. The size estimate updates as you make changes.
    Use **Pattern (optional)** and **Add** for a custom exclusion. Use
    **Remove** beside a pattern to take it out of the selection.
    Choose a local location for **Recovery copies**. Leave room for both synced
@@ -24,7 +28,43 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
 4. Review the direction of the first sync. Use an empty destination for an
    upload or download. If both folders contain files, ask the owner to compare
    and preserve both sets before proceeding. Choose **Start first sync** once
-   the setup checks pass.
+   the setup checks pass. The first-sync screen shows elapsed time,
+   transferred bytes and files, and a progress bar. The bar fills as bytes
+   transfer when the expected byte total is known. FolderSync can estimate
+   time left after two minutes. Keep the destination folder unchanged until
+   first sync finishes, and ask others with access to wait before editing it.
+5. If the first sync stops, choose **Resume first sync** on the mapping.
+   FolderSync checks that the files already on the destination still match
+   the source and that the folder selection still matches the original setup.
+   If a check fails, preserve both folders and review the paths shown.
+
+## Archive finished folders during setup
+
+Under **Choose what to include**, FolderSync suggests **Upload as one
+archive** for an immediate subfolder with at least 2,000 included files and
+no included file modified in the past 12 months. The count applies your
+exclusions, including any suggested build and cache folders you keep
+excluded. Clear any archive suggestion you want to keep as ordinary files.
+**Review** shows the selected archives and where the originals will go.
+
+When you start first sync, FolderSync checks that the disk has room to make
+and verify each ZIP while the original is still present. ZIPs contain the
+included files, including Git repository data within included folders. The
+complete original moves to **FolderSync Archived Originals** on the same
+disk, outside the mapping. The ZIP takes its place in the mapping and syncs
+as an ordinary file. First-sync progress shows ZIP creation before upload
+and then counts each ZIP as one file at its on-disk size. Resuming a stopped
+transfer reuses the finished ZIPs. Keep the source folders quiet while the
+ZIPs are made.
+
+If the holding folder is inaccessible or the ZIP name is already in use,
+review the error before starting. If the app stops during a move, reopen
+FolderSync with the same disk connected so it can recover the archive before
+you resume first sync.
+
+Open the mapping’s **Archived originals** section to see their sizes and
+reveal them in Finder. FolderSync keeps the originals until you remove them
+yourself. Open a ZIP to retrieve an included file.
 
 ## Everyday use
 
@@ -38,10 +78,13 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
   finish, and **Sync now** still works for eligible mappings. To hold one
   mapping, use its **Pause** button. Use **Resume scheduling** in the sidebar
   for the whole Mac, or **Resume** for a paused mapping.
-- In **Change subfolders…**, use **Remove** beside a custom pattern, then
-  choose **Review changes**. Check **Removed exclusions** and the first-sync
-  checks before confirming. Files you newly exclude stay on disk. Ask the
-  owner to review the change if both sides already contain files.
+- In **Change subfolders…**, choose **Add suggested build and cache exclusions**
+  or add your own patterns. Choose **Review changes** to see the matched Drive
+  file counts and sizes. After catch-up, FolderSync moves those Drive copies
+  into Recovery and leaves the copies on this Mac in place. Another Mac may
+  move its copies into its own recovery folder on its next successful sync.
+  Removing an exclusion from a mapping populated on both sides still requires
+  reviewing both folders.
 - FolderSync appears in the Dock and app switcher while its window is open.
   Closing the window leaves it running in the menu bar. Use **Show window**
   to reopen it. **Quit FolderSync** stops new runs and exits the app. If a
@@ -66,6 +109,10 @@ on the card for your folder.
 - If you see **A different disk named … is connected**, reconnect the original
   disk. If the right disk still shows a folder change or mounts at a new
   location, leave the mapping held and ask the owner.
+- If an exclusion change stops during or after a Drive move, open Recovery.
+  Choose **Finish excluding** to continue or **Put the moved files back** to
+  return the verified copies to Data. The mapping stays held until one of
+  these actions succeeds.
 - For **Can’t access** messages, check the disk and folder permissions, then
   choose **Check again**. Ask the owner if the check still fails.
 - A **Low space** advisory names the mappings on the volume that needs space.

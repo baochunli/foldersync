@@ -30,6 +30,25 @@ pub struct MappingCounters {
     pub open_recovery_cases: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoppedFirstSync {
+    pub files_copied: u64,
+    pub total_files: Option<u64>,
+    pub cause: Option<String>,
+}
+
+impl StoppedFirstSync {
+    pub fn status_text(&self) -> String {
+        match self.total_files {
+            Some(total) => format!(
+                "First sync stopped · {} of {total} files copied",
+                self.files_copied.min(total)
+            ),
+            None => format!("First sync stopped · {} files copied", self.files_copied),
+        }
+    }
+}
+
 /// Immutable per-mapping view published in [`StatusSnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MappingStatusSnapshot {
@@ -54,6 +73,10 @@ pub struct MappingStatusSnapshot {
     pub execution: Execution,
     pub intent: Intent,
     pub scheduling_enabled: bool,
+    #[serde(default)]
+    pub filter_migration_held: bool,
+    #[serde(default)]
+    pub filter_migration_phase: Option<crate::manager::FilterMigrationPhase>,
     #[serde(default = "default_schedule_interval_secs")]
     pub schedule_interval_secs: u64,
     #[serde(default)]
@@ -66,6 +89,8 @@ pub struct MappingStatusSnapshot {
     pub last_run_outcome: Option<RunOutcome>,
     pub last_run_completed_at: Option<String>,
     pub last_run_summary: Option<String>,
+    #[serde(default)]
+    pub stopped_first_sync: Option<StoppedFirstSync>,
     /// Run ID whose conflict copies have not yet been marked reviewed by the user.
     #[serde(default)]
     pub unreviewed_conflict_run_id: Option<RunId>,
@@ -105,6 +130,25 @@ pub enum FolderSizeStatus {
     Failed { cause: String },
 }
 
+/// Local archive preparation and retained-original status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveState {
+    Pending,
+    Creating { bytes: u64, total: u64 },
+    Failed { cause: String },
+    Complete,
+}
+
+/// One confirmed archive and its retained original, where available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveStatus {
+    pub mapping_id: MappingId,
+    pub folder: String,
+    pub state: ArchiveState,
+    pub holding_path: Option<PathBuf>,
+    pub original_bytes: Option<u64>,
+}
+
 /// Immutable manager-wide snapshot published to UI/CLI subscribers (§16).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSnapshot {
@@ -120,6 +164,8 @@ pub struct StatusSnapshot {
     pub mappings: Vec<MappingStatusSnapshot>,
     #[serde(default)]
     pub folder_sizes: Vec<FolderSizeSnapshot>,
+    #[serde(default)]
+    pub archives: Vec<ArchiveStatus>,
 }
 
 /// Bounded activity and diagnostic events emitted by the manager.
@@ -149,8 +195,17 @@ pub enum ManagerEvent {
         mapping_id: MappingId,
         run_id: RunId,
         bytes_transferred: u64,
-        total_bytes: Option<u64>,
+        #[serde(default)]
+        bytes_already_present: u64,
+        #[serde(default)]
+        expected_bytes: Option<u64>,
+        #[serde(default)]
+        expected_files: Option<u64>,
         files_transferred: u64,
+        #[serde(default)]
+        files_already_present: u64,
+        #[serde(default)]
+        first_sync_total_files: Option<u64>,
         files_checked: u64,
         timestamp: String,
     },
