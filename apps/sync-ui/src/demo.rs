@@ -860,6 +860,9 @@ impl DemoSource {
             }
             UiCommand::WizardSelectAccount(acct) => {
                 cancel_demo_size(&mut snap);
+                if snap.wizard.selected_account != acct {
+                    snap.wizard.reset_suggestions();
+                }
                 snap.wizard.selected_account = acct;
                 snap.wizard.no_other_sync_confirmed = false;
                 snap.wizard.cloud_recovery_path = format!(
@@ -933,6 +936,15 @@ impl DemoSource {
                 }
             }
             UiCommand::WizardSetRemotePath(path) => {
+                if snap
+                    .wizard
+                    .remote_folder_path
+                    .as_deref()
+                    .map(normalize_path)
+                    != Some(normalize_path(&path))
+                {
+                    snap.wizard.reset_suggestions();
+                }
                 snap.wizard.remote_folder_path = Some(path);
                 snap.wizard.no_other_sync_confirmed = false;
                 recompute_wizard_checks(&mut snap);
@@ -1514,6 +1526,9 @@ fn apply_wizard_folder_selection(snap: &mut UiSnapshot, folder: &str) {
         .iter()
         .find(|c| c.name == folder)
         .cloned();
+    if snap.wizard.selected_folder != folder {
+        snap.wizard.reset_suggestions();
+    }
     snap.wizard.selected_folder = folder.to_owned();
     snap.wizard.local_path.clear();
     snap.wizard.location_check_pending = false;
@@ -1894,8 +1909,8 @@ fn recompute_wizard_checks(snap: &mut UiSnapshot) {
             // Synthetic nested folders in the Projects fixture (for example a/build/x.o).
             for (pattern, folder_count, file_count, bytes) in [
                 ("build/**", 28, 608, 2_300_000_000),
-                ("Pods/**", 4, 70, 600_000_000),
-                (".venv/**", 2, 42, 100_000_000),
+                ("Pods/**", 4, 111, 600_000_000),
+                (".venv/**", 1, 1, 100_000_000),
             ] {
                 observed.insert(
                     pattern,

@@ -235,6 +235,7 @@ test("Suggested exclusions show measured folders and can be removed individually
   await app.press("id:subfolder-renders");
   expect(app.texts().join("\n")).toContain("Suggested: build and cache folders");
   expect(app.texts().join("\n")).toContain("28 folders, 608 files, 2.3 GB");
+  expect(app.texts()).toContain("1 folder, 1 file, 100.0 MB");
   expect(app.texts()).toContain("15.6 GB");
   expect(app.shows("id:remove-pattern-Pods/**")).toBe(true);
   expect(app.shows("id:remove-pattern-.venv/**")).toBe(true);
@@ -252,6 +253,26 @@ test("Suggested exclusions show measured folders and can be removed individually
   expect(app.texts()).toContain("18.6 GB");
   expect(app.shows("id:remove-pattern-*.bak")).toBe(true);
   expect(app.texts().join("\n")).not.toContain("Suggested: build and cache folders");
+});
+
+test("Suggested exclusions reset when the selected folder changes", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:add-mapping-btn");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  await app.press("id:remove-pattern-build/**");
+  await app.press("id:wizard-step-2");
+  await app.press("id:wizard-folder-Projects");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  expect(app.shows("id:remove-pattern-build/**")).toBe(false);
+
+  await app.press("id:wizard-step-2");
+  await app.press("id:wizard-folder-Shared-Media");
+  await app.press("id:wizard-folder-Projects");
+  await pickDemoFolder(app);
+  await app.press("id:wizard-step-4");
+  expect(app.shows("id:remove-pattern-build/**")).toBe(true);
 });
 
 test("First-sync demo shows a long transfer with shared progress", async () => {

@@ -116,7 +116,7 @@ fn setup_dirs(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, Path
     )
 }
 
-fn drive_wizard_init(
+fn configure_fixture_wizard(
     mgr: &ManagerSource,
     remote_parent: &Path,
     remote_folder: &Path,
@@ -140,8 +140,146 @@ fn drive_wizard_init(
     mgr.dispatch(UiCommand::WizardSetLocalRecoveryPath(
         local_recovery.to_string_lossy().into_owned(),
     ));
+}
+
+fn drive_wizard_init(
+    mgr: &ManagerSource,
+    remote_parent: &Path,
+    remote_folder: &Path,
+    local_folder: &Path,
+    local_recovery: &Path,
+) {
+    configure_fixture_wizard(
+        mgr,
+        remote_parent,
+        remote_folder,
+        local_folder,
+        local_recovery,
+    );
     mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
     mgr.dispatch(UiCommand::WizardStartFirstSync);
+}
+
+#[test]
+fn suggested_exclusions_stay_removed_when_reopening_a_saved_mapping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    for (folder, payload) in [("build", b"output"), ("Pods", b"vendor")] {
+        let dir = remote_folder.join("nested").join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file"), payload).unwrap();
+    }
+    let launcher = Arc::new(FakeBisyncLauncher::new());
+    launcher.push_script(FakeLaunchScript::default());
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        launcher,
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    configure_fixture_wizard(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let new = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.wizard.recovery_valid());
+    assert_eq!(
+        new.wizard.extra_exclusions(),
+        ["Pods/**".to_owned(), "build/**".to_owned()].into()
+    );
+
+    mgr.dispatch(UiCommand::WizardRemovePattern("build/**".to_owned()));
+    mgr.dispatch(UiCommand::WizardAddPattern("*.bak".to_owned()));
+    mgr.dispatch(UiCommand::WizardSaveDraft);
+    let saved = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.mappings.len() == 1);
+    let saved_mapping = &saved.mappings[0];
+    assert_eq!(saved_mapping.custom_exclusions, ["*.bak", "Pods/**"]);
+    let id = saved_mapping.id.clone();
+
+    for (command, step) in [
+        (UiCommand::ResumeDraft(id.clone()), WizardStep::Location),
+        (UiCommand::FinishSetup(id.clone()), WizardStep::Review),
+    ] {
+        mgr.dispatch(command);
+        let reopened = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.wizard.step == step);
+        assert_eq!(
+            reopened.wizard.custom_patterns, saved_mapping.custom_exclusions,
+            "{step:?}"
+        );
+        assert_eq!(reopened.wizard.cloud_file_count, Some(1), "{step:?}");
+        assert_eq!(reopened.wizard.cloud_total_bytes, Some(6), "{step:?}");
+    }
+
+    mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    mgr.dispatch(UiCommand::WizardStartFirstSync);
+    let ready = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.mapping(&id)
+            .is_some_and(|mapping| mapping.state.readiness() == Readiness::Ready)
+    });
+    assert_eq!(
+        ready.mapping(&id).unwrap().custom_exclusions,
+        saved_mapping.custom_exclusions
+    );
+    mgr.dispatch(UiCommand::ChangeSubfolders(id));
+    let changing = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.changing_subfolders
+    });
+    assert_eq!(
+        changing.wizard.custom_patterns,
+        saved_mapping.custom_exclusions
+    );
+    mgr.shutdown();
+}
+
+#[test]
+fn suggested_exclusions_reset_dismissals_when_choosing_another_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state_dir, finder_dir, remote_parent, remote_folder, local_folder, local_recovery) =
+        setup_dirs(tmp.path());
+    let other_folder = remote_parent.join("Other");
+    for folder in [&remote_folder, &other_folder] {
+        let build = folder.join("source/build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("cache"), b"generated").unwrap();
+    }
+    let mgr = ManagerSource::spawn_for_app(test_mgr_config(
+        state_dir,
+        finder_dir,
+        Arc::new(FakeBisyncLauncher::new()),
+        Arc::new(RecordingFinderNotifier::new()),
+    ));
+    configure_fixture_wizard(
+        &mgr,
+        &remote_parent,
+        &remote_folder,
+        &local_folder,
+        &local_recovery,
+    );
+    let new = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.wizard.recovery_valid());
+    assert_eq!(new.wizard.custom_patterns, ["build/**"]);
+    mgr.dispatch(UiCommand::WizardRemovePattern("build/**".to_owned()));
+    mgr.dispatch(UiCommand::WizardAddPattern("*.bak".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetRemotePath(
+        remote_folder.to_string_lossy().into_owned(),
+    ));
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Folder));
+    let same = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.step == WizardStep::Folder
+    });
+    assert_eq!(same.wizard.custom_patterns, ["*.bak"]);
+    assert_eq!(same.wizard.cloud_total_bytes, Some(9));
+
+    mgr.dispatch(UiCommand::WizardSelectFolder("Other".to_owned()));
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Location));
+    let other = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.selected_folder == "Other" && s.wizard.step == WizardStep::Location
+    });
+    assert_eq!(other.wizard.custom_patterns, ["*.bak", "build/**"]);
+    assert_eq!(other.wizard.cloud_total_bytes, Some(0));
+    mgr.shutdown();
 }
 
 #[test]

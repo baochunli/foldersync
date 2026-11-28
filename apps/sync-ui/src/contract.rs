@@ -1472,6 +1472,11 @@ impl WizardDraft {
             .collect();
     }
 
+    pub(crate) fn reset_suggestions(&mut self) {
+        self.dismissed_suggestions.clear();
+        self.update_suggestions(BTreeMap::new());
+    }
+
     pub(crate) fn remove_all_suggested(&mut self) -> bool {
         if self.suggested_folders.is_empty() {
             return false;

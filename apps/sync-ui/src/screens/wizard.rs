@@ -1417,11 +1417,21 @@ fn render_step_subfolders(
             };
             let name = suggestion.pattern.trim_end_matches("**");
             let folders = format_count(counts.folder_count as u64);
+            let folder_label = if counts.folder_count == 1 {
+                "folder"
+            } else {
+                "folders"
+            };
             let files = format_count(counts.file_count as u64);
+            let file_label = if counts.file_count == 1 {
+                "file"
+            } else {
+                "files"
+            };
             let size = counts
                 .total_bytes
                 .map_or_else(|| "size unknown".to_owned(), format_bytes);
-            let stats = format!("{folders} folders, {files} files, {size}");
+            let stats = format!("{folders} {folder_label}, {files} {file_label}, {size}");
             side_card = side_card.child(
                 view()
                     .flex_col()

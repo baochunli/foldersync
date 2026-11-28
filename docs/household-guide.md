@@ -28,9 +28,10 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
 4. Review the direction of the first sync. Use an empty destination for an
    upload or download. If both folders contain files, ask the owner to compare
    and preserve both sets before proceeding. Choose **Start first sync** once
-   the setup checks pass. The first-sync screen shows elapsed time and
-   transferred bytes and files. When FolderSync knows the expected totals,
-   it shows a progress bar and can estimate time left after two minutes.
+   the setup checks pass. The first-sync screen shows elapsed time,
+   transferred bytes and files, and a progress bar. The bar fills as bytes
+   transfer when the expected byte total is known. FolderSync can estimate
+   time left after two minutes.
 
 ## Everyday use
 

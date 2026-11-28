@@ -1770,6 +1770,7 @@ fn handle_ui_command(
             if state.wizard.selected_account != acct {
                 cancel_folder_size(state);
                 clear_cloud_catalog(state);
+                state.wizard.reset_suggestions();
                 state.wizard.selected_folder.clear();
                 state.wizard.remote_folder_path = None;
                 state.wizard.drive_collection = None;
@@ -1859,6 +1860,11 @@ fn handle_ui_command(
                     ));
                     return (None, None);
                 }
+            }
+            if state.wizard.remote_folder_path.as_deref().map(Path::new)
+                != Some(candidate.as_path())
+            {
+                state.wizard.reset_suggestions();
             }
             if let Some(name) = candidate.file_name().and_then(|n| n.to_str()) {
                 state.wizard.selected_folder = name.to_owned();
@@ -2377,7 +2383,6 @@ fn wizard_review_fingerprint(wizard: &WizardDraft) -> String {
 #[test]
 fn wizard_review_fingerprint_changes_with_drive_ancestry() {
     let mut wizard = default_real_wizard();
-    wizard.suggest_exclusions = false;
     wizard.drive_collection = Some(CloudCollection {
         folder_id: "research-id".to_owned(),
         display_path: "Data/Research".to_owned(),
@@ -2574,6 +2579,7 @@ fn load_mapping_into_wizard(
     // Reset wizard cleanly before populating from `rec` so prior draft exclusions
     // never leak into a resumed draft or Finish Setup session (HIGH #1).
     let mut wizard = default_real_wizard();
+    wizard.suggest_exclusions = false;
     wizard.editing_mapping_id = Some(rec.id.clone());
     wizard.selected_account = rec.account_id.clone();
     wizard.selected_folder = rec.collection.display_name().to_owned();
@@ -2904,12 +2910,14 @@ fn project_drive_candidate(
 }
 
 fn select_cloud_folder(state: &mut WorkerState, candidate: CloudFolderCandidate) {
-    let same_folder = state.wizard.selected_folder == candidate.name;
+    let same_folder = state.wizard.selected_folder == candidate.name
+        && state.wizard.drive_collection == candidate.collection;
     if same_folder && candidate.size == FolderSize::Calculating {
         return;
     }
     cancel_folder_size(state);
     if !same_folder {
+        state.wizard.reset_suggestions();
         state.wizard.subfolders.clear();
     }
     state.wizard.selected_folder = candidate.name;
