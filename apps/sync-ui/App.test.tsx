@@ -242,7 +242,7 @@ test("Mapping schedule, volume, and subfolder change review; Activity raw log to
   await app.press("id:filter-change-consent");
   expect(app.enabled("id:filter-change-confirm")).toBe(true);
   await app.press("id:filter-change-confirm");
-  expect(app.texts().join("\n")).toContain("First sync");
+  expect(app.texts()).toContain("Update subfolder selection · Family");
   expect(detailText).toContain("Sync now");
 
   // Activity screen: indeterminate scanning + elapsed time, raw log closed by default
@@ -254,6 +254,30 @@ test("Mapping schedule, volume, and subfolder change review; Activity raw log to
 
   await app.press("id:activity-raw-log-toggle");
   expect(app.shows("id:activity-raw-log-body")).toBe(true);
+});
+
+test("Suggested exclusions can be reviewed before updating an established mapping", async () => {
+  const app = await open(".", DESKTOP);
+  await app.press("id:open-detail-family");
+  await app.press("id:change-subfolders-btn");
+  await app.type("id:wizard-pattern-input", "build/**");
+  await app.press("id:wizard-add-pattern-btn");
+  await app.press("id:add-suggested-exclusions");
+  expect(app.texts().filter((label) => label === "build/**").length).toBe(1);
+  expect(app.enabled("id:add-suggested-exclusions")).toBe(false);
+  await app.press("id:filter-change-preview");
+  expect(app.texts()).toContain("New exclusions");
+  expect(app.texts()).toContain("0 files · 0 B");
+  expect(app.texts().join("\n")).toContain("copies in Google Drive move to the Recovery folder");
+  expect(app.enabled("id:filter-change-confirm")).toBe(false);
+  await app.press("id:filter-change-consent");
+  expect(app.enabled("id:filter-change-confirm")).toBe(true);
+  await app.press("id:filter-change-confirm");
+  expect(app.texts()).toContain("Update subfolder selection · Family");
+  expect(app.texts()).toContain("Catch up with the current selection");
+  expect(app.texts()).toContain("Move excluded cloud files to Recovery");
+  expect(app.texts()).toContain("Set up the new selection");
+  expect(app.shows("id:wizard-stop-first-sync-btn")).toBe(true);
 });
 
 test("Custom exclusions can be removed individually from a new mapping", async () => {

@@ -72,10 +72,13 @@ yourself. Open a ZIP to retrieve an included file.
   finish, and **Sync now** still works for eligible mappings. To hold one
   mapping, use its **Pause** button. Use **Resume scheduling** in the sidebar
   for the whole Mac, or **Resume** for a paused mapping.
-- In **Change subfolders…**, use **Remove** beside a custom pattern, then
-  choose **Review changes**. Check **Removed exclusions** and the first-sync
-  checks before confirming. Files you newly exclude stay on disk. Ask the
-  owner to review the change if both sides already contain files.
+- In **Change subfolders…**, choose **Add suggested build and cache exclusions**
+  or add your own patterns. Choose **Review changes** to see the matched Drive
+  file counts and sizes. After catch-up, FolderSync moves those Drive copies
+  into Recovery and leaves the copies on this Mac in place. Another Mac may
+  move its copies into its own recovery folder on its next successful sync.
+  Removing an exclusion from a mapping populated on both sides still requires
+  reviewing both folders.
 - FolderSync appears in the Dock and app switcher while its window is open.
   Closing the window leaves it running in the menu bar. Use **Show window**
   to reopen it. **Quit FolderSync** stops new runs and exits the app. If a
@@ -100,6 +103,10 @@ on the card for your folder.
 - If you see **A different disk named … is connected**, reconnect the original
   disk. If the right disk still shows a folder change or mounts at a new
   location, leave the mapping held and ask the owner.
+- If an exclusion change stops during or after a Drive move, open Recovery.
+  Choose **Finish excluding** to continue or **Put the moved files back** to
+  return the verified copies to Data. The mapping stays held until one of
+  these actions succeeds.
 - For **Can’t access** messages, check the disk and folder permissions, then
   choose **Check again**. Ask the owner if the check still fails.
 - A **Low space** advisory names the mappings on the volume that needs space.

@@ -35,8 +35,9 @@ pub use log_parser::{
 };
 pub use lsjson::{
     DuplicateDirFinding, LsJsonEntry, LsJsonError, LsJsonRequest, RemoteSize, ResolvedComponent,
-    ResolvedRemotePath, find_duplicate_dir_names, list_dirs_with_runner, parse_lsjson_entries,
-    resolve_folder_path_with_runner, verify_expected_folder_identity_with_runner,
+    ResolvedRemotePath, check_filtered, find_duplicate_dir_names, list_dirs_with_runner,
+    parse_lsjson_entries, render_move_filter, resolve_folder_path_with_runner,
+    verify_expected_folder_identity_with_runner,
 };
 pub use outcome::{
     EXIT_CODE_TABLE_VERSION, Outcome, RcloneExitCode, classify_exit_code, classify_outcome,

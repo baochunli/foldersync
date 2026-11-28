@@ -1,9 +1,10 @@
 use std::{
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -12,22 +13,69 @@ use std::{
 
 use chrono::TimeDelta;
 use rclone_adapter::{
-    AccountConfigLock, FakeProcessRunner, FakeRunScript, OutputLine, PasswordCommand, ProcessError,
-    ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle, SpawnOptions, StreamKind,
-    pinned_binary_path,
+    AccountConfigLock, ExitStatusInfo, FakeProcessRunner, FakeRunScript, OutputLine,
+    PasswordCommand, ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle,
+    SpawnOptions, StreamKind, pinned_binary_path,
 };
 use sync_core::{AccountId, CloudCollection, MappingId, Readiness, RunOutcome};
 use sync_manager::{
     AccountRecord, AccountServiceConfig, AddMappingCommand, CollectionSkipReason,
-    DriveAuthorization, FixedClock, FolderSizeStatus, InMemorySecretStore, InitializeCommand,
-    ManagerConfig, ManagerEvent, RealBisyncLauncher, SecretStore, SecretString, SqliteStateStore,
-    SyncManager, scoped_credential_key,
+    DriveAuthorization, FilterChangePreview, FilterMigrationPhase, FixedClock, FolderSizeStatus,
+    InMemorySecretStore, InitializeCommand, ManagerConfig, ManagerEvent, MappingStatusSnapshot,
+    RealBisyncLauncher, SecretStore, SecretString, SqliteStateStore, SyncManager,
+    scoped_credential_key,
 };
 
 struct FixtureRunner {
     fake: FakeProcessRunner,
     root: PathBuf,
     mkdir_calls: AtomicUsize,
+    fail_next_mkdir: AtomicBool,
+    synthesize_drive_ids: bool,
+    pre_move_check_fault: Mutex<Option<CheckFault>>,
+    post_move_check_fault: Mutex<Option<(usize, CheckFault)>>,
+    stop_after_first_move: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+enum CheckFault {
+    Fail,
+    WaitForStop(mpsc::Sender<()>),
+}
+
+impl FixtureRunner {
+    fn take_check_fault(&self) -> Option<CheckFault> {
+        if self.root.join("Data/Research/proj/build/x.o").exists() {
+            self.pre_move_check_fault.lock().unwrap().take()
+        } else {
+            let mut fault = self.post_move_check_fault.lock().unwrap();
+            match fault.as_mut() {
+                Some((remaining, _)) if *remaining > 0 => {
+                    *remaining -= 1;
+                    None
+                }
+                _ => fault.take().map(|(_, fault)| fault),
+            }
+        }
+    }
+}
+
+fn wait_for_test_stop(
+    spec: &ProcessSpec,
+    options: SpawnOptions,
+    started: mpsc::Sender<()>,
+) -> Result<RunHandle, ProcessError> {
+    let runner = FakeProcessRunner::new();
+    runner.push_run(FakeRunScript {
+        wait_for_stop: true,
+        exit_status_on_stop: Some(ExitStatusInfo {
+            code: None,
+            signal: Some(libc::SIGINT),
+        }),
+        ..Default::default()
+    });
+    let child = runner.spawn(spec, options)?;
+    started.send(()).unwrap();
+    Ok(child)
 }
 
 impl ProcessRunner for FixtureRunner {
@@ -36,9 +84,15 @@ impl ProcessRunner for FixtureRunner {
         let command = args[0].to_str().unwrap();
         if command == "mkdir" {
             self.mkdir_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_next_mkdir.swap(false, Ordering::SeqCst) {
+                return Err(ProcessError::Spawn {
+                    program: spec.program.clone(),
+                    source: std::io::Error::other("injected recovery mkdir failure"),
+                });
+            }
         }
         let directory_listing = args.iter().any(|arg| arg == "--dirs-only");
-        if directory_listing
+        if directory_listing && !self.synthesize_drive_ids
             || command == "config"
             || command == "size" && args.iter().any(|arg| arg == "household:Data/Slow")
         {
@@ -46,6 +100,82 @@ impl ProcessRunner for FixtureRunner {
         }
         let mut spec = spec.clone();
         spec.current_dir = Some(self.root.clone());
+        if command == "check"
+            && let Some(fault) = self.take_check_fault()
+        {
+            if let CheckFault::WaitForStop(started) = fault {
+                return wait_for_test_stop(&spec, options, started);
+            }
+            let runner = FakeProcessRunner::new();
+            runner.push_run(FakeRunScript {
+                lines: vec![OutputLine {
+                    stream: StreamKind::Stderr,
+                    text: "injected check difference".to_owned(),
+                    truncated: false,
+                }],
+                exit_status: ExitStatusInfo {
+                    code: Some(1),
+                    signal: None,
+                },
+                ..Default::default()
+            });
+            return runner.spawn(&spec, options);
+        }
+        if command == "move"
+            && let Some(started) = self.stop_after_first_move.lock().unwrap().take()
+        {
+            let path = |arg: &std::ffi::OsStr| {
+                self.root
+                    .join(arg.to_str().unwrap().strip_prefix("household:").unwrap())
+                    .join(EXCLUDED_BUILD_FILES[0].0)
+            };
+            let destination = path(&args[2]);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::rename(path(&args[1]), destination).unwrap();
+            return wait_for_test_stop(&spec, options, started);
+        }
+        if self.synthesize_drive_ids
+            && command == "lsjson"
+            && let Some(subpath) = args
+                .iter()
+                .find_map(|arg| arg.to_str()?.strip_prefix("household:"))
+        {
+            let output = RealProcessRunner
+                .spawn(&spec, SpawnOptions::default())?
+                .wait()?;
+            let stdout = output.output.stdout_text();
+            let mut lines = output.output.lines;
+            if output.exit_status.is_success() {
+                let mut entries: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+                for entry in &mut entries {
+                    let relative = Path::new(subpath).join(entry["Path"].as_str().unwrap());
+                    // A local same-filesystem move preserves the inode, as a Drive move
+                    // must preserve the object ID. Keep the pinned engine's actual hashes.
+                    let id = match relative.to_str().unwrap() {
+                        "Data" => "data-id".to_owned(),
+                        "Data/Research" => "research-id".to_owned(),
+                        _ => format!(
+                            "fixture-{}",
+                            fs::metadata(self.root.join(relative)).unwrap().ino()
+                        ),
+                    };
+                    entry["ID"] = id.into();
+                }
+                lines.retain(|line| line.stream != StreamKind::Stdout);
+                lines.push(OutputLine {
+                    stream: StreamKind::Stdout,
+                    text: serde_json::to_string(&entries).unwrap(),
+                    truncated: false,
+                });
+            }
+            let runner = FakeProcessRunner::new();
+            runner.push_run(FakeRunScript {
+                lines,
+                exit_status: output.exit_status,
+                ..Default::default()
+            });
+            return runner.spawn(&spec, options);
+        }
         RealProcessRunner.spawn(&spec, options)
     }
 }
@@ -62,6 +192,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(ready: bool) -> Option<Self> {
+        Self::new_with_drive_ids(ready, false)
+    }
+
+    fn new_with_drive_ids(ready: bool, synthesize_drive_ids: bool) -> Option<Self> {
         let binary = pinned_binary_path()?;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -69,6 +203,11 @@ impl Fixture {
             fake: FakeProcessRunner::new(),
             root: root.clone(),
             mkdir_calls: AtomicUsize::new(0),
+            fail_next_mkdir: AtomicBool::new(false),
+            synthesize_drive_ids,
+            pre_move_check_fault: Mutex::new(None),
+            post_move_check_fault: Mutex::new(None),
+            stop_after_first_move: Mutex::new(None),
         });
         let state = root.join("state");
         let account_dir = state.join("accounts/drive");
@@ -117,6 +256,9 @@ impl Fixture {
     }
 
     fn listing(&self, children: &[(&str, &str)]) {
+        if self.runner.synthesize_drive_ids {
+            return;
+        }
         self.dirs(&[("Data", "data-id")]);
         self.dirs(children);
     }
@@ -150,6 +292,18 @@ impl Fixture {
             self.root().join("local-recovery"),
         )
         .unwrap()
+    }
+
+    fn reopen(mut self) -> Self {
+        drop(self.manager);
+        self.manager = open_manager(
+            &self.state,
+            pinned_binary_path().unwrap(),
+            &self.clock,
+            &self.runner,
+            &self.secrets,
+        );
+        self
     }
 }
 
@@ -599,6 +753,544 @@ fn drive_preview_counts_excluded_files_in_subfolder_totals() {
         ),
         (1, 7, true)
     );
+}
+
+const EXCLUDED_BUILD_FILES: [(&str, &[u8]); 2] = [
+    ("proj/build/x.o", b"compiled"),
+    ("proj/node_modules/m.js", b"dependency"),
+];
+
+fn filter_migration_fixture() -> Option<Fixture> {
+    let fx = Fixture::new_with_drive_ids(true, true)?;
+    let local = fx.root().join("local");
+    for (relative, contents) in EXCLUDED_BUILD_FILES.into_iter().chain([
+        ("proj/src/a.txt", b"source".as_slice()),
+        ("proj/src/build", b"a file named build".as_slice()),
+    ]) {
+        let path = local.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    initialize_research(&fx, rclone_adapter::InitPreference::Path1);
+    Some(fx)
+}
+
+fn add_invalid_excluded_name(fx: &Fixture) -> PathBuf {
+    let file = fx.root().join("Data/Research/.Trashes/invalid?.txt");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, b"already excluded").unwrap();
+    file
+}
+
+fn preview_build_exclusions(fx: &Fixture) -> FilterChangePreview {
+    let preview = fx
+        .manager
+        .propose_filter_change(
+            &MappingId::new("local"),
+            ["build/**".to_owned(), "node_modules/**".to_owned()].into(),
+        )
+        .unwrap();
+    assert!(preview.is_narrowing());
+    assert_eq!(
+        preview
+            .cloud_move_counts()
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.pattern.as_str(), entry.file_count, entry.total_bytes))
+            .collect::<Vec<_>>(),
+        [("build/**", 1, 8), ("node_modules/**", 1, 10)]
+    );
+    preview
+}
+
+fn moved_build_root(fx: &Fixture) -> PathBuf {
+    let device = SqliteStateStore::open(&fx.state.join("state.sqlite"))
+        .unwrap()
+        .get_default_device()
+        .unwrap()
+        .unwrap();
+    let recovery = fx
+        .root()
+        .join("Recovery/research-id")
+        .join(device.id.as_str());
+    let paths: Vec<_> = fs::read_dir(recovery)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|run| run.join(EXCLUDED_BUILD_FILES[0].0).exists())
+        .collect();
+    assert_eq!(paths.len(), 1, "expected one move run, found {paths:?}");
+    paths.into_iter().next().unwrap()
+}
+
+fn assert_build_files_moved(fx: &Fixture, moved: &Path) {
+    let remote = fx.root().join("Data/Research");
+    for (relative, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(
+            fs::read(fx.root().join("local").join(relative)).unwrap(),
+            bytes
+        );
+        assert_eq!(fs::read(moved.join(relative)).unwrap(), bytes);
+        assert!(!remote.join(relative).exists());
+    }
+    assert_eq!(fs::read(remote.join("proj/src/a.txt")).unwrap(), b"source");
+    assert_eq!(
+        fs::read(remote.join("proj/src/build")).unwrap(),
+        b"a file named build"
+    );
+    assert!(!moved.join("proj/src/a.txt").exists());
+    assert!(!moved.join("proj/src/build").exists());
+}
+
+#[test]
+fn drive_narrowing_moves_excluded_objects_to_recovery_and_leaves_local_copies() {
+    let Some(fx) = filter_migration_fixture() else {
+        return;
+    };
+    let initial_generation = fx.manager.snapshot().mappings[0]
+        .active_generation_id
+        .clone();
+    let remote = fx.root().join("Data/Research");
+    let initial_ids = EXCLUDED_BUILD_FILES
+        .map(|(relative, _)| fs::metadata(remote.join(relative)).unwrap().ino());
+    let preview = preview_build_exclusions(&fx);
+    let invalid = add_invalid_excluded_name(&fx);
+    // This file is absent from the review inventory. The old-filter catch-up
+    // uploads it, and the fresh move inventory must then include it.
+    let pending = "proj/build/pending.o";
+    fs::write(
+        fx.root().join("local").join(pending),
+        b"compiled after review",
+    )
+    .unwrap();
+    fx.manager.apply_filter_change(preview).unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert_eq!(
+        mapping.readiness,
+        Readiness::Ready,
+        "{:?}",
+        mapping.last_run_summary
+    );
+    assert_ne!(mapping.active_generation_id, initial_generation);
+    assert!(mapping.scheduling_enabled);
+    assert!(!mapping.filter_migration_held);
+    let moved = moved_build_root(&fx);
+    assert_build_files_moved(&fx, &moved);
+    assert_eq!(
+        EXCLUDED_BUILD_FILES.map(|(relative, _)| fs::metadata(moved.join(relative)).unwrap().ino()),
+        initial_ids,
+        "server-side move preserves identity"
+    );
+    assert_eq!(
+        fs::read(moved.join(pending)).unwrap(),
+        b"compiled after review"
+    );
+    assert_eq!(
+        fs::read(fx.root().join("local").join(pending)).unwrap(),
+        b"compiled after review"
+    );
+    assert!(!remote.join(pending).exists());
+    assert_eq!(fs::read(invalid).unwrap(), b"already excluded");
+    fx.manager.run_now("local").unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(
+        snapshot.mappings[0].last_run_outcome,
+        Some(RunOutcome::Success)
+    );
+    assert_eq!(
+        snapshot.mappings[0].active_generation_id,
+        mapping.active_generation_id
+    );
+    assert_build_files_moved(&fx, &moved);
+    assert_eq!(
+        fs::read(moved.join(pending)).unwrap(),
+        b"compiled after review"
+    );
+    assert!(!remote.join(pending).exists());
+}
+
+fn assert_held_filter_change(fx: &Fixture, original: &MappingStatusSnapshot) {
+    let snapshot = fx.manager.snapshot();
+    let mapping = &snapshot.mappings[0];
+    assert!(mapping.filter_migration_held);
+    assert_eq!(mapping.readiness, Readiness::RecoveryRequired);
+    assert_eq!(mapping.active_generation_id, original.active_generation_id);
+    assert_eq!(mapping.exclusions, original.exclusions);
+    assert_eq!(mapping.intent, original.intent);
+    assert_eq!(mapping.scheduling_enabled, original.scheduling_enabled);
+    assert_eq!(mapping.next_poll_at, None);
+    assert!(fx.manager.run_now("local").is_err());
+    assert!(fx.manager.complete_recovery("local", true).is_err());
+    assert!(
+        fx.manager
+            .inspect_recovery("local")
+            .unwrap()
+            .filter_migration_held
+    );
+}
+
+fn hold_filter_change_and_reopen(fx: Fixture) -> Fixture {
+    let original = fx.manager.snapshot();
+    *fx.runner.post_move_check_fault.lock().unwrap() = Some((0, CheckFault::Fail));
+    let preview = preview_build_exclusions(&fx);
+    fx.manager.apply_filter_change(preview).unwrap();
+    fx.manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert!(fx.runner.post_move_check_fault.lock().unwrap().is_none());
+    assert_build_files_moved(&fx, &moved_build_root(&fx));
+    add_invalid_excluded_name(&fx);
+    let fx = fx.reopen();
+    assert_held_filter_change(&fx, &original.mappings[0]);
+    fx
+}
+
+#[test]
+fn drive_narrowing_can_finish_after_post_move_failure_and_restart() {
+    let Some(fx) = filter_migration_fixture() else {
+        return;
+    };
+    let old_generation = fx.manager.snapshot().mappings[0]
+        .active_generation_id
+        .clone();
+    let fx = hold_filter_change_and_reopen(fx);
+    let moved = moved_build_root(&fx);
+    fx.manager.finish_filter_change("local").unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert!(
+        !mapping.filter_migration_held,
+        "{:?}",
+        mapping.last_run_summary
+    );
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_ne!(mapping.active_generation_id, old_generation);
+    assert!(
+        mapping
+            .exclusions
+            .iter()
+            .any(|pattern| pattern == "build/**")
+    );
+    assert!(mapping.scheduling_enabled);
+    assert_build_files_moved(&fx, &moved);
+}
+
+#[test]
+fn drive_narrowing_can_restore_after_post_move_failure_and_restart() {
+    let Some(fx) = filter_migration_fixture() else {
+        return;
+    };
+    let original = fx.manager.snapshot();
+    let fx = hold_filter_change_and_reopen(fx);
+    let moved = moved_build_root(&fx);
+    let (relative, original_bytes) = EXCLUDED_BUILD_FILES[0];
+    let occupied = fx.root().join("Data/Research").join(relative);
+    fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+    fs::write(&occupied, b"new file in Data").unwrap();
+    if fx.manager.restore_filter_change("local").is_ok() {
+        fx.manager
+            .wait_until_idle(Duration::from_secs(120))
+            .unwrap();
+    }
+    assert!(fx.manager.snapshot().mappings[0].filter_migration_held);
+    assert_eq!(fs::read(&occupied).unwrap(), b"new file in Data");
+    assert_eq!(fs::read(moved.join(relative)).unwrap(), original_bytes);
+    fs::rename(occupied, fx.root().join("preserved-collision")).unwrap();
+    fx.manager.restore_filter_change("local").unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert!(
+        !mapping.filter_migration_held,
+        "{:?}",
+        mapping.last_run_summary
+    );
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(
+        mapping.active_generation_id,
+        original.mappings[0].active_generation_id
+    );
+    assert_eq!(mapping.exclusions, original.mappings[0].exclusions);
+    assert!(mapping.scheduling_enabled);
+    for (relative, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(
+            fs::read(fx.root().join("local").join(relative)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(fx.root().join("Data/Research").join(relative)).unwrap(),
+            bytes
+        );
+        assert!(!moved.join(relative).exists());
+    }
+    fx.manager.run_now("local").unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(
+        snapshot.mappings[0].last_run_outcome,
+        Some(RunOutcome::Success)
+    );
+}
+
+#[test]
+fn drive_narrowing_mkdir_failure_leaves_the_old_mapping_runnable() {
+    let Some(fx) = filter_migration_fixture() else {
+        return;
+    };
+    let preview = preview_build_exclusions(&fx);
+    let original = fx.manager.snapshot();
+    fx.runner.fail_next_mkdir.store(true, Ordering::SeqCst);
+    fx.manager.apply_filter_change(preview).unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert!(!fx.runner.fail_next_mkdir.load(Ordering::SeqCst));
+    assert!(!mapping.filter_migration_held);
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(
+        mapping.active_generation_id,
+        original.mappings[0].active_generation_id
+    );
+    assert_eq!(mapping.exclusions, original.mappings[0].exclusions);
+    assert!(mapping.next_poll_at.is_some());
+    assert_ne!(mapping.last_run_outcome, Some(RunOutcome::Success));
+    assert!(
+        mapping
+            .last_run_summary
+            .as_deref()
+            .unwrap()
+            .contains("injected recovery mkdir failure")
+    );
+    for (path, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(
+            fs::read(fx.root().join("Data/Research").join(path)).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[test]
+fn drive_narrowing_can_move_all_included_content() {
+    let Some(fx) = Fixture::new_with_drive_ids(true, true) else {
+        return;
+    };
+    let local = fx.root().join("local");
+    for (path, bytes) in EXCLUDED_BUILD_FILES {
+        let file = local.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, bytes).unwrap();
+    }
+    initialize_research(&fx, rclone_adapter::InitPreference::Path1);
+    let preview = preview_build_exclusions(&fx);
+    assert_eq!(
+        preview
+            .preflight()
+            .remote_inventory
+            .as_ref()
+            .unwrap()
+            .file_count,
+        0
+    );
+    fx.manager.apply_filter_change(preview).unwrap();
+    let after = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(after.mappings[0].readiness, Readiness::Ready);
+    assert!(!after.mappings[0].filter_migration_held);
+    let recovery = moved_build_root(&fx);
+    for (path, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(fs::read(local.join(path)).unwrap(), bytes);
+        assert_eq!(fs::read(recovery.join(path)).unwrap(), bytes);
+        assert!(!fx.root().join("Data/Research").join(path).exists());
+    }
+}
+
+#[test]
+fn drive_narrowing_pre_move_check_failure_preserves_old_schedule_and_data() {
+    assert_pre_move_check_keeps_original_mapping(false);
+}
+
+#[test]
+fn drive_narrowing_stop_during_check_preserves_old_schedule_and_data() {
+    assert_pre_move_check_keeps_original_mapping(true);
+}
+
+fn assert_pre_move_check_keeps_original_mapping(stop: bool) {
+    let Some(fx) = filter_migration_fixture() else {
+        return;
+    };
+    let original = fx.manager.snapshot();
+    let original = &original.mappings[0];
+    let preview = preview_build_exclusions(&fx);
+    let (fault, waiting) = if stop {
+        let (started, waiting) = mpsc::channel();
+        (CheckFault::WaitForStop(started), Some(waiting))
+    } else {
+        (CheckFault::Fail, None)
+    };
+    *fx.runner.pre_move_check_fault.lock().unwrap() = Some(fault);
+    fx.manager.apply_filter_change(preview).unwrap();
+    if let Some(waiting) = waiting {
+        waiting.recv_timeout(Duration::from_secs(75)).unwrap();
+        assert_eq!(
+            fx.manager.snapshot().mappings[0].filter_migration_phase,
+            Some(FilterMigrationPhase::Checking)
+        );
+        fx.manager.stop_run("local").unwrap();
+    }
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert!(fx.runner.pre_move_check_fault.lock().unwrap().is_none());
+    assert!(!mapping.filter_migration_held);
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(mapping.active_generation_id, original.active_generation_id);
+    assert_eq!(mapping.exclusions, original.exclusions);
+    assert_eq!(mapping.intent, original.intent);
+    assert_eq!(mapping.scheduling_enabled, original.scheduling_enabled);
+    assert!(mapping.next_poll_at.is_some());
+    if !stop {
+        assert!(
+            mapping
+                .last_run_summary
+                .as_deref()
+                .unwrap()
+                .contains("injected check difference")
+        );
+    }
+    for (relative, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(
+            fs::read(fx.root().join("local").join(relative)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(fx.root().join("Data/Research").join(relative)).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[test]
+fn drive_narrowing_stop_during_move_keeps_partial_recovery_and_can_restore() {
+    let Some(fx) = filter_migration_fixture() else {
+        return;
+    };
+    let original = fx.manager.snapshot();
+    let original = &original.mappings[0];
+    let preview = preview_build_exclusions(&fx);
+    let (started, first_moved) = mpsc::channel();
+    *fx.runner.stop_after_first_move.lock().unwrap() = Some(started);
+    fx.manager.apply_filter_change(preview).unwrap();
+    first_moved.recv_timeout(Duration::from_secs(75)).unwrap();
+    assert_eq!(
+        fx.manager.snapshot().mappings[0].filter_migration_phase,
+        Some(FilterMigrationPhase::MovingToRecovery)
+    );
+    fx.manager.stop_run("local").unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert_held_filter_change(&fx, original);
+    let summary = snapshot.mappings[0].last_run_summary.as_deref().unwrap();
+    let (first_file, first_bytes) = EXCLUDED_BUILD_FILES[0];
+    let (second_file, second_bytes) = EXCLUDED_BUILD_FILES[1];
+    assert!(summary.contains(first_file), "{summary}");
+    assert!(!summary.contains(second_file), "{summary}");
+    let moved = moved_build_root(&fx);
+    let data = fx.root().join("Data/Research");
+    assert_eq!(fs::read(moved.join(first_file)).unwrap(), first_bytes);
+    assert!(!data.join(first_file).exists());
+    assert!(!moved.join(second_file).exists());
+    assert_eq!(fs::read(data.join(second_file)).unwrap(), second_bytes);
+    fx.manager.restore_filter_change("local").unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert!(
+        !mapping.filter_migration_held,
+        "{:?}",
+        mapping.last_run_summary
+    );
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(mapping.active_generation_id, original.active_generation_id);
+    assert_eq!(mapping.exclusions, original.exclusions);
+    for (relative, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(
+            fs::read(fx.root().join("local").join(relative)).unwrap(),
+            bytes
+        );
+        assert_eq!(fs::read(data.join(relative)).unwrap(), bytes);
+        assert!(!moved.join(relative).exists());
+    }
+}
+
+#[test]
+fn drive_narrowing_stop_during_recheck_or_final_verification_keeps_hold() {
+    for (checks_before_stop, phase) in [
+        (0, FilterMigrationPhase::MovingToRecovery),
+        (1, FilterMigrationPhase::Verifying),
+    ] {
+        let Some(fx) = filter_migration_fixture() else {
+            return;
+        };
+        fx.manager.pause("local").unwrap();
+        let original = fx.manager.snapshot();
+        let original = &original.mappings[0];
+        let preview = preview_build_exclusions(&fx);
+        let (started, checking) = mpsc::channel();
+        *fx.runner.post_move_check_fault.lock().unwrap() =
+            Some((checks_before_stop, CheckFault::WaitForStop(started)));
+        fx.manager.apply_filter_change(preview).unwrap();
+        checking.recv_timeout(Duration::from_secs(75)).unwrap();
+        let in_progress = fx.manager.snapshot();
+        assert_eq!(in_progress.mappings[0].filter_migration_phase, Some(phase));
+        assert_eq!(
+            in_progress.mappings[0].active_generation_id,
+            original.active_generation_id
+        );
+        fx.manager.stop_run("local").unwrap();
+        fx.manager
+            .wait_until_idle(Duration::from_secs(120))
+            .unwrap();
+        assert_held_filter_change(&fx, original);
+        assert_build_files_moved(&fx, &moved_build_root(&fx));
+        fx.manager.finish_filter_change("local").unwrap();
+        let finished = fx
+            .manager
+            .wait_until_idle(Duration::from_secs(120))
+            .unwrap();
+        let mapping = &finished.mappings[0];
+        assert!(
+            !mapping.filter_migration_held,
+            "{:?}",
+            mapping.last_run_summary
+        );
+        assert_ne!(mapping.active_generation_id, original.active_generation_id);
+        assert_eq!(mapping.intent, original.intent);
+        assert_eq!(mapping.scheduling_enabled, original.scheduling_enabled);
+        assert_eq!(mapping.next_poll_at, None);
+    }
 }
 
 fn put_mapping_on_authentication_hold(fx: &Fixture) -> (SqliteStateStore, AccountRecord) {

@@ -8,13 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use sync_core::archive::ArchiveSuggestion;
-use sync_core::policy::SUGGESTED_EXCLUSIONS;
 use sync_core::{
     AccountId, AvailableAction, CloudCollection, DEFAULT_EXCLUSIONS, Execution, Intent,
-    LastRunSummary, MappingId, MappingState, Readiness, RunId, VolumeIdentity, VolumeKind,
-    available_actions, status_text,
+    LastRunSummary, MappingId, MappingState, Readiness, RunId, SUGGESTED_EXCLUSIONS,
+    VolumeIdentity, VolumeKind, available_actions, status_text,
 };
-use sync_manager::{ArchiveStatus, init::SuggestedFolderInventory};
+use sync_manager::{
+    ArchiveStatus, ExclusionMatch, FilterMigrationPhase, init::SuggestedFolderInventory,
+};
 
 pub(crate) const SYNC_ALL_NOW_LABEL: &str = "Sync all now";
 
@@ -459,6 +460,7 @@ pub struct MappingSnapshot {
     pub unreviewed_conflicts: Option<UnreviewedConflicts>,
     pub available_actions: Vec<AvailableAction>,
     pub scheduling_enabled: bool,
+    pub filter_migration_held: bool,
     pub volume_issue: Option<String>,
     pub schedule_minutes: u32,
     pub next_check_label: String,
@@ -1373,6 +1375,8 @@ pub struct FilterReview {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub checks: Vec<LocationCheck>,
+    pub narrowing: bool,
+    pub cloud_move_counts: Option<Vec<ExclusionMatch>>,
 }
 
 impl FilterReview {
@@ -1382,12 +1386,20 @@ impl FilterReview {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterMigrationProgress {
+    pub phase: FilterMigrationPhase,
+    pub moves_drive_files: bool,
+    pub restoring: bool,
+}
+
 /// Draft state for the 6-step Add-mapping flow.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WizardDraft {
     pub step: WizardStep,
     pub changing_subfolders: bool,
     pub filter_review: Option<FilterReview>,
+    pub filter_migration_progress: Option<FilterMigrationProgress>,
     pub volume_free_bytes: Option<u64>,
     /// Mapping ID when resuming an existing draft or finishing first sync (#3).
     pub editing_mapping_id: Option<MappingId>,
@@ -1570,6 +1582,14 @@ impl WizardDraft {
             .extend(self.suggested_folders.keys().copied());
         self.suggested_folders.clear();
         true
+    }
+
+    pub(crate) fn add_suggested_exclusions(&mut self) -> bool {
+        let mut changed = false;
+        for suggestion in SUGGESTED_EXCLUSIONS {
+            changed |= self.add_custom_pattern(suggestion.pattern);
+        }
+        changed
     }
 
     pub fn extra_exclusions(&self) -> BTreeSet<String> {
@@ -1836,6 +1856,10 @@ pub enum UiCommand {
         mapping_id: MappingId,
         resume_and_run: bool,
     },
+    ResolveFilterMigration {
+        mapping_id: MappingId,
+        restore: bool,
+    },
     RemoveMapping(MappingId),
     DiscardDraft(MappingId),
     ResumeDraft(MappingId),
@@ -1843,6 +1867,7 @@ pub enum UiCommand {
     ChangeSubfolders(MappingId),
     PreviewFilterChange,
     ApplyFilterChange,
+    AddSuggestedExclusions,
     SetScheduleInterval {
         mapping_id: MappingId,
         minutes: u32,

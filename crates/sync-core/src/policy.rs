@@ -333,7 +333,7 @@ pub const DEFAULT_EXCLUSIONS: &[DefaultExclusion] = &[
     },
 ];
 
-/// Optional directory exclusions offered when setting up a new mapping.
+/// Optional directory exclusions offered during setup and filter changes.
 pub const SUGGESTED_EXCLUSIONS: &[DefaultExclusion] = &[
     DefaultExclusion {
         pattern: "node_modules/**",

@@ -608,7 +608,9 @@ fn space_only_updates_notify_ui_without_rewriting_finder_status() {
 fn filter_migration_rechecks_inventory_and_holds_when_both_sides_have_data() {
     let fixture = Fixture::new();
     let manager = SyncManager::open(fixture.config()).unwrap();
-    fixture.initialize(&manager, fixture.command());
+    let mut command = fixture.command();
+    command.extra_exclusions.insert("legacy/**".to_owned());
+    fixture.initialize(&manager, command);
     let id = MappingId::new("notes");
     let old = manager.snapshot().mappings[0]
         .active_generation_id

@@ -731,3 +731,231 @@ fn interrupted_run_transitions_to_recovery_required_surviving_restart() {
     }
     panic!("both batches completed before StopRun could interrupt a transfer");
 }
+
+#[test]
+fn narrowing_populated_mapping_catches_up_and_keeps_excluded_local_fixture_files() {
+    if !require_pinned_rclone("narrowing_populated_mapping") {
+        return;
+    }
+    let fx = RealFixture::new();
+    write_rel(&fx.local_dir, "proj/build/x.o", b"original object");
+    write_rel(&fx.local_dir, "proj/node_modules/m.js", b"original module");
+    write_rel(&fx.local_dir, "proj/src/a.txt", b"original source");
+    let mgr = fx.open_manager();
+    mgr.register_local_fixture_account("local-1", "Local fixture")
+        .unwrap();
+    let mut cmd = fx.add_mapping_cmd();
+    cmd.extra_exclusions.insert("archive/**".to_owned());
+    mgr.add_mapping(cmd).unwrap();
+    let id = MappingId::new("research");
+    mgr.initialize(InitializeCommand {
+        mapping_id: id.clone(),
+        expected_direction: None,
+    })
+    .unwrap();
+    let before = mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let old_id = before.mappings[0].active_generation_id.as_ref().unwrap();
+    let old_generation = mgr.get_generation(old_id).unwrap().unwrap();
+    let old_filters = fs::read(&old_generation.filters_file_path).unwrap();
+
+    let mixed = mgr
+        .propose_filter_change(&id, ["build/**".to_owned()].into())
+        .unwrap();
+    assert!(
+        mgr.apply_filter_change(mixed)
+            .unwrap_err()
+            .cause()
+            .contains("already contain data")
+    );
+    let preview = mgr
+        .propose_filter_change(
+            &id,
+            ["archive/**", "build/**", "node_modules/**"]
+                .map(str::to_owned)
+                .into(),
+        )
+        .unwrap();
+    write_rel(&fx.local_dir, "proj/src/a.txt", b"pending source edit");
+    mgr.apply_filter_change(preview).unwrap();
+    let after = mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let mapping = &after.mappings[0];
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_ne!(mapping.active_generation_id.as_ref(), Some(old_id));
+    assert!(mapping.scheduling_enabled);
+    assert_eq!(tree_hashes(&fx.local_dir), tree_hashes(&fx.remote_dir));
+    assert_eq!(
+        fs::read(fx.remote_dir.join("proj/src/a.txt")).unwrap(),
+        b"pending source edit"
+    );
+    assert_eq!(
+        fs::read(&old_generation.filters_file_path).unwrap(),
+        old_filters
+    );
+    assert!(
+        tree_hashes(&fx.remote_recovery)
+            .keys()
+            .all(|path| path.ends_with("/proj/src/a.txt"))
+    );
+
+    write_rel(&fx.local_dir, "proj/build/x.o", b"local-only build change");
+    write_rel(&fx.local_dir, "proj/src/a.txt", b"included source change");
+    mgr.run_now(id.clone()).unwrap();
+    mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        fs::read(fx.remote_dir.join("proj/build/x.o")).unwrap(),
+        b"original object"
+    );
+    assert_eq!(
+        fs::read(fx.remote_dir.join("proj/src/a.txt")).unwrap(),
+        b"included source change"
+    );
+    fs::remove_file(fx.remote_dir.join("proj/build/x.o")).unwrap();
+    mgr.run_now(id).unwrap();
+    mgr.wait_until_idle(Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        fs::read(fx.local_dir.join("proj/build/x.o")).unwrap(),
+        b"local-only build change"
+    );
+    mgr.shutdown().unwrap();
+}
+
+fn fake_narrowing_fixture() -> (
+    RealFixture,
+    SyncManager,
+    std::sync::Arc<sync_manager::FakeBisyncLauncher>,
+) {
+    let fixture = RealFixture::new();
+    write_rel(&fixture.local_dir, "proj/build/x.o", b"built");
+    write_rel(&fixture.local_dir, "proj/src/a.txt", b"source");
+    let launcher = std::sync::Arc::new(sync_manager::FakeBisyncLauncher::new());
+    let mut config = ManagerConfig::with_state_dir(&fixture.state_dir);
+    config.launcher = launcher.clone();
+    let manager = SyncManager::open(config).unwrap();
+    manager
+        .register_local_fixture_account("local-1", "Local fixture")
+        .unwrap();
+    manager.add_mapping(fixture.add_mapping_cmd()).unwrap();
+    launcher.push_script(Default::default());
+    manager
+        .initialize(InitializeCommand {
+            mapping_id: MappingId::new("research"),
+            expected_direction: None,
+        })
+        .unwrap();
+    manager.wait_until_idle(Duration::from_secs(15)).unwrap();
+    write_rel(&fixture.remote_dir, "proj/build/x.o", b"built");
+    write_rel(&fixture.remote_dir, "proj/src/a.txt", b"source");
+    (fixture, manager, launcher)
+}
+
+#[test]
+fn catch_up_retryable_failure_keeps_the_active_generation_and_scheduling() {
+    use rclone_adapter::{ExitStatusInfo, OutputLine, StreamKind};
+    use sync_manager::FakeLaunchScript;
+
+    let (_fixture, manager, launcher) = fake_narrowing_fixture();
+    let id = MappingId::new("research");
+    let original = manager.snapshot();
+    launcher.push_script(FakeLaunchScript {
+        exit_status: ExitStatusInfo {
+            code: Some(5),
+            signal: None,
+        },
+        lines: vec![OutputLine {
+            stream: StreamKind::Stderr,
+            text: "temporary network error".to_owned(),
+            truncated: false,
+        }],
+        ..Default::default()
+    });
+    manager
+        .apply_filter_change(
+            manager
+                .propose_filter_change(&id, ["build/**".to_owned()].into())
+                .unwrap(),
+        )
+        .unwrap();
+    let snapshot = manager.wait_until_idle(Duration::from_secs(15)).unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(
+        mapping.active_generation_id,
+        original.mappings[0].active_generation_id
+    );
+    assert_eq!(mapping.exclusions, original.mappings[0].exclusions);
+    assert_eq!(
+        mapping.scheduling_enabled,
+        original.mappings[0].scheduling_enabled
+    );
+    assert_eq!(mapping.last_run_outcome, Some(RunOutcome::RetryableFailure));
+    assert!(
+        mapping
+            .last_run_summary
+            .as_deref()
+            .unwrap()
+            .contains("Catch-up sync stopped")
+    );
+    assert_eq!(launcher.launched_plans().len(), 2);
+}
+
+#[test]
+fn stop_during_catch_up_or_rebaseline_keeps_the_old_generation() {
+    use std::sync::{Arc, mpsc};
+    use sync_manager::{FakeLaunchScript, FilterMigrationPhase};
+
+    if !require_pinned_rclone("stop_during_catch_up_or_rebaseline") {
+        return;
+    }
+    for phase in [
+        FilterMigrationPhase::CatchUp,
+        FilterMigrationPhase::Rebaseline,
+    ] {
+        let (fixture, manager, launcher) = fake_narrowing_fixture();
+        let id = MappingId::new("research");
+        let original = manager.snapshot();
+        let generation = manager
+            .get_generation(original.mappings[0].active_generation_id.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        let filters = fs::read(&generation.filters_file_path).unwrap();
+        if phase == FilterMigrationPhase::Rebaseline {
+            launcher.push_script(Default::default());
+        }
+        let (entered, receiver) = mpsc::channel();
+        launcher.push_script(FakeLaunchScript {
+            wait_for_stop: true,
+            on_wait: Some(Arc::new(move || {
+                entered.send(()).unwrap();
+            })),
+            ..Default::default()
+        });
+        let preview = manager
+            .propose_filter_change(&id, ["build/**".to_owned()].into())
+            .unwrap();
+        manager.apply_filter_change(preview).unwrap();
+        receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            manager.snapshot().mappings[0].filter_migration_phase,
+            Some(phase)
+        );
+        manager.stop_run(id).unwrap();
+        let after = manager.wait_until_idle(Duration::from_secs(30)).unwrap();
+        let mapping = &after.mappings[0];
+        assert_eq!(
+            mapping.active_generation_id,
+            original.mappings[0].active_generation_id
+        );
+        assert_eq!(mapping.exclusions, original.mappings[0].exclusions);
+        assert_eq!(
+            mapping.scheduling_enabled,
+            original.mappings[0].scheduling_enabled
+        );
+        assert_eq!(mapping.last_run_outcome, Some(RunOutcome::Interrupted));
+        assert_eq!(fs::read(&generation.filters_file_path).unwrap(), filters);
+        assert_eq!(
+            tree_hashes(&fixture.local_dir),
+            tree_hashes(&fixture.remote_dir)
+        );
+        assert_eq!(launcher.stop_calls(), 1);
+    }
+}

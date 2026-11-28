@@ -340,23 +340,35 @@ generations with a recorded successful initialization.
 
 ## Changing exclusions
 
-Preview a filter change to see the added and removed exclusions, both endpoint
-inventories, and the proposed first-sync direction. Subfolder counts and
-sizes include currently excluded files. The transfer estimate uses the
-proposed exclusions. An unresolved orphan that
-blocks the worker also blocks applying the preview. The mapping keeps its
-current baseline and exclusions while that hold is open. Confirming an
-eligible preview retires the old baseline from normal runs and repeats
-preflight using the proposed filters. Each attempt that reaches initialization
-gets its own generation, frozen filter file, and empty bisync work directory.
-Prior work directories remain available for inspection. Files newly excluded
-from sync stay in place.
+Review shows added and removed exclusions. For an established mapping with
+files on both sides, adding exclusions runs one migration while the mapping
+holds its run slot. The old generation first catches up under its frozen
+filters. Then a check compares the remaining sync scope under the new filters.
 
-The initializer supports upload to an empty destination, download to an empty
-local folder, and two empty folders. If both folders contain data, review and
-preserve both copies before consolidating to one side or using a fresh empty
-destination. If contents changed after a preview and preflight can no longer
-initialize safely, scheduling remains off until the new setup succeeds.
+For Drive, FolderSync derives the move list from a fresh rclone inventory and
+records it in the run log. Before the first move, it saves a recovery hold
+and a manifest of paths, object IDs, sizes, and hashes. It moves the matched
+files to the device and run folder in Drive Recovery, verifies their IDs
+and bytes there, and verifies their absence in Data. The Mac copies stay in
+place. Local-directory fixtures keep the excluded files on both sides.
+
+FolderSync checks the remaining scope again before setting up a separate,
+narrower generation. The re-baseline uses Path1 preference and both recovery
+directories. A final check must pass before FolderSync activates the new
+generation and restores scheduling eligibility. Previous generation files
+stay available for inspection.
+
+If a Drive move could have occurred, the recovery hold survives Stop, failures,
+and restart. The old generation and scheduling preference stay saved while
+the hold blocks normal runs. **Finish excluding** verifies the files already
+moved and continues with any remaining moves. **Put the moved files back**
+restores the verified files to Data before making the old generation eligible
+again. If a path is occupied or its identity differs, FolderSync holds the
+mapping for review.
+
+Removing exclusions uses the existing first-sync checks. If both folders
+contain data, preserve and review both copies before choosing an empty
+destination or consolidating to one side.
 
 ## Runtime engine
 

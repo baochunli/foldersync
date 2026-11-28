@@ -229,7 +229,7 @@ fn verified_zip_and_retained_originals_integrate_with_regular_two_way_sync() {
             .join("abandoned.zip.foldersync-partial")
             .exists()
     );
-    assert_eq!(fs::read(stale_partial).unwrap(), b"local-only partial");
+    assert_eq!(fs::read(&stale_partial).unwrap(), b"local-only partial");
     let mut entries = zip::ZipArchive::new(Cursor::new(&zip)).unwrap();
     assert_eq!(entries.len(), 2_000);
     assert!(entries.by_name("Finished/node_modules/recent").is_err());
@@ -240,6 +240,59 @@ fn verified_zip_and_retained_originals_integrate_with_regular_two_way_sync() {
         .read_to_end(&mut git_bytes)
         .unwrap();
     assert_eq!(git_bytes, b"git object");
+
+    let staging_rule = "*.zip.foldersync-partial";
+    let reviewed = first
+        .propose_filter_change(
+            &fixture.id,
+            BTreeSet::from(["node_modules/**".into(), staging_rule.into()]),
+        )
+        .unwrap();
+    assert!(reviewed.added_exclusions().is_empty());
+    assert!(reviewed.removed_exclusions().is_empty());
+
+    let reviewed = first
+        .propose_filter_change(
+            &fixture.id,
+            BTreeSet::from(["node_modules/**".into(), "build/**".into()]),
+        )
+        .unwrap();
+    assert_eq!(reviewed.added_exclusions(), ["build/**"]);
+    assert!(reviewed.removed_exclusions().is_empty());
+    first.apply_filter_change(reviewed).unwrap();
+    let narrowed = first.wait_until_idle(Duration::from_secs(60)).unwrap();
+    let mapping = &narrowed.mappings[0];
+    assert_eq!(mapping.readiness, Readiness::Ready, "{narrowed:?}");
+    assert_ne!(
+        mapping.active_generation_id, initialized.mappings[0].active_generation_id,
+        "{narrowed:?}"
+    );
+    assert!(
+        !mapping
+            .exclusions
+            .iter()
+            .any(|pattern| pattern == staging_rule)
+    );
+    let generation = first
+        .get_generation(mapping.active_generation_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(generation.config.effective_filters.contains(staging_rule));
+    assert!(
+        generation
+            .config
+            .effective_filters
+            .contains("node_modules/**")
+    );
+    assert!(generation.config.effective_filters.contains("build/**"));
+    assert_eq!(fs::read(stale_partial).unwrap(), b"local-only partial");
+    assert!(
+        !fixture
+            .cloud
+            .join("abandoned.zip.foldersync-partial")
+            .exists()
+    );
+    assert_eq!(fs::read(fixture.cloud.join("Finished.zip")).unwrap(), zip);
     first.shutdown().unwrap();
 
     let mac_two = fixture.local.with_file_name("mac-two");

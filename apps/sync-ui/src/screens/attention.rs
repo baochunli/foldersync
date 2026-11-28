@@ -2,7 +2,7 @@
 //! and the guided Start recovery checklist (`ui-spec.md` §5.6).
 
 use nsh_core::{file_dialog::OpenDialog, prelude::*};
-use sync_core::{Intent, MappingId, Readiness, RunId};
+use sync_core::{Execution, Intent, MappingId, Readiness, RunId};
 
 use crate::contract::{
     AttentionItem, AttentionKind, IconKind, RecoveryCauseKind, ScreenRoute, StatusModifier,
@@ -638,7 +638,9 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
             1 => "1 recovery copy was kept.".to_owned(),
             n => format!("{n} recovery copies were kept."),
         };
-        let evidence_line = if detail_text.trim().is_empty() {
+        let evidence_line = if m.filter_migration_held {
+            detail_text
+        } else if detail_text.trim().is_empty() {
             copies_part
         } else {
             format!("{detail_text}. {copies_part}")
@@ -670,7 +672,11 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                                     .text_color(p.fg),
                             )
                             .child(link_button(
-                                "Show run log and recovery copies",
+                                if m.filter_migration_held {
+                                    "Show run log"
+                                } else {
+                                    "Show run log and recovery copies"
+                                },
                                 S_COMPACT,
                                 move || {
                                     c_log.open_run_inspection(id_log.clone(), rid_log.clone());
@@ -808,6 +814,65 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                         move || c_recheck.send(UiCommand::InspectRecovery(id_recheck.clone())),
                     )),
                 );
+        } else if m.filter_migration_held {
+            let idle = matches!(m.state.execution, Execution::Idle | Execution::Interrupted);
+            let can_resolve = idle && inspected_ok && identities_ok && orphan_alive == Some(false);
+            let waiting = (!can_resolve).then_some("Waiting for recovery checks and the job slot");
+            let mut actions = view()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .pt(px(4.0))
+                .child(
+                    app_button(
+                        "Finish excluding",
+                        BtnKind::Primary,
+                        false,
+                        !can_resolve,
+                        None,
+                        waiting,
+                        move || {
+                            c_run.send(UiCommand::ResolveFilterMigration {
+                                mapping_id: id_run.clone(),
+                                restore: false,
+                            });
+                        },
+                    )
+                    .test_id("recovery-finish-excluding"),
+                )
+                .child(
+                    app_button(
+                        "Put the moved files back",
+                        BtnKind::Default,
+                        false,
+                        !can_resolve,
+                        None,
+                        waiting,
+                        move || {
+                            c_keep.send(UiCommand::ResolveFilterMigration {
+                                mapping_id: id_keep.clone(),
+                                restore: true,
+                            });
+                        },
+                    )
+                    .test_id("recovery-restore-exclusions"),
+                );
+            if idle && inspected_ok && !can_resolve {
+                let c_recheck = ctrl.clone();
+                let id_recheck = m.id.clone();
+                actions = actions.child(app_button(
+                    "Check again",
+                    BtnKind::Default,
+                    false,
+                    false,
+                    None,
+                    None,
+                    move || c_recheck.send(UiCommand::InspectRecovery(id_recheck.clone())),
+                ));
+            }
+            body = body
+                .child(text("The run log lists files moved to Google Drive Recovery. Finish excluding to apply the new selection, or put the moved files back to keep the previous selection.").text_color(p.fg).pt(px(8.0)))
+                .child(actions);
         } else {
             let can_resume =
                 inspected_ok && identities_ok && orphan_alive == Some(false) && !ambiguous;
@@ -871,12 +936,14 @@ pub fn recovery_view(ctrl: AppController, mapping_id: MappingId) -> impl IntoEle
                 );
         }
 
-        body = body.child(
-            text("To get back a file: choose it in Show run log and recovery copies, then Copy to inspection folder…. FolderSync never puts it back into the synced folder for you.")
-                .text_size(px(S_SMALL))
-                .text_color(p.muted)
-                .pt(px(8.0)),
-        );
+        if !m.filter_migration_held {
+            body = body.child(
+                text("To get back a file: choose it in Show run log and recovery copies, then Copy to inspection folder…. FolderSync never puts it back into the synced folder for you.")
+                    .text_size(px(S_SMALL))
+                    .text_color(p.muted)
+                    .pt(px(8.0)),
+            );
+        }
 
         view()
             .flex_col()

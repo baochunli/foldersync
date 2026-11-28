@@ -17,8 +17,9 @@ use std::{
 
 use rclone_adapter::{
     BackupDir2, BisyncMarker, BisyncRequest, EngineIdentity, InitPreference, LaunchError, LogEvent,
-    Outcome, Path2, ProcessError, RealProcessRunner, RunMode, SpawnOptions, classify_run_outcome,
-    pinned_binary_path, qualify_binary, sha256_file,
+    LsJsonRequest, Outcome, Path2, ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner,
+    RunHandle, RunMode, SpawnOptions, check_filtered, classify_run_outcome, pinned_binary_path,
+    qualify_binary, render_move_filter, sha256_file,
 };
 use sha2::{Digest, Sha256};
 
@@ -201,6 +202,158 @@ fn assert_trees_match_truth(ws: &TempWorkspace, expected: &BTreeMap<String, Stri
     let h2 = tree_hashes(&ws.path2);
     assert_eq!(&h1, expected, "path1 does not match truth set");
     assert_eq!(&h2, expected, "path2 does not match truth set");
+}
+
+#[test]
+fn inverse_filter_selects_only_new_exclusions_with_the_pinned_listing_rules() {
+    let filter = render_move_filter(
+        ["already/**", "hidden/"],
+        ["build/**", "/root-target/**", "embedded/cache/", "artifact"],
+    )
+    .unwrap();
+    assert!(render_move_filter(["build/**\n+ **"], ["node_modules/**"]).is_err());
+    let Some(engine) = qualified_pinned_engine(
+        "inverse_filter_selects_only_new_exclusions_with_the_pinned_listing_rules",
+    ) else {
+        return;
+    };
+    let ws = TempWorkspace::new("inverse-filter");
+    let expected = [
+        "build/root.o",
+        "project/artifact",
+        "project/build/nested.o",
+        "project/embedded/cache/nested",
+        "root-target/root.o",
+    ];
+    for path in expected.into_iter().chain([
+        "already/build/keep.o",
+        "hidden/embedded/cache/keep",
+        "other/build",
+        "project/embedded/cache-similar/keep",
+        "project/root-target/keep.o",
+        "artifact/not-a-match",
+    ]) {
+        write_file(&ws.path2, path, path.as_bytes());
+    }
+    fs::write(&ws.filters_file, filter).unwrap();
+    fs::write(&ws.config_path, "[fixture]\ntype = local\n").unwrap();
+    let cloud = LsJsonRequest::new(engine, ws.config_path.clone(), "fixture", false, None).unwrap();
+    let mut selected: Vec<_> = cloud
+        .list_files(
+            ws.path2.to_str().unwrap(),
+            Some(&ws.filters_file),
+            &RealProcessRunner,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    selected.sort();
+    assert_eq!(selected, expected);
+}
+
+#[test]
+fn verifies_and_moves_only_the_pinned_engines_nested_exclusion_matches() {
+    let Some(engine) = qualified_pinned_engine(
+        "verifies_and_moves_only_the_pinned_engines_nested_exclusion_matches",
+    ) else {
+        return;
+    };
+    let mut ws = TempWorkspace::new("exclusion-recovery");
+    for root in [&ws.path1, &ws.path2] {
+        write_file(root, "project/build/x.o", b"build result");
+        write_file(root, "project/src/a.txt", b"source A");
+    }
+    fs::write(&ws.filters_file, "- build/**\n").unwrap();
+    fs::write(&ws.config_path, "[fixture]\ntype = local\n").unwrap();
+    let (request, _, _) = ws.build_request(&engine, RunMode::Normal, 10);
+    check_filtered(&request, &ws.filters_file, &RealProcessRunner).unwrap();
+    // A same-size edit of an included file must be caught by its hash.
+    write_file(&ws.path2, "project/src/a.txt", b"source B");
+    assert!(check_filtered(&request, &ws.filters_file, &RealProcessRunner).is_err());
+    write_file(&ws.path2, "project/src/a.txt", b"source A");
+
+    struct FixtureRunner<'a> {
+        root: &'a Path,
+        force_copy_fallback: bool,
+    }
+
+    impl ProcessRunner for FixtureRunner<'_> {
+        fn spawn(
+            &self,
+            spec: &ProcessSpec,
+            options: SpawnOptions,
+        ) -> Result<RunHandle, ProcessError> {
+            let mut spec = spec.clone();
+            spec.current_dir = Some(self.root.to_path_buf());
+            if self.force_copy_fallback {
+                spec.args.push("--disable=Move".into());
+            }
+            RealProcessRunner.spawn(&spec, options)
+        }
+    }
+
+    let cloud = LsJsonRequest::new(engine, ws.config_path.clone(), "fixture", false, None).unwrap();
+    let runner = FixtureRunner {
+        root: &ws.root,
+        force_copy_fallback: false,
+    };
+    let all = cloud.list_files("path2", None, &runner).unwrap();
+    let kept = cloud
+        .list_files("path2", Some(&ws.filters_file), &runner)
+        .unwrap();
+    let excluded: Vec<_> = all
+        .iter()
+        .filter(|entry| !kept.iter().any(|other| other.path == entry.path))
+        .collect();
+    let [entry] = excluded.as_slice() else {
+        panic!("expected exactly one nested exclude, got {excluded:?}");
+    };
+    assert_eq!(entry.path, "project/build/x.o");
+    assert!(!entry.hashes.is_empty());
+    let move_list = ws.root.join("files-from-raw");
+    fs::write(&move_list, format!("{}\n", entry.path)).unwrap();
+    let fallback = FixtureRunner {
+        force_copy_fallback: true,
+        ..runner
+    };
+    assert!(
+        cloud
+            .move_files("path2", "recovery", &move_list, &fallback)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(ws.path2.join(&entry.path)).unwrap(),
+        b"build result"
+    );
+    assert!(!ws.root.join("recovery").join(&entry.path).exists());
+
+    cloud
+        .move_files("path2", "recovery", &move_list, &runner)
+        .unwrap();
+    assert!(!ws.path2.join(&entry.path).exists());
+    assert_eq!(
+        fs::read(ws.path1.join(&entry.path)).unwrap(),
+        b"build result"
+    );
+    assert_eq!(cloud.list_files("path2", None, &runner).unwrap(), kept);
+    let recovered = cloud.list_files("recovery", None, &runner).unwrap();
+    assert_eq!(recovered, vec![(*entry).clone()]);
+    check_filtered(&request, &ws.filters_file, &RealProcessRunner).unwrap();
+
+    // A different file that appeared at the restore destination is preserved.
+    write_file(&ws.path2, &entry.path, b"new build result");
+    cloud
+        .move_files("recovery", "path2", &move_list, &runner)
+        .unwrap();
+    assert_eq!(
+        fs::read(ws.path2.join(&entry.path)).unwrap(),
+        b"new build result"
+    );
+    assert_eq!(
+        cloud.list_files("recovery", None, &runner).unwrap(),
+        recovered
+    );
 }
 
 #[test]

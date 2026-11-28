@@ -36,7 +36,7 @@ pub enum Path2 {
 }
 
 impl Path2 {
-    fn to_os_string(&self) -> OsString {
+    pub(crate) fn to_os_string(&self) -> OsString {
         match self {
             Path2::DriveRemote { remote, path } | Path2::OtherRemote { remote, path } => {
                 OsString::from(format!("{remote}:{path}"))
@@ -45,7 +45,7 @@ impl Path2 {
         }
     }
 
-    fn is_drive_remote(&self) -> bool {
+    pub(crate) fn is_drive_remote(&self) -> bool {
         matches!(self, Path2::DriveRemote { .. })
     }
 }
@@ -488,7 +488,7 @@ impl BisyncRequest {
     }
 }
 
-fn validate_local_path(field: &'static str, path: &Path) -> Result<(), RequestError> {
+pub(crate) fn validate_local_path(field: &'static str, path: &Path) -> Result<(), RequestError> {
     if path.as_os_str().is_empty() {
         return Err(RequestError::EmptyPath { field });
     }
@@ -657,7 +657,7 @@ fn resolve_with_existing_ancestor(
     }
 }
 
-fn remote_paths_overlap(a: &str, b: &str) -> bool {
+pub(crate) fn remote_paths_overlap(a: &str, b: &str) -> bool {
     let sa: Vec<&str> = a.split('/').collect();
     let sb: Vec<&str> = b.split('/').collect();
     sa.starts_with(&sb) || sb.starts_with(&sa)

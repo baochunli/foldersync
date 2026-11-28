@@ -27,19 +27,18 @@ use rclone_adapter::{
     InitPreference, ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle,
     SpawnOptions,
 };
-use sync_core::policy::SUGGESTED_EXCLUSIONS;
 use sync_core::{
-    ACCESS_MARKER_FILENAME, AccountId, CloudCollection, DEFAULT_EXCLUSIONS, Execution, Intent,
-    LastRunSummary, MappingId, MappingState, Readiness, RunId, VolumeIdentity, VolumeKind,
-    WallTime, available_actions,
+    ACCESS_MARKER_FILENAME, AccountId, CloudCollection, DEFAULT_EXCLUSIONS, Execution,
+    GenerationId, Intent, LastRunSummary, MappingId, MappingState, Readiness, RunId, RunOutcome,
+    SUGGESTED_EXCLUSIONS, VolumeIdentity, VolumeKind, WallTime, available_actions,
 };
 use sync_manager::{
     AccountError, AccountRecord, AccountService, AccountServiceConfig, AddDriveAccountRequest,
     AddMappingCommand, ArchiveState, BisyncLauncher, CollectionCandidate,
     ControlledShutdownOutcome, DarwinFinderNotifier, DriveAuthorization, FilterChangePreview,
-    FinderActionDispatch, FinderNotifier, FolderSizeSnapshot, FolderSizeStatus,
-    ImportAccountRequest, InitializeCommand, ManagerConfig, ManagerError, ManagerEvent,
-    MappingStatusSnapshot, NoopFinderNotifier, OperationCanceller, OperationHandle,
+    FilterMigrationPhase, FinderActionDispatch, FinderNotifier, FolderSizeSnapshot,
+    FolderSizeStatus, ImportAccountRequest, InitializeCommand, ManagerConfig, ManagerError,
+    ManagerEvent, MappingStatusSnapshot, NoopFinderNotifier, OperationCanceller, OperationHandle,
     RecoveryCopySide, RunRecord, SecretString, SideClassification, SkippedCollection,
     StatusSnapshot, SyncManager, ValidatedFinderAction, detect_volume_identity,
     inspect_local_endpoint_detailed,
@@ -48,12 +47,13 @@ use sync_manager::{
 use crate::{
     contract::{
         AccountSnapshot, AccountStatus, ActiveRunSnapshot, ActivityEvent, AttentionItem,
-        AttentionKind, AttentionPriority, CloudFolderCandidate, DemoPreset, FilterReview,
-        FinderExtensionStatus, FolderSize, IconKind, InspectedRunSnapshot, LocationCheck,
-        MappingSnapshot, PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData,
-        RecoveryCopyItem, ReviewScenario, RunPhase, RunRecordSnapshot, ScheduledCheck, ScreenRoute,
-        StatusModifier, SubfolderNode, Tone, TransferProgress, UiCommand, UiSnapshot,
-        UnreviewedConflicts, VolumeSnapshot, WizardDraft, WizardStep, format_bytes, is_low_space,
+        AttentionKind, AttentionPriority, CloudFolderCandidate, DemoPreset,
+        FilterMigrationProgress, FilterReview, FinderExtensionStatus, FolderSize, IconKind,
+        InspectedRunSnapshot, LocationCheck, MappingSnapshot, PreferencesSnapshot,
+        RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem, ReviewScenario, RunPhase,
+        RunRecordSnapshot, ScheduledCheck, ScreenRoute, StatusModifier, SubfolderNode, Tone,
+        TransferProgress, UiCommand, UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardDraft,
+        WizardStep, format_bytes, is_low_space,
     },
     system_actions::{
         LaunchAtLoginOutcome, SystemActionOutcome, SystemActionRequest, SystemActions,
@@ -583,6 +583,7 @@ struct WorkerState {
     live_progress: Option<LiveRunProgress>,
     first_sync_started_at: Option<Instant>,
     filter_preview: Option<FilterChangePreview>,
+    filter_migration_watch: Option<FilterMigrationWatch>,
     wizard: WizardDraft,
     cloud_catalog: Vec<CloudFolderCandidate>,
     skipped_cloud_folders: Vec<SkippedCollection>,
@@ -599,6 +600,11 @@ struct WorkerState {
     status_notice: Option<String>,
     action_error: Option<String>,
     device_id: String,
+}
+
+struct FilterMigrationWatch {
+    previous_generation: GenerationId,
+    accepted_sequence: u64,
 }
 
 fn manager_worker_main(
@@ -649,6 +655,7 @@ fn manager_worker_main(
         live_progress: None,
         first_sync_started_at: None,
         filter_preview: None,
+        filter_migration_watch: None,
         wizard: default_real_wizard(),
         cloud_catalog: Vec::new(),
         skipped_cloud_folders: Vec::new(),
@@ -1009,7 +1016,9 @@ fn manager_worker_main(
                 {
                     state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
                 }
-                if m.readiness == Readiness::Ready && m.execution == Execution::Idle {
+                if state.wizard.filter_migration_progress.is_some() {
+                    update_filter_migration(&mut state, m, snap.sequence);
+                } else if m.readiness == Readiness::Ready && m.execution == Execution::Idle {
                     if state.wizard.first_sync_preflight_done {
                         state.wizard.first_sync_completed = true;
                         state.wizard.first_sync_stopping = false;
@@ -1112,7 +1121,9 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                     now,
                 ));
             }
-            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id) {
+            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
+                && state.wizard.filter_migration_progress.is_none()
+            {
                 state.wizard.first_sync_preflight_done = true;
                 state.wizard.first_sync_markers_ready = true;
             }
@@ -1182,7 +1193,9 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
             {
                 state.live_progress = None;
             }
-            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id) {
+            if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
+                && state.wizard.filter_migration_progress.is_none()
+            {
                 if let Some(started) = state.first_sync_started_at {
                     state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
                 }
@@ -1214,6 +1227,7 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
         } => {
             state.recent_runs_dirty = true;
             if state.wizard.first_sync_mapping_id.as_ref() == Some(&mapping_id)
+                && state.wizard.filter_migration_progress.is_none()
                 && !state.wizard.first_sync_stopping
                 && state.wizard.first_sync_error.is_none()
             {
@@ -1241,7 +1255,7 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                 state.wizard.first_sync_stopping = false;
             }
             state.action_error = Some(full);
-            push_ui_event(state, format!("First sync check failed: {cause}"), None);
+            push_ui_event(state, format!("Sync could not continue. {cause}"), None);
             true
         }
         ManagerEvent::ShutdownTimedOut { mapping_id, .. } => {
@@ -1469,6 +1483,57 @@ fn handle_ui_command(
             }
             (None, None)
         }
+        UiCommand::ResolveFilterMigration {
+            mapping_id,
+            restore,
+        } => {
+            if let Some(mgr) = &state.mgr {
+                let snapshot = mgr.snapshot();
+                let Some(mapping) = snapshot.mappings.iter().find(|m| m.id == mapping_id) else {
+                    state.action_error = Some("The held mapping could not be found.".to_owned());
+                    return (None, None);
+                };
+                let Some(previous_generation) = mapping.active_generation_id.clone() else {
+                    state.action_error = Some("The previous sync setup is unavailable.".to_owned());
+                    return (None, None);
+                };
+                let result = if restore {
+                    mgr.restore_filter_change(mapping_id.clone())
+                } else {
+                    mgr.finish_filter_change(mapping_id.clone())
+                };
+                match result {
+                    Ok(accepted) => {
+                        state.recovery_checklist = None;
+                        state.wizard = default_real_wizard();
+                        state.wizard.changing_subfolders = true;
+                        state.wizard.selected_folder = mapping.display_name.clone();
+                        begin_filter_migration(
+                            state,
+                            mapping_id,
+                            FilterMigrationWatch {
+                                previous_generation,
+                                accepted_sequence: accepted.snapshot.sequence,
+                            },
+                            FilterMigrationProgress {
+                                phase: if restore {
+                                    FilterMigrationPhase::Restoring
+                                } else {
+                                    FilterMigrationPhase::Checking
+                                },
+                                moves_drive_files: true,
+                                restoring: restore,
+                            },
+                        );
+                        return (Some(ScreenRoute::AddMapping), None);
+                    }
+                    Err(err) => {
+                        state.action_error = Some(format!("{} {}", err.cause(), err.next_step()));
+                    }
+                }
+            }
+            (None, None)
+        }
         UiCommand::RemoveMapping(id) | UiCommand::DiscardDraft(id) => {
             if let Some(mgr) = &state.mgr {
                 match mgr.remove_mapping(id) {
@@ -1546,6 +1611,9 @@ fn handle_ui_command(
                 && let Some(preview) = state.filter_preview.take()
             {
                 let id = preview.mapping_id().clone();
+                let previous_generation = preview.previous_generation_id().clone();
+                let narrowing = preview.is_narrowing();
+                let moves_drive_files = preview.cloud_move_counts().is_some();
                 let preflight = preview.preflight();
                 let local = preflight.local_inventory.as_ref().ok();
                 let remote = preflight.remote_inventory.as_ref().ok();
@@ -1559,6 +1627,19 @@ fn handle_ui_command(
                     _ => ReviewScenario::BothEmpty,
                 };
                 match mgr.apply_filter_change(preview) {
+                    Ok(accepted) if narrowing => begin_filter_migration(
+                        state,
+                        id,
+                        FilterMigrationWatch {
+                            previous_generation,
+                            accepted_sequence: accepted.snapshot.sequence,
+                        },
+                        FilterMigrationProgress {
+                            phase: FilterMigrationPhase::CatchUp,
+                            moves_drive_files,
+                            restoring: false,
+                        },
+                    ),
                     Ok(_) => begin_first_sync(state, id),
                     Err(err) => {
                         invalidate_wizard_confirmation(&mut state.wizard);
@@ -1566,6 +1647,15 @@ fn handle_ui_command(
                         state.action_error = Some(format!("{} {}", err.cause(), err.next_step()));
                     }
                 }
+            }
+            (None, None)
+        }
+        UiCommand::AddSuggestedExclusions => {
+            if state.wizard.changing_subfolders
+                && state.wizard.step == WizardStep::Subfolders
+                && state.wizard.add_suggested_exclusions()
+            {
+                wizard_exclusions_changed(state);
             }
             (None, None)
         }
@@ -2326,42 +2416,55 @@ fn project_filter_review(preview: &FilterChangePreview, free_bytes: Option<u64>)
             }),
         }
     }
-    checks.push(LocationCheck {
-        ok: preflight.direction.is_ok(),
-        message: match &preflight.direction {
-            Ok(InitPreference::Path2) => "First sync downloads from the cloud.".to_owned(),
-            Ok(InitPreference::Path1)
-                if preflight
-                    .local_inventory
-                    .as_ref()
-                    .is_ok_and(|i| i.file_count > 0) =>
-            {
-                "First sync uploads to the cloud.".to_owned()
-            }
-            Ok(InitPreference::Path1) => "First sync sets up access markers.".to_owned(),
-            Err(reason) => reason.clone(),
-        },
-    });
-    if matches!(preflight.direction, Ok(InitPreference::Path2))
-        && let (Some(free), Ok(cloud)) = (free_bytes, &preflight.remote_inventory)
-    {
+    if preview.is_narrowing() {
         checks.push(LocationCheck {
-            ok: cloud.total_bytes <= free,
-            message: format!(
-                "{} to download · {} free on the target volume.",
-                format_bytes(cloud.total_bytes),
-                format_bytes(free)
-            ),
+            ok: true,
+            message:
+                "FolderSync will catch up and check the new selection before moving any files."
+                    .to_owned(),
         });
+    } else {
+        checks.push(LocationCheck {
+            ok: preflight.direction.is_ok(),
+            message: match &preflight.direction {
+                Ok(InitPreference::Path2) => "First sync downloads from the cloud.".to_owned(),
+                Ok(InitPreference::Path1)
+                    if preflight
+                        .local_inventory
+                        .as_ref()
+                        .is_ok_and(|i| i.file_count > 0) =>
+                {
+                    "First sync uploads to the cloud.".to_owned()
+                }
+                Ok(InitPreference::Path1) => "First sync sets up access markers.".to_owned(),
+                Err(reason) => reason.clone(),
+            },
+        });
+        if matches!(preflight.direction, Ok(InitPreference::Path2))
+            && let (Some(free), Ok(cloud)) = (free_bytes, &preflight.remote_inventory)
+        {
+            checks.push(LocationCheck {
+                ok: cloud.total_bytes <= free,
+                message: format!(
+                    "{} to download · {} free on the target volume.",
+                    format_bytes(cloud.total_bytes),
+                    format_bytes(free)
+                ),
+            });
+        }
     }
     FilterReview {
         added: preview.added_exclusions().to_vec(),
         removed: preview.removed_exclusions().to_vec(),
         checks,
+        narrowing: preview.is_narrowing(),
+        cloud_move_counts: preview.cloud_move_counts().map(<[_]>::to_vec),
     }
 }
 
 fn begin_first_sync(state: &mut WorkerState, mapping_id: MappingId) {
+    state.filter_migration_watch = None;
+    state.wizard.filter_migration_progress = None;
     state.wizard.editing_mapping_id = Some(mapping_id.clone());
     state.wizard.first_sync_mapping_id = Some(mapping_id);
     state.wizard.first_sync_preflight_done = false;
@@ -2374,11 +2477,76 @@ fn begin_first_sync(state: &mut WorkerState, mapping_id: MappingId) {
     state.wizard.step = WizardStep::FirstSync;
 }
 
+fn begin_filter_migration(
+    state: &mut WorkerState,
+    mapping_id: MappingId,
+    watch: FilterMigrationWatch,
+    progress: FilterMigrationProgress,
+) {
+    begin_first_sync(state, mapping_id);
+    state.filter_migration_watch = Some(watch);
+    state.wizard.filter_migration_progress = Some(progress);
+}
+
+fn update_filter_migration(
+    state: &mut WorkerState,
+    mapping: &MappingStatusSnapshot,
+    sequence: u64,
+) {
+    let Some(watch) = &state.filter_migration_watch else {
+        return;
+    };
+    if sequence < watch.accepted_sequence {
+        return;
+    }
+    let wizard = &mut state.wizard;
+    let Some(progress) = &mut wizard.filter_migration_progress else {
+        return;
+    };
+    if let Some(phase) = mapping.filter_migration_phase {
+        progress.phase = phase;
+        return;
+    }
+    let completed = if progress.restoring {
+        !mapping.filter_migration_held
+    } else {
+        mapping
+            .active_generation_id
+            .as_ref()
+            .is_some_and(|generation| generation != &watch.previous_generation)
+    };
+    if completed && mapping.readiness == Readiness::Ready {
+        wizard.first_sync_completed = true;
+        wizard.first_sync_stopping = false;
+        state.filter_migration_watch = None;
+    } else if matches!(mapping.execution, Execution::Idle | Execution::Interrupted) {
+        if wizard.first_sync_stopping {
+            show_stopped_first_sync(state);
+        } else if wizard.first_sync_error.is_none() {
+            wizard.first_sync_error = Some(
+                mapping
+                    .last_run_summary
+                    .clone()
+                    .filter(|_| mapping.last_run_outcome != Some(RunOutcome::Success))
+                    .unwrap_or_else(|| {
+                        "FolderSync could not finish updating the selection. Review the run log."
+                            .to_owned()
+                    }),
+            );
+        }
+        state.filter_migration_watch = None;
+    }
+}
+
 fn show_stopped_first_sync(state: &mut WorkerState) {
-    state.wizard.first_sync_stopping = false;
-    invalidate_wizard_confirmation(&mut state.wizard);
-    if state.wizard.changing_subfolders {
-        state.wizard.first_sync_error =
+    let wizard = &mut state.wizard;
+    wizard.first_sync_stopping = false;
+    invalidate_wizard_confirmation(wizard);
+    if wizard.filter_migration_progress.is_some() {
+        wizard.first_sync_error =
+            Some("Subfolder update stopped. Open the mapping to review its setup.".to_owned());
+    } else if wizard.changing_subfolders {
+        wizard.first_sync_error =
             Some("First sync stopped. Open the mapping to review its setup.".to_owned());
     } else {
         state.wizard.step = WizardStep::Review;
@@ -3787,6 +3955,7 @@ fn project_ui_snapshot(
             unreviewed_conflicts,
             available_actions: available_actions(&mapping_state),
             scheduling_enabled: m.scheduling_enabled,
+            filter_migration_held: m.filter_migration_held,
             volume_issue: (m.readiness == Readiness::VolumeUnavailable)
                 .then(|| m.status_text.trim_end_matches(" (paused)").to_owned()),
             schedule_minutes: (m.schedule_interval_secs / 60).max(1) as u32,
@@ -4220,6 +4389,7 @@ fn default_real_wizard() -> WizardDraft {
     WizardDraft {
         changing_subfolders: false,
         filter_review: None,
+        filter_migration_progress: None,
         volume_free_bytes: None,
         step: WizardStep::Account,
         editing_mapping_id: None,

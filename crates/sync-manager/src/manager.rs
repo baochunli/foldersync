@@ -85,6 +85,11 @@ use crate::{
     },
 };
 
+mod filter_change;
+
+use filter_change::{ActiveFilterChange, FILTER_MIGRATION_HOLD, FilterJob};
+pub use filter_change::{ExclusionMatch, FilterMigrationPhase};
+
 const ENGINE_PROFILE_VERSION: &str = "v1";
 const SCHEDULE_TICK: Duration = Duration::from_secs(1);
 const VOLUME_POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -117,6 +122,7 @@ fn plain_recovery_reason_label(reason_kind: &str) -> &'static str {
         "orphan_running" => "earlier sync still running",
         "orphan_ambiguous" => "unresolved earlier sync process",
         "deletion_guard_aborted" => "stopped by the deletion limit",
+        FILTER_MIGRATION_HOLD => "exclusion change incomplete",
         "interrupted" | "force_stopped" | "shutdown_timeout" | "volume_disconnected" => {
             "interrupted sync"
         }
@@ -264,6 +270,7 @@ pub struct FilterChangePreview {
     added_exclusions: Vec<String>,
     removed_exclusions: Vec<String>,
     preflight: PreflightPreview,
+    cloud_move_counts: Option<Vec<ExclusionMatch>>,
 }
 
 impl FilterChangePreview {
@@ -285,6 +292,21 @@ impl FilterChangePreview {
 
     pub fn removed_exclusions(&self) -> &[String] {
         &self.removed_exclusions
+    }
+
+    pub fn is_narrowing(&self) -> bool {
+        !self.added_exclusions.is_empty()
+            && self.removed_exclusions.is_empty()
+            && [
+                &self.preflight.local_inventory,
+                &self.preflight.remote_inventory,
+            ]
+            .into_iter()
+            .all(|inventory| inventory.as_ref().is_ok_and(|inv| inv.all_items_count > 0))
+    }
+
+    pub fn cloud_move_counts(&self) -> Option<&[ExclusionMatch]> {
+        self.cloud_move_counts.as_deref()
     }
 
     pub fn preflight(&self) -> &PreflightPreview {
@@ -309,6 +331,21 @@ fn effective_exclusions(extra: &BTreeSet<String>) -> Result<BTreeSet<String>, Ma
         patterns.insert(pattern.to_owned());
     }
     Ok(patterns)
+}
+
+fn archive_staging_filter(archive_folders: &BTreeSet<String>) -> Option<String> {
+    (!archive_folders.is_empty()).then(|| format!("*{ARCHIVE_PARTIAL_SUFFIX}"))
+}
+
+fn configured_exclusions(
+    filters: impl IntoIterator<Item = String>,
+    archive_folders: &BTreeSet<String>,
+) -> Vec<String> {
+    let staging_filter = archive_staging_filter(archive_folders);
+    filters
+        .into_iter()
+        .filter(|pattern| staging_filter.as_ref() != Some(pattern))
+        .collect()
 }
 
 /// Input for [`ManagerCommand::AddMapping`].
@@ -575,6 +612,7 @@ pub struct RecoveryReport {
     pub mapping_id: MappingId,
     pub state: MappingState,
     pub open_cases: Vec<RecoveryCaseView>,
+    pub filter_migration_held: bool,
     pub workdir_files: Vec<String>,
     pub has_lock_file: bool,
     pub recent_runs: Vec<RunRecord>,
@@ -1000,6 +1038,7 @@ fn validate_complete_layout(
 
 #[derive(Debug, Clone)]
 enum QueuedJobKind {
+    FilterChange(FilterJob),
     Prepared {
         generation_id: GenerationId,
         mode: RunMode,
@@ -1080,6 +1119,9 @@ fn restore_size_status(
 }
 
 fn cancel_auxiliary_operations(guard: &SharedState) {
+    if let Some(active) = &guard.active_filter_change {
+        active.control.cancel();
+    }
     if let Some(control) = &guard.sizing {
         control.cancel();
     }
@@ -1114,6 +1156,7 @@ struct SharedState {
     latest_snapshot: Arc<StatusSnapshot>,
     job_queue: VecDeque<QueuedJob>,
     active_run: Option<ActiveRunControl>,
+    active_filter_change: Option<ActiveFilterChange>,
     preflight_mapping: Option<MappingId>,
     next_init_attempt_id: u64,
     active_init_attempt: Option<(MappingId, u64)>,
@@ -1316,6 +1359,7 @@ impl SyncManager {
                 latest_snapshot: initial_snapshot,
                 job_queue: VecDeque::new(),
                 active_run: None,
+                active_filter_change: None,
                 preflight_mapping: None,
                 next_init_attempt_id: 0,
                 active_init_attempt: None,
@@ -1558,9 +1602,7 @@ impl SyncManager {
         }
 
         let mut exclusions = effective_exclusions(&cmd.extra_exclusions)?;
-        if !archive_folders.is_empty() {
-            exclusions.insert(format!("*{ARCHIVE_PARTIAL_SUFFIX}"));
-        }
+        exclusions.extend(archive_staging_filter(archive_folders));
 
         let local_inventory =
             inspect_local_endpoint_detailed(&local_path, &collection, &exclusions)
@@ -1692,7 +1734,7 @@ impl SyncManager {
     pub fn propose_filter_change(
         &self,
         mapping_id: &MappingId,
-        extra_exclusions: BTreeSet<String>,
+        mut extra_exclusions: BTreeSet<String>,
     ) -> Result<FilterChangePreview, ManagerError> {
         let mapping = lookup_mapping(&self.inner.state.lock().unwrap().store, mapping_id)?;
         let previous_generation_id =
@@ -1705,7 +1747,12 @@ impl SyncManager {
                         .to_owned(),
                     next_step: "Review first-sync setup before saving exclusions.".to_owned(),
                 })?;
-        let old: BTreeSet<_> = mapping.exclusions.iter().cloned().collect();
+        let mut old: BTreeSet<_> = mapping.exclusions.iter().cloned().collect();
+        // The staging rule is part of both generations even though it isn't a
+        // user choice and is absent from the stored selection.
+        let staging_filter = archive_staging_filter(&mapping.archive_folders);
+        old.extend(staging_filter.clone());
+        extra_exclusions.extend(staging_filter);
         let new = effective_exclusions(&extra_exclusions)?;
         let cmd = AddMappingCommand {
             id: mapping.id,
@@ -1723,25 +1770,39 @@ impl SyncManager {
             schedule_interval: Duration::from_secs(mapping.schedule_interval_secs),
         };
         let preflight = self.preflight_mapping_preview(&cmd, Some(mapping_id))?;
-        Ok(FilterChangePreview {
+        let mut preview = FilterChangePreview {
             mapping_id: mapping_id.clone(),
             previous_generation_id,
             effective_exclusions: new.iter().cloned().collect(),
             added_exclusions: new.difference(&old).cloned().collect(),
             removed_exclusions: old.difference(&new).cloned().collect(),
             preflight,
-        })
+            cloud_move_counts: None,
+        };
+        if preview.is_narrowing()
+            && preview.preflight.layout_error.is_none()
+            && matches!(cmd.remote_endpoint, RemoteEndpoint::DriveRemote { .. })
+        {
+            preview.cloud_move_counts = Some(filter_change::preview_move_counts(
+                &self.inner,
+                &cmd,
+                &old,
+                &preview.added_exclusions,
+            )?);
+        }
+        Ok(preview)
     }
 
-    /// Stops normal runs for the old generation and queues a fresh first-sync
-    /// preflight using the reviewed direction. Prior generations remain on disk.
+    /// Queues a narrowing migration or the existing first-sync preflight.
     pub fn apply_filter_change(
         &self,
         preview: FilterChangePreview,
     ) -> Result<CommandAcceptance, ManagerError> {
         let mut guard = self.inner.state.lock().unwrap();
         let mut mapping = lookup_mapping(&guard.store, &preview.mapping_id)?;
+        let narrowing = preview.is_narrowing();
         if guard.shutdown
+            || guard.filter_change_running(&mapping.id)
             || guard.storage_blocked_mappings.contains(&mapping.id)
             || mapping.active_generation_id.as_ref() != Some(&preview.previous_generation_id)
             || mapping.state.readiness() != Readiness::Ready
@@ -1777,13 +1838,57 @@ impl SyncManager {
         if let Some(cause) = preview
             .preflight
             .layout_error
-            .or_else(|| preview.preflight.detected_volume.err())
+            .clone()
+            .or_else(|| preview.preflight.detected_volume.as_ref().err().cloned())
         {
             return Err(ManagerError::PreflightRejected {
                 cause,
                 next_step: "Correct the folder setup and review the new selection again."
                     .to_owned(),
             });
+        }
+        if narrowing {
+            for inventory in [
+                &preview.preflight.local_inventory,
+                &preview.preflight.remote_inventory,
+            ] {
+                let inventory = inventory
+                    .as_ref()
+                    .map_err(|cause| filter_change::rejected(cause.clone()))?;
+                if let Some(cause) = inventory
+                    .marker_conflict
+                    .as_ref()
+                    .or(inventory.name_findings.first())
+                {
+                    return Err(filter_change::rejected(cause.clone()));
+                }
+                if !inventory.symlinks.is_empty() || !inventory.special_files.is_empty() {
+                    return Err(filter_change::rejected(
+                        "Remove unsupported items from the sync scope before changing exclusions.",
+                    ));
+                }
+            }
+            let generation = active_generation(&guard.store, &mapping)?
+                .ok_or_else(|| filter_change::rejected("The verified generation is missing."))?;
+            if !guard
+                .store
+                .list_open_recovery_cases(&mapping.id)?
+                .is_empty()
+                || mapping.unreviewed_conflict_run_id.is_some()
+            {
+                return Err(filter_change::rejected(
+                    "Resolve the mapping's recovery or conflicts before changing exclusions.",
+                ));
+            }
+            return filter_change::queue(
+                &self.inner,
+                &mut guard,
+                mapping,
+                FilterJob::Apply {
+                    generation_id: generation.id,
+                    exclusions: preview.effective_exclusions,
+                },
+            );
         }
         let direction = preview.preflight.direction.map_err(|cause| ManagerError::PreflightRejected {
             cause,
@@ -1797,7 +1902,8 @@ impl SyncManager {
         );
         mapping.scheduling_enabled = false;
         mapping.active_generation_id = None;
-        mapping.exclusions = preview.effective_exclusions;
+        mapping.exclusions =
+            configured_exclusions(preview.effective_exclusions, &mapping.archive_folders);
         mapping.updated_at = self.inner.clock.now_rfc3339();
         guard.store.update_mapping_runtime(&mapping)?;
         guard.schedules.remove(&mapping.id);
@@ -3078,7 +3184,7 @@ impl SyncManager {
             scheduling_enabled: false,
             state: initial_state,
             active_generation_id: None,
-            exclusions: effective_exclusions.into_iter().collect(),
+            exclusions: configured_exclusions(effective_exclusions, &archive_folders),
             archive_folders,
             max_delete_percent: max_del.value(),
             last_run_id: None,
@@ -3488,6 +3594,13 @@ impl SyncManager {
         }
 
         let mut mapping = reload_checked_mapping(&guard, &checked.mapping)?;
+        if guard.filter_change_running(&mapping.id)
+            || filter_change::hold(&guard.store, &mapping.id)?.is_some()
+        {
+            return Err(filter_change::rejected(
+                "A change to exclusions is already running.",
+            ));
+        }
         if apply_checked_volume(&self.inner, &mut guard, &mut mapping, &checked)? {
             publish_updated_snapshot(&self.inner, &mut guard)?;
         }
@@ -3650,6 +3763,8 @@ impl SyncManager {
             }
             apply_checked_volume(&self.inner, &mut guard, &mut mapping, &checked)?;
             if guard.storage_blocked_mappings.contains(&mapping.id)
+                || guard.filter_change_running(&mapping.id)
+                || filter_change::hold(&guard.store, &mapping.id)?.is_some()
                 || mapping.state.readiness() != Readiness::Ready
                 || mapping.state.execution != Execution::Idle
                 || mapping.state.intent != Intent::Enabled
@@ -3830,6 +3945,13 @@ impl SyncManager {
         if apply_checked_volume(&self.inner, &mut guard, &mut mapping, &checked)? {
             publish_updated_snapshot(&self.inner, &mut guard)?;
         }
+        if filter_change::hold(&guard.store, &mapping.id)?.is_some()
+            || guard.filter_change_running(&mapping.id)
+        {
+            return Err(filter_change::rejected(
+                "Choose Finish excluding or Put the moved files back in Recovery.",
+            ));
+        }
         if mapping.state.readiness() != Readiness::RecoveryRequired {
             return Err(ManagerError::InvalidState {
                 mapping_id,
@@ -3915,6 +4037,14 @@ impl SyncManager {
                     cause: format!("Mapping `{mapping_id}` does not exist."),
                     next_step: "Check the mapping list and try again.".to_string(),
                 })?;
+
+        if filter_change::hold(&guard.store, &mapping.id)?.is_some()
+            || guard.filter_change_running(&mapping.id)
+        {
+            return Err(filter_change::rejected(
+                "Finish excluding or put the moved files back before removing this mapping.",
+            ));
+        }
 
         if matches!(
             mapping.state.execution,
@@ -4226,7 +4356,7 @@ impl SyncManager {
                     .filter(|j| j.mapping_id == mapping.id)
                     .filter_map(|j| match j.kind {
                         QueuedJobKind::InitializePreflight { attempt_id, .. } => Some(attempt_id),
-                        QueuedJobKind::Prepared { .. } => None,
+                        QueuedJobKind::Prepared { .. } | QueuedJobKind::FilterChange(_) => None,
                     })
                     .collect();
                 for attempt_id in queued_attempts {
@@ -4240,6 +4370,7 @@ impl SyncManager {
                     schedule.hint_at = None;
                 }
 
+                guard.cancel_filter_change(&mapping.id);
                 if transition.effect == TransitionEffect::RequestGracefulStop {
                     if let Some(active) = guard.active_run.as_mut()
                         && active.mapping_id == mapping.id
@@ -4355,6 +4486,7 @@ impl SyncManager {
                 schedule.finish(self.inner.clock.now_utc(), false, "");
                 schedule.hint_at = None;
             }
+            guard.cancel_filter_change(&mapping.id);
             let stopper = if let Some(active) = guard.active_run.as_mut()
                 && active.mapping_id == mapping.id
             {
@@ -4447,6 +4579,9 @@ impl SyncManager {
         };
 
         let report = RecoveryReport {
+            filter_migration_held: open_cases
+                .iter()
+                .any(|view| view.case.reason_kind == FILTER_MIGRATION_HOLD),
             mapping_id: mapping.id,
             state: mapping.state,
             open_cases,
@@ -4762,6 +4897,9 @@ fn apply_checked_volume(
         }
     }
 
+    if !is_present {
+        guard.cancel_filter_change(&mapping.id);
+    }
     if !is_present
         && let Some(active) = guard.active_run.as_mut()
         && active.mapping_id == mapping.id
@@ -4916,6 +5054,8 @@ fn schedule_tick(
     let mut orphan = None;
     for mut mapping in mappings {
         if !mapping.scheduling_enabled
+            || guard.filter_change_running(&mapping.id)
+            || filter_change::hold(&guard.store, &mapping.id)?.is_some()
             || mapping.state.readiness() != Readiness::Ready
             || mapping.state.intent != Intent::Enabled
             || guard.storage_blocked_mappings.contains(&mapping.id)
@@ -5665,6 +5805,12 @@ fn reconcile_startup_state(
         if reconciled_mappings.contains(&mapping.id) {
             continue;
         }
+        if filter_change::hold(store, &mapping.id)?.is_some() {
+            mapping.state.execution = Execution::Idle;
+            mapping.updated_at = now.clone();
+            store.update_mapping_runtime(&mapping)?;
+            continue;
+        }
         match mapping.state.execution {
             Execution::Queued => {
                 mapping.state.execution = Execution::Idle;
@@ -6154,6 +6300,22 @@ fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapsh
             .map(|schedule| schedule.next_poll(m.schedule_interval_secs));
 
         views.push(MappingStatusSnapshot {
+            filter_migration_held: open_cases
+                .iter()
+                .any(|case| case.reason_kind == FILTER_MIGRATION_HOLD),
+            filter_migration_phase: guard
+                .active_filter_change
+                .as_ref()
+                .filter(|active| active.mapping_id == m.id)
+                .map(|active| active.phase)
+                .or_else(|| {
+                    guard.job_queue.iter().find_map(|job| match &job.kind {
+                        QueuedJobKind::FilterChange(change) if job.mapping_id == m.id => {
+                            Some(change.phase())
+                        }
+                        _ => None,
+                    })
+                }),
             id: m.id,
             display_name,
             account_id: m.account_id,
@@ -6196,6 +6358,12 @@ fn build_snapshot(guard: &SharedState, clock: &dyn Clock) -> Result<StatusSnapsh
             .active_run
             .as_ref()
             .map(|run| run.mapping_id.clone())
+            .or_else(|| {
+                guard
+                    .active_filter_change
+                    .as_ref()
+                    .map(|job| job.mapping_id.clone())
+            })
             .or_else(|| {
                 guard
                     .archive_progress
@@ -6449,9 +6617,7 @@ fn run_init_preflight_unlocked(
     )?;
 
     let mut effective_filters: BTreeSet<String> = mapping.exclusions.iter().cloned().collect();
-    if !mapping.archive_folders.is_empty() {
-        effective_filters.insert(format!("*{ARCHIVE_PARTIAL_SUFFIX}"));
-    }
+    effective_filters.extend(archive_staging_filter(&mapping.archive_folders));
 
     let mut gen_num = gen_num;
     let mapping_dir = inner.state_dir.join("mappings").join(mapping.id.as_str());
@@ -6800,6 +6966,7 @@ enum DequeueOutcome {
     Skip,
     Prepared(Box<PreparedRun>),
     InitPreflight(Box<InitPreflightClaim>),
+    FilterChange(MappingId, FilterJob, ProcessControl),
 }
 
 fn worker_loop(inner: Arc<ManagerInner>) {
@@ -6845,6 +7012,16 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                     continue;
                 }
                 match &job.kind {
+                    QueuedJobKind::FilterChange(change) => {
+                        let control = ProcessControl::default();
+                        guard.active_filter_change = Some(ActiveFilterChange {
+                            mapping_id: job.mapping_id.clone(),
+                            control: control.clone(),
+                            phase: change.phase(),
+                        });
+                        guard.worker_busy = true;
+                        DequeueOutcome::FilterChange(job.mapping_id, change.clone(), control)
+                    }
                     QueuedJobKind::Prepared {
                         generation_id,
                         mode,
@@ -6926,8 +7103,11 @@ fn worker_loop(inner: Arc<ManagerInner>) {
         match outcome {
             DequeueOutcome::Shutdown => break,
             DequeueOutcome::Skip => continue,
+            DequeueOutcome::FilterChange(mapping_id, job, control) => {
+                filter_change::run_job(&inner, mapping_id, job, control);
+            }
             DequeueOutcome::Prepared(prepared) => {
-                execute_prepared_job(&inner, *prepared);
+                execute_prepared_job(&inner, *prepared, None);
                 let mut guard = inner.state.lock().unwrap();
                 guard.worker_busy = false;
                 if guard.active_run.is_none() && guard.job_queue.is_empty() {
@@ -7027,7 +7207,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                     }
                 };
                 if let Some(prepared) = maybe_prepared {
-                    execute_prepared_job(&inner, prepared);
+                    execute_prepared_job(&inner, prepared, None);
                 }
                 let mut guard = inner.state.lock().unwrap();
                 guard.worker_busy = false;
@@ -7144,7 +7324,9 @@ fn claim_and_prepare_locked(
     };
 
     // Recheck eligibility right before claiming active slot (HIGH #5).
-    if mapping.state.execution != Execution::Queued {
+    if mapping.state.execution != Execution::Queued
+        || filter_change::hold(&guard.store, mapping_id)?.is_some()
+    {
         return Ok(None);
     }
     let is_init = matches!(mode, RunMode::Initialize(_));
@@ -7176,6 +7358,37 @@ fn claim_and_prepare_locked(
         return Ok(None);
     }
 
+    prepare_run_locked(
+        inner,
+        guard,
+        mapping,
+        generation_id,
+        RunPurpose::Bisync(mode),
+        expected,
+    )
+    .map(Some)
+}
+
+#[derive(Clone, Copy)]
+enum RunPurpose {
+    Bisync(RunMode),
+    MoveExcluded,
+}
+
+fn prepare_run_locked(
+    inner: &ManagerInner,
+    guard: &mut SharedState,
+    mut mapping: MappingRecord,
+    generation_id: &GenerationId,
+    purpose: RunPurpose,
+    expected: Option<RunInventory>,
+) -> Result<PreparedRun, ManagerError> {
+    let mode = match purpose {
+        RunPurpose::Bisync(mode) => mode,
+        RunPurpose::MoveExcluded => RunMode::Normal,
+    };
+    let is_init =
+        matches!(mode, RunMode::Initialize(_)) && !guard.filter_change_running(&mapping.id);
     let generation =
         guard
             .store
@@ -7236,11 +7449,13 @@ fn claim_and_prepare_locked(
         }
     };
 
-    let mode_label = match mode {
-        RunMode::Normal => "normal".to_string(),
-        RunMode::Initialize(InitPreference::Path1) => "init_path1".to_string(),
-        RunMode::Initialize(InitPreference::Path2) => "init_path2".to_string(),
-    };
+    let mode_label = match purpose {
+        RunPurpose::MoveExcluded => "filter_move",
+        RunPurpose::Bisync(RunMode::Normal) => "normal",
+        RunPurpose::Bisync(RunMode::Initialize(InitPreference::Path1)) => "init_path1",
+        RunPurpose::Bisync(RunMode::Initialize(InitPreference::Path2)) => "init_path2",
+    }
+    .to_owned();
 
     let started_at = inner.clock.now_rfc3339();
     let run = RunRecord {
@@ -7251,7 +7466,10 @@ fn claim_and_prepare_locked(
         status: "starting".to_string(),
         started_at: started_at.clone(),
         finished_at: None,
-        workdir_path: generation.workdir_path.clone(),
+        workdir_path: match purpose {
+            RunPurpose::MoveExcluded => run_dir.clone(),
+            RunPurpose::Bisync(_) => generation.workdir_path.clone(),
+        },
         backup_dir1: backup_dir1.clone(),
         backup_dir2: backup_dir2_str,
         run_dir,
@@ -7277,7 +7495,7 @@ fn claim_and_prepare_locked(
     // Persist run-start row (run id, generation, workdir, recovery paths) BEFORE spawn (§12, §14).
     guard.store.insert_run_start(&run)?;
 
-    if is_init {
+    if is_init || guard.filter_change_running(&mapping.id) {
         mapping.state.execution = Execution::Running;
     } else {
         mapping.state = apply_event(mapping.state, ObservedEvent::RunStarted).state;
@@ -7285,7 +7503,7 @@ fn claim_and_prepare_locked(
     mapping.updated_at = started_at.clone();
     guard.store.update_mapping_runtime(&mapping)?;
 
-    if let Some(schedule) = guard.schedules.get_mut(mapping_id) {
+    if let Some(schedule) = guard.schedules.get_mut(&mapping.id) {
         schedule.hint_at = None;
     }
     guard.active_run = Some(ActiveRunControl {
@@ -7313,7 +7531,7 @@ fn claim_and_prepare_locked(
         backup_dir2,
     };
 
-    Ok(Some(PreparedRun {
+    Ok(PreparedRun {
         run,
         mapping,
         generation,
@@ -7322,7 +7540,7 @@ fn claim_and_prepare_locked(
         is_init,
         expected,
         log_file,
-    }))
+    })
 }
 
 fn record_prepare_failure_locked(
@@ -7653,12 +7871,24 @@ fn launch_cancellation(guard: &SharedState, run_id: &RunId) -> Option<bool> {
     }
 }
 
-fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
+fn execute_prepared_job(
+    inner: &Arc<ManagerInner>,
+    mut prepared: PreparedRun,
+    verified_drive: Option<&LockedDrive<'_>>,
+) {
     let volume = observe_binding(inner.volume_probe.as_ref(), &prepared.mapping.local_binding);
-    let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+    let control = inner
+        .state
+        .lock()
+        .unwrap()
+        .active_filter_change
+        .as_ref()
+        .filter(|change| change.mapping_id == prepared.mapping.id)
+        .map(|change| change.control.clone())
+        .unwrap_or_else(|| ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT));
     let open_drive = || -> Result<Option<LockedDrive<'_>>, EndpointCheckError> {
         verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)?;
-        if prepared.mapping.remote_endpoint_kind != "drive_remote" {
+        if verified_drive.is_some() || prepared.mapping.remote_endpoint_kind != "drive_remote" {
             return Ok(None);
         }
         inner
@@ -7688,7 +7918,7 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
             return;
         }
     };
-    if let Some(drive) = &drive {
+    if let Some(drive) = verified_drive.or(drive.as_ref()) {
         prepared.plan.config_path = drive.account.config_path.clone();
         prepared.plan.password_command = drive.request.password_command().cloned();
     }
@@ -8322,6 +8552,11 @@ fn finalize_completed_run(
                     apply_event(mapping.state, ObservedEvent::RunFinished(core_outcome)).state;
             }
 
+            if guard.filter_change_running(&mapping.id)
+                && matches!(core_outcome, RunOutcome::Success)
+            {
+                mapping.state.execution = Execution::Running;
+            }
             mapping.last_run_id = Some(run.id.clone());
             mapping.last_run_outcome = Some(core_outcome);
             mapping.last_run_completed_at = Some(now.clone());
