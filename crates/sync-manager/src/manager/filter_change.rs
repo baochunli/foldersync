@@ -192,6 +192,56 @@ fn file_inventory(
     Ok(inventory)
 }
 
+/// Validate the selected files and the directories used to address them.
+/// Keep unrelated entries only to detect aliases of paths in this scope.
+fn move_inventory(
+    entries: Vec<LsJsonEntry>,
+    manifest: &MigrationManifest,
+) -> Result<BTreeMap<String, LsJsonEntry>, ManagerError> {
+    let files: BTreeSet<_> = manifest
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    let mut scope = files.clone();
+    for path in &files {
+        scope.extend(path.match_indices('/').map(|(index, _)| &path[..index]));
+    }
+    let mut names: Vec<_> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    let present: BTreeSet<_> = names.iter().copied().collect();
+    // Include planned paths missing on this side to catch case and Unicode
+    // aliases of a destination that is about to be created.
+    names.extend(files.difference(&present).copied());
+    if let Some(finding) = sync_core::validate_names(&names)
+        .into_iter()
+        .find(|finding| {
+            finding
+                .paths
+                .iter()
+                .any(|path| scope.contains(path.as_str()))
+        })
+    {
+        return Err(rejected(finding.cause));
+    }
+    let mut inventory = BTreeMap::new();
+    for entry in entries
+        .into_iter()
+        .filter(|entry| scope.contains(entry.path.as_str()))
+    {
+        let is_file = files.contains(entry.path.as_str());
+        if is_file == entry.is_dir {
+            return Err(rejected(format!(
+                "The Drive file or folder `{}` occupies a path required by the exclusion move.",
+                entry.path
+            )));
+        }
+        if is_file {
+            inventory.insert(entry.path.clone(), entry);
+        }
+    }
+    Ok(inventory)
+}
+
 fn temporary_filters(rules: &str) -> Result<tempfile::NamedTempFile, ManagerError> {
     let mut file = tempfile::NamedTempFile::new()
         .map_err(|err| rejected(format!("Could not stage the exclusion filter: {err}")))?;
@@ -254,7 +304,7 @@ struct MigrationManifest {
 }
 
 enum TransferAction<'a> {
-    FirstMove,
+    FirstMove(Vec<LsJsonEntry>),
     Finish {
         original: &'a RunRecord,
         filters: &'a Path,
@@ -317,9 +367,14 @@ impl Migration<'_> {
         prepare_run_locked(self.inner, &mut guard, mapping, id, purpose)
     }
 
-    fn bisync(&self, prepared: PreparedRun, label: &str) -> Result<(), ManagerError> {
+    fn bisync(
+        &self,
+        prepared: PreparedRun,
+        label: &str,
+        drive: Option<&LockedDrive<'_>>,
+    ) -> Result<(), ManagerError> {
         let id = prepared.run.id.clone();
-        execute_prepared_job(self.inner, prepared);
+        execute_prepared_job(self.inner, prepared, drive);
         self.check_cancelled()?;
         let guard = self.inner.state.lock().unwrap();
         let run = guard
@@ -405,26 +460,30 @@ impl Migration<'_> {
         let mapping = prepared.mapping.clone();
         let old = prepared.generation.clone();
         let gate_plan = prepared.plan.clone();
-        self.bisync(prepared, "Catch-up sync")?;
+        self.bisync(prepared, "Catch-up sync", None)?;
 
         self.phase(FilterMigrationPhase::Checking)?;
         let filters =
             temporary_filters(&render_filters_file(&exclusions.iter().cloned().collect()))?;
         let drive = self.open_drive(&mapping, &old)?;
         self.check_trees(gate_plan.clone(), filters.path(), drive.as_ref())?;
-        if let Some(drive) = drive {
-            let files = self.find_new_exclusions(&drive, &mapping, &old, &exclusions)?;
-            if !files.is_empty() {
-                let manifest = MigrationManifest {
-                    exclusions: exclusions.clone(),
-                    files,
-                };
+        if let Some(drive) = drive.as_ref() {
+            let (manifest, inventory) =
+                self.find_new_exclusions(drive, &mapping, &old, exclusions)?;
+            if !manifest.files.is_empty() {
                 let prepared = self.prepare(&old.id, RunPurpose::MoveExcluded)?;
-                self.transfer(prepared, &drive, &manifest, TransferAction::FirstMove)?;
-                self.check_trees(gate_plan, filters.path(), Some(&drive))?;
+                self.transfer(
+                    prepared,
+                    drive,
+                    &manifest,
+                    TransferAction::FirstMove(inventory),
+                )?;
+                self.check_trees(gate_plan, filters.path(), Some(drive))?;
             }
+            self.rebaseline(&old, manifest.exclusions, Some(drive))
+        } else {
+            self.rebaseline(&old, exclusions, None)
         }
-        self.rebaseline(&old, exclusions)
     }
 
     fn find_new_exclusions(
@@ -432,8 +491,8 @@ impl Migration<'_> {
         drive: &LockedDrive<'_>,
         mapping: &MappingRecord,
         old: &GenerationRecord,
-        exclusions: &[String],
-    ) -> Result<Vec<MoveFile>, ManagerError> {
+        exclusions: Vec<String>,
+    ) -> Result<(MigrationManifest, Vec<LsJsonEntry>), ManagerError> {
         let previous = &old.config.effective_filters;
         let added = exclusions
             .iter()
@@ -441,35 +500,57 @@ impl Migration<'_> {
             .map(String::as_str);
         let rules = render_move_filter(previous.iter().map(String::as_str), added)?;
         let filter = temporary_filters(&rules)?;
-        let matched = file_inventory(drive, &mapping.collection.display_path, Some(filter.path()))?;
-        if matched.contains_key(ACCESS_MARKER_FILENAME) {
-            return Err(rejected(
-                "The new exclusions would hide the FolderSync access marker.",
-            ));
-        }
-        matched
-            .into_values()
-            .map(|entry| {
-                let id = entry.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+        let inventory = drive
+            .request
+            .list_inventory(
+                &mapping.collection.display_path,
+                Some(filter.path()),
+                &drive.runner,
+            )
+            .map_err(|error| drive_error(error.into()))?;
+        let mut files = Vec::new();
+        for entry in inventory.iter().filter(|entry| !entry.is_dir) {
+            if entry.path == ACCESS_MARKER_FILENAME {
+                return Err(rejected(
+                    "The new exclusions would hide the FolderSync access marker.",
+                ));
+            }
+            let id = entry
+                .id
+                .as_ref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
                     rejected(format!("Drive did not report an ID for `{}`.", entry.path))
                 })?;
-                if entry.size < 0
-                    || entry.hashes.is_empty()
-                    || entry.hashes.values().any(String::is_empty)
-                {
-                    return Err(rejected(format!(
-                        "Drive could not verify the bytes of `{}`.",
-                        entry.path
-                    )));
-                }
-                Ok(MoveFile {
-                    path: entry.path,
-                    id,
-                    size: entry.size,
-                    hashes: entry.hashes,
-                })
-            })
-            .collect()
+            if entry.size < 0
+                || entry.hashes.is_empty()
+                || entry.hashes.values().any(String::is_empty)
+            {
+                return Err(rejected(format!(
+                    "Drive could not verify the bytes of `{}`.",
+                    entry.path
+                )));
+            }
+            if entry
+                .path
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+                || entry.path.chars().any(char::is_control)
+            {
+                return Err(rejected(format!(
+                    "The Drive file path `{}` is invalid.",
+                    entry.path
+                )));
+            }
+            files.push(MoveFile {
+                path: entry.path.clone(),
+                id: id.clone(),
+                size: entry.size,
+                hashes: entry.hashes.clone(),
+            });
+        }
+        files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        Ok((MigrationManifest { exclusions, files }, inventory))
     }
 
     fn recover(&self, restore: bool) -> Result<(), ManagerError> {
@@ -537,29 +618,14 @@ impl Migration<'_> {
         self.transfer(prepared, &drive, &manifest, action)?;
         if let Some(filters) = filters {
             self.check_trees(plan, filters.path(), Some(&drive))?;
-            drop(drive);
-            self.rebaseline(&old, manifest.exclusions)?;
+            self.rebaseline(&old, manifest.exclusions, Some(&drive))?;
         } else {
             self.release(None, "Restored all moved files to Data.")?;
         }
         Ok(())
     }
 
-    fn persist_hold(
-        &self,
-        run: &RunRecord,
-        manifest: &MigrationManifest,
-    ) -> Result<(), ManagerError> {
-        let bytes = serde_json::to_vec(manifest).map_err(|err| {
-            rejected(format!("Could not save the planned exclusion moves: {err}"))
-        })?;
-        write_private_file_under(
-            "exclusion move manifest",
-            &self.inner.state_dir,
-            &run.run_dir.join(MANIFEST),
-            &bytes,
-        )?;
-        let mut guard = self.inner.state.lock().unwrap();
+    fn persist_hold(&self, guard: &mut SharedState, run: &RunRecord) -> Result<(), ManagerError> {
         self.check_cancelled()?;
         let mut mapping = lookup_mapping(&guard.store, self.mapping_id)?;
         if mapping.state.readiness() != Readiness::Ready
@@ -596,7 +662,6 @@ impl Migration<'_> {
         guard
             .store
             .commit_mapping_and_recovery(&mapping, Some(&case))?;
-        publish_updated_snapshot(self.inner, &mut guard)?;
         Ok(())
     }
 
@@ -660,26 +725,25 @@ impl Migration<'_> {
     ) -> Result<(), ManagerError> {
         let mapping = &prepared.mapping;
         let run = &prepared.run;
-        let first_move = matches!(action, TransferAction::FirstMove);
-        let (original_run, restore) = match action {
-            TransferAction::FirstMove => (run, false),
+        let (original_run, restore, first_inventory) = match action {
+            TransferAction::FirstMove(inventory) => (run, false, Some(inventory)),
             TransferAction::Finish { original, filters } => {
                 self.check_trees(prepared.plan.clone(), filters, Some(drive))?;
-                (original, false)
+                (original, false, None)
             }
-            TransferAction::Restore { original } => (original, true),
+            TransferAction::Restore { original } => (original, true, None),
         };
         validate_safe_path_id("migration run", original_run.id.as_str())?;
-        let prefix =
-            drive_recovery_directory(drive, mapping, false, &|| self.control.check().is_err())?;
-        let recovery = format!("{prefix}/{}", original_run.id);
-        if original_run.backup_dir2 != format!("{}:{recovery}", drive.request.remote_name()) {
+        let remote = format!("{}:", drive.request.remote_name());
+        let recovery_root = mapping
+            .cloud_recovery_path
+            .strip_prefix(&remote)
+            .ok_or_else(|| rejected("The saved cloud Recovery destination has changed."))?;
+        let recovery = format!("{recovery_root}/{}/{}", mapping.device_id, original_run.id);
+        if original_run.backup_dir2 != format!("{remote}{recovery}") {
             return Err(rejected(
                 "The saved cloud Recovery destination has changed.",
             ));
-        }
-        if first_move {
-            self.persist_hold(run, manifest)?;
         }
         self.phase(if restore {
             FilterMigrationPhase::Restoring
@@ -697,8 +761,20 @@ impl Migration<'_> {
         } else {
             (data.as_str(), recovery.as_str())
         };
-        let source_files = file_inventory(drive, source, None)?;
-        let target_files = file_inventory(drive, target, None)?;
+        let list_side = |root| {
+            drive
+                .request
+                .list_inventory(root, None, &drive.runner)
+                .map_err(|error| drive_error(error.into()))
+                .and_then(|entries| move_inventory(entries, manifest))
+        };
+        let first_move = first_inventory.is_some();
+        let mut source_files = if let Some(entries) = first_inventory {
+            move_inventory(entries, manifest)?
+        } else {
+            list_side(source)?
+        };
+        let mut target_files = list_side(target)?;
         let mut pending = String::new();
         for file in &manifest.files {
             match (source_files.get(&file.path), target_files.get(&file.path)) {
@@ -726,27 +802,22 @@ impl Migration<'_> {
                 &list,
                 pending.as_bytes(),
             )?;
-            drive
-                .verify_collection(&mapping.collection)
-                .map_err(drive_error)?;
-            for root in [source, target] {
-                let entries = drive
-                    .request
-                    .list_entries(root, true, &drive.runner)
-                    .map_err(|err| drive_error(err.into()))?;
-                if let Some(finding) = sync_core::validate_names(
-                    &entries.iter().map(|entry| &entry.path).collect::<Vec<_>>(),
-                )
-                .into_iter()
-                .next()
-                {
-                    return Err(rejected(finding.cause));
-                }
+            if first_move {
+                let bytes = serde_json::to_vec(manifest).map_err(|err| {
+                    rejected(format!("Could not save the planned exclusion moves: {err}"))
+                })?;
+                write_private_file_under(
+                    "exclusion move manifest",
+                    &self.inner.state_dir,
+                    &run.run_dir.join(MANIFEST),
+                    &bytes,
+                )?;
             }
             let runner = RecordedMoveRunner {
                 migration: self,
                 drive,
-                run_id: &run.id,
+                run,
+                first_move,
             };
             if let Err(err) = drive.request.move_files(source, target, &list, &runner) {
                 return Err(self.incomplete_move(
@@ -757,22 +828,19 @@ impl Migration<'_> {
                     err,
                 ));
             }
+            (source_files, target_files) =
+                (|| Ok::<_, ManagerError>((list_side(source)?, list_side(target)?)))().map_err(
+                    |err| {
+                        self.incomplete_move(
+                            &mut prepared.log_file,
+                            drive,
+                            manifest,
+                            &recovery,
+                            err.cause(),
+                        )
+                    },
+                )?;
         }
-        let verify = || {
-            Ok::<_, ManagerError>((
-                file_inventory(drive, source, None)?,
-                file_inventory(drive, target, None)?,
-            ))
-        };
-        let (source_files, target_files) = verify().map_err(|err| {
-            self.incomplete_move(
-                &mut prepared.log_file,
-                drive,
-                manifest,
-                &recovery,
-                err.cause(),
-            )
-        })?;
         let mut incomplete = Vec::new();
         for file in &manifest.files {
             if !source_files.contains_key(&file.path)
@@ -859,6 +927,7 @@ impl Migration<'_> {
         &self,
         old: &GenerationRecord,
         exclusions: Vec<String>,
+        drive: Option<&LockedDrive<'_>>,
     ) -> Result<(), ManagerError> {
         self.phase(FilterMigrationPhase::Rebaseline)?;
         let generation = self.create_generation(old, exclusions)?;
@@ -868,10 +937,10 @@ impl Migration<'_> {
         )?;
         let plan = prepared.plan.clone();
         let mapping = prepared.mapping.clone();
-        self.bisync(prepared, "Re-baseline")?;
+        self.bisync(prepared, "Re-baseline", drive)?;
         self.phase(FilterMigrationPhase::Verifying)?;
-        let drive = self.open_drive(&mapping, &generation)?;
-        self.check_trees(plan, &generation.filters_file_path, drive.as_ref())?;
+        self.verify_base(&mapping, &generation)?;
+        self.check_trees(plan, &generation.filters_file_path, drive)?;
         self.release(Some(&generation), "Verified the narrower sync generation.")
     }
 
@@ -981,24 +1050,38 @@ fn sync_move_log(log: &fs::File) -> Result<(), ManagerError> {
 struct RecordedMoveRunner<'a> {
     migration: &'a Migration<'a>,
     drive: &'a LockedDrive<'a>,
-    run_id: &'a RunId,
+    run: &'a RunRecord,
+    first_move: bool,
 }
 
 impl ProcessRunner for RecordedMoveRunner<'_> {
     fn spawn(&self, spec: &ProcessSpec, options: SpawnOptions) -> Result<RunHandle, ProcessError> {
         let inner = self.migration.inner;
-        let guard = inner.state.lock().unwrap();
+        let mut guard = inner.state.lock().unwrap();
         self.migration.control.check()?;
-        if launch_cancellation(&guard, self.run_id).is_some() {
+        if launch_cancellation(&guard, &self.run.id).is_some() {
             return Err(ProcessError::Canceled);
+        }
+        if self.first_move {
+            self.migration
+                .persist_hold(&mut guard, self.run)
+                .map_err(|error| ProcessError::Spawn {
+                    program: spec.program.clone(),
+                    source: io::Error::other(error),
+                })?;
         }
         let handle = self.drive.runner.spawn(spec, options)?;
         let engine = self.drive.request.engine().into();
-        if let Err(error) =
-            guard
-                .store
-                .update_run_child_identity(self.run_id, handle.identity(), &engine)
-        {
+        let saved = guard
+            .store
+            .update_run_child_identity(&self.run.id, handle.identity(), &engine)
+            .and_then(|()| {
+                if self.first_move {
+                    publish_updated_snapshot(inner, &mut guard)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = saved {
             drop(guard);
             let _ = handle.stop_handle().force_stop(Duration::ZERO);
             let _ = handle.wait();
@@ -1042,6 +1125,14 @@ pub(super) fn run_job(
                 mapping.state.execution = Execution::Idle;
             }
             mapping.updated_at = now.clone();
+            if mapping.last_run_outcome == Some(RunOutcome::Success) {
+                mapping.last_run_outcome = Some(if control.check().is_err() {
+                    RunOutcome::Interrupted
+                } else {
+                    RunOutcome::UnknownFailure
+                });
+                mapping.last_run_completed_at = Some(now.clone());
+            }
             mapping.last_run_summary_text = Some(err.cause());
             guard.store.update_mapping_runtime(&mapping)
         })();

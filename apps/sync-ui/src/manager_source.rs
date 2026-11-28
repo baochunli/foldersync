@@ -1121,7 +1121,7 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                 state.wizard.first_sync_stopping = false;
             }
             state.action_error = Some(full);
-            push_ui_event(state, format!("First sync check failed: {cause}"), None);
+            push_ui_event(state, format!("Sync could not continue. {cause}"), None);
             true
         }
         ManagerEvent::ShutdownTimedOut { mapping_id, .. } => {

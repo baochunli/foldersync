@@ -289,14 +289,36 @@ impl LsJsonRequest {
         filters_file: Option<&Path>,
         runner: &dyn ProcessRunner,
     ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        self.list_recursive_inventory(subpath, filters_file, runner, true)
+    }
+
+    /// Lists files with hashes and directory objects in the same recursive walk.
+    pub fn list_inventory(
+        &self,
+        subpath: &str,
+        filters_file: Option<&Path>,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        self.list_recursive_inventory(subpath, filters_file, runner, false)
+    }
+
+    fn list_recursive_inventory(
+        &self,
+        subpath: &str,
+        filters_file: Option<&Path>,
+        runner: &dyn ProcessRunner,
+        files_only: bool,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
         let mut args = vec![
             "lsjson".into(),
             self.target(subpath)?,
             "--recursive".into(),
-            "--files-only".into(),
             "--hash-type=md5".into(),
             "--log-level=ERROR".into(),
         ];
+        if files_only {
+            args.push("--files-only".into());
+        }
         if let Some(filters) = filters_file {
             validate_local_path("filters_file", filters)?;
             args.extend(["--filter-from".into(), filters.as_os_str().into()]);

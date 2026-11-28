@@ -30,9 +30,11 @@ Both paths check SHA-256 before running
 `<binary> version --config <throwaway-temp-config> --ask-password=false` with
 closed stdin, a cleared environment, and an isolated `HOME`. The version must
 equal `1.76.0`. The immutable `EngineIdentity` records the resolved path, host
-platform, version, and verified digest. The adapter checks that digest once
-per bisync launch, immediately before spawning with `RealProcessRunner`.
-The qualified digest is retained across launches.
+platform, version, and verified digest. Before each spawn, the adapter
+compares the current binary's digest with the pin. It reuses the SHA-256 in
+process while the canonical path, size, and modification time match. On Unix,
+the device, inode, and change time must also match. A changed file is hashed
+again before launch.
 
 `rclone selfupdate` and `rclone` on `PATH` are never used.
 
@@ -222,7 +224,7 @@ verification, and a second clean sync cycle
 
 | Scenario | Result | Observed details |
 | --- | --- | --- |
-| Binary SHA-256 + isolated `version` qualification + launch re-hash | Passed | Exact host manifest digest and `rclone v1.76.0` match using throwaway `--config` and isolated env; binary replacement detected both before qualification and between qualification and sync launch. |
+| Binary SHA-256 + isolated `version` qualification + launch digest check | Passed | Exact host manifest digest and `rclone v1.76.0` match using throwaway `--config` and isolated env; binary replacement detected both before qualification and between qualification and sync launch. |
 | Parent `RCLONE_FORCE=true` & `RCLONE_RESYNC=true` isolation | Passed | `env_clear` + allowlist prevented parent `RCLONE_RESYNC=true` from initializing an uninitialized workdir (`Critical { requires_resync: true }`) and prevented `RCLONE_FORCE=true` from bypassing `--max-delete 10` (`DeletionGuardAborted`, zero deletes). |
 | Initialization (`--resync-mode path1` and `--resync-mode path2`) | Passed | Propagated initial tree in the chosen direction and remained clean on the second normal cycle. |
 | Bidirectional add / edit / delete + `--backup-dir1/2` | Passed | Changes propagated both ways; overwritten and deleted files were captured in `--backup-dir1` and `--backup-dir2` with exact pre-change SHA-256 hashes; second cycle preserved truth set without resurrection. |

@@ -291,11 +291,7 @@ impl FilterChangePreview {
                 &self.preflight.remote_inventory,
             ]
             .into_iter()
-            .all(|inventory| {
-                inventory
-                    .as_ref()
-                    .is_ok_and(|inv| inv.classification == crate::init::SideClassification::HasData)
-            })
+            .all(|inventory| inventory.as_ref().is_ok_and(|inv| inv.all_items_count > 0))
     }
 
     pub fn cloud_move_counts(&self) -> Option<&[ExclusionMatch]> {
@@ -6484,7 +6480,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                 filter_change::run_job(&inner, mapping_id, job, control);
             }
             DequeueOutcome::Prepared(prepared) => {
-                execute_prepared_job(&inner, *prepared);
+                execute_prepared_job(&inner, *prepared, None);
                 let mut guard = inner.state.lock().unwrap();
                 guard.worker_busy = false;
                 if guard.active_run.is_none() && guard.job_queue.is_empty() {
@@ -6583,7 +6579,7 @@ fn worker_loop(inner: Arc<ManagerInner>) {
                     }
                 };
                 if let Some(prepared) = maybe_prepared {
-                    execute_prepared_job(&inner, prepared);
+                    execute_prepared_job(&inner, prepared, None);
                 }
                 let mut guard = inner.state.lock().unwrap();
                 guard.worker_busy = false;
@@ -7242,7 +7238,11 @@ fn launch_cancellation(guard: &SharedState, run_id: &RunId) -> Option<bool> {
     }
 }
 
-fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
+fn execute_prepared_job(
+    inner: &Arc<ManagerInner>,
+    mut prepared: PreparedRun,
+    verified_drive: Option<&LockedDrive<'_>>,
+) {
     let volume = observe_binding(inner.volume_probe.as_ref(), &prepared.mapping.local_binding);
     let control = inner
         .state
@@ -7255,7 +7255,7 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
         .unwrap_or_else(|| ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT));
     let open_drive = || -> Result<Option<LockedDrive<'_>>, EndpointCheckError> {
         verify_endpoints_for_generation(inner, &prepared.mapping, &prepared.generation, &volume)?;
-        if prepared.mapping.remote_endpoint_kind != "drive_remote" {
+        if verified_drive.is_some() || prepared.mapping.remote_endpoint_kind != "drive_remote" {
             return Ok(None);
         }
         inner
@@ -7285,7 +7285,7 @@ fn execute_prepared_job(inner: &Arc<ManagerInner>, mut prepared: PreparedRun) {
             return;
         }
     };
-    if let Some(drive) = &drive {
+    if let Some(drive) = verified_drive.or(drive.as_ref()) {
         prepared.plan.config_path = drive.account.config_path.clone();
         prepared.plan.password_command = drive.request.password_command().cloned();
     }

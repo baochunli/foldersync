@@ -3,11 +3,15 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fs::{self, File},
-    io::Read,
+    fs::{self, File, Metadata, OpenOptions},
+    io::{self, Read},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
 };
 
 use serde::Deserialize;
@@ -22,11 +26,12 @@ const EMBEDDED_MANIFEST_TOML: &str = include_str!("../../../packaging/qualificat
 const BUNDLE_HELPER: &str = "Contents/Helpers/rclone";
 const BUNDLE_MANIFEST: &str = "Contents/Resources/rclone-manifest.json";
 static PROBE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static EXECUTABLE_DIGESTS: Mutex<BTreeMap<PathBuf, ExecutableDigest>> = Mutex::new(BTreeMap::new());
 
 /// Verified identity of the pinned rclone executable, stored with each run.
 ///
 /// Fields are private so callers cannot forge or mutate an identity after
-/// qualification; launch boundaries also re-verify the binary's SHA-256 on disk.
+/// qualification; launch boundaries also check the SHA-256 of the current binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineIdentity {
     version: String,
@@ -272,19 +277,24 @@ pub fn host_platform_key() -> Result<&'static str, QualificationError> {
 
 /// Computes the lowercase hex SHA-256 digest of a file using streaming reads.
 pub fn sha256_file(path: &Path) -> Result<String, QualificationError> {
-    let mut file = File::open(path).map_err(|source| QualificationError::HashIo {
+    let file = File::open(path).map_err(|source| hash_io(path, source))?;
+    sha256_open_file(path, &file)
+}
+
+fn hash_io(path: &Path, source: io::Error) -> QualificationError {
+    QualificationError::HashIo {
         path: path.to_path_buf(),
         source,
-    })?;
+    }
+}
+
+fn sha256_open_file(path: &Path, mut file: &File) -> Result<String, QualificationError> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
-            .map_err(|source| QualificationError::HashIo {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            .map_err(|source| hash_io(path, source))?;
         if n == 0 {
             break;
         }
@@ -297,6 +307,86 @@ pub fn sha256_file(path: &Path) -> Result<String, QualificationError> {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+#[derive(PartialEq, Eq)]
+struct ExecutableStamp {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl ExecutableStamp {
+    fn from_metadata(meta: Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular file",
+            ));
+        }
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified()?,
+            #[cfg(unix)]
+            identity: (meta.dev(), meta.ino()),
+            #[cfg(unix)]
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+struct ExecutableDigest {
+    stamp: ExecutableStamp,
+    sha256: Arc<str>,
+}
+
+pub(crate) fn executable_sha256(path: &Path) -> Result<Arc<str>, QualificationError> {
+    let io_error = |source| hash_io(path, source);
+    // Keep metadata observation and cache fill under the same lock. Concurrent
+    // launches of one executable share a single full read for unchanged bytes.
+    let mut cache = EXECUTABLE_DIGESTS.lock().unwrap();
+    let canonical = path.canonicalize().map_err(io_error)?;
+    let path_stamp = || fs::metadata(path).and_then(ExecutableStamp::from_metadata);
+    let stamp = path_stamp().map_err(io_error)?;
+    if let Some(entry) = cache.get(&canonical).filter(|entry| entry.stamp == stamp) {
+        return Ok(Arc::clone(&entry.sha256));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(io_error)?;
+    let file_stamp = || file.metadata().and_then(ExecutableStamp::from_metadata);
+    let changed = || {
+        io_error(io::Error::other(
+            "binary changed during SHA-256 verification",
+        ))
+    };
+    if file_stamp().map_err(io_error)? != stamp {
+        return Err(changed());
+    }
+    let sha256 = Arc::<str>::from(sha256_open_file(path, &file)?);
+    if file_stamp().map_err(io_error)? != stamp || path_stamp().map_err(io_error)? != stamp {
+        return Err(changed());
+    }
+    cache.insert(
+        canonical,
+        ExecutableDigest {
+            stamp,
+            sha256: Arc::clone(&sha256),
+        },
+    );
+    Ok(sha256)
 }
 
 /// Extracts the rclone version string from `<binary> version` stdout.
@@ -360,9 +450,9 @@ impl Drop for ProbeTempDir {
     }
 }
 
-/// Re-hashes the binary referenced by `identity` on disk and confirms its
-/// executable metadata and SHA-256 still match the identity established at
-/// qualification. Also checks the identity against the host version and platform pins.
+/// Confirms that the binary referenced by `identity` is still executable and
+/// matches its qualified SHA-256. Hashes are reused for an unchanged file.
+/// Also checks the identity against the host version and platform pins.
 pub fn verify_binary_integrity(identity: &EngineIdentity) -> Result<(), QualificationError> {
     let manifest = QualificationManifest::embedded()?;
     verify_binary_integrity_with_manifest(identity, &manifest)
@@ -427,12 +517,12 @@ pub(crate) fn verify_executable_metadata(
 
 fn verify_executable_digest(identity: &EngineIdentity) -> Result<(), QualificationError> {
     verify_executable_metadata(identity)?;
-    let actual_sha256 = sha256_file(&identity.path)?;
-    if actual_sha256 != identity.sha256 {
+    let actual_sha256 = executable_sha256(&identity.path)?;
+    if actual_sha256.as_ref() != identity.sha256 {
         return Err(QualificationError::Sha256Mismatch {
             path: identity.path.clone(),
             expected: identity.sha256.clone(),
-            actual: actual_sha256,
+            actual: actual_sha256.to_string(),
         });
     }
     Ok(())
@@ -524,7 +614,7 @@ fn probe_version(
 /// the workspace's pinned rclone when running outside a bundle.
 ///
 /// Call at startup and retain the returned identity for subsequent launches.
-/// Each launch re-hashes the helper against the digest established here. A
+/// Each launch checks the helper against the digest established here. A
 /// bundle error is final. `Ok(None)` means the workspace binary is absent.
 pub fn qualify_pinned_binary() -> Result<Option<EngineIdentity>, QualificationError> {
     #[cfg(target_os = "macos")]
@@ -985,6 +1075,49 @@ mod tests {
         let stdout =
             "rclone v1.76.0\n- os/version: darwin 27.2.1 (64 bit)\n- go/version: go1.27.3\n";
         assert_eq!(parse_rclone_version(stdout).unwrap(), "1.76.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_sha256_shares_digest_and_invalidates_timestamp_preserving_replacement() {
+        let dir = unique_temp_dir("cached-digest");
+        let binary = dir.join("rclone");
+        let alias = dir.join("alias");
+        fs::write(&binary, b"before").unwrap();
+        std::os::unix::fs::symlink(&binary, &alias).unwrap();
+        let modified = fs::metadata(&binary).unwrap().modified().unwrap();
+
+        let [original, repeated] = std::thread::scope(|scope| {
+            [
+                scope.spawn(|| executable_sha256(&binary).unwrap()),
+                scope.spawn(|| executable_sha256(&alias).unwrap()),
+            ]
+            .map(|call| call.join().unwrap())
+        });
+        assert!(Arc::ptr_eq(&original, &repeated));
+        assert_eq!(original.as_ref(), sha256_file(&binary).unwrap());
+
+        // A same-length rewrite must invalidate the cache even if its mtime is restored.
+        fs::write(&binary, b"edited").unwrap();
+        File::open(&binary).unwrap().set_modified(modified).unwrap();
+        assert_eq!(fs::metadata(&binary).unwrap().modified().unwrap(), modified);
+        let edited = executable_sha256(&binary).unwrap();
+        assert_ne!(original, edited);
+        assert_eq!(edited.as_ref(), sha256_file(&binary).unwrap());
+
+        // Atomic replacement under the same path and timestamp must also rehash.
+        let replacement = dir.join("replacement");
+        fs::write(&replacement, b"after!").unwrap();
+        File::open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(&replacement, &binary).unwrap();
+        assert_eq!(fs::metadata(&binary).unwrap().modified().unwrap(), modified);
+        let replaced = executable_sha256(&alias).unwrap();
+        assert_ne!(edited, replaced);
+        assert_eq!(replaced.as_ref(), sha256_file(&binary).unwrap());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

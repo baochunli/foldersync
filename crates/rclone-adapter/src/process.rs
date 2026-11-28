@@ -826,17 +826,17 @@ impl ProcessRunner for RealProcessRunner {
 
         // Check the pinned digest immediately before spawning the executable.
         if let Some(expected_sha256) = &spec.expected_binary_sha256 {
-            let actual = crate::qualification::sha256_file(&spec.program).map_err(|err| {
+            let actual = crate::qualification::executable_sha256(&spec.program).map_err(|err| {
                 ProcessError::IntegrityCheck {
                     program: spec.program.clone(),
                     reason: err.to_string(),
                 }
             })?;
-            if &actual != expected_sha256 {
+            if actual.as_ref() != expected_sha256 {
                 return Err(ProcessError::BinaryIntegrityMismatch {
                     program: spec.program.clone(),
                     expected: expected_sha256.clone(),
-                    actual,
+                    actual: actual.to_string(),
                 });
             }
         }

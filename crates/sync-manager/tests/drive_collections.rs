@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -30,6 +30,7 @@ struct FixtureRunner {
     fake: FakeProcessRunner,
     root: PathBuf,
     mkdir_calls: AtomicUsize,
+    fail_next_mkdir: AtomicBool,
     synthesize_drive_ids: bool,
     pre_move_check_fault: Mutex<Option<CheckFault>>,
     post_move_check_fault: Mutex<Option<(usize, CheckFault)>>,
@@ -83,6 +84,12 @@ impl ProcessRunner for FixtureRunner {
         let command = args[0].to_str().unwrap();
         if command == "mkdir" {
             self.mkdir_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_next_mkdir.swap(false, Ordering::SeqCst) {
+                return Err(ProcessError::Spawn {
+                    program: spec.program.clone(),
+                    source: std::io::Error::other("injected recovery mkdir failure"),
+                });
+            }
         }
         let directory_listing = args.iter().any(|arg| arg == "--dirs-only");
         if directory_listing && !self.synthesize_drive_ids
@@ -196,6 +203,7 @@ impl Fixture {
             fake: FakeProcessRunner::new(),
             root: root.clone(),
             mkdir_calls: AtomicUsize::new(0),
+            fail_next_mkdir: AtomicBool::new(false),
             synthesize_drive_ids,
             pre_move_check_fault: Mutex::new(None),
             post_move_check_fault: Mutex::new(None),
@@ -767,6 +775,13 @@ fn filter_migration_fixture() -> Option<Fixture> {
     Some(fx)
 }
 
+fn add_invalid_excluded_name(fx: &Fixture) -> PathBuf {
+    let file = fx.root().join("Data/Research/.Trashes/invalid?.txt");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, b"already excluded").unwrap();
+    file
+}
+
 fn preview_build_exclusions(fx: &Fixture) -> FilterChangePreview {
     let preview = fx
         .manager
@@ -838,6 +853,7 @@ fn drive_narrowing_moves_excluded_objects_to_recovery_and_leaves_local_copies() 
     let initial_ids = EXCLUDED_BUILD_FILES
         .map(|(relative, _)| fs::metadata(remote.join(relative)).unwrap().ino());
     let preview = preview_build_exclusions(&fx);
+    let invalid = add_invalid_excluded_name(&fx);
     // This file is absent from the review inventory. The old-filter catch-up
     // uploads it, and the fresh move inventory must then include it.
     let pending = "proj/build/pending.o";
@@ -877,6 +893,7 @@ fn drive_narrowing_moves_excluded_objects_to_recovery_and_leaves_local_copies() 
         b"compiled after review"
     );
     assert!(!remote.join(pending).exists());
+    assert_eq!(fs::read(invalid).unwrap(), b"already excluded");
     fx.manager.run_now("local").unwrap();
     let snapshot = fx
         .manager
@@ -928,6 +945,7 @@ fn hold_filter_change_and_reopen(fx: Fixture) -> Fixture {
         .unwrap();
     assert!(fx.runner.post_move_check_fault.lock().unwrap().is_none());
     assert_build_files_moved(&fx, &moved_build_root(&fx));
+    add_invalid_excluded_name(&fx);
     let fx = fx.reopen();
     assert_held_filter_change(&fx, &original.mappings[0]);
     fx
@@ -1025,6 +1043,82 @@ fn drive_narrowing_can_restore_after_post_move_failure_and_restart() {
         snapshot.mappings[0].last_run_outcome,
         Some(RunOutcome::Success)
     );
+}
+
+#[test]
+fn drive_narrowing_mkdir_failure_leaves_the_old_mapping_runnable() {
+    let Some(fx) = filter_migration_fixture() else {
+        return;
+    };
+    let preview = preview_build_exclusions(&fx);
+    let original = fx.manager.snapshot();
+    fx.runner.fail_next_mkdir.store(true, Ordering::SeqCst);
+    fx.manager.apply_filter_change(preview).unwrap();
+    let snapshot = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    let mapping = &snapshot.mappings[0];
+    assert!(!fx.runner.fail_next_mkdir.load(Ordering::SeqCst));
+    assert!(!mapping.filter_migration_held);
+    assert_eq!(mapping.readiness, Readiness::Ready);
+    assert_eq!(
+        mapping.active_generation_id,
+        original.mappings[0].active_generation_id
+    );
+    assert_eq!(mapping.exclusions, original.mappings[0].exclusions);
+    assert!(mapping.next_poll_at.is_some());
+    assert_ne!(mapping.last_run_outcome, Some(RunOutcome::Success));
+    assert!(
+        mapping
+            .last_run_summary
+            .as_deref()
+            .unwrap()
+            .contains("injected recovery mkdir failure")
+    );
+    for (path, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(
+            fs::read(fx.root().join("Data/Research").join(path)).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[test]
+fn drive_narrowing_can_move_all_included_content() {
+    let Some(fx) = Fixture::new_with_drive_ids(true, true) else {
+        return;
+    };
+    let local = fx.root().join("local");
+    for (path, bytes) in EXCLUDED_BUILD_FILES {
+        let file = local.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, bytes).unwrap();
+    }
+    initialize_research(&fx, rclone_adapter::InitPreference::Path1);
+    let preview = preview_build_exclusions(&fx);
+    assert_eq!(
+        preview
+            .preflight()
+            .remote_inventory
+            .as_ref()
+            .unwrap()
+            .file_count,
+        0
+    );
+    fx.manager.apply_filter_change(preview).unwrap();
+    let after = fx
+        .manager
+        .wait_until_idle(Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(after.mappings[0].readiness, Readiness::Ready);
+    assert!(!after.mappings[0].filter_migration_held);
+    let recovery = moved_build_root(&fx);
+    for (path, bytes) in EXCLUDED_BUILD_FILES {
+        assert_eq!(fs::read(local.join(path)).unwrap(), bytes);
+        assert_eq!(fs::read(recovery.join(path)).unwrap(), bytes);
+        assert!(!fx.root().join("Data/Research").join(path).exists());
+    }
 }
 
 #[test]
