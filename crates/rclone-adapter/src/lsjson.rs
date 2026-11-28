@@ -17,7 +17,8 @@ use thiserror::Error;
 use crate::{
     config::stderr_indicates_auth_failure,
     process::{
-        ProcessError, ProcessRunner, ProcessSpec, RunOutput, SpawnOptions, minimal_isolated_env,
+        OutputLimits, ProcessError, ProcessRunner, ProcessSpec, RunOutput, SpawnOptions,
+        StreamKind, minimal_isolated_env,
     },
     qualification::{
         EngineIdentity, QualificationError, QualificationManifest,
@@ -46,6 +47,8 @@ pub struct LsJsonEntry {
     pub orig_id: Option<String>,
     #[serde(default)]
     pub is_bucket: Option<bool>,
+    #[serde(default)]
+    pub hashes: BTreeMap<String, String>,
 }
 
 /// Resolved single component along a cloud collection path.
@@ -246,6 +249,16 @@ impl LsJsonRequest {
         manifest: &QualificationManifest,
         runner: &dyn ProcessRunner,
     ) -> Result<RunOutput, LsJsonError> {
+        self.run_with_limits(args, manifest, runner, OutputLimits::default())
+    }
+
+    fn run_with_limits(
+        &self,
+        args: Vec<OsString>,
+        manifest: &QualificationManifest,
+        runner: &dyn ProcessRunner,
+        limits: OutputLimits,
+    ) -> Result<RunOutput, LsJsonError> {
         verify_binary_identity_with_manifest(&self.engine, manifest)?;
         verify_executable_metadata(&self.engine)?;
         // The real runner verifies the executable digest at the spawn boundary.
@@ -256,7 +269,15 @@ impl LsJsonRequest {
             env: minimal_isolated_env(self.config_path.parent()),
             expected_binary_sha256: Some(self.engine.sha256().to_string()),
         };
-        let output = runner.spawn(&spec, SpawnOptions::default())?.wait()?;
+        let output = runner
+            .spawn(
+                &spec,
+                SpawnOptions {
+                    limits,
+                    line_observer: None,
+                },
+            )?
+            .wait()?;
         if !output.exit_status.is_success() {
             let detail = output.output.stderr_text().trim().to_owned();
             if stderr_indicates_auth_failure(&detail) {
@@ -298,6 +319,65 @@ impl LsJsonRequest {
         }
         let output = self.run_command(args, runner)?;
         parse_lsjson_entries(&complete_stdout(&output)?)
+    }
+
+    /// Uses the same rclone filter parser as bisync's frozen filters file.
+    pub fn list_filtered_remote(
+        &self,
+        subpath: &str,
+        filters_file: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        self.list_filtered(self.target(subpath)?, filters_file, true, runner)
+    }
+
+    pub fn list_filtered_local(
+        &self,
+        root: &Path,
+        filters_file: &Path,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        if !root.is_absolute() {
+            return Err(RequestError::RelativePath {
+                field: "inventory_root",
+                path: root.into(),
+            }
+            .into());
+        }
+        self.list_filtered(root.into(), filters_file, false, runner)
+    }
+
+    fn list_filtered(
+        &self,
+        target: OsString,
+        filters_file: &Path,
+        remote: bool,
+        runner: &dyn ProcessRunner,
+    ) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+        let mut args = vec![
+            "lsjson".into(),
+            target,
+            "--recursive".into(),
+            "--filter-from".into(),
+            filters_file.into(),
+            "--no-mimetype".into(),
+        ];
+        // Drive supplies MD5 as object metadata. It is needed to recognize the
+        // pinned engine's scratch filenames on the local destination.
+        if remote && self.is_drive {
+            args.extend(["--hash".into(), "--hash-type".into(), "MD5".into()]);
+        }
+        let output = self.run_with_limits(
+            self.with_config_args(args),
+            &QualificationManifest::embedded()?,
+            runner,
+            OutputLimits {
+                max_lines: 1_000_002,
+                max_total_bytes: 256 * 1024 * 1024,
+                ..Default::default()
+            },
+        )?;
+        parse_filtered_inventory(output)
     }
 
     /// Counts supported objects without retrieving file contents.
@@ -388,6 +468,53 @@ impl LsJsonRequest {
         )?;
         Ok(())
     }
+}
+
+fn parse_filtered_inventory(output: RunOutput) -> Result<Vec<LsJsonEntry>, LsJsonError> {
+    let incomplete = || LsJsonError::ParseJson {
+        reason: "rclone did not return a complete file inventory".into(),
+    };
+    if output.output.dropped_lines != 0 || output.output.truncated_lines != 0 {
+        return Err(incomplete());
+    }
+    // Pinned lsjson writes a JSON array with one object per line. Consume the
+    // captured lines directly so a large scan does not need another text buffer.
+    let mut lines = output
+        .output
+        .lines
+        .into_iter()
+        .filter(|line| line.stream == StreamKind::Stdout)
+        .map(|line| line.text);
+    let first = lines.next().ok_or_else(incomplete)?;
+    if first.trim() != "[" {
+        return parse_lsjson_entries(&first).and_then(|entries| {
+            if !first.trim().starts_with('[') || lines.next().is_some() {
+                Err(incomplete())
+            } else {
+                Ok(entries)
+            }
+        });
+    }
+    let mut entries = Vec::new();
+    let mut previous_had_comma = true;
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        if line == "]" && (entries.is_empty() || !previous_had_comma) && lines.next().is_none() {
+            return Ok(entries);
+        }
+        if !previous_had_comma {
+            return Err(incomplete());
+        }
+        previous_had_comma = line.ends_with(',');
+        let entry =
+            serde_json::from_str(line.strip_suffix(',').unwrap_or(line)).map_err(|err| {
+                LsJsonError::ParseJson {
+                    reason: err.to_string(),
+                }
+            })?;
+        entries.push(entry);
+    }
+    Err(incomplete())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

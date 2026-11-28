@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rclone_adapter::{InitPreference, LsJsonEntry};
+use rclone_adapter::{InitPreference, LsJsonEntry, ProcessRunner};
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccessMarker, CloudCollection, MappingId, VolumeIdentity,
     validate_names,
@@ -352,6 +352,7 @@ pub struct EndpointInventory {
     pub root: PathBuf,
     pub classification: SideClassification,
     pub item_count: usize,
+    pub file_count: usize,
     pub has_valid_marker: bool,
 }
 
@@ -496,6 +497,7 @@ pub fn inspect_local_endpoint(
         root: inv.root,
         classification: inv.classification,
         item_count: inv.all_items_count,
+        file_count: inv.file_count,
         has_valid_marker: inv.has_valid_marker,
     })
 }
@@ -766,13 +768,16 @@ fn drive_marker_error(path: &str, cause: &str) -> ManagerError {
     }
 }
 
-fn read_marker_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_marker_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?
-        .take(MAX_DRIVE_MARKER_BYTES + 1)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular access marker"));
+    }
+    file.take(MAX_DRIVE_MARKER_BYTES + 1)
         .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
@@ -781,6 +786,7 @@ fn read_drive_marker(
     drive: &LockedDrive<'_>,
     collection: &CloudCollection,
     entries: &[LsJsonEntry],
+    runner: &dyn ProcessRunner,
 ) -> Result<Option<Vec<u8>>, ManagerError> {
     let marker_path = format!("{}/{ACCESS_MARKER_FILENAME}", collection.display_path);
     let mut matching = entries
@@ -804,7 +810,7 @@ fn read_drive_marker(
     let destination = scratch.path().join(ACCESS_MARKER_FILENAME);
     drive
         .request
-        .fetch_marker(&marker_path, &destination, &drive.runner)
+        .fetch_marker(&marker_path, &destination, runner)
         .map_err(|err| drive_error(err.into()))?;
     let bytes = read_marker_bytes(&destination).map_err(|_| {
         drive_marker_error(&marker_path, "The Drive access marker could not be read.")
@@ -850,7 +856,7 @@ pub(crate) fn inspect_drive_endpoint(
         .request
         .list_entries(&collection.display_path, true, &drive.runner)
         .map_err(|err| drive_error(err.into()))?;
-    let marker = read_drive_marker(drive, collection, &entries)?;
+    let marker = read_drive_marker(drive, collection, &entries, &drive.runner)?;
     let paths: Vec<_> = entries
         .iter()
         .filter(|entry| entry.path != ACCESS_MARKER_FILENAME)
@@ -933,11 +939,19 @@ pub(crate) fn verify_drive_marker(
     drive: &LockedDrive<'_>,
     collection: &CloudCollection,
 ) -> Result<Vec<u8>, ManagerError> {
+    verify_drive_marker_with_runner(drive, collection, &drive.runner)
+}
+
+pub(crate) fn verify_drive_marker_with_runner(
+    drive: &LockedDrive<'_>,
+    collection: &CloudCollection,
+    runner: &dyn ProcessRunner,
+) -> Result<Vec<u8>, ManagerError> {
     let entries = drive
         .request
-        .list_entries(&collection.display_path, false, &drive.runner)
+        .list_entries(&collection.display_path, false, runner)
         .map_err(|err| drive_error(err.into()))?;
-    read_drive_marker(drive, collection, &entries)?.ok_or_else(|| {
+    read_drive_marker(drive, collection, &entries, runner)?.ok_or_else(|| {
         drive_marker_error(
             &collection.display_path,
             "The expected Drive access marker is missing.",
@@ -1017,4 +1031,202 @@ pub fn render_filters_file(exclusions: &BTreeSet<String>) -> String {
         }
     }
     out
+}
+
+/// Comparison evidence for reusing a recorded first-sync generation.
+pub(crate) struct ResumeInventory {
+    pub total_files: u64,
+    pub files_already_present: u64,
+    pub partials: Vec<(String, u64)>,
+}
+
+pub(crate) fn verify_first_sync_subset(
+    source: &[LsJsonEntry],
+    destination: &[LsJsonEntry],
+    source_root: &Path,
+    destination_root: &Path,
+    destination_is_local: bool,
+    drive: bool,
+) -> Result<ResumeInventory, ManagerError> {
+    let source = index_resume_entries(source)?;
+    let destination = index_resume_entries(destination)?;
+    let unique_paths: BTreeSet<_> = source.keys().chain(destination.keys()).copied().collect();
+    if let Some(finding) = validate_names(&unique_paths.into_iter().collect::<Vec<_>>()).first() {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "{} Paths: {}.",
+                finding.cause,
+                finding
+                    .paths
+                    .iter()
+                    .take(5)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            next_step: finding.next_step.clone(),
+        });
+    }
+
+    let is_data_file = |entry: &&LsJsonEntry| !entry.is_dir && entry.path != ACCESS_MARKER_FILENAME;
+    let mut inventory = ResumeInventory {
+        total_files: source.values().copied().filter(is_data_file).count() as u64,
+        files_already_present: 0,
+        partials: Vec::new(),
+    };
+    // An unmatched local file is only an engine partial when its exact name
+    // matches the pinned engine's fingerprint of an included, still-missing
+    // source file. A user file merely ending in .partial is ordinary data.
+    let mut expected_partials = BTreeMap::new();
+    if destination_is_local
+        && destination.values().any(|entry| {
+            !entry.is_dir
+                && entry.path.ends_with(".partial")
+                && !source.contains_key(entry.path.as_str())
+        })
+    {
+        for entry in source.values().copied().filter(is_data_file) {
+            if !destination.contains_key(entry.path.as_str())
+                && let Some(partial) = rclone_partial_path(entry, drive)
+            {
+                // A CRC collision is ambiguous even if both source sizes match.
+                expected_partials
+                    .entry(partial)
+                    .and_modify(|size| *size = None)
+                    .or_insert(Some(entry.size));
+            }
+        }
+    }
+
+    let mut offending = Vec::new();
+    for (&path, &entry) in &destination {
+        if path == ACCESS_MARKER_FILENAME || (entry.is_dir && !source.contains_key(path)) {
+            continue;
+        }
+        match source.get(path) {
+            Some(source_entry) if entry.is_dir && source_entry.is_dir => {}
+            Some(source_entry) if files_match(source_entry, entry, drive) => {
+                inventory.files_already_present += 1;
+            }
+            None if expected_partials
+                .get(path)
+                .and_then(|size| *size)
+                .is_some_and(|size| entry.size >= 0 && entry.size <= size) =>
+            {
+                inventory
+                    .partials
+                    .push((path.to_owned(), entry.size as u64));
+            }
+            _ if offending.len() < 5 => offending.push(path),
+            _ => {}
+        }
+    }
+    // A filtered-out case alias, symlink, or special file can still occupy a
+    // new destination pathname on a local filesystem. An absent listing entry
+    // alone is insufficient proof that its live pathname is free.
+    if destination_is_local {
+        for entry in source.values().copied().filter(is_data_file) {
+            if offending.len() == 5 {
+                break;
+            }
+            if !destination.contains_key(entry.path.as_str())
+                && !matches!(fs::symlink_metadata(destination_root.join(&entry.path)), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+            {
+                offending.push(entry.path.as_str());
+            }
+        }
+    }
+    if !offending.is_empty() {
+        return Err(ManagerError::PreflightRejected {
+            cause: format!(
+                "Both the local folder and the cloud collection already contain data. Automatic initialization will not merge two populated trees. Review these paths: {}.",
+                offending.join(", ")
+            ),
+            next_step: format!(
+                "Preserve the files in both folders, then review `{}` and `{}` before trying again.",
+                source_root.display(),
+                destination_root.display()
+            ),
+        });
+    }
+    Ok(inventory)
+}
+
+fn index_resume_entries(
+    entries: &[LsJsonEntry],
+) -> Result<BTreeMap<&str, &LsJsonEntry>, ManagerError> {
+    let mut index = BTreeMap::new();
+    for entry in entries {
+        let path = entry.path.as_str();
+        if path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || Path::new(path)
+                .file_name()
+                .is_none_or(|name| name != entry.name.as_str())
+            || (!entry.is_dir && entry.size < 0)
+            || index.insert(path, entry).is_some()
+        {
+            return Err(ManagerError::PreflightRejected {
+                cause: format!("Could not safely identify the first-sync path `{path}`."),
+                next_step: "Review unsupported or duplicate files and folders before resuming."
+                    .into(),
+            });
+        }
+    }
+    Ok(index)
+}
+
+fn files_match(source: &LsJsonEntry, destination: &LsJsonEntry, drive: bool) -> bool {
+    if source.is_dir || destination.is_dir || source.size < 0 || source.size != destination.size {
+        return false;
+    }
+    let Ok(source_time) = chrono::DateTime::parse_from_rfc3339(&source.mod_time) else {
+        return false;
+    };
+    let Ok(destination_time) = chrono::DateTime::parse_from_rfc3339(&destination.mod_time) else {
+        return false;
+    };
+    if drive {
+        // Drive stores timestamps at millisecond precision. Match rclone's
+        // strict comparison window so the recorded file is also skipped.
+        (source_time - destination_time).abs() < chrono::TimeDelta::milliseconds(1)
+    } else {
+        source_time == destination_time
+    }
+}
+
+/// rclone v1.76.0 uses CRC32(path + fast source fingerprint), then truncates
+/// long basenames before appending the partial suffix.
+fn rclone_partial_path(entry: &LsJsonEntry, drive_source: bool) -> Option<String> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&entry.mod_time)
+        .ok()?
+        .to_utc();
+    let seconds = timestamp.format("%Y-%m-%d %H:%M:%S");
+    let nanos = format!("{:09}", timestamp.timestamp_subsec_nanos());
+    let fractional = nanos.trim_end_matches('0');
+    let mut fingerprint = format!("{}{},{seconds}", entry.path, entry.size);
+    if !fractional.is_empty() {
+        fingerprint.push('.');
+        fingerprint.push_str(fractional);
+    }
+    fingerprint.push_str(" +0000 UTC");
+    if drive_source {
+        let md5 = entry
+            .hashes
+            .iter()
+            .find(|(name, value)| name.eq_ignore_ascii_case("md5") && !value.is_empty())?
+            .1;
+        fingerprint.push(',');
+        fingerprint.push_str(md5);
+    }
+    let suffix = format!(".{:08x}.partial", crc32fast::hash(fingerprint.as_bytes()));
+    let mut end = entry.path.len();
+    if entry.name.len() > 100 {
+        end -= suffix.len();
+        while !entry.path.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    Some(format!("{}{suffix}", &entry.path[..end]))
 }

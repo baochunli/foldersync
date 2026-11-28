@@ -206,6 +206,8 @@ fn r2_h2_refuses_symlinked_leaves_under_state_root() {
                     last_verified_phase: "pre_spawn".to_string(),
                     files_checked: 0,
                     files_transferred: 0,
+                    first_sync_total_files: None,
+                    files_already_present: 0,
                     bytes_transferred: 0,
                     conflict_count: 0,
                 })
@@ -520,6 +522,8 @@ fn r2_h6_deleted_exe_and_missing_pid_stay_inconclusive_and_block_globally() {
                 last_verified_phase: "spawned".to_string(),
                 files_checked: 0,
                 files_transferred: 0,
+                first_sync_total_files: None,
+                files_already_present: 0,
                 bytes_transferred: 0,
                 conflict_count: 0,
             })

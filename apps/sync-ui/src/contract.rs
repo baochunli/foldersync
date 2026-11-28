@@ -12,6 +12,8 @@ use sync_core::{
     available_actions, status_text,
 };
 
+use sync_manager::StoppedFirstSync;
+
 pub(crate) const SYNC_ALL_NOW_LABEL: &str = "Sync all now";
 
 /// Top-level route shown in the main window content area.
@@ -165,6 +167,7 @@ pub enum StatusModifier {
         expected_id: String,
         found_id: String,
     },
+    StoppedFirstSync(StoppedFirstSync),
     /// Recovery cause detail.
     RecoveryCause {
         kind: RecoveryCauseKind,
@@ -567,6 +570,25 @@ impl MappingSnapshot {
                 show_force_stop: false,
                 show_pause: intent == Intent::Enabled,
                 show_resume: intent == Intent::Paused,
+                is_draft: false,
+                needs_init: false,
+                sync_now_tooltip: None,
+            };
+        }
+
+        if let StatusModifier::StoppedFirstSync(stopped) = &self.modifier {
+            return PresentedStatus {
+                pill_label: None,
+                pill_tone: Tone::Neutral,
+                icon: IconKind::Stop,
+                status_line: stopped.status_text(),
+                why_line: stopped.cause.clone(),
+                secondary_link: None,
+                sync_now_enabled: false,
+                show_stop: false,
+                show_force_stop: false,
+                show_pause: false,
+                show_resume: false,
                 is_draft: false,
                 needs_init: false,
                 sync_now_tooltip: None,
@@ -1291,6 +1313,7 @@ pub struct WizardDraft {
     /// True while waiting for Stop on the active first sync run to finish (HIGH #4).
     pub first_sync_stopping: bool,
     pub first_sync_percent: u8,
+    pub first_sync_file_progress: Option<(u64, u64)>,
     pub first_sync_elapsed_secs: u64,
     pub first_sync_completed: bool,
     pub first_sync_error: Option<String>,
@@ -1577,6 +1600,7 @@ pub enum UiCommand {
     SyncReadyMappings,
     PauseMapping(MappingId),
     ResumeMapping(MappingId),
+    ResumeFirstSync(MappingId),
     StopRun(MappingId),
     ForceStopRun(MappingId),
     SetSchedulingPaused(bool),

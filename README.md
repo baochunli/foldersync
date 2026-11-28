@@ -95,6 +95,9 @@ and its [OFL-1.1 license](apps/sync-ui/assets/fonts/OFL.txt).
 Overview paths use a single line with a middle ellipsis when space is tight.
 The full path remains available in the accessibility label and mapping detail.
 Automatic scheduling starts after FolderSync verifies a mapping’s first sync.
+If it stops partway through, **Resume first sync** checks the files already
+copied and continues with the original folder selection. Keep the destination
+folder unchanged while the first sync is running.
 Choose its polling interval in the mapping’s **Schedule** section. Pause
 scheduling in the sidebar or menu bar. **Sync now** requests an on-demand run
 while scheduling is paused.

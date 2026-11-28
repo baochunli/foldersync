@@ -30,6 +30,25 @@ pub struct MappingCounters {
     pub open_recovery_cases: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoppedFirstSync {
+    pub files_copied: u64,
+    pub total_files: Option<u64>,
+    pub cause: Option<String>,
+}
+
+impl StoppedFirstSync {
+    pub fn status_text(&self) -> String {
+        match self.total_files {
+            Some(total) => format!(
+                "First sync stopped · {} of {total} files copied",
+                self.files_copied.min(total)
+            ),
+            None => format!("First sync stopped · {} files copied", self.files_copied),
+        }
+    }
+}
+
 /// Immutable per-mapping view published in [`StatusSnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MappingStatusSnapshot {
@@ -66,6 +85,8 @@ pub struct MappingStatusSnapshot {
     pub last_run_outcome: Option<RunOutcome>,
     pub last_run_completed_at: Option<String>,
     pub last_run_summary: Option<String>,
+    #[serde(default)]
+    pub stopped_first_sync: Option<StoppedFirstSync>,
     /// Run ID whose conflict copies have not yet been marked reviewed by the user.
     #[serde(default)]
     pub unreviewed_conflict_run_id: Option<RunId>,
@@ -151,6 +172,10 @@ pub enum ManagerEvent {
         bytes_transferred: u64,
         total_bytes: Option<u64>,
         files_transferred: u64,
+        #[serde(default)]
+        files_already_present: u64,
+        #[serde(default)]
+        first_sync_total_files: Option<u64>,
         files_checked: u64,
         timestamp: String,
     },

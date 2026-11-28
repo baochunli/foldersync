@@ -4,6 +4,27 @@ import { expect, open, test } from "nsh/test";
 
 const DESKTOP = { width: 1120, height: 760, platform: "macos" as const };
 
+test("Stopped first sync shows copied files and can resume", async () => {
+  const app = await open(".", DESKTOP);
+  expect(app.texts().join("\n")).toContain("First sync stopped · 3 of 8 files copied");
+  expect(app.shows("id:remove-stopped-first-sync-notes-stopped")).toBe(true);
+
+  await app.press("id:open-detail-research");
+  await app.press("id:detail-step-state-btn");
+  await app.press("id:detail-step-state-btn");
+  await app.press("id:nav-overview");
+
+  await app.press("id:resume-first-sync-notes-stopped");
+  expect(app.texts()).toContain("First sync · Recipes");
+  expect(app.texts().join("\n")).not.toContain("First sync stopped · 3 of 8 files copied");
+  expect(app.texts().join("\n")).toContain("3 of 8 files copied");
+  await app.press("id:wizard-stop-first-sync-btn");
+  expect(app.texts().join("\n")).toContain("First sync stopped · 3 of 8 files copied");
+  await app.press("id:resume-first-sync-notes-stopped");
+  await app.press("id:wizard-demo-complete-first-sync-btn");
+  expect(app.texts()).toContain("Checked the result");
+});
+
 async function startDemoSignIn(app: Awaited<ReturnType<typeof open>>) {
   await app.press("id:accounts-connect-btn");
   await app.type("id:accounts-account-id", "work-2");
@@ -127,6 +148,7 @@ test("Add-mapping review blocks both-populated with no Start first sync button",
   await pickDemoFolder(app);
   await app.press("id:wizard-step-6");
   expect(app.texts()).toContain("Review “Projects”");
+  expect(app.texts().join("\n")).toContain("Keep the destination folder unchanged until the first sync finishes.");
   expect(app.shows("id:wizard-start-first-sync-btn")).toBe(true);
   expect(app.enabled("id:wizard-start-first-sync-btn")).toBe(false);
 

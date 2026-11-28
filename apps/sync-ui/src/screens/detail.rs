@@ -72,6 +72,13 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
         }));
     }
 
+    let stopped = matches!(
+        m.modifier,
+        crate::contract::StatusModifier::StoppedFirstSync(_)
+    );
+    if stopped && let Some(cause) = pres.why_line.as_ref() {
+        status_row = status_row.child(text(cause.clone()).text_color(p.muted));
+    }
     let name_force = m.display_name.clone();
     let primary_action = if pres.show_stop {
         app_button(
@@ -812,8 +819,18 @@ fn render_detail(ctrl: AppController, snap: &UiSnapshot, m: &MappingSnapshot) ->
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(primary_action)
-                                .child(pause_resume_action)
+                                .child(if stopped {
+                                    super::stopped_first_sync_actions(&ctrl, &m.id, &m.display_name)
+                                        .into_element()
+                                } else {
+                                    view()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .gap(px(6.0))
+                                        .child(primary_action)
+                                        .child(pause_resume_action)
+                                        .into_element()
+                                })
                                 .child(more_btn);
                             if snap.is_demo_mode {
                                 bar = bar.child(

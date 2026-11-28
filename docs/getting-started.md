@@ -127,10 +127,12 @@ them to Git.
    parent.
 6. In **Review**, check the direction shown and confirm that no other sync
    app manages the local folder. Choose **Start first sync** when the
-   checks pass. FolderSync starts checking the mapping automatically after it
-   verifies the first sync. The default deletion limit stops a run that
-   would delete more than 10% of tracked files. Check both folders and your
-   backup if a run stops.
+   checks pass. Keep the destination folder unchanged until the first sync
+   finishes. If it stops, choose **Resume first sync** on the mapping to check
+   and continue from the files already copied. FolderSync starts checking the
+   mapping automatically after it verifies the first sync. The default
+   deletion limit stops a run that would delete more than 10% of tracked
+   files. Check both folders and your backup if a run stops.
 7. In macOS **System Settings → General → Login Items & Extensions**, scroll
    to **Extensions** and turn on FolderSync's Finder extension. Recent macOS
    versions list it under **File Providers** as **FolderSync**, not under

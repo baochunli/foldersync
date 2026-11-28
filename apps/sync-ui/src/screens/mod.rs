@@ -22,6 +22,57 @@ use crate::contract::{ScreenRoute, UiCommand, UiSnapshot};
 use crate::demo::DemoSource;
 use crate::manager_source::ManagerSource;
 
+fn stopped_first_sync_actions(ctrl: &AppController, id: &MappingId, name: &str) -> View {
+    use crate::theme::{BtnKind, app_button};
+
+    let resume = ctrl.clone();
+    let remove = ctrl.clone();
+    let resume_id = id.clone();
+    let remove_id = id.clone();
+    let name = name.to_owned();
+    view()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(6.0))
+        .child(
+            app_button(
+                "Resume first sync",
+                BtnKind::Primary,
+                true,
+                false,
+                None,
+                None,
+                move || {
+                    resume.send(UiCommand::ResumeFirstSync(resume_id.clone()));
+                    if let AppDataSource::Demo(_) = &resume.source
+                        && resume.snapshot.with_untracked(|snap| {
+                            snap.wizard.first_sync_mapping_id.as_ref() == Some(&resume_id)
+                                && snap.wizard.step == crate::contract::WizardStep::FirstSync
+                                && snap.action_error.is_none()
+                        })
+                    {
+                        resume.navigate(ScreenRoute::AddMapping);
+                    }
+                },
+            )
+            .test_id(&format!("resume-first-sync-{id}")),
+        )
+        .child(
+            app_button(
+                "Remove mapping…",
+                BtnKind::Default,
+                true,
+                false,
+                None,
+                None,
+                move || {
+                    remove.confirm_remove_mapping(remove_id.clone(), name.clone());
+                },
+            )
+            .test_id(&format!("remove-stopped-first-sync-{id}")),
+        )
+}
+
 /// Active backend backing the FolderSync desktop UI.
 #[derive(Clone)]
 pub enum AppDataSource {

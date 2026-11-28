@@ -585,7 +585,16 @@ fn mapping_row(
         .justify_end()
         .gap(px(6.0));
 
-    if pres.is_draft {
+    if matches!(
+        m.modifier,
+        crate::contract::StatusModifier::StoppedFirstSync(_)
+    ) {
+        col_actions = col_actions.child(super::stopped_first_sync_actions(
+            &ctrl,
+            &m.id,
+            &m.display_name,
+        ));
+    } else if pres.is_draft {
         let ctrl_cont = ctrl.clone();
         let ctrl_disc = ctrl.clone();
         let id_cont = m.id.clone();

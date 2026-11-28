@@ -1989,9 +1989,7 @@ fn render_step_review(ctrl: AppController, draft: &WizardDraft, is_demo: bool) -
                         ),
                 )
                 .child(
-                    text("If you can, ask others not to change ")
-                    .child(mono_text(format!("Data/{}", draft.selected_folder), S_CAPTION, p.muted))
-                    .child(text(" until the first sync finishes."))
+                    text("Keep the destination folder unchanged until the first sync finishes. Ask others with access to wait before editing it.")
                     .pl(px(26.0))
                     .text_size(px(S_SMALL))
                     .text_color(p.muted),
@@ -2009,6 +2007,29 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
     let c_done = ctrl.clone();
     let c_open_detail = ctrl.clone();
     let c_demo_finish = ctrl.clone();
+    if let Some(mapping) = draft
+        .first_sync_mapping_id
+        .as_ref()
+        .and_then(|id| snap.mapping(id))
+        && let crate::contract::StatusModifier::StoppedFirstSync(stopped) = &mapping.modifier
+    {
+        let mut status = card().child(card_title(stopped.status_text()));
+        if let Some(cause) = draft.first_sync_error.as_ref().or(stopped.cause.as_ref()) {
+            status = status.child(text(cause.clone()).text_color(p.muted));
+        }
+        return view()
+            .flex_col()
+            .gap(px(14.0))
+            .child(page_title(format!("First sync · {}", mapping.display_name)))
+            .child(status.child(super::stopped_first_sync_actions(
+                &ctrl,
+                &mapping.id,
+                &mapping.display_name,
+            )))
+            .child(link_button("Back to Overview", S_SMALL, move || {
+                c_done.navigate(ScreenRoute::Overview)
+            }));
+    }
     let elapsed = format_duration(draft.first_sync_elapsed_secs);
 
     // #4: Direction-accurate verb and progress text.
@@ -2097,6 +2118,11 @@ fn render_first_sync(ctrl: AppController, snap: &UiSnapshot) -> View {
             text(format!(
                 "Checking folders before syncing… · elapsed {elapsed}"
             ))
+        } else if let Some((copied, total)) = draft.first_sync_file_progress {
+            emphasized_line(
+                verb,
+                format!(" · {copied} of {total} files copied · elapsed {elapsed}"),
+            )
         } else if let Some(rest) = in_flight_line.strip_prefix(verb) {
             emphasized_line(verb, rest.to_owned())
         } else {

@@ -24,7 +24,12 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
 4. Review the direction of the first sync. Use an empty destination for an
    upload or download. If both folders contain files, ask the owner to compare
    and preserve both sets before proceeding. Choose **Start first sync** once
-   the setup checks pass.
+   the setup checks pass. Keep the destination folder unchanged until the
+   first sync finishes, and ask others with access to wait before editing it.
+5. If the first sync stops, choose **Resume first sync** on the mapping.
+   FolderSync checks that the files already on the destination still match
+   the source and that the folder selection still matches the original setup.
+   If a check fails, preserve both folders and review the paths shown.
 
 ## Everyday use
 

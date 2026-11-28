@@ -132,19 +132,26 @@ Initialization uses the same validated base profile, except:
 
 ### Interrupted first-sync qualification
 
-Resume is blocked on rclone 1.76.0. A local-to-local fixture started with
-matching markers and a destination that was a subset of the source. After
-rclone began staging a missing file, an independent writer created that file
-at the destination. Rclone replaced the new file, exited successfully, and
-left both recovery directories empty. This occurred with both preferred
-directions and with the initialization profile augmented by `--immutable`
-and `--no-update-modtime`.
+Resume uses the original direction, work directory, frozen filters, and
+backup paths. Both before request preparation and immediately before
+launch, FolderSync requires the destination's included files to match a
+subset of the source by path, size, and modification time. Local-to-local
+checks compare exact times. With Drive, the allowed difference is strictly
+less than 1 ms, matching rclone's Drive timestamp precision. Scheduling
+becomes eligible only after normal bisync verification succeeds.
 
-A subset check cannot reserve destination names. On the local backend,
-rclone checks for an existing destination before staging the copy and
-publishes the staged file with a rename that can replace a newly created
-file. Safe resume requires a destination write that fails atomically if
-another writer has claimed the name.
+First sync and resume share a concurrent-writer window. The local backend
+looks for an existing destination before staging a copy and publishes the
+staged file with a rename. If someone creates that pathname after the
+check, the rename can replace it. In both preferred directions a
+local-to-local fixture reproduced replacement with exit status 0 and
+empty recovery folders, even with `--immutable` and
+`--no-update-modtime`. Keep the destination folder unchanged until the
+first sync finishes, including when resuming.
+
+The opt-in test `rclone_can_replace_a_file_created_during_first_sync_publish`
+in `crates/sync-manager/tests/local_rclone_e2e.rs` records this behavior on
+disposable local directories.
 [Resync copy passes](https://github.com/rclone/rclone/blob/v1.76.0/cmd/bisync/resync.go#L104-L119) ·
 [Local file publication](https://github.com/rclone/rclone/blob/v1.76.0/backend/local/local.go#L1114-L1148)
 

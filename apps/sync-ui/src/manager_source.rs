@@ -897,6 +897,8 @@ fn manager_worker_main(
                     if let Some(started) = state.first_sync_started_at {
                         state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
                     }
+                } else if m.stopped_first_sync.is_some() {
+                    state.wizard.first_sync_stopping = false;
                 } else if state.wizard.first_sync_stopping
                     && m.execution == Execution::Idle
                     && m.readiness == Readiness::NeedsInitialization
@@ -996,6 +998,9 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
             run_id,
             bytes_transferred,
             total_bytes,
+            files_transferred,
+            files_already_present,
+            first_sync_total_files,
             ..
         } => {
             match state.live_progress.as_mut() {
@@ -1019,6 +1024,16 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                 && let Some(started) = state.first_sync_started_at
             {
                 state.wizard.first_sync_elapsed_secs = started.elapsed().as_secs();
+                if let Some(total) = first_sync_total_files {
+                    let done = files_already_present
+                        .saturating_add(files_transferred)
+                        .min(total);
+                    let prior = state
+                        .wizard
+                        .first_sync_file_progress
+                        .map_or(0, |(done, _)| done);
+                    state.wizard.first_sync_file_progress = Some((prior.max(done), total));
+                }
             }
             true
         }
@@ -1053,9 +1068,12 @@ fn handle_manager_event(state: &mut WorkerState, ev: ManagerEvent) -> bool {
                     state.wizard.first_sync_completed = true;
                     state.wizard.first_sync_stopping = false;
                     state.wizard.first_sync_percent = 100;
-                } else if state.wizard.first_sync_stopping {
-                    show_stopped_first_sync(&mut state.wizard);
-                } else {
+                } else if matches!(
+                    outcome.as_str(),
+                    "first_sync_stopped" | "canceled_before_spawn"
+                ) {
+                    state.wizard.first_sync_stopping = false;
+                } else if outcome != "preflight_failed" {
                     // Surface terminal engine failures in the wizard (HIGH #4).
                     state.wizard.first_sync_stopping = false;
                     state.wizard.first_sync_error = Some(format!(
@@ -1229,6 +1247,38 @@ fn handle_ui_command(
         UiCommand::ResumeMapping(id) => {
             if let Some(mgr) = &state.mgr {
                 record_mgr_result(state, mgr.resume(id));
+            }
+            (None, None)
+        }
+        UiCommand::ResumeFirstSync(id) => {
+            let Some(mgr) = &state.mgr else {
+                return (None, None);
+            };
+            match mgr.resume_first_sync(id.clone()) {
+                Ok(acceptance) => {
+                    if let Some(mapping) = acceptance.snapshot.mappings.iter().find(|m| m.id == id)
+                    {
+                        let direction = mapping
+                            .last_run_id
+                            .as_ref()
+                            .and_then(|rid| mgr.get_run(rid).ok().flatten())
+                            .map(|run| run.mode);
+                        state.wizard = default_real_wizard();
+                        state.wizard.editing_mapping_id = Some(id.clone());
+                        state.wizard.selected_account = mapping.account_id.clone();
+                        state.wizard.selected_folder = mapping.display_name.clone();
+                        state.wizard.volume_name = mapping.volume_name.clone();
+                        state.wizard.review_scenario = match direction.as_deref() {
+                            Some("init_path2") => ReviewScenario::CloudToLocal,
+                            _ => ReviewScenario::LocalToCloud,
+                        };
+                        begin_first_sync(state, id);
+                    }
+                    return (Some(ScreenRoute::AddMapping), None);
+                }
+                Err(err) => {
+                    state.action_error = Some(format!("{} {}", err.cause(), err.next_step()))
+                }
             }
             (None, None)
         }
@@ -2192,6 +2242,7 @@ fn begin_first_sync(state: &mut WorkerState, mapping_id: MappingId) {
     state.wizard.first_sync_completed = false;
     state.wizard.first_sync_error = None;
     state.wizard.first_sync_percent = 0;
+    state.wizard.first_sync_file_progress = None;
     state.wizard.first_sync_elapsed_secs = 0;
     state.first_sync_started_at = Some(Instant::now());
     state.wizard.step = WizardStep::FirstSync;
@@ -3423,6 +3474,8 @@ fn project_ui_snapshot(
                 .map_or(StatusModifier::None, |entry| StatusModifier::QueuedBehind {
                     active_name: entry.display_name.clone(),
                 })
+        } else if let Some(stopped) = &m.stopped_first_sync {
+            StatusModifier::StoppedFirstSync(stopped.clone())
         } else if m.readiness == Readiness::RecoveryRequired {
             StatusModifier::RecoveryCause {
                 kind: RecoveryCauseKind::Interrupted,
@@ -3712,6 +3765,11 @@ fn project_run_record(r: RunRecord) -> RunRecordSnapshot {
             Tone::Attn,
             IconKind::Bang,
         ),
+        Some("first_sync_stopped") => (
+            "First sync stopped".to_owned(),
+            Tone::Neutral,
+            IconKind::Stop,
+        ),
         Some("interrupted" | "force_stopped" | "canceled_before_spawn") => {
             ("Interrupted".to_owned(), Tone::Err, IconKind::Octagon)
         }
@@ -3756,6 +3814,11 @@ fn build_real_attention_items(
 ) -> Vec<AttentionItem> {
     let mut items = Vec::new();
     for m in mappings {
+        if matches!(m.modifier, StatusModifier::StoppedFirstSync(_))
+            && m.state.readiness() == Readiness::RecoveryRequired
+        {
+            continue;
+        }
         match m.state.readiness() {
             Readiness::AuthenticationRequired => {
                 items.push(AttentionItem {
@@ -4008,6 +4071,7 @@ fn default_real_wizard() -> WizardDraft {
         first_sync_markers_ready: false,
         first_sync_stopping: false,
         first_sync_percent: 0,
+        first_sync_file_progress: None,
         first_sync_elapsed_secs: 0,
         first_sync_completed: false,
         first_sync_error: None,

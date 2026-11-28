@@ -435,6 +435,8 @@ fn h6_live_orphan_and_inconclusive_probe_block_global_worker_and_report_unknown(
                 last_verified_phase: "spawned".to_string(),
                 files_checked: 0,
                 files_transferred: 0,
+                first_sync_total_files: None,
+                files_already_present: 0,
                 bytes_transferred: 0,
                 conflict_count: 0,
             })

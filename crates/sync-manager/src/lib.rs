@@ -59,7 +59,7 @@ pub use secrets::{
 };
 pub use snapshot::{
     FolderSizeSnapshot, FolderSizeStatus, ManagerEvent, MappingCounters, MappingStatusSnapshot,
-    SnapshotReceiver, StatusSnapshot,
+    SnapshotReceiver, StatusSnapshot, StoppedFirstSync,
 };
 pub use store::{
     AccountRecord, DeviceRecord, GenerationRecord, MappingRecord, RecoveryCaseRecord, RunRecord,
