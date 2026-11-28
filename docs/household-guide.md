@@ -17,12 +17,14 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
    Connect an external disk before selecting a folder on it. After choosing a
    local folder, wait for the disk and free-space checks before continuing.
 3. Under **Choose what to include**, clear the subfolders you want to skip.
-   **Suggested: build and cache folders** lists matching folders that
-   FolderSync found and pre-excluded, with their folder count, file count,
-   and size. Choose **Remove** or **Remove all suggested** to include
-   those files. The size estimate updates as you make changes.
-   Use **Pattern (optional)** and **Add** for a custom exclusion. Use
-   **Remove** beside a pattern to take it out of the selection.
+   **Left out of Google Drive: build and cache folders** shows the matches
+   with their folder count, file count, and size. Checked folders are left
+   out. Clear individual checkboxes or use the heading checkbox to change
+   them all. You can change your choices when you resume a saved draft.
+   In **Pattern (optional)**, separate custom exclusions with spaces, commas,
+   or new lines. Choose **Add** or press Return. Use **Remove** beside a
+   custom pattern to include matching files again.
+   When a step needs a check, FolderSync shows its progress before you continue.
    Choose a local location for **Recovery copies**. Leave room for both synced
    files and earlier versions.
 4. Review the direction of the first sync. Use an empty destination for an
@@ -41,11 +43,12 @@ A mapping is one Google Drive folder paired with a folder on this Mac.
 ## Archive finished folders during setup
 
 Under **Choose what to include**, FolderSync suggests **Upload as one
-archive** for an immediate subfolder with at least 2,000 included files and
+archive** beside an immediate subfolder with at least 100 included files and
 no included file modified in the past 12 months. The count applies your
 exclusions, including any suggested build and cache folders you keep
 excluded. Clear any archive suggestion you want to keep as ordinary files.
 **Review** shows the selected archives and where the originals will go.
+The .zip keeps the folder’s date.
 
 When you start first sync, FolderSync checks that the disk has room to make
 and verify each ZIP while the original is still present. ZIPs contain the
@@ -78,7 +81,7 @@ yourself. Open a ZIP to retrieve an included file.
   finish, and **Sync now** still works for eligible mappings. To hold one
   mapping, use its **Pause** button. Use **Resume scheduling** in the sidebar
   for the whole Mac, or **Resume** for a paused mapping.
-- In **Change subfolders…**, choose **Add suggested build and cache exclusions**
+- In **Change subfolders…**, choose **Leave out build and cache folders**
   or add your own patterns. Choose **Review changes** to see the matched Drive
   file counts and sizes. After catch-up, FolderSync moves those Drive copies
   into Recovery and leaves the copies on this Mac in place. Another Mac may

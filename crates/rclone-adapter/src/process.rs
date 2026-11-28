@@ -371,6 +371,14 @@ impl ProcessControl {
         }
     }
 
+    /// Starts a new deadline while keeping the caller's cancellation signal.
+    pub fn with_fresh_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            canceled: self.canceled.clone(),
+            deadline: Some(Instant::now() + timeout),
+        }
+    }
+
     pub fn cancel(&self) {
         self.canceled.store(true, Ordering::SeqCst);
     }

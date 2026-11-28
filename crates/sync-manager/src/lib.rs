@@ -48,8 +48,9 @@ pub use manager::{
     AddMappingCommand, CommandAcceptance, CommandOutcome, ControlledShutdownOutcome,
     ExclusionMatch, FilterChangePreview, FilterMigrationPhase, FinderActionDispatch,
     InitializeCommand, ManagerCommand, ManagerConfig, OperationCanceller, OperationHandle,
-    PreflightPreview, RecoveryCaseView, RecoveryCopyEntry, RecoveryCopySide, RecoveryReport,
-    RemoteEndpoint, SyncManager,
+    PreflightPhase, PreflightPreview, PreparedDraft, PreparedFirstSync, RecoveryCaseView,
+    RecoveryCopyEntry, RecoveryCopySide, RecoveryReport, RemoteEndpoint, SyncManager,
+    WizardInventoryCache,
 };
 pub use platform::{
     FakeProcessInspector, LiveProcessInfo, MountedVolume, OsProcessInspector, OsVolumeProbe,

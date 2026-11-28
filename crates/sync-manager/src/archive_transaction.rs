@@ -82,6 +82,29 @@ impl Stamp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArchiveTimestamp {
+    pub(crate) seconds: i64,
+    pub(crate) nanos: u32,
+}
+
+impl ArchiveTimestamp {
+    fn choose(source: Stamp, newest_file: Option<Self>) -> Result<Self, ManagerError> {
+        match u32::try_from(source.modified_nanos)
+            .ok()
+            .filter(|&nanos| nanos < 1_000_000_000)
+        {
+            Some(nanos) => Ok(Self {
+                seconds: source.modified_seconds,
+                nanos,
+            }),
+            None => {
+                newest_file.ok_or_else(|| reject("No readable modification time for the archive"))
+            }
+        }
+    }
+}
+
 struct Entry {
     stamp: Stamp,
     is_dir: bool,
@@ -106,6 +129,8 @@ struct Record {
     root: PathBuf,
     root_id: Identity,
     source: Identity,
+    #[serde(default)]
+    timestamp: Option<ArchiveTimestamp>,
     phase: Phase,
 }
 
@@ -280,6 +305,7 @@ impl ArchiveJournal {
                 .is_some_and(|item| item.is_file && item.stamp == partial)
             {
                 // A crash occurred after both renames.
+                replay_zip_date(&root, &names.final_name, partial, row.timestamp)?;
                 sync_dir(&root)?;
                 sync_dir(&holding)?;
                 row.phase = Phase::Completed;
@@ -288,6 +314,7 @@ impl ArchiveJournal {
                     .is_some_and(|item| item.is_file && item.stamp == partial)
             {
                 // A crash occurred after the original was moved but before publication.
+                replay_zip_date(&root, &names.partial, partial, row.timestamp)?;
                 sync_dir(&holding)?;
                 rename_exclusive(&root, &names.partial, &root, &names.final_name)?;
                 sync_dir(&root)?;
@@ -315,14 +342,15 @@ impl ArchiveJournal {
         subfolder: &str,
         estimated_bytes: u64,
         cancel: &dyn Fn() -> bool,
-        build: impl FnOnce(&mut File) -> Result<u64, ManagerError>,
+        build: impl FnOnce(&mut File) -> Result<(u64, Option<ArchiveTimestamp>), ManagerError>,
     ) -> Result<(), ManagerError> {
         check_stop(cancel)?;
         self.recover(root)?;
         let (root_path, root) = checked_root(root)?;
         let root_id = identity(&root)?;
         let names = Names::new(subfolder)?;
-        let source = check_source(&root, subfolder)?;
+        let source_stamp = check_source(&root, subfolder)?;
+        let source = source_stamp.id;
         ensure_vacant(&root, &names.final_name)?;
         ensure_vacant(&root, &names.partial)?;
         if let Some(holding) = checked_holding(&root_path, &root, holding_path, subfolder, false)? {
@@ -352,16 +380,19 @@ impl ArchiveJournal {
                     root: root_path.clone(),
                     root_id,
                     source,
+                    timestamp: None,
                     phase: Phase::Writing {
                         partial: partial_id,
                     },
                 },
             );
             self.save(&records)?;
-            let original_bytes = build(&mut out)?;
+            let (original_bytes, newest_file) = build(&mut out)?;
             check_stop(cancel)?;
             out.sync_all()
                 .map_err(|e| io_error("flush the verified ZIP", e))?;
+            let timestamp = ArchiveTimestamp::choose(source_stamp, newest_file)?;
+            set_zip_date(&out, timestamp)?;
             let partial =
                 Stamp::for_file(&out).map_err(|e| io_error("identify the verified ZIP", e))?;
             sync_dir(&root)?;
@@ -373,6 +404,7 @@ impl ArchiveJournal {
                 .get_mut(subfolder)
                 .expect("archive intent was inserted");
             row.original.bytes = original_bytes;
+            row.timestamp = Some(timestamp);
             row.phase = Phase::Verified {
                 partial,
                 holding_parent,
@@ -381,7 +413,7 @@ impl ArchiveJournal {
 
             ensure_vacant(&root, &names.final_name)?;
             if identity(&open_absolute_dir(&root_path)?)? != root_id
-                || check_source(&root, subfolder)? != source
+                || check_source(&root, subfolder)?.id != source
                 || !entry(&root, &names.partial)?
                     .is_some_and(|item| item.is_file && item.stamp == partial)
                 || identity(&open_absolute_dir(
@@ -494,7 +526,7 @@ fn checked_root(path: &Path) -> Result<(PathBuf, File), ManagerError> {
     Ok((canonical, root))
 }
 
-fn check_source(root: &File, name: &str) -> Result<Identity, ManagerError> {
+fn check_source(root: &File, name: &str) -> Result<Stamp, ManagerError> {
     let root_id = identity(root)?;
     let source = entry(root, name)?
         .filter(|item| item.is_dir)
@@ -504,7 +536,7 @@ fn check_source(root: &File, name: &str) -> Result<Identity, ManagerError> {
             ))
         })?;
     same_volume(root_id, source.stamp.id)?;
-    Ok(source.stamp.id)
+    Ok(source.stamp)
 }
 
 fn checked_holding(
@@ -701,6 +733,78 @@ fn entry(dir: &File, name: &str) -> Result<Option<Entry>, ManagerError> {
         is_dir: mode == libc::S_IFDIR,
         is_file: mode == libc::S_IFREG,
     }))
+}
+
+fn replay_zip_date(
+    dir: &File,
+    name: &str,
+    expected: Stamp,
+    timestamp: Option<ArchiveTimestamp>,
+) -> Result<(), ManagerError> {
+    let Some(timestamp) = timestamp else {
+        return Ok(());
+    };
+    let name = cstr(OsStr::new(name))?;
+    // SAFETY: Valid directory descriptor and a NUL-terminated single component.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    let zip = file_from_fd(fd, "open the verified archive")?;
+    if !zip
+        .metadata()
+        .map_err(|e| io_error("inspect the verified archive", e))?
+        .is_file()
+        || Stamp::for_file(&zip).map_err(|e| io_error("identify the verified archive", e))?
+            != expected
+    {
+        return Err(reject(
+            "The verified archive changed before its date could be recovered",
+        ));
+    }
+    set_zip_date(&zip, timestamp)
+}
+
+fn set_zip_date(file: &File, timestamp: ArchiveTimestamp) -> Result<(), ManagerError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::{
+            fs::FileTimes,
+            os::macos::fs::FileTimesExt,
+            time::{Duration, UNIX_EPOCH},
+        };
+        let seconds = Duration::from_secs(timestamp.seconds.unsigned_abs());
+        let time = if timestamp.seconds < 0 {
+            UNIX_EPOCH.checked_sub(seconds)
+        } else {
+            UNIX_EPOCH.checked_add(seconds)
+        };
+        let date = time
+            .and_then(|time| time.checked_add(Duration::from_nanos(u64::from(timestamp.nanos))))
+            .ok_or_else(|| reject("The archive modification time is out of range"))?;
+        if let Err(error) = file.set_times(FileTimes::new().set_created(date))
+            && error.raw_os_error() != Some(libc::EOPNOTSUPP)
+            && error.raw_os_error() != Some(libc::ENOTSUP)
+        {
+            return Err(io_error("set the archive creation date", error));
+        }
+    }
+    let time = libc::timespec {
+        tv_sec: timestamp.seconds as libc::time_t,
+        tv_nsec: timestamp.nanos.into(),
+    };
+    // SAFETY: A valid file descriptor and two initialized timespecs.
+    if unsafe { libc::futimens(file.as_raw_fd(), [time, time].as_ptr()) } != 0 {
+        return Err(io_error(
+            "set the archive modification and access dates",
+            io::Error::last_os_error(),
+        ));
+    }
+    file.sync_all()
+        .map_err(|error| io_error("flush the archive dates", error))
 }
 
 fn ensure_vacant(dir: &File, name: &str) -> Result<(), ManagerError> {

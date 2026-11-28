@@ -77,7 +77,7 @@ fn verification_failure_keeps_original_and_cleans_partial() {
             out.write_all(&[bytes[0] ^ 1]).unwrap();
             verify_zip(out, &files, |_| Ok(()))
                 .map_err(|error| io_error("check archive CRC", error))?;
-            Ok(bytes.len() as u64)
+            Ok((bytes.len() as u64, None))
         });
     assert!(result.unwrap_err().cause().contains("checksum"));
     f.untouched();
@@ -109,7 +109,7 @@ fn stop_before_creation_and_after_writing_keeps_original() {
         },
         |out| {
             out.write_all(b"verified archive").unwrap();
-            Ok(8)
+            Ok((8, None))
         },
     );
     assert!(result.is_err());
@@ -126,7 +126,7 @@ fn stop_before_creation_and_after_writing_keeps_original() {
         |out| {
             out.write_all(b"verified archive").unwrap();
             canceled.store(true, Ordering::SeqCst);
-            Ok(8)
+            Ok((8, None))
         },
     );
     assert!(result.is_err());
@@ -189,7 +189,7 @@ fn a_collision_after_review_leaves_foreign_files_untouched() {
         .archive(&f.root, &f.holding, "old", 50, &|| false, |out| {
             out.write_all(b"our archive").unwrap();
             fs::write(&final_path, b"foreign ZIP").unwrap();
-            Ok(8)
+            Ok((8, None))
         })
         .unwrap_err();
     assert!(err.cause().contains("already exists"));
@@ -208,6 +208,15 @@ fn interrupted(f: &Fixture, moved: bool, published: bool) {
     partial.write_all(b"verified archive bytes").unwrap();
     partial.sync_all().unwrap();
     let source = check_source(&root, "old").unwrap();
+    let timestamp = ArchiveTimestamp {
+        seconds: 1_600_000_000,
+        nanos: 123_456_000,
+    };
+    set_zip_date(&partial, timestamp).unwrap();
+    // A read of the staged file can change atime between runs.
+    partial
+        .set_times(fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH))
+        .unwrap();
     f.journal
         .save(&Records::from([(
             "old".to_owned(),
@@ -220,7 +229,8 @@ fn interrupted(f: &Fixture, moved: bool, published: bool) {
                 },
                 root: root_path,
                 root_id: identity(&root).unwrap(),
-                source,
+                source: source.id,
+                timestamp: Some(timestamp),
                 phase: Phase::Verified {
                     partial: Stamp::for_file(&partial).unwrap(),
                     holding_parent: identity(&holding).unwrap(),
@@ -253,6 +263,15 @@ fn restart_resolves_each_rename_boundary_and_keeps_owned_bytes() {
         assert!(!f.journal.has_pending().unwrap());
         assert!(!f.root.join("old").exists());
         assert!(!f.root.join("old.zip.foldersync-partial").exists());
+        let metadata = fs::metadata(f.root.join("old.zip")).unwrap();
+        assert_eq!(
+            (metadata.mtime(), metadata.mtime_nsec()),
+            (1_600_000_000, 123_456_000)
+        );
+        assert_eq!(
+            (metadata.atime(), metadata.atime_nsec()),
+            (1_600_000_000, 123_456_000)
+        );
         assert_eq!(
             fs::read(f.root.join("old.zip")).unwrap(),
             b"verified archive bytes"
@@ -319,4 +338,39 @@ fn deleting_mapping_metadata_preserves_the_completed_holding_tree() {
         fs::read(f.holding.join("proj/.git/objects/object")).unwrap(),
         b"original"
     );
+}
+
+#[test]
+fn archive_date_uses_folder_then_newest_file_when_unreadable() {
+    let f = Fixture::new();
+    let folder = File::open(f.root.join("old")).unwrap();
+    let timestamp = ArchiveTimestamp {
+        seconds: 1_500_000_000,
+        nanos: 123_000_000,
+    };
+    set_zip_date(&folder, timestamp).unwrap();
+    let expected = folder.metadata().unwrap().modified().unwrap();
+    let fallback = ArchiveTimestamp {
+        seconds: 1_600_000_000,
+        nanos: 500,
+    };
+    let mut stamp = Stamp::for_file(&folder).unwrap();
+    stamp.modified_nanos = -1;
+    assert_eq!(
+        ArchiveTimestamp::choose(stamp, Some(fallback)).unwrap(),
+        fallback
+    );
+    f.journal
+        .archive(&f.root, &f.holding, "old", 50, &|| false, |out| {
+            out.write_all(b"verified archive bytes").unwrap();
+            Ok((8, Some(fallback)))
+        })
+        .unwrap();
+    let zip = fs::metadata(f.root.join("old.zip")).unwrap();
+    assert_eq!(zip.modified().unwrap(), expected);
+    assert_eq!(zip.accessed().unwrap(), expected);
+    #[cfg(target_os = "macos")]
+    if let Ok(created) = zip.created() {
+        assert_eq!(created, expected);
+    }
 }

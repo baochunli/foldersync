@@ -140,6 +140,11 @@ fn configure_fixture_wizard(
     mgr.dispatch(UiCommand::WizardSetLocalRecoveryPath(
         local_recovery.to_string_lossy().into_owned(),
     ));
+    wait_for_snapshot(mgr, Duration::from_secs(5), |s| {
+        s.wizard.local_path == local_folder.to_string_lossy()
+            && s.wizard.local_recovery_path == local_recovery.to_string_lossy()
+            && !s.wizard.location_check_pending
+    });
 }
 
 fn drive_wizard_init(
@@ -204,13 +209,34 @@ fn suggested_exclusions_stay_removed_when_reopening_a_saved_mapping() {
         (UiCommand::FinishSetup(id.clone()), WizardStep::Review),
     ] {
         mgr.dispatch(command);
-        let reopened = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| s.wizard.step == step);
+        let reopened = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+            s.wizard.step == step && !s.wizard.location_check_pending
+        });
         assert_eq!(
             reopened.wizard.custom_patterns, saved_mapping.custom_exclusions,
             "{step:?}"
         );
         assert_eq!(reopened.wizard.cloud_file_count, Some(1), "{step:?}");
         assert_eq!(reopened.wizard.cloud_total_bytes, Some(6), "{step:?}");
+    }
+
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Subfolders));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.step == WizardStep::Subfolders && !s.wizard.location_check_pending
+    });
+    for excluded in [true, false] {
+        mgr.dispatch(UiCommand::WizardSetSuggestion {
+            pattern: "build/**".into(),
+            excluded,
+        });
+        let checked = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+            !s.wizard.location_check_pending
+                && s.wizard.extra_exclusions().contains("build/**") == excluded
+        });
+        assert_eq!(
+            checked.wizard.cloud_file_count,
+            Some(usize::from(!excluded))
+        );
     }
 
     mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
@@ -265,6 +291,9 @@ fn suggested_exclusions_reset_dismissals_when_choosing_another_folder() {
     mgr.dispatch(UiCommand::WizardSetRemotePath(
         remote_folder.to_string_lossy().into_owned(),
     ));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.custom_patterns == ["*.bak"] && !s.wizard.location_check_pending
+    });
     mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Folder));
     let same = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
         s.wizard.step == WizardStep::Folder
@@ -275,7 +304,9 @@ fn suggested_exclusions_reset_dismissals_when_choosing_another_folder() {
     mgr.dispatch(UiCommand::WizardSelectFolder("Other".to_owned()));
     mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Location));
     let other = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
-        s.wizard.selected_folder == "Other" && s.wizard.step == WizardStep::Location
+        s.wizard.selected_folder == "Other"
+            && s.wizard.step == WizardStep::Location
+            && !s.wizard.location_check_pending
     });
     assert_eq!(other.wizard.custom_patterns, ["*.bak", "build/**"]);
     assert_eq!(other.wizard.cloud_total_bytes, Some(0));
@@ -357,7 +388,7 @@ fn automatic_build_exclusion_updates_archive_eligibility() {
     let finished = local_folder.join("Finished");
     fs::create_dir_all(finished.join("project/build")).unwrap();
     let old = fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_000));
-    for name in (0..1999)
+    for name in (0..99)
         .map(|i| format!("{i}.txt"))
         .chain(["project/build/old.o".to_owned()])
     {
@@ -382,18 +413,18 @@ fn automatic_build_exclusion_updates_archive_eligibility() {
         s.wizard.local_file_count.is_some()
     });
     assert_eq!(snap.wizard.custom_patterns, ["build/**"]);
-    assert_eq!(snap.wizard.local_file_count, Some(1_999));
+    assert_eq!(snap.wizard.local_file_count, Some(99));
     assert!(snap.wizard.archive_suggestions.is_empty());
 
     mgr.dispatch(UiCommand::WizardRemovePattern("build/**".to_owned()));
     let snap = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
-        s.wizard.custom_patterns.is_empty()
+        s.wizard.custom_patterns.is_empty() && !s.wizard.location_check_pending
     });
     let [suggestion] = snap.wizard.archive_suggestions.as_slice() else {
         panic!("expected one archive suggestion");
     };
     assert_eq!(suggestion.name, "Finished");
-    assert_eq!(suggestion.file_count, 2_000);
+    assert_eq!(suggestion.file_count, 100);
     mgr.shutdown();
 }
 
@@ -934,12 +965,20 @@ fn wizard_saves_edits_exclusions_persists_accounts_and_invalidates_confirmation(
     mgr.dispatch(UiCommand::ResumeDraft(draft1_id.clone()));
     wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
         s.wizard.editing_mapping_id.as_ref() == Some(&draft1_id)
+            && !s.wizard.location_check_pending
             && s.wizard.custom_patterns.contains(&"*.bak".to_owned())
     });
     mgr.dispatch(UiCommand::WizardAddPattern("*.log".to_owned()));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard
+            .custom_patterns
+            .iter()
+            .any(|pattern| pattern == "*.log")
+            && !s.wizard.location_check_pending
+    });
     mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
     wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
-        s.wizard.no_other_sync_confirmed
+        s.wizard.no_other_sync_confirmed && !s.wizard.location_check_pending
     });
 
     // Mutate remote inventory AFTER user confirmed -> Start MUST invalidate confirmation!
@@ -1198,9 +1237,15 @@ fn manager_source_confirms_new_subfolders_before_reinitializing() {
 
 #[test]
 fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
     use rclone_adapter::{
-        FakeProcessRunner, FakeRunScript, PasswordCommand, ProcessError, ProcessRunner,
-        ProcessSpec, RealProcessRunner, RunHandle, SpawnOptions,
+        AccountConfigLock, FakeProcessRunner, FakeRunScript, PasswordCommand, ProcessError,
+        ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle, SpawnOptions,
     };
     use sync_core::{AccessMarker, AccountId, DeviceId};
     use sync_manager::{
@@ -1208,9 +1253,13 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
         SecretString, SqliteStateStore, scoped_credential_key,
     };
 
+    type InventoryGate = (mpsc::Sender<Instant>, mpsc::Receiver<()>);
+
     struct DriveFixtureRunner {
         remote_root: PathBuf,
         size: FakeProcessRunner,
+        inventory_gate: Mutex<Option<InventoryGate>>,
+        inventory_calls: AtomicUsize,
     }
 
     impl ProcessRunner for DriveFixtureRunner {
@@ -1240,6 +1289,13 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
                     ..Default::default()
                 });
                 return listing.spawn(spec, options);
+            }
+            if spec.args[0] == "lsjson" && spec.args.iter().any(|arg| arg == "--recursive") {
+                self.inventory_calls.fetch_add(1, Ordering::Relaxed);
+                if let Some((started, release)) = self.inventory_gate.lock().unwrap().take() {
+                    started.send(Instant::now()).unwrap();
+                    let _ = release.recv_timeout(Duration::from_secs(3));
+                }
             }
             let mut spec = spec.clone();
             spec.current_dir = Some(self.remote_root.clone());
@@ -1280,7 +1336,7 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
             kind: "drive".to_owned(),
             remote_name: "household".to_owned(),
             remote_root_folder_id: "parent-id".to_owned(),
-            config_path,
+            config_path: config_path.clone(),
             auth_status: "ready".to_owned(),
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -1297,6 +1353,8 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
     let runner = Arc::new(DriveFixtureRunner {
         remote_root,
         size: FakeProcessRunner::new(),
+        inventory_gate: Mutex::new(None),
+        inventory_calls: AtomicUsize::new(0),
     });
     runner.size.push_run(FakeRunScript {
         wait_for_stop: true,
@@ -1339,13 +1397,53 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
     mgr.dispatch(UiCommand::WizardSetLocalRecoveryPath(
         local_recovery.to_string_lossy().into_owned(),
     ));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.local_path == local_folder.to_string_lossy()
+            && s.wizard.local_recovery_path == local_recovery.to_string_lossy()
+            && !s.wizard.location_check_pending
+    });
     mgr.dispatch(UiCommand::WizardSelectFolder("Research".to_owned()));
     wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
         s.folder_size_pending && !runner.size.spawned_specs().is_empty()
     });
+    let (started, scanning) = mpsc::channel();
+    let (release, blocked) = mpsc::channel();
+    *runner.inventory_gate.lock().unwrap() = Some((started, blocked));
+    let clicked = Instant::now();
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Location));
+    let entered = scanning.recv_timeout(Duration::from_secs(20)).unwrap();
+    let pending = mgr.snapshot();
+    mgr.dispatch(UiCommand::SetSchedulingPaused(true));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !mgr.snapshot().scheduling_paused && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let responsive = mgr.snapshot().scheduling_paused;
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Folder));
+    while mgr.snapshot().wizard.step != WizardStep::Folder && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let went_back = mgr.snapshot().wizard.step == WizardStep::Folder;
+    let _ = release.send(());
+    eprintln!(
+        "Folder → Location reached the fake recursive Drive listing after {:?}; Back processed in {:?}",
+        entered.duration_since(clicked),
+        entered.elapsed()
+    );
+    assert_eq!(pending.wizard.step, WizardStep::Location);
+    assert!(pending.wizard.location_check_pending);
+    assert!(pending.wizard.location_checks.is_empty());
+    assert!(
+        responsive,
+        "scheduling must respond while inventory is held"
+    );
+    assert!(went_back, "Back must invalidate the job before it finishes");
+    assert!(store.list_mappings().unwrap().is_empty());
     mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Location));
     let location = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
-        s.wizard.step == WizardStep::Location && !s.folder_size_pending
+        s.wizard.step == WizardStep::Location
+            && !s.folder_size_pending
+            && !s.wizard.location_check_pending
     });
     assert_eq!(runner.size.stop_calls(), 1);
     assert_eq!(location.action_error, None);
@@ -1375,13 +1473,123 @@ fn drive_wizard_saves_after_size_cancellation_and_initializes_collection() {
     assert_eq!(draft.collection, collection);
     assert_eq!(draft.cloud_recovery_path, "household:Recovery/research-id");
 
+    fs::write(
+        collection_folder.join("added-during-setup.txt"),
+        "additional",
+    )
+    .unwrap();
+    fs::write(
+        local_folder.join("unseen.txt"),
+        "added after the first listing",
+    )
+    .unwrap();
+    let scans = runner.inventory_calls.load(Ordering::Relaxed);
+    let next_started = Instant::now();
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Subfolders));
+    let subfolders = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.wizard.step == WizardStep::Subfolders && !s.wizard.location_check_pending
+    });
+    assert_eq!(subfolders.wizard.cloud_file_count, Some(1));
+    assert_eq!(subfolders.wizard.local_file_count, Some(0));
+    eprintln!(
+        "Location → Subfolders reused its listings and saved after {:?}",
+        next_started.elapsed()
+    );
+    for pattern in ["*.bak", "*.tmp", "*.log"] {
+        mgr.dispatch(UiCommand::WizardAddPattern(pattern.into()));
+    }
+    let filtered = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.custom_patterns.len() == 3 && !s.wizard.location_check_pending
+    });
+    assert_eq!(filtered.wizard.cloud_file_count, Some(1));
+    assert_eq!(filtered.wizard.local_file_count, Some(0));
+    assert_eq!(runner.inventory_calls.load(Ordering::Relaxed), scans);
+    fs::remove_file(local_folder.join("unseen.txt")).unwrap();
+
+    let other_local = local_folder.parent().unwrap().join("alternate");
+    fs::create_dir(&other_local).unwrap();
+    fs::write(other_local.join("new.txt"), "second local folder").unwrap();
+    mgr.dispatch(UiCommand::WizardSetLocalPath(
+        other_local.to_string_lossy().into(),
+    ));
+    let alternate = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.local_path == other_local.to_string_lossy() && !s.wizard.location_check_pending
+    });
+    assert_eq!(alternate.wizard.local_file_count, Some(1));
+    assert_eq!(runner.inventory_calls.load(Ordering::Relaxed), scans);
+    mgr.dispatch(UiCommand::WizardSetLocalPath(
+        local_folder.to_string_lossy().into(),
+    ));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.local_path == local_folder.to_string_lossy() && !s.wizard.location_check_pending
+    });
+
+    let recovery_started = Instant::now();
+    mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Recovery));
+    let recovery = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.wizard.step == WizardStep::Recovery && !s.wizard.location_check_pending
+    });
+    assert!(recovery.wizard.recovery_valid());
+    assert_eq!(recovery.wizard.cloud_file_count, Some(1));
+    eprintln!(
+        "Subfolders → Recovery reused cached inventory in {:?}",
+        recovery_started.elapsed()
+    );
+
+    let lock =
+        AccountConfigLock::acquire(&config_path.parent().unwrap().join("config.lock")).unwrap();
+    let waiting_since = Instant::now();
+    mgr.dispatch(UiCommand::WizardCheckAgain);
+    let waiting = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.waiting_for_account()
+    });
+    assert!(waiting.wizard.location_checks.is_empty());
+    assert!(waiting.wizard.recovery_checks.is_empty());
+    assert_eq!(waiting.action_error, None);
+    std::thread::sleep(Duration::from_millis(160));
+    drop(lock);
+    let released = Instant::now();
+    let refreshed = wait_for_snapshot(&mgr, Duration::from_secs(10), |s| {
+        s.wizard.step == WizardStep::Recovery && !s.wizard.location_check_pending
+    });
+    assert_eq!(refreshed.action_error, None);
+    assert_eq!(refreshed.wizard.cloud_file_count, Some(2));
+    assert!(refreshed.wizard.recovery_valid());
+    assert_eq!(runner.inventory_calls.load(Ordering::Relaxed), scans + 1);
+    eprintln!(
+        "Check again held the fake account lock for {:?}; completed in {:?} after release",
+        released.duration_since(waiting_since),
+        released.elapsed()
+    );
+
+    let review_started = Instant::now();
     mgr.dispatch(UiCommand::WizardSetStep(WizardStep::Review));
     let review = wait_for_snapshot(&mgr, Duration::from_secs(20), |s| {
-        s.wizard.step == WizardStep::Review || s.action_error.is_some()
+        (s.wizard.step == WizardStep::Review && !s.wizard.location_check_pending)
+            || s.action_error.is_some()
     });
+    eprintln!(
+        "Recovery → Review checks and draft ready after {:?}",
+        review_started.elapsed()
+    );
     assert_eq!(review.action_error, None);
     assert_eq!(review.wizard.drive_collection.as_ref(), Some(&collection));
+    assert_eq!(runner.inventory_calls.load(Ordering::Relaxed), scans + 1);
+    fs::write(collection_folder.join("late.txt"), "added before start").unwrap();
     mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    mgr.dispatch(UiCommand::WizardStartFirstSync);
+    let changed = wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.action_error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed since you confirmed"))
+    });
+    assert_eq!(changed.wizard.cloud_file_count, Some(3));
+    assert_eq!(runner.inventory_calls.load(Ordering::Relaxed), scans + 2);
+
+    mgr.dispatch(UiCommand::WizardSetNoOtherSyncConfirmed(true));
+    wait_for_snapshot(&mgr, Duration::from_secs(5), |s| {
+        s.wizard.no_other_sync_confirmed && s.action_error.is_none()
+    });
     mgr.dispatch(UiCommand::WizardStartFirstSync);
     let complete = wait_for_snapshot(&mgr, Duration::from_secs(240), |s| {
         (s.wizard.first_sync_completed

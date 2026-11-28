@@ -124,7 +124,7 @@ and file count before choosing subfolder exclusions. FolderSync compares that
 estimate with free space on known volumes and checks the chosen destination
 again during setup. Review the first sync before starting it.
 
-The wizard can suggest ZIPs for finished subfolders with at least 2,000
+The wizard can suggest ZIPs for finished subfolders with at least 100
 included files and no included file changed in the past 12 months. Review
 which originals will move into the same disk’s **FolderSync Archived
 Originals** folder. Other Macs receive the same verified ZIPs through

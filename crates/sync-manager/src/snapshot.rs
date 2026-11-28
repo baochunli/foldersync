@@ -126,6 +126,7 @@ pub struct FolderSizeSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FolderSizeStatus {
     Calculating,
+    AccountBusy,
     Known { bytes: u64, files: u64 },
     Failed { cause: String },
 }

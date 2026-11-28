@@ -114,7 +114,7 @@ impl Fixture {
         let folder = self.local.join("Finished");
         fs::create_dir_all(folder.join("proj/.git/objects")).unwrap();
         fs::create_dir(folder.join("node_modules")).unwrap();
-        for i in 0..1999 {
+        for i in 0..99 {
             write_old(&folder.join(format!("{i}.txt")), b"finished");
         }
         write_old(&folder.join("proj/.git/objects/fixture"), b"git object");
@@ -248,7 +248,7 @@ fn review_uses_included_inventory_and_refuses_an_existing_zip() {
         .preflight_mapping_preview_with_archives(&command, None, &selected())
         .unwrap();
     let inventory = preview.local_inventory.unwrap();
-    assert_eq!(inventory.archive_suggestions[0].file_count, 2_000);
+    assert_eq!(inventory.archive_suggestions[0].file_count, 100);
     assert!(
         preview.archive_errors.is_empty(),
         "{:?}",
@@ -298,6 +298,11 @@ fn verified_zip_and_retained_originals_integrate_with_regular_two_way_sync() {
     command.extra_exclusions.insert("node_modules/**".into());
     let original = fixture.local.join("Finished/proj/.git/objects/fixture");
     let original_mtime = fs::metadata(&original).unwrap().modified().unwrap();
+    let folder_date = UNIX_EPOCH + Duration::from_secs(1_605_000_000);
+    fs::File::open(fixture.local.join("Finished"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(folder_date))
+        .unwrap();
 
     // The reserved name remains outside both sync directions even when a
     // leftover partial is present alongside the successfully prepared ZIP.
@@ -345,6 +350,15 @@ fn verified_zip_and_retained_originals_integrate_with_regular_two_way_sync() {
         fs::read(holding.join("node_modules/recent")).unwrap(),
         b"excluded"
     );
+    for root in [&fixture.local, &fixture.cloud] {
+        assert_eq!(
+            fs::metadata(root.join("Finished.zip"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            folder_date
+        );
+    }
     let zip = fs::read(fixture.local.join("Finished.zip")).unwrap();
     assert_eq!(fs::read(fixture.cloud.join("Finished.zip")).unwrap(), zip);
     let expected = events.try_iter().find_map(|event| match event {
@@ -364,7 +378,7 @@ fn verified_zip_and_retained_originals_integrate_with_regular_two_way_sync() {
     );
     assert_eq!(fs::read(&stale_partial).unwrap(), b"local-only partial");
     let mut entries = zip::ZipArchive::new(Cursor::new(&zip)).unwrap();
-    assert_eq!(entries.len(), 2_000);
+    assert_eq!(entries.len(), 100);
     assert!(entries.by_name("Finished/node_modules/recent").is_err());
     let mut git_bytes = Vec::new();
     entries

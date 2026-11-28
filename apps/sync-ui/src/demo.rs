@@ -4,7 +4,7 @@
 //! Never touches the filesystem, rclone, Keychain, real macOS system services,
 //! or `sync-manager`. All sample data is neutral and matches `ui-spec.md` §2 and §6.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +27,8 @@ use crate::contract::{
     LocationCheck, MappingSnapshot, PreferencesSnapshot, RecoveryCauseKind, RecoveryChecklistData,
     RecoveryCopyItem, ReviewScenario, RunPhase, RunRecordSnapshot, SYNC_ALL_NOW_LABEL,
     ScheduledCheck, ScreenRoute, StatusModifier, SubfolderNode, Tone, TransferProgress, UiCommand,
-    UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardDraft, WizardStep, is_low_space,
+    UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardCheck, WizardDraft, WizardStep,
+    is_low_space,
 };
 use crate::system_actions::{RecordingSystemActions, SystemActions};
 
@@ -37,6 +38,7 @@ const DEMO_BUILD_BYTES: u64 = 2_300_000_000;
 /// In-memory manager stand-in used only when demo mode is explicitly requested.
 pub struct DemoSource {
     snapshot: RefCell<UiSnapshot>,
+    preview_wizard_check: Cell<bool>,
     next_event_id: RefCell<u64>,
     prior_account_status: RefCell<BTreeMap<AccountId, AccountStatus>>,
     system_actions: Arc<dyn SystemActions>,
@@ -60,6 +62,7 @@ impl DemoSource {
         let snap = build_snapshot(preset);
         Self {
             snapshot: RefCell::new(snap),
+            preview_wizard_check: Cell::new(false),
             next_event_id: RefCell::new(100),
             prior_account_status: RefCell::new(BTreeMap::new()),
             system_actions,
@@ -959,12 +962,32 @@ impl DemoSource {
             }
             UiCommand::WizardSetStep(step) => {
                 recompute_wizard_checks(&mut snap);
-                if snap.wizard.can_visit_step(step) {
+                if snap.wizard.transition_check.is_none() && snap.wizard.can_visit_step(step) {
                     if step != WizardStep::Folder {
                         cancel_demo_size(&mut snap);
                     }
+                    let previous = snap.wizard.step;
                     snap.wizard.step = step;
+                    if step != previous && self.preview_wizard_check.replace(false) {
+                        let label = if step == WizardStep::Folder {
+                            "Loading folders from the account…".to_owned()
+                        } else if previous == WizardStep::Folder {
+                            "Checking the Google Drive folder…".to_owned()
+                        } else {
+                            format!("Counting files in {}…", snap.wizard.selected_folder)
+                        };
+                        snap.wizard.transition_check = Some(WizardCheck::new(label));
+                        snap.wizard.location_check_pending = true;
+                        snap.wizard.location_checks.clear();
+                        snap.wizard.recovery_checks.clear();
+                    }
                 }
+            }
+            UiCommand::DemoPreviewWizardCheck => self.preview_wizard_check.set(true),
+            UiCommand::DemoFinishWizardCheck => {
+                snap.wizard.transition_check = None;
+                snap.wizard.location_check_pending = false;
+                recompute_wizard_checks(&mut snap);
             }
             UiCommand::WizardSelectAccount(acct) => {
                 cancel_demo_size(&mut snap);
@@ -995,8 +1018,13 @@ impl DemoSource {
                     snap.folder_size_pending = true;
                 }
             }
-            UiCommand::WizardCancelFolderSize | UiCommand::WizardLeave => {
-                cancel_demo_size(&mut snap)
+            UiCommand::WizardCancelFolderSize => cancel_demo_size(&mut snap),
+            UiCommand::WizardLeave => {
+                self.preview_wizard_check.set(false);
+                if snap.wizard.transition_check.take().is_some() {
+                    snap.wizard.location_check_pending = false;
+                }
+                cancel_demo_size(&mut snap);
             }
             UiCommand::WizardRefreshFolders => {}
             UiCommand::DemoFailFolderSize => {
@@ -1098,11 +1126,12 @@ impl DemoSource {
             UiCommand::WizardToggleArchive(folder) => {
                 snap.wizard.toggle_archive(folder);
             }
+            UiCommand::WizardSetAllArchives(selected) => snap.wizard.set_all_archives(selected),
             UiCommand::WizardToggleDefaultExclusions => {
                 snap.wizard.show_default_exclusions = !snap.wizard.show_default_exclusions;
             }
             UiCommand::WizardAddPattern(pattern) => {
-                if snap.wizard.add_custom_pattern(&pattern) {
+                if snap.wizard.add_pattern_list(&pattern) {
                     snap.wizard.no_other_sync_confirmed = false;
                     snap.wizard.filter_review = None;
                     recompute_wizard_checks(&mut snap);
@@ -1115,8 +1144,14 @@ impl DemoSource {
                     recompute_wizard_checks(&mut snap);
                 }
             }
-            UiCommand::WizardRemoveAllSuggested => {
-                if snap.wizard.remove_all_suggested() {
+            UiCommand::WizardSetSuggestion { pattern, excluded } => {
+                if snap.wizard.set_suggestion(&pattern, excluded) {
+                    snap.wizard.no_other_sync_confirmed = false;
+                    recompute_wizard_checks(&mut snap);
+                }
+            }
+            UiCommand::WizardSetAllSuggestions(excluded) => {
+                if snap.wizard.set_all_suggestions(excluded) {
                     snap.wizard.no_other_sync_confirmed = false;
                     recompute_wizard_checks(&mut snap);
                 }
@@ -1183,6 +1218,7 @@ impl DemoSource {
                     None,
                 );
             }
+            UiCommand::WizardCheckAgain => recompute_wizard_checks(&mut snap),
             UiCommand::WizardStartFirstSync => {
                 // #3: Create/update a real mapping and start its first sync cleanly.
                 recompute_wizard_checks(&mut snap);
@@ -2162,13 +2198,15 @@ fn recompute_wizard_checks(snap: &mut UiSnapshot) {
         if measure_projects {
             let skipped_bytes = wizard
                 .suggested_folders
-                .values()
-                .filter_map(|counts| counts.total_bytes)
+                .iter()
+                .filter(|(pattern, _)| wizard.suggestion_excluded(pattern))
+                .filter_map(|(_, counts)| counts.total_bytes)
                 .sum::<u64>();
             let skipped_files = wizard
                 .suggested_folders
-                .values()
-                .map(|counts| counts.file_count)
+                .iter()
+                .filter(|(pattern, _)| wizard.suggestion_excluded(pattern))
+                .map(|(_, counts)| counts.file_count)
                 .sum::<usize>();
             let bytes = 18_600_000_000 - skipped_bytes;
             if let Some(root) = wizard
@@ -2247,7 +2285,7 @@ fn recompute_wizard_checks(snap: &mut UiSnapshot) {
                 4_000 + cache_files as u64,
                 9_800_000_000 + cache_bytes,
             ),
-            ("Reports", 2_500, 3_300_000_000),
+            ("Reports", 100, 3_300_000_000),
         ]
         .into_iter()
         .filter(|(folder, _, _)| {
@@ -2545,6 +2583,7 @@ fn default_wizard_draft(skip_account: bool) -> WizardDraft {
         location_checks: Vec::new(),
         local_path: String::new(),
         location_check_pending: false,
+        transition_check: None,
         volume_name: "WorkSSD".to_owned(),
         volume_kind: VolumeKind::External,
         volume_fs: "APFS".to_owned(),

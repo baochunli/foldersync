@@ -1700,8 +1700,16 @@ impl AccountService {
         &self,
         id: &AccountId,
     ) -> Result<CollectionListing, AccountError> {
+        self.list_collection_candidates_controlled(id, &ProcessControl::default())
+    }
+
+    pub(crate) fn list_collection_candidates_controlled(
+        &self,
+        id: &AccountId,
+        control: &ProcessControl,
+    ) -> Result<CollectionListing, AccountError> {
         let _state_lock = self.maybe_lock_state()?;
-        let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+        let control = control.with_fresh_timeout(DRIVE_COMMAND_TIMEOUT);
         let drive = self.locked_drive(id, &control)?;
         drive.candidates(&drive.data_id()?)
     }

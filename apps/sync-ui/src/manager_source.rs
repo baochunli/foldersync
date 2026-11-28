@@ -24,8 +24,8 @@ use std::{
 
 use chrono::DateTime;
 use rclone_adapter::{
-    InitPreference, ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner, RunHandle,
-    SpawnOptions,
+    InitPreference, ProcessControl, ProcessError, ProcessRunner, ProcessSpec, RealProcessRunner,
+    RunHandle, SpawnOptions,
 };
 use sync_core::{
     ACCESS_MARKER_FILENAME, AccountId, CloudCollection, DEFAULT_EXCLUSIONS, Execution,
@@ -34,14 +34,14 @@ use sync_core::{
 };
 use sync_manager::{
     AccountError, AccountRecord, AccountService, AccountServiceConfig, AddDriveAccountRequest,
-    AddMappingCommand, ArchiveState, BisyncLauncher, CollectionCandidate,
+    AddMappingCommand, ArchiveState, BisyncLauncher, CollectionCandidate, CommandOutcome,
     ControlledShutdownOutcome, DarwinFinderNotifier, DriveAuthorization, FilterChangePreview,
     FilterMigrationPhase, FinderActionDispatch, FinderNotifier, FolderSizeSnapshot,
     FolderSizeStatus, ImportAccountRequest, InitializeCommand, ManagerConfig, ManagerError,
     ManagerEvent, MappingStatusSnapshot, NoopFinderNotifier, OperationCanceller, OperationHandle,
-    RecoveryCopySide, RunRecord, SecretString, SideClassification, SkippedCollection,
-    StatusSnapshot, SyncManager, ValidatedFinderAction, detect_volume_identity,
-    inspect_local_endpoint_detailed,
+    PreflightPhase, PreparedDraft, PreparedFirstSync, RecoveryCopySide, RunRecord, SecretString,
+    SideClassification, SkippedCollection, StatusSnapshot, SyncManager, ValidatedFinderAction,
+    WizardInventoryCache, detect_volume_identity, inspect_local_endpoint_detailed,
 };
 
 use crate::{
@@ -52,8 +52,8 @@ use crate::{
         InspectedRunSnapshot, LocationCheck, MappingSnapshot, PreferencesSnapshot,
         RecoveryCauseKind, RecoveryChecklistData, RecoveryCopyItem, ReviewScenario, RunPhase,
         RunRecordSnapshot, ScheduledCheck, ScreenRoute, StatusModifier, SubfolderNode, Tone,
-        TransferProgress, UiCommand, UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardDraft,
-        WizardStep, format_bytes, is_low_space,
+        TransferProgress, UiCommand, UiSnapshot, UnreviewedConflicts, VolumeSnapshot, WizardCheck,
+        WizardDraft, WizardStep, format_bytes, is_low_space,
     },
     system_actions::{
         LaunchAtLoginOutcome, SystemActionOutcome, SystemActionRequest, SystemActions,
@@ -206,6 +206,9 @@ impl Default for ManagerSourceConfig {
 
 enum WorkerCmd {
     Command(UiCommand),
+    WizardProgress(u64, String, usize),
+    WizardWaiting(u64, String, Option<MappingId>),
+    WizardChecked(u64, Option<Box<WizardCheckResult>>),
     AuthorizationReady(SecretString),
     AccountOperationFinished(Result<AccountRecord, String>),
     SystemActionCompleted {
@@ -607,6 +610,41 @@ struct PendingFolderSize {
     canceled: bool,
 }
 
+#[derive(Clone, Copy)]
+enum WizardCheckKind {
+    Catalog,
+    Inventory { save: bool, resume: bool },
+    SaveDraft,
+    FilterPreview,
+    StartFirstSync,
+}
+
+struct RequestedWizardCheck {
+    generation: u64,
+    previous_step: WizardStep,
+    kind: WizardCheckKind,
+}
+
+struct RunningWizardCheck {
+    generation: u64,
+    control: ProcessControl,
+    worker: JoinHandle<()>,
+}
+
+type WizardCatalog = (Vec<CloudFolderCandidate>, Vec<SkippedCollection>);
+
+enum WizardCheckResult {
+    Catalog(Result<WizardCatalog, String>),
+    Inventory(Box<WizardDraft>, Option<Result<PreparedDraft, String>>),
+    SaveDraft(Result<PreparedDraft, String>),
+    StartFirstSync {
+        wizard: Box<WizardDraft>,
+        mapping: Option<Result<(MappingId, PreparedFirstSync), String>>,
+    },
+    FilterPreview(Result<Box<FilterChangePreview>, String>),
+    Error(String),
+}
+
 struct WorkerState {
     mgr: Option<Arc<SyncManager>>,
     account_service: Option<Arc<AccountService>>,
@@ -630,8 +668,11 @@ struct WorkerState {
     cloud_catalog: Vec<CloudFolderCandidate>,
     skipped_cloud_folders: Vec<SkippedCollection>,
     cloud_catalog_error: Option<String>,
-    refresh_catalog_after_size: bool,
     pending_folder_size: Option<PendingFolderSize>,
+    next_wizard_check: u64,
+    requested_wizard_check: Option<RequestedWizardCheck>,
+    wizard_inventory: Arc<Mutex<WizardInventoryCache>>,
+    running_wizard_check: Option<RunningWizardCheck>,
     requested_folder_size: Option<String>,
     inspected_run: Option<InspectedRunSnapshot>,
     recovery_checklist: Option<RecoveryChecklistData>,
@@ -702,8 +743,11 @@ fn manager_worker_main(
         cloud_catalog: Vec::new(),
         skipped_cloud_folders: Vec::new(),
         cloud_catalog_error: None,
-        refresh_catalog_after_size: false,
         pending_folder_size: None,
+        next_wizard_check: 0,
+        requested_wizard_check: None,
+        wizard_inventory: Arc::default(),
+        running_wizard_check: None,
         requested_folder_size: None,
         inspected_run: None,
         recovery_checklist: None,
@@ -812,7 +856,7 @@ fn manager_worker_main(
                             };
                             ui_slot.publish_snapshot(pending);
                         }
-                        recompute_real_wizard_inventory(&mut state);
+                        refresh_wizard_inventory(&mut state);
                     }
                     need_emit = true;
                     if let Some(route) = nav {
@@ -824,6 +868,78 @@ fn manager_worker_main(
                             request,
                         });
                     }
+                }
+                WorkerCmd::WizardProgress(generation, label, files_counted) => {
+                    if wizard_progress_matches(&state, generation)
+                        && let Some(check) = &mut state.wizard.transition_check
+                    {
+                        check.label = label;
+                        check.files_counted = files_counted;
+                        check.waiting = false;
+                        check.holder = None;
+                        need_emit = true;
+                    }
+                }
+                WorkerCmd::WizardWaiting(generation, label, holder) => {
+                    if wizard_progress_matches(&state, generation)
+                        && let Some(check) = &mut state.wizard.transition_check
+                    {
+                        check.label = label;
+                        check.files_counted = 0;
+                        check.waiting = true;
+                        check.holder = holder;
+                        need_emit = true;
+                    }
+                }
+                WorkerCmd::WizardChecked(generation, result) => {
+                    if let Some(job) = state.running_wizard_check.take() {
+                        let _ = job.worker.join();
+                    }
+                    if wizard_check_matches(&state, generation)
+                        && let Some(result) = result
+                    {
+                        state.requested_wizard_check = None;
+                        state.wizard.transition_check = None;
+                        state.wizard.location_check_pending = false;
+                        match *result {
+                            WizardCheckResult::Catalog(result) => apply_catalog(&mut state, result),
+                            WizardCheckResult::Error(error) => state.action_error = Some(error),
+                            WizardCheckResult::Inventory(wizard, prepared) => {
+                                apply_checked_wizard(&mut state, *wizard);
+                                if let Some(prepared) = prepared {
+                                    commit_checked_draft(&mut state, prepared);
+                                }
+                            }
+                            WizardCheckResult::StartFirstSync { wizard, mapping } => {
+                                apply_checked_wizard(&mut state, *wizard);
+                                if let Some(error) = first_sync_check_error(&state.wizard) {
+                                    invalidate_wizard_confirmation(&mut state.wizard);
+                                    state.action_error = Some(error.to_owned());
+                                } else if let Some(mapping) = mapping {
+                                    start_checked_first_sync(&mut state, mapping);
+                                }
+                            }
+                            WizardCheckResult::FilterPreview(Ok(preview)) => {
+                                state.wizard.filter_review = Some(project_filter_review(
+                                    &preview,
+                                    state.wizard.volume_free_bytes,
+                                ));
+                                state.filter_preview = Some(*preview);
+                            }
+                            WizardCheckResult::FilterPreview(Err(error)) => {
+                                state.wizard.step = WizardStep::Subfolders;
+                                state.action_error = Some(error);
+                            }
+                            WizardCheckResult::SaveDraft(prepared) => {
+                                if commit_checked_draft(&mut state, prepared) {
+                                    ui_slot.push_control(UiControlEvent::Navigate(
+                                        ScreenRoute::Overview,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    need_emit = true;
                 }
                 WorkerCmd::AuthorizationReady(url) => {
                     if state.authorization_canceller.is_none() {
@@ -978,6 +1094,7 @@ fn manager_worker_main(
                         need_emit = true;
                         continue;
                     }
+                    finish_wizard_worker(&mut state);
                     if let Some(mgr) = state.mgr.take() {
                         match mgr.controlled_shutdown(timeout) {
                             Ok(outcome) => {
@@ -1023,6 +1140,7 @@ fn manager_worker_main(
                     }
                 }
                 WorkerCmd::ShutdownNow => {
+                    finish_wizard_worker(&mut state);
                     stop_flag.store(true, Ordering::Relaxed);
                     if state.reconnecting_account.is_some()
                         && let Some(mgr) = &state.mgr
@@ -1100,8 +1218,10 @@ fn manager_worker_main(
                 &latest_cached,
             );
         }
+        start_wizard_check(&mut state);
     }
 
+    finish_wizard_worker(&mut state);
     stop_flag.store(true, Ordering::Relaxed);
     inbox.close();
     ui_slot.close();
@@ -1588,6 +1708,7 @@ fn handle_ui_command(
                 match result {
                     Ok(accepted) => {
                         state.recovery_checklist = None;
+                        reset_wizard_inventory(state);
                         state.wizard = default_real_wizard();
                         state.wizard.changing_subfolders = true;
                         state.wizard.selected_folder = mapping.display_name.clone();
@@ -1661,23 +1782,17 @@ fn handle_ui_command(
         UiCommand::PreviewFilterChange => {
             if state.wizard.changing_subfolders
                 && state.wizard.step == WizardStep::Subfolders
-                && let Some(id) = state.wizard.editing_mapping_id.clone()
-                && let Some(mgr) = &state.mgr
+                && state.wizard.editing_mapping_id.is_some()
+                && state.mgr.is_some()
             {
                 invalidate_wizard_confirmation(&mut state.wizard);
-                match mgr.propose_filter_change(&id, state.wizard.extra_exclusions()) {
-                    Ok(preview) => {
-                        state.wizard.filter_review = Some(project_filter_review(
-                            &preview,
-                            state.wizard.volume_free_bytes,
-                        ));
-                        state.filter_preview = Some(preview);
-                        state.wizard.step = WizardStep::Review;
-                    }
-                    Err(err) => {
-                        state.action_error = Some(format!("{} {}", err.cause(), err.next_step()))
-                    }
-                }
+                state.wizard.step = WizardStep::Review;
+                request_wizard_check(
+                    state,
+                    WizardCheckKind::FilterPreview,
+                    WizardStep::Subfolders,
+                    "Checking the new subfolder selection…",
+                );
             }
             (None, None)
         }
@@ -1836,6 +1951,9 @@ fn handle_ui_command(
                                 .local_account_parents
                                 .insert(acct_id.clone(), stored_parent);
                         }
+                        if state.wizard.selected_account != acct_id {
+                            reset_wizard_inventory(state);
+                        }
                         state.wizard.selected_account = acct_id;
                         refresh_real_catalog(state);
                     }
@@ -1890,6 +2008,7 @@ fn handle_ui_command(
             (None, None)
         }
         UiCommand::WizardReset => {
+            reset_wizard_inventory(state);
             cancel_folder_size(state);
             state.filter_preview = None;
             state.wizard = default_real_wizard();
@@ -1917,17 +2036,35 @@ fn handle_ui_command(
             {
                 refresh_real_catalog(state);
             }
-            recompute_real_wizard_inventory(state);
+            if state.requested_wizard_check.is_none() {
+                recompute_real_wizard_inventory(state);
+            }
             (None, None)
         }
         UiCommand::WizardSetStep(step) => {
             if state.wizard.changing_subfolders {
                 if step == WizardStep::Subfolders && state.wizard.step == WizardStep::Review {
+                    cancel_wizard_check(state);
                     state.filter_preview = None;
                     invalidate_wizard_confirmation(&mut state.wizard);
                     state.wizard.step = step;
                 }
                 return (None, None);
+            }
+            if step == state.wizard.step {
+                return (None, None);
+            }
+            if let Some(request) = &state.requested_wizard_check {
+                if step >= state.wizard.step {
+                    return (None, None);
+                }
+                // Returning to the source step restores its previously published inventory.
+                if step == request.previous_step {
+                    cancel_wizard_check(state);
+                    state.wizard.step = step;
+                    return (None, None);
+                }
+                cancel_wizard_check(state);
             }
             if state.wizard.can_visit_step(step)
                 && (step < WizardStep::Folder
@@ -1944,26 +2081,35 @@ fn handle_ui_command(
                         }))
                 && (step < WizardStep::Location || state.wizard.has_cloud_folder())
             {
-                let entering_folder = step == WizardStep::Folder && state.wizard.step != step;
+                let previous = state.wizard.step;
+                let label = state.wizard.transition_label(
+                    step,
+                    state.cloud_catalog.is_empty(),
+                    drive_size_holds_wizard_account(state),
+                );
                 if step != WizardStep::Folder {
                     cancel_folder_size(state);
                 }
                 state.wizard.step = step;
-                if entering_folder && state.cloud_catalog.is_empty() {
-                    refresh_real_catalog(state);
+                if let Some(label) = label {
+                    let kind = if step == WizardStep::Folder {
+                        WizardCheckKind::Catalog
+                    } else {
+                        WizardCheckKind::Inventory {
+                            save: true,
+                            resume: false,
+                        }
+                    };
+                    request_wizard_check(state, kind, previous, label);
                 } else if step >= WizardStep::Location {
                     recompute_real_wizard_inventory(state);
-                    if !drive_size_holds_wizard_account(state)
-                        && let Err(err) = persist_real_draft_if_ready(state, false)
-                    {
-                        state.action_error = Some(err);
-                    }
                 }
             }
             (None, None)
         }
         UiCommand::WizardSelectAccount(acct) => {
             if state.wizard.selected_account != acct {
+                reset_wizard_inventory(state);
                 cancel_folder_size(state);
                 clear_cloud_catalog(state);
                 state.wizard.reset_suggestions();
@@ -2007,9 +2153,13 @@ fn handle_ui_command(
                         state.cloud_catalog.sort_by(|a, b| a.name.cmp(&b.name));
                         select_cloud_folder(state, item);
                     }
-                    Err(err) => {
-                        state.action_error = Some(format!("{} {}", err.cause(), err.next_step()))
+                    Err(ManagerError::AccountBusy { .. }) => {
+                        let (waiting, _) = waiting_for_account(mgr, &state.wizard.selected_account);
+                        state.status_notice = Some(format!(
+                            "{waiting} Try again when the account is available."
+                        ));
                     }
+                    Err(err) => state.action_error = Some(manager_error_text(err)),
                 }
             }
             (None, None)
@@ -2018,7 +2168,12 @@ fn handle_ui_command(
             refresh_real_catalog(state);
             (None, None)
         }
-        UiCommand::WizardCancelFolderSize | UiCommand::WizardLeave => {
+        UiCommand::WizardCancelFolderSize => {
+            cancel_folder_size(state);
+            (None, None)
+        }
+        UiCommand::WizardLeave => {
+            reset_wizard_inventory(state);
             cancel_folder_size(state);
             (None, None)
         }
@@ -2071,14 +2226,16 @@ fn handle_ui_command(
             }
             state.wizard.remote_folder_path = Some(trimmed.to_owned());
             invalidate_wizard_confirmation(&mut state.wizard);
-            recompute_real_wizard_inventory(state);
+            refresh_wizard_inventory(state);
             (None, None)
         }
         UiCommand::WizardSetLocalPath(path) => {
-            let p = PathBuf::from(path.trim());
-            if state.wizard.local_path != path.trim() {
-                state.wizard.reset_archive_choices();
+            if state.wizard.local_path == path.trim() {
+                return (None, None);
             }
+            cancel_wizard_check(state);
+            let p = PathBuf::from(path.trim());
+            state.wizard.reset_archive_choices();
             state.wizard.local_path = path.trim().to_owned();
             state.wizard.location_check_pending = !state.wizard.local_path.is_empty();
             state.wizard.location_checks.clear();
@@ -2103,7 +2260,9 @@ fn handle_ui_command(
             invalidate_wizard_confirmation(&mut state.wizard);
             (None, None)
         }
-        UiCommand::DemoPreviewLocationCheck(_) => (None, None),
+        UiCommand::DemoPreviewLocationCheck(_)
+        | UiCommand::DemoPreviewWizardCheck
+        | UiCommand::DemoFinishWizardCheck => (None, None),
         UiCommand::WizardToggleSubfolder(sub_id) => {
             if sub_id == "root" {
                 let next = !state
@@ -2123,6 +2282,17 @@ fn handle_ui_command(
         }
         UiCommand::WizardToggleArchive(folder) => {
             state.wizard.toggle_archive(folder);
+            if state.wizard.step == WizardStep::Subfolders && state.requested_wizard_check.is_some()
+            {
+                wizard_exclusions_changed(state);
+            }
+            (None, None)
+        }
+        UiCommand::WizardSetAllArchives(selected) => {
+            state.wizard.set_all_archives(selected);
+            if state.requested_wizard_check.is_some() {
+                wizard_exclusions_changed(state);
+            }
             (None, None)
         }
         UiCommand::WizardToggleDefaultExclusions => {
@@ -2130,7 +2300,7 @@ fn handle_ui_command(
             (None, None)
         }
         UiCommand::WizardAddPattern(pattern) => {
-            if state.wizard.add_custom_pattern(&pattern) {
+            if state.wizard.add_pattern_list(&pattern) {
                 wizard_exclusions_changed(state);
             }
             (None, None)
@@ -2141,8 +2311,14 @@ fn handle_ui_command(
             }
             (None, None)
         }
-        UiCommand::WizardRemoveAllSuggested => {
-            if state.wizard.remove_all_suggested() {
+        UiCommand::WizardSetSuggestion { pattern, excluded } => {
+            if state.wizard.set_suggestion(&pattern, excluded) {
+                wizard_exclusions_changed(state);
+            }
+            (None, None)
+        }
+        UiCommand::WizardSetAllSuggestions(excluded) => {
+            if state.wizard.set_all_suggestions(excluded) {
                 wizard_exclusions_changed(state);
             }
             (None, None)
@@ -2150,7 +2326,7 @@ fn handle_ui_command(
         UiCommand::WizardSetLocalRecoveryPath(path) => {
             state.wizard.local_recovery_path = path.trim().to_owned();
             invalidate_wizard_confirmation(&mut state.wizard);
-            recompute_real_wizard_inventory(state);
+            refresh_wizard_inventory(state);
             (None, None)
         }
         UiCommand::WizardSetReviewScenario(_) | UiCommand::DemoFailFolderSize => (None, None),
@@ -2164,88 +2340,40 @@ fn handle_ui_command(
             (None, None)
         }
         UiCommand::WizardSaveDraft => {
-            if state.wizard.changing_subfolders {
+            if state.wizard.changing_subfolders
+                || state
+                    .requested_wizard_check
+                    .as_ref()
+                    .is_some_and(|request| matches!(request.kind, WizardCheckKind::SaveDraft))
+            {
                 return (None, None);
             }
-            if let Err(err) = persist_real_draft_if_ready(state, true) {
-                state.action_error = Some(err);
+            cancel_folder_size(state);
+            request_wizard_check(
+                state,
+                WizardCheckKind::SaveDraft,
+                state.wizard.step,
+                "Saving the draft…",
+            );
+            (None, None)
+        }
+        UiCommand::WizardCheckAgain => {
+            if !state.wizard.changing_subfolders && !state.wizard.local_path.is_empty() {
+                reset_wizard_inventory(state);
+                invalidate_wizard_confirmation(&mut state.wizard);
+                refresh_wizard_inventory(state);
             }
             (None, None)
         }
         UiCommand::WizardStartFirstSync => {
-            if state.wizard.changing_subfolders {
-                return (None, None);
-            }
-            let prior_fp = state.wizard.reviewed_fingerprint.clone();
-            recompute_real_wizard_inventory(state);
-            if state.wizard.step != WizardStep::Review
-                && state.wizard.selected_archives().next().is_some()
-            {
-                invalidate_wizard_confirmation(&mut state.wizard);
-                state.action_error =
-                    Some("Confirm your archive choices on Review first.".to_owned());
-                return (None, None);
-            }
-            let current_fp = wizard_review_fingerprint(&state.wizard);
-            if prior_fp.as_deref() != Some(current_fp.as_str()) {
-                // Inventory or direction changed since confirmation -> invalidate confirmation (HIGH #1).
-                invalidate_wizard_confirmation(&mut state.wizard);
-                state.action_error = Some(
-                    "Folder contents or settings changed since you confirmed. Review the updated plan and confirm again."
-                        .to_owned(),
+            if !state.wizard.changing_subfolders && state.requested_wizard_check.is_none() {
+                reset_wizard_inventory(state);
+                request_wizard_check(
+                    state,
+                    WizardCheckKind::StartFirstSync,
+                    state.wizard.step,
+                    "Checking both folders before first sync…",
                 );
-                return (None, None);
-            }
-            if state.wizard.download_exceeds_free_space() {
-                state.action_error = Some("This selection exceeds available space. Leave out more subfolders or choose a volume with more free space.".to_owned());
-                return (None, None);
-            }
-            if !state.wizard.can_start_first_sync() {
-                state.action_error = Some(
-                    "Finish the required checks and confirmation before starting the first sync."
-                        .to_owned(),
-                );
-                return (None, None);
-            }
-            let add_cmd = match build_add_mapping_from_wizard(state) {
-                Ok(cmd) => cmd,
-                Err(err) => {
-                    state.action_error = Some(err);
-                    return (None, None);
-                }
-            };
-            let mapping_id = add_cmd.id.clone();
-            let expected_direction = match state.wizard.review_scenario {
-                ReviewScenario::CloudToLocal => Some(InitPreference::Path2),
-                ReviewScenario::LocalToCloud | ReviewScenario::BothEmpty => {
-                    Some(InitPreference::Path1)
-                }
-                ReviewScenario::BothPopulated => {
-                    state.action_error = Some(
-                        "Both folders already contain files. Choose an empty local folder first."
-                            .to_owned(),
-                    );
-                    return (None, None);
-                }
-            };
-
-            if let Some(mgr) = &state.mgr {
-                // ALWAYS persist all reviewed edits & exclusions before starting initialization (HIGH #1).
-                if let Err(err) =
-                    mgr.add_mapping_with_archives(add_cmd, state.wizard.selected_archive_names())
-                {
-                    state.action_error = Some(format!("{} {}", err.cause(), err.next_step()));
-                    return (None, None);
-                }
-                match mgr.start_initialize(InitializeCommand {
-                    mapping_id: mapping_id.clone(),
-                    expected_direction,
-                }) {
-                    Ok(_) => begin_first_sync(state, mapping_id),
-                    Err(err) => {
-                        state.action_error = Some(format!("{} {}", err.cause(), err.next_step()));
-                    }
-                }
             }
             (None, None)
         }
@@ -2544,6 +2672,65 @@ fn project_filter_review(preview: &FilterChangePreview, free_bytes: Option<u64>)
     }
 }
 
+fn apply_checked_wizard(state: &mut WorkerState, mut checked: WizardDraft) {
+    checked.show_default_exclusions = state.wizard.show_default_exclusions;
+    checked.no_other_sync_confirmed = state.wizard.no_other_sync_confirmed;
+    checked.reviewed_fingerprint = state.wizard.reviewed_fingerprint.take();
+    state.wizard = checked;
+}
+
+fn first_sync_check_error(wizard: &WizardDraft) -> Option<&'static str> {
+    if wizard.step != WizardStep::Review && wizard.selected_archives().next().is_some() {
+        return Some("Confirm your archive choices on Review first.");
+    }
+    let current_fp = wizard_review_fingerprint(wizard);
+    if wizard.reviewed_fingerprint.as_deref() != Some(current_fp.as_str()) {
+        return Some(
+            "Folder contents or settings changed since you confirmed. Review the updated plan and confirm again.",
+        );
+    }
+    if wizard.download_exceeds_free_space() {
+        return Some(
+            "This selection exceeds available space. Leave out more subfolders or choose a volume with more free space.",
+        );
+    }
+    if !wizard.can_start_first_sync() {
+        return Some("Finish the required checks and confirmation before starting the first sync.");
+    }
+    None
+}
+
+fn start_checked_first_sync(
+    state: &mut WorkerState,
+    result: Result<(MappingId, PreparedFirstSync), String>,
+) {
+    let (mapping_id, prepared) = match result {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            state.action_error = Some(error);
+            return;
+        }
+    };
+    let expected_direction = match state.wizard.review_scenario {
+        ReviewScenario::CloudToLocal => Some(InitPreference::Path2),
+        ReviewScenario::LocalToCloud | ReviewScenario::BothEmpty => Some(InitPreference::Path1),
+        ReviewScenario::BothPopulated => return,
+    };
+    if let Some(mgr) = &state.mgr {
+        if let Err(error) = mgr.commit_prepared_first_sync(prepared) {
+            state.action_error = Some(manager_error_text(error));
+            return;
+        }
+        match mgr.start_initialize(InitializeCommand {
+            mapping_id: mapping_id.clone(),
+            expected_direction,
+        }) {
+            Ok(_) => begin_first_sync(state, mapping_id),
+            Err(error) => state.action_error = Some(manager_error_text(error)),
+        }
+    }
+}
+
 fn begin_first_sync(state: &mut WorkerState, mapping_id: MappingId) {
     state.filter_migration_watch = None;
     state.wizard.filter_migration_progress = None;
@@ -2633,7 +2820,7 @@ fn show_stopped_first_sync(state: &mut WorkerState) {
     } else {
         state.wizard.step = WizardStep::Review;
         if state.wizard.selected_archives().next().is_some() {
-            recompute_real_wizard_inventory(state);
+            refresh_wizard_inventory(state);
         }
     }
 }
@@ -2642,9 +2829,9 @@ fn wizard_exclusions_changed(state: &mut WorkerState) {
     invalidate_wizard_confirmation(&mut state.wizard);
     if state.wizard.changing_subfolders {
         state.filter_preview = None;
-    } else {
-        recompute_real_wizard_inventory(state);
+        return;
     }
+    refresh_wizard_inventory(state);
 }
 
 fn invalidate_wizard_confirmation(wizard: &mut WizardDraft) {
@@ -2938,6 +3125,7 @@ fn load_mapping_into_wizard(
         wizard.drive_collection = Some(rec.collection.clone());
     }
     let snapshot = mgr.snapshot();
+    reset_wizard_inventory(state);
     cancel_folder_size(state);
     clear_cloud_catalog(state);
     state.wizard = wizard;
@@ -2961,49 +3149,381 @@ fn load_mapping_into_wizard(
         }
     } else {
         state.wizard.step = requested_step;
-        recompute_real_wizard_inventory(state);
-        state.wizard.step = if state.wizard.can_visit_step(requested_step) {
-            requested_step
-        } else {
-            WizardStep::Location
-        };
+        request_wizard_check(
+            state,
+            WizardCheckKind::Inventory {
+                save: false,
+                resume: true,
+            },
+            requested_step,
+            "Checking disk and free space…",
+        );
     }
     true
 }
 
-fn persist_real_draft_if_ready(state: &mut WorkerState, explicit_save: bool) -> Result<(), String> {
-    let cmd = match build_add_mapping_from_wizard(state) {
+fn prepare_checked_draft(
+    mgr: &SyncManager,
+    wizard: &WizardDraft,
+    id: &MappingId,
+    control: &ProcessControl,
+    explicit: bool,
+) -> Option<Result<PreparedDraft, ManagerError>> {
+    let cmd = match build_mapping_command(wizard, id.clone()) {
         Ok(cmd) => cmd,
         Err(err) => {
-            return if explicit_save { Err(err) } else { Ok(()) };
+            return explicit.then_some(Err(ManagerError::PreflightRejected {
+                cause: err,
+                next_step: String::new(),
+            }));
         }
     };
-    let Some(mgr) = &state.mgr else {
-        return Err("Manager is not running.".to_owned());
-    };
-    let can_save = mgr
+    if mgr
         .snapshot()
         .mappings
         .iter()
-        .find(|m| m.id == cmd.id)
-        .is_none_or(|m| m.readiness == Readiness::Unconfigured);
-    if !can_save {
-        return if explicit_save {
-            Err(format!(
-                "Mapping `{}` is already configured and cannot be overwritten as a draft.",
-                cmd.id
-            ))
-        } else {
-            Ok(())
-        };
+        .any(|mapping| mapping.id == cmd.id && mapping.readiness != Readiness::Unconfigured)
+    {
+        return explicit.then(|| {
+            Err(ManagerError::PreflightRejected {
+                cause: format!(
+                    "Mapping `{}` is already configured and cannot be overwritten as a draft.",
+                    cmd.id
+                ),
+                next_step: String::new(),
+            })
+        });
     }
-    match mgr.save_draft_mapping(cmd.clone()) {
-        Ok(_) => {
-            state.wizard.editing_mapping_id = Some(cmd.id);
-            Ok(())
+    Some(mgr.prepare_draft_mapping(cmd, control))
+}
+
+fn commit_checked_draft(state: &mut WorkerState, prepared: Result<PreparedDraft, String>) -> bool {
+    let Some(mgr) = &state.mgr else { return false };
+    match prepared.and_then(|draft| mgr.commit_prepared_draft(draft).map_err(manager_error_text)) {
+        Ok(accepted) => {
+            if let CommandOutcome::DraftSaved { mapping_id } = accepted.outcome {
+                state.wizard.editing_mapping_id = Some(mapping_id);
+            }
+            true
         }
-        Err(err) => Err(format!("{} {}", err.cause(), err.next_step())),
+        Err(error) => {
+            state.action_error = Some(error);
+            false
+        }
     }
+}
+
+fn manager_error_text(error: ManagerError) -> String {
+    format!("{} {}", error.cause(), error.next_step())
+        .trim_end()
+        .to_owned()
+}
+
+fn request_wizard_check(
+    state: &mut WorkerState,
+    mut kind: WizardCheckKind,
+    mut previous_step: WizardStep,
+    label: &str,
+) {
+    let coalesce = matches!(
+        kind,
+        WizardCheckKind::Inventory {
+            save: false,
+            resume: false
+        }
+    ) && state
+        .requested_wizard_check
+        .as_ref()
+        .is_some_and(|request| matches!(request.kind, WizardCheckKind::Inventory { .. }));
+    if coalesce {
+        let request = state
+            .requested_wizard_check
+            .as_ref()
+            .expect("inventory request exists");
+        kind = request.kind;
+        previous_step = request.previous_step;
+    } else {
+        cancel_wizard_check(state);
+    }
+    state.next_wizard_check += 1;
+    state.requested_wizard_check = Some(RequestedWizardCheck {
+        generation: state.next_wizard_check,
+        kind,
+        previous_step,
+    });
+    if !coalesce {
+        state.wizard.transition_check = Some(WizardCheck::new(label));
+    }
+    state.wizard.location_check_pending = matches!(
+        kind,
+        WizardCheckKind::Inventory { .. } | WizardCheckKind::StartFirstSync
+    );
+    if let Some(check) = &mut state.wizard.transition_check {
+        check.saving_draft = matches!(kind, WizardCheckKind::SaveDraft);
+        check.keep_content = !check.saving_draft
+            && (coalesce
+                || previous_step == state.wizard.step
+                || state.wizard.step == WizardStep::Subfolders)
+            && matches!(
+                state.wizard.step,
+                WizardStep::Location | WizardStep::Subfolders
+            );
+    }
+    if matches!(kind, WizardCheckKind::Catalog) {
+        clear_cloud_catalog(state);
+    }
+}
+
+fn wizard_check_matches(state: &WorkerState, generation: u64) -> bool {
+    state
+        .requested_wizard_check
+        .as_ref()
+        .is_some_and(|request| request.generation == generation)
+}
+
+fn wizard_progress_matches(state: &WorkerState, generation: u64) -> bool {
+    state.requested_wizard_check.is_some()
+        && state
+            .running_wizard_check
+            .as_ref()
+            .is_some_and(|job| job.generation == generation && job.control.check().is_ok())
+}
+
+fn reset_wizard_inventory(state: &mut WorkerState) {
+    cancel_wizard_check(state);
+    state.wizard_inventory = Arc::default();
+}
+
+fn cancel_wizard_check(state: &mut WorkerState) {
+    if state.requested_wizard_check.take().is_some() {
+        state.wizard.transition_check = None;
+        state.wizard.location_check_pending = false;
+        if let Some(job) = &state.running_wizard_check {
+            job.control.cancel();
+        }
+    }
+}
+
+fn finish_wizard_worker(state: &mut WorkerState) {
+    cancel_wizard_check(state);
+    if let Some(job) = state.running_wizard_check.take() {
+        let _ = job.worker.join();
+    }
+}
+
+fn start_wizard_check(state: &mut WorkerState) {
+    if state.running_wizard_check.is_some() || drive_size_holds_wizard_account(state) {
+        return;
+    }
+    let (Some(request), Some(mgr)) = (&state.requested_wizard_check, state.mgr.clone()) else {
+        return;
+    };
+    let generation = request.generation;
+    let kind = request.kind;
+    let id = wizard_mapping_id(state);
+    let mut wizard = state.wizard.clone();
+    wizard.transition_check = None;
+    wizard.location_check_pending = false;
+    let parent = state
+        .local_account_parents
+        .get(&wizard.selected_account)
+        .cloned();
+    let control = ProcessControl::default();
+    let worker_control = control.clone();
+    let inbox = state.inbox.clone();
+    let cache = Arc::clone(&state.wizard_inventory);
+    let worker = thread::spawn(move || {
+        let name = Path::new(&wizard.local_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| wizard.selected_folder.clone());
+        let counting_label = format!("Counting files in {name}…");
+        let mut last_progress = None::<(&str, Instant)>;
+        let mut progress = |phase| {
+            let (label, count) = match phase {
+                PreflightPhase::Drive => ("Checking the Google Drive folder…", 0),
+                PreflightPhase::Local(count) => (counting_label.as_str(), count),
+                PreflightPhase::LocalDestination => ("Checking the destination folder…", 0),
+                PreflightPhase::Archives => ("Checking folders selected for archiving…", 0),
+            };
+            if count > 0 && !count.is_multiple_of(256) {
+                return;
+            }
+            let now = Instant::now();
+            if last_progress.is_none_or(|(last, at)| {
+                last != label || now.duration_since(at) >= Duration::from_millis(250)
+            }) {
+                last_progress = Some((label, now));
+                inbox.push_cmd(WorkerCmd::WizardProgress(
+                    generation,
+                    label.to_owned(),
+                    count,
+                ));
+            }
+        };
+
+        let mut check = || -> Result<WizardCheckResult, ManagerError> {
+            match kind {
+                WizardCheckKind::Catalog => {
+                    let result = read_wizard_catalog(
+                        Some(&mgr),
+                        &wizard,
+                        parent.as_deref(),
+                        &worker_control,
+                    );
+                    Ok(WizardCheckResult::Catalog(wizard_check_result(result)?))
+                }
+                WizardCheckKind::Inventory { .. } | WizardCheckKind::StartFirstSync => {
+                    let mut checked = wizard.clone();
+                    recompute_wizard_inventory(
+                        &mut checked,
+                        Some(&mgr),
+                        &id,
+                        &worker_control,
+                        &mut progress,
+                        &mut cache.lock().unwrap(),
+                    )?;
+                    if matches!(kind, WizardCheckKind::StartFirstSync) {
+                        let mapping = if first_sync_check_error(&checked).is_none() {
+                            match build_mapping_command(&checked, id.clone()) {
+                                Ok(cmd) => Some(wizard_check_result(
+                                    mgr.prepare_first_sync_mapping(
+                                        cmd,
+                                        checked.selected_archive_names(),
+                                        &worker_control,
+                                        &mut cache.lock().unwrap(),
+                                    )
+                                    .map(|mapping| (id.clone(), mapping)),
+                                )?),
+                                Err(error) => Some(Err(error)),
+                            }
+                        } else {
+                            None
+                        };
+                        return Ok(WizardCheckResult::StartFirstSync {
+                            wizard: Box::new(checked),
+                            mapping,
+                        });
+                    }
+                    let mut prepared = None;
+                    if let WizardCheckKind::Inventory { save, resume } = kind {
+                        if save && worker_control.check().is_ok() {
+                            if checked.drive_collection.is_some() && !checked.local_path.is_empty()
+                            {
+                                inbox.push_cmd(WorkerCmd::WizardProgress(
+                                    generation,
+                                    "Saving the draft…".into(),
+                                    0,
+                                ));
+                            }
+                            prepared =
+                                prepare_checked_draft(&mgr, &checked, &id, &worker_control, false)
+                                    .map(wizard_check_result)
+                                    .transpose()?;
+                        }
+                        if resume && !checked.can_visit_step(checked.step) {
+                            checked.step = WizardStep::Location;
+                        }
+                    }
+                    Ok(WizardCheckResult::Inventory(Box::new(checked), prepared))
+                }
+                WizardCheckKind::SaveDraft => {
+                    let prepared = prepare_checked_draft(&mgr, &wizard, &id, &worker_control, true)
+                        .expect("explicit draft preparation always returns a result");
+                    Ok(WizardCheckResult::SaveDraft(wizard_check_result(prepared)?))
+                }
+                WizardCheckKind::FilterPreview => {
+                    let result = mgr.propose_filter_change_controlled(
+                        &id,
+                        wizard.extra_exclusions(),
+                        &worker_control,
+                        &mut progress,
+                    );
+                    Ok(WizardCheckResult::FilterPreview(wizard_check_result(
+                        result.map(Box::new),
+                    )?))
+                }
+            }
+        };
+        let mut last_wait = None;
+        let result = loop {
+            if worker_control.check().is_err() {
+                break None;
+            }
+            match check() {
+                Ok(result) => break worker_control.check().is_ok().then_some(Box::new(result)),
+                Err(ManagerError::AccountBusy { .. }) => {
+                    wait_for_wizard_account(
+                        &mgr,
+                        &wizard.selected_account,
+                        &inbox,
+                        generation,
+                        &mut last_wait,
+                    );
+                }
+                Err(error) => {
+                    // Inventory reports validation errors inline. Any remaining error belongs to the check itself.
+                    break Some(Box::new(WizardCheckResult::Error(manager_error_text(
+                        error,
+                    ))));
+                }
+            }
+        };
+        inbox.push_cmd(WorkerCmd::WizardChecked(generation, result));
+    });
+    state.running_wizard_check = Some(RunningWizardCheck {
+        generation,
+        control,
+        worker,
+    });
+}
+
+fn wizard_check_result<T>(
+    result: Result<T, ManagerError>,
+) -> Result<Result<T, String>, ManagerError> {
+    match result {
+        Err(error @ ManagerError::AccountBusy { .. }) => Err(error),
+        result => Ok(result.map_err(manager_error_text)),
+    }
+}
+
+fn waiting_for_account(mgr: &SyncManager, account: &AccountId) -> (String, Option<MappingId>) {
+    if let Some(mapping) = mgr.snapshot().mappings.iter().find(|mapping| {
+        &mapping.account_id == account
+            && matches!(mapping.execution, Execution::Running | Execution::Stopping)
+    }) {
+        return (
+            format!(
+                "Waiting for “{}” to finish syncing (it uses the same Google Drive account)…",
+                mapping.display_name
+            ),
+            Some(mapping.id.clone()),
+        );
+    }
+    (
+        "Waiting for the Google Drive account to become available…".to_owned(),
+        None,
+    )
+}
+
+fn wait_for_wizard_account(
+    mgr: &SyncManager,
+    account: &AccountId,
+    inbox: &WorkerInbox,
+    generation: u64,
+    last_wait: &mut Option<(String, Option<MappingId>)>,
+) {
+    let waiting = waiting_for_account(mgr, account);
+    if last_wait.as_ref() != Some(&waiting) {
+        inbox.push_cmd(WorkerCmd::WizardWaiting(
+            generation,
+            waiting.0.clone(),
+            waiting.1.clone(),
+        ));
+        *last_wait = Some(waiting);
+    }
+    // The terminal run snapshot can precede release of the account lock.
+    thread::sleep(Duration::from_millis(500));
 }
 
 fn allocate_unique_mapping_id(state: &WorkerState, folder: &str) -> MappingId {
@@ -3031,59 +3551,64 @@ fn allocate_unique_mapping_id(state: &WorkerState, folder: &str) -> MappingId {
     MappingId::new(format!("{base}-{}", chrono::Utc::now().timestamp_millis()))
 }
 
-fn build_add_mapping_from_wizard(state: &WorkerState) -> Result<AddMappingCommand, String> {
-    let folder = state.wizard.selected_folder.trim();
-    let local_str = state.wizard.local_path.trim();
-    let remote_str = state
+fn wizard_mapping_id(state: &WorkerState) -> MappingId {
+    state
         .wizard
+        .editing_mapping_id
+        .clone()
+        .unwrap_or_else(|| allocate_unique_mapping_id(state, state.wizard.selected_folder.trim()))
+}
+
+fn build_mapping_command(
+    wizard: &WizardDraft,
+    mapping_id: MappingId,
+) -> Result<AddMappingCommand, String> {
+    let folder = wizard.selected_folder.trim();
+    let local_str = wizard.local_path.trim();
+    let remote_str = wizard
         .remote_folder_path
         .as_deref()
         .map(str::trim)
         .unwrap_or("");
-    if folder.is_empty() || local_str.is_empty() || !state.wizard.has_cloud_folder() {
+    if folder.is_empty() || local_str.is_empty() || !wizard.has_cloud_folder() {
         return Err(
             "Choose a folder in Data, a local folder on this Mac, and a recovery folder first."
                 .to_owned(),
         );
     }
-    let mapping_id = state
-        .wizard
-        .editing_mapping_id
-        .clone()
-        .unwrap_or_else(|| allocate_unique_mapping_id(state, folder));
-    let local_rec = if state.wizard.local_recovery_path.trim().is_empty() {
+    let local_rec = if wizard.local_recovery_path.trim().is_empty() {
         PathBuf::from(local_str)
             .parent()
             .ok_or_else(|| "Choose a local folder inside a mounted volume.".to_owned())?
             .join("FolderSyncRecovery")
             .join(mapping_id.as_str())
     } else {
-        PathBuf::from(state.wizard.local_recovery_path.trim())
+        PathBuf::from(wizard.local_recovery_path.trim())
     };
-    if let Some(collection) = &state.wizard.drive_collection {
+    if let Some(collection) = &wizard.drive_collection {
         let mut cmd = AddMappingCommand::drive(
             mapping_id,
-            state.wizard.selected_account.clone(),
+            wizard.selected_account.clone(),
             collection.clone(),
             PathBuf::from(local_str),
             local_rec,
         )
         .map_err(|err| format!("{} {}", err.cause(), err.next_step()))?;
-        cmd.extra_exclusions = state.wizard.extra_exclusions();
+        cmd.extra_exclusions = wizard.extra_exclusions();
         return Ok(cmd);
     }
-    let remote_rec = if state.wizard.cloud_recovery_path.trim().is_empty() {
+    let remote_rec = if wizard.cloud_recovery_path.trim().is_empty() {
         PathBuf::from(remote_str)
             .parent()
             .ok_or_else(|| "Choose a valid destination folder.".to_owned())?
             .join("FolderSyncRecovery-Remote")
             .join(mapping_id.as_str())
     } else {
-        PathBuf::from(state.wizard.cloud_recovery_path.trim())
+        PathBuf::from(wizard.cloud_recovery_path.trim())
     };
     let mut cmd = AddMappingCommand::local_fixture(
         mapping_id,
-        state.wizard.selected_account.clone(),
+        wizard.selected_account.clone(),
         format!("Data/{folder}"),
         PathBuf::from(local_str),
         PathBuf::from(remote_str),
@@ -3092,7 +3617,7 @@ fn build_add_mapping_from_wizard(state: &WorkerState) -> Result<AddMappingComman
     )
     .map_err(|err| format!("{} {}", err.cause(), err.next_step()))?;
 
-    cmd.extra_exclusions = state.wizard.extra_exclusions();
+    cmd.extra_exclusions = wizard.extra_exclusions();
     Ok(cmd)
 }
 
@@ -3100,48 +3625,79 @@ fn clear_cloud_catalog(state: &mut WorkerState) {
     state.cloud_catalog.clear();
     state.skipped_cloud_folders.clear();
     state.cloud_catalog_error = None;
-    state.refresh_catalog_after_size = false;
 }
 
 fn refresh_real_catalog(state: &mut WorkerState) {
     clear_cloud_catalog(state);
-    let Some(parent) = state
+    if !state
         .local_account_parents
-        .get(&state.wizard.selected_account)
-        .cloned()
-    else {
-        if drive_size_holds_wizard_account(state) {
-            state.refresh_catalog_after_size = true;
-        } else if let Some(mgr) = &state.mgr {
-            match mgr.list_collection_candidates(&state.wizard.selected_account) {
-                Ok(listing) => {
-                    state.cloud_catalog = listing
-                        .candidates
-                        .into_iter()
-                        .map(|candidate| project_drive_candidate(state, candidate))
-                        .collect();
-                    state.skipped_cloud_folders = listing.skipped;
-                }
-                Err(err) => {
-                    state.cloud_catalog_error =
-                        Some(format!("{} {}", err.cause(), err.next_step()));
-                }
-            }
-        }
+        .contains_key(&state.wizard.selected_account)
+    {
+        request_wizard_check(
+            state,
+            WizardCheckKind::Catalog,
+            state.wizard.step,
+            "Loading folders from the account…",
+        );
         return;
+    }
+    let result = read_wizard_catalog(
+        state.mgr.as_deref(),
+        &state.wizard,
+        state
+            .local_account_parents
+            .get(&state.wizard.selected_account)
+            .map(PathBuf::as_path),
+        &ProcessControl::default(),
+    );
+    apply_catalog(state, result.map_err(manager_error_text));
+}
+
+fn apply_catalog(state: &mut WorkerState, result: Result<WizardCatalog, String>) {
+    match result {
+        Ok((items, skipped)) => {
+            state.cloud_catalog = items;
+            state.skipped_cloud_folders = skipped;
+        }
+        Err(error) => state.cloud_catalog_error = Some(error),
+    }
+}
+
+fn read_wizard_catalog(
+    mgr: Option<&SyncManager>,
+    wizard: &WizardDraft,
+    parent: Option<&Path>,
+    control: &ProcessControl,
+) -> Result<WizardCatalog, ManagerError> {
+    let Some(parent) = parent else {
+        let Some(mgr) = mgr else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let listing =
+            mgr.list_collection_candidates_controlled(&wizard.selected_account, control)?;
+        let items = listing
+            .candidates
+            .into_iter()
+            .map(|candidate| drive_candidate(Some(mgr), wizard, candidate))
+            .collect();
+        return Ok((items, listing.skipped));
     };
-    let existing_mappings = state
-        .mgr
-        .as_ref()
+    let existing_mappings = mgr
         .map(|m| m.snapshot().mappings.clone())
         .unwrap_or_default();
 
-    let Ok(entries) = fs::read_dir(&parent) else {
-        state.cloud_catalog_error = Some("Can’t read the local test account folder.".to_owned());
-        return;
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Err(ManagerError::Io {
+            cause: "Can’t read the local test account folder.".to_owned(),
+            next_step: "Check that the account folder is accessible.".to_owned(),
+        });
     };
     let mut items = Vec::new();
     for entry in entries.flatten() {
+        control.check().map_err(|error| ManagerError::Io {
+            cause: error.to_string(),
+            next_step: String::new(),
+        })?;
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
@@ -3163,8 +3719,8 @@ fn refresh_real_catalog(state: &mut WorkerState) {
         let on_this_mac = existing_mappings
             .iter()
             .find(|m| {
-                m.account_id == state.wizard.selected_account
-                    && Some(&m.id) != state.wizard.editing_mapping_id.as_ref()
+                m.account_id == wizard.selected_account
+                    && Some(&m.id) != wizard.editing_mapping_id.as_ref()
                     && m.display_name.eq_ignore_ascii_case(&name)
             })
             .map(|m| m.volume_name.clone());
@@ -3186,20 +3742,28 @@ fn refresh_real_catalog(state: &mut WorkerState) {
         });
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
-    state.cloud_catalog = items;
+    Ok((items, Vec::new()))
 }
 
 fn project_drive_candidate(
     state: &WorkerState,
     candidate: CollectionCandidate,
 ) -> CloudFolderCandidate {
-    let on_this_mac = state.mgr.as_ref().and_then(|mgr| {
+    drive_candidate(state.mgr.as_deref(), &state.wizard, candidate)
+}
+
+fn drive_candidate(
+    mgr: Option<&SyncManager>,
+    wizard: &WizardDraft,
+    candidate: CollectionCandidate,
+) -> CloudFolderCandidate {
+    let on_this_mac = mgr.and_then(|mgr| {
         mgr.snapshot()
             .mappings
             .iter()
             .find(|mapping| {
                 mapping.collection_folder_id == candidate.collection.folder_id
-                    && Some(&mapping.id) != state.wizard.editing_mapping_id.as_ref()
+                    && Some(&mapping.id) != wizard.editing_mapping_id.as_ref()
             })
             .map(|mapping| format!("On {}", mapping.volume_name))
     });
@@ -3218,6 +3782,7 @@ fn select_cloud_folder(state: &mut WorkerState, candidate: CloudFolderCandidate)
     if same_folder && candidate.size == FolderSize::Calculating {
         return;
     }
+    cancel_wizard_check(state);
     cancel_folder_size(state);
     if !same_folder {
         state.wizard.reset_suggestions();
@@ -3298,22 +3863,7 @@ fn update_folder_size(state: &mut WorkerState) {
         };
         let pending = state.pending_folder_size.take().expect("size was pending");
         if !pending.canceled && pending.account == state.wizard.selected_account {
-            set_folder_size(state, &pending.folder_id, project_folder_size(result));
-        }
-        if state.refresh_catalog_after_size {
-            if state.wizard.step == WizardStep::Folder {
-                refresh_real_catalog(state);
-            } else {
-                state.refresh_catalog_after_size = false;
-            }
-        }
-        if state.wizard.step == WizardStep::Location
-            && pending.account == state.wizard.selected_account
-        {
-            recompute_real_wizard_inventory(state);
-            if let Err(err) = persist_real_draft_if_ready(state, false) {
-                state.action_error = Some(err);
-            }
+            set_folder_size(state, &pending.folder_id, project_folder_size(&mgr, result));
         }
     }
 
@@ -3329,7 +3879,7 @@ fn update_folder_size(state: &mut WorkerState) {
                     && size.folder_id == folder_id
                     && size.status != FolderSizeStatus::Calculating
             }) {
-                set_folder_size(state, &folder_id, project_folder_size(result));
+                set_folder_size(state, &folder_id, project_folder_size(&mgr, result));
             } else {
                 state.pending_folder_size = Some(PendingFolderSize {
                     account,
@@ -3353,9 +3903,12 @@ fn set_folder_size(state: &mut WorkerState, id: &str, size: FolderSize) {
     }
 }
 
-fn project_folder_size(result: &FolderSizeSnapshot) -> FolderSize {
+fn project_folder_size(mgr: &SyncManager, result: &FolderSizeSnapshot) -> FolderSize {
     match &result.status {
         FolderSizeStatus::Calculating => FolderSize::Calculating,
+        FolderSizeStatus::AccountBusy => {
+            FolderSize::WaitingForAccount(waiting_for_account(mgr, &result.account_id).0)
+        }
         FolderSizeStatus::Known { bytes, files } => FolderSize::Known {
             bytes: *bytes,
             files: Some(*files),
@@ -3420,56 +3973,104 @@ fn set_subfolder_inventory(
     wizard.subfolders = nodes;
 }
 
+fn refresh_wizard_inventory(state: &mut WorkerState) {
+    if !state.wizard.local_path.is_empty() {
+        request_wizard_check(
+            state,
+            WizardCheckKind::Inventory {
+                save: false,
+                resume: false,
+            },
+            state.wizard.step,
+            "Checking disk and free space…",
+        );
+    } else {
+        cancel_wizard_check(state);
+        recompute_real_wizard_inventory(state);
+    }
+}
+
 fn recompute_real_wizard_inventory(state: &mut WorkerState) {
-    let prior_archives = state.wizard.selected_archive_names();
-    recompute_real_wizard_inventory_with_archives(state, &prior_archives);
-    let selected = state.wizard.selected_archive_names();
-    if state.wizard.step == WizardStep::Review && !selected.is_empty() && selected != prior_archives
+    if !state.wizard.local_path.is_empty()
+        && state.wizard.drive_collection.is_some()
+        && drive_size_holds_wizard_account(state)
     {
-        recompute_real_wizard_inventory_with_archives(state, &selected);
-        if state.wizard.selected_archive_names() != selected {
-            state.wizard.archive_errors.push(
+        state.wizard.location_check_pending = true;
+        return;
+    }
+    let id = wizard_mapping_id(state);
+    let result = recompute_wizard_inventory(
+        &mut state.wizard,
+        state.mgr.as_deref(),
+        &id,
+        &ProcessControl::default(),
+        &mut |_| {},
+        &mut WizardInventoryCache::default(),
+    );
+    if let Err(error) = result {
+        state.status_notice = Some(manager_error_text(error));
+        state.wizard.location_check_pending = true;
+    }
+}
+
+fn recompute_wizard_inventory(
+    wizard: &mut WizardDraft,
+    mgr: Option<&SyncManager>,
+    id: &MappingId,
+    control: &ProcessControl,
+    progress: &mut impl FnMut(PreflightPhase),
+    cache: &mut WizardInventoryCache,
+) -> Result<(), ManagerError> {
+    let prior_archives = wizard.selected_archive_names();
+    recompute_inventory_with_archives(wizard, mgr, id, control, progress, &prior_archives, cache)?;
+    let selected = wizard.selected_archive_names();
+    if wizard.step == WizardStep::Review
+        && !selected.is_empty()
+        && selected != prior_archives
+        && control.check().is_ok()
+    {
+        recompute_inventory_with_archives(wizard, mgr, id, control, progress, &selected, cache)?;
+        if wizard.selected_archive_names() != selected {
+            wizard.archive_errors.push(
                 "Folder contents changed during the archive check. Review the selection again."
                     .to_owned(),
             );
         }
     }
+    Ok(())
 }
 
-fn recompute_real_wizard_inventory_with_archives(
-    state: &mut WorkerState,
+fn recompute_inventory_with_archives(
+    wizard: &mut WizardDraft,
+    mgr: Option<&SyncManager>,
+    id: &MappingId,
+    control: &ProcessControl,
+    progress: &mut impl FnMut(PreflightPhase),
     archive_names: &BTreeSet<String>,
-) {
+    cache: &mut WizardInventoryCache,
+) -> Result<(), ManagerError> {
     let mut loc_checks = Vec::new();
     let mut rec_checks = Vec::new();
-    let trimmed_local = state.wizard.local_path.trim().to_owned();
+    let trimmed_local = wizard.local_path.trim().to_owned();
     let local_path = PathBuf::from(&trimmed_local);
 
-    if !trimmed_local.is_empty()
-        && state.wizard.drive_collection.is_some()
-        && drive_size_holds_wizard_account(state)
-    {
-        // The canceled measurement still owns the account. Its completion resumes this check.
-        state.wizard.location_check_pending = true;
-        return;
-    }
-    state.wizard.location_check_pending = false;
-    state.wizard.archive_errors.clear();
-    state.wizard.archive_holding_folder = None;
+    wizard.location_check_pending = false;
+    wizard.archive_errors.clear();
+    wizard.archive_holding_folder = None;
 
     let volume_space = if trimmed_local.is_empty() {
         None
     } else {
         match detect_volume_identity(&local_path) {
             Ok(det) => {
-                state.wizard.volume_name = det.display_name;
-                state.wizard.volume_kind = det.identity.kind;
-                state.wizard.volume_fs = det.filesystem;
+                wizard.volume_name = det.display_name;
+                wizard.volume_kind = det.identity.kind;
+                wizard.volume_fs = det.filesystem;
                 Some(det.space)
             }
             Err(err) => {
-                state.wizard.volume_name = "unknown".to_owned();
-                state.wizard.volume_fs = "unknown".to_owned();
+                wizard.volume_name = "unknown".to_owned();
+                wizard.volume_fs = "unknown".to_owned();
                 loc_checks.push(LocationCheck {
                     ok: false,
                     message: err.cause(),
@@ -3478,44 +4079,52 @@ fn recompute_real_wizard_inventory_with_archives(
             }
         }
     };
-    state.wizard.volume_free_bytes = volume_space.map(|space| space.free_bytes);
+    wizard.volume_free_bytes = volume_space.map(|space| space.free_bytes);
     if let Some(space) = volume_space {
-        state.wizard.volume_free_gb = space.free_bytes / 1_000_000_000;
-        state.wizard.volume_total_gb = (space.total_bytes / 1_000_000_000).max(1);
+        wizard.volume_free_gb = space.free_bytes / 1_000_000_000;
+        wizard.volume_total_gb = (space.total_bytes / 1_000_000_000).max(1);
     }
 
     let mut local_inv_res = None;
     let mut remote_inv_res = None;
     let mut layout_err = None;
-    let mut preview_exclusions = state.wizard.extra_exclusions();
-    if state.wizard.suggest_exclusions {
+    let mut preview_exclusions = wizard.extra_exclusions();
+    if wizard.suggest_exclusions {
         // Apply candidates to the preview without saving absent patterns on the mapping.
         preview_exclusions.extend(
             SUGGESTED_EXCLUSIONS
                 .iter()
-                .filter(|entry| !state.wizard.dismissed_suggestions.contains(entry.pattern))
+                .filter(|entry| !wizard.dismissed_suggestions.contains(entry.pattern))
                 .map(|entry| entry.pattern.to_owned()),
         );
     }
 
-    if let Some(mgr) = &state.mgr
-        && let Ok(mut cmd) = build_add_mapping_from_wizard(state)
+    if let Some(mgr) = mgr
+        && let Ok(mut cmd) = build_mapping_command(wizard, id.clone())
     {
         cmd.extra_exclusions = preview_exclusions;
-        let editing_id = state.wizard.editing_mapping_id.as_ref();
-        match mgr.preflight_mapping_preview_with_archives(&cmd, editing_id, archive_names) {
+        let editing_id = wizard.editing_mapping_id.as_ref();
+        match mgr.preflight_mapping_preview_cached(
+            &cmd,
+            editing_id,
+            archive_names,
+            control,
+            progress,
+            cache,
+        ) {
             Ok(preview) => {
                 if let Ok(det) = preview.detected_volume {
-                    state.wizard.volume_name = det.display_name;
-                    state.wizard.volume_kind = det.identity.kind;
-                    state.wizard.volume_fs = det.filesystem;
+                    wizard.volume_name = det.display_name;
+                    wizard.volume_kind = det.identity.kind;
+                    wizard.volume_fs = det.filesystem;
                 }
                 layout_err = preview.layout_error;
-                state.wizard.archive_errors = preview.archive_errors;
-                state.wizard.archive_holding_folder = preview.archive_holding_folder;
+                wizard.archive_errors = preview.archive_errors;
+                wizard.archive_holding_folder = preview.archive_holding_folder;
                 local_inv_res = Some(preview.local_inventory);
                 remote_inv_res = Some(preview.remote_inventory);
             }
+            Err(err @ ManagerError::AccountBusy { .. }) => return Err(err),
             Err(err) => {
                 loc_checks.push(LocationCheck {
                     ok: false,
@@ -3526,14 +4135,23 @@ fn recompute_real_wizard_inventory_with_archives(
     } else if !trimmed_local.is_empty() && loc_checks.is_empty() {
         // Destination not selected yet — still inspect local folder honestly (never swallow errors).
         let collection = CloudCollection {
-            display_path: format!("Data/{}", state.wizard.selected_folder),
-            folder_id: format!("local-col-Data_{}", state.wizard.selected_folder),
+            display_path: format!("Data/{}", wizard.selected_folder),
+            folder_id: format!("local-col-Data_{}", wizard.selected_folder),
             ancestor_ids: vec!["local-root".to_owned()],
         };
         let mut exclusions = sync_core::default_exclusion_patterns();
         exclusions.extend(preview_exclusions);
         local_inv_res = Some(
-            inspect_local_endpoint_detailed(&local_path, &collection, &exclusions)
+            cache
+                .inspect_local(&local_path, &collection, &exclusions, &mut |count| {
+                    progress(PreflightPhase::Local(count));
+                    control
+                        .check()
+                        .map_err(|err| ManagerError::PreflightRejected {
+                            cause: err.to_string(),
+                            next_step: "Check the folder again.".to_owned(),
+                        })
+                })
                 .map_err(|e| e.cause()),
         );
     }
@@ -3633,7 +4251,7 @@ fn recompute_real_wizard_inventory_with_archives(
             None
         }
         None => {
-            if !trimmed_local.is_empty() && !state.wizard.has_cloud_folder() {
+            if !trimmed_local.is_empty() && !wizard.has_cloud_folder() {
                 loc_checks.push(LocationCheck {
                     ok: false,
                     message: "Choose a folder from the account before continuing.".to_owned(),
@@ -3648,9 +4266,9 @@ fn recompute_real_wizard_inventory_with_archives(
         .filter(|i| i.classification == SideClassification::HasData)
         .or(local_ok)
     {
-        set_subfolder_inventory(&mut state.wizard, src_inv);
+        set_subfolder_inventory(wizard, src_inv);
     }
-    state.wizard.archive_suggestions = if state.wizard.changing_subfolders {
+    wizard.archive_suggestions = if wizard.changing_subfolders {
         Vec::new()
     } else {
         local_ok
@@ -3658,7 +4276,7 @@ fn recompute_real_wizard_inventory_with_archives(
             .unwrap_or_default()
     };
 
-    if state.wizard.suggest_exclusions {
+    if !wizard.changing_subfolders {
         let mut observed = BTreeMap::new();
         for inventory in [local_ok, remote_ok].into_iter().flatten() {
             for (&pattern, counts) in &inventory.suggested_folders {
@@ -3675,14 +4293,14 @@ fn recompute_real_wizard_inventory_with_archives(
                     .or_insert_with(|| counts.clone());
             }
         }
-        state.wizard.update_suggestions(observed);
+        wizard.update_suggestions(observed);
     }
 
-    state.wizard.cloud_file_count = remote_ok.map(|i| i.file_count);
-    state.wizard.cloud_total_bytes = remote_ok.map(|i| i.total_bytes);
-    state.wizard.local_file_count = local_ok.map(|i| i.file_count);
-    state.wizard.local_total_bytes = local_ok.map(|i| i.total_bytes);
-    state.wizard.marker_reused = remote_ok.is_some_and(|i| i.has_valid_marker);
+    wizard.cloud_file_count = remote_ok.map(|i| i.file_count);
+    wizard.cloud_total_bytes = remote_ok.map(|i| i.total_bytes);
+    wizard.local_file_count = local_ok.map(|i| i.file_count);
+    wizard.local_total_bytes = local_ok.map(|i| i.total_bytes);
+    wizard.marker_reused = remote_ok.is_some_and(|i| i.has_valid_marker);
 
     let mut symlinks = Vec::new();
     let mut name_issues = Vec::new();
@@ -3690,13 +4308,13 @@ fn recompute_real_wizard_inventory_with_archives(
         symlinks.extend(inv.symlinks.iter().cloned());
         name_issues.extend(inv.name_findings.iter().cloned());
     }
-    state.wizard.found_symlinks = symlinks;
-    state.wizard.found_name_issues = name_issues;
+    wizard.found_symlinks = symlinks;
+    wizard.found_name_issues = name_issues;
 
     // Derive ReviewScenario strictly from verified inventories (never from unread sides).
     let local_has = local_ok.is_some_and(|i| i.classification == SideClassification::HasData);
     let remote_has = remote_ok.is_some_and(|i| i.classification == SideClassification::HasData);
-    state.wizard.review_scenario = match (remote_has, local_has) {
+    wizard.review_scenario = match (remote_has, local_has) {
         (true, true) => ReviewScenario::BothPopulated,
         (true, false) => ReviewScenario::CloudToLocal,
         (false, true) => ReviewScenario::LocalToCloud,
@@ -3704,7 +4322,7 @@ fn recompute_real_wizard_inventory_with_archives(
     };
 
     // Layout & recovery disjointness from manager's single validate_complete_layout (HIGH #2).
-    let rec_local = state.wizard.local_recovery_path.trim().to_owned();
+    let rec_local = wizard.local_recovery_path.trim().to_owned();
     let layout_is_recovery = layout_err
         .as_deref()
         .is_some_and(|msg| msg.to_ascii_lowercase().contains("recovery"));
@@ -3775,8 +4393,9 @@ fn recompute_real_wizard_inventory_with_archives(
         }
     }
 
-    state.wizard.location_checks = loc_checks;
-    state.wizard.recovery_checks = rec_checks;
+    wizard.location_checks = loc_checks;
+    wizard.recovery_checks = rec_checks;
+    Ok(())
 }
 
 fn emit_snapshot(
@@ -4100,7 +4719,14 @@ fn project_ui_snapshot(
         skipped_cloud_folders: state.skipped_cloud_folders.clone(),
         cloud_catalog_error: state.cloud_catalog_error.clone(),
         folder_size_pending: state.pending_folder_size.is_some(),
-        wizard: state.wizard.clone(),
+        wizard: {
+            let mut wizard = state.wizard.clone();
+            if wizard.transition_check.is_some() {
+                wizard.location_checks.clear();
+                wizard.recovery_checks.clear();
+            }
+            wizard
+        },
         preferences: state.preferences.clone(),
         reconnecting_account: state.reconnecting_account.clone(),
         account_operation_pending: state.account_worker.is_some(),
@@ -4501,6 +5127,7 @@ fn default_real_wizard() -> WizardDraft {
         drive_collection: None,
         local_path: String::new(),
         location_check_pending: false,
+        transition_check: None,
         volume_name: "unknown".to_owned(),
         volume_kind: VolumeKind::Internal,
         volume_fs: "unknown".to_owned(),

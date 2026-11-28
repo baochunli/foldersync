@@ -18,7 +18,7 @@ use nsh_base::alert_dialog;
 use nsh_core::prelude::*;
 use sync_core::{MappingId, RunId};
 
-use crate::contract::{ScreenRoute, UiCommand, UiSnapshot};
+use crate::contract::{ScreenRoute, UiCommand, UiSnapshot, WizardCheck, WizardStep};
 use crate::demo::DemoSource;
 use crate::manager_source::ManagerSource;
 
@@ -154,6 +154,35 @@ impl AppController {
         }
         match &self.source {
             AppDataSource::Manager(mgr) => {
+                if let UiCommand::WizardSetStep(step) = &cmd {
+                    let allowed = self.snapshot.with_untracked(|snap| {
+                        let wizard = &snap.wizard;
+                        wizard
+                            .transition_check
+                            .as_ref()
+                            .is_none_or(|check| check.waiting && *step < wizard.step)
+                    });
+                    if !allowed {
+                        return;
+                    }
+                    self.snapshot.update(|snap| {
+                        let wizard = &mut snap.wizard;
+                        if wizard.transition_check.is_none()
+                            && wizard.can_visit_step(*step)
+                            && let Some(label) = wizard.transition_label(
+                                *step,
+                                snap.cloud_catalog.is_empty(),
+                                snap.folder_size_pending,
+                            )
+                        {
+                            wizard.step = *step;
+                            wizard.transition_check = Some(WizardCheck::new(label));
+                            wizard.location_check_pending = *step >= WizardStep::Location;
+                            wizard.location_checks.clear();
+                            wizard.recovery_checks.clear();
+                        }
+                    });
+                }
                 mgr.dispatch(cmd);
             }
             AppDataSource::Demo(demo) => {

@@ -86,6 +86,7 @@ pub(crate) fn check_archive_selection(
     folder: &str,
     exclusions: &BTreeSet<String>,
     remote_names: &[String],
+    cached_local_names: Option<&[String]>,
 ) -> Result<PathBuf, ManagerError> {
     // The ordinary preview models FolderSync's simple path globs. Advanced
     // rclone syntax is rejected here so an approximate match never decides
@@ -110,9 +111,13 @@ pub(crate) fn check_archive_selection(
             "The archive name `{zip}` is not supported."
         )));
     }
-    let local_names = local_names(root)
-        .map_err(|err| archive_rejected(format!("Could not inspect the Mac folder: {err}.")))?;
-    check_zip_name(&zip, &local_names, "the Mac folder")?;
+    if let Some(names) = cached_local_names {
+        check_zip_name(&zip, names, "the Mac folder")?;
+    } else {
+        let names = local_names(root)
+            .map_err(|err| archive_rejected(format!("Could not inspect the Mac folder: {err}.")))?;
+        check_zip_name(&zip, &names, "the Mac folder")?;
+    }
     check_zip_name(&zip, remote_names, "the destination folder")?;
     Ok(holding_path)
 }

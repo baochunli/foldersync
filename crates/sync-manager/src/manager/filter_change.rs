@@ -255,8 +255,9 @@ pub(super) fn preview_move_counts(
     cmd: &AddMappingCommand,
     old: &BTreeSet<String>,
     added: &[String],
+    cancellation: &ProcessControl,
 ) -> Result<Vec<ExclusionMatch>, ManagerError> {
-    let control = ProcessControl::with_timeout(DRIVE_COMMAND_TIMEOUT);
+    let control = cancellation.with_fresh_timeout(DRIVE_COMMAND_TIMEOUT);
     let drive = inner
         .accounts
         .locked_drive(&cmd.account_id, &control)
